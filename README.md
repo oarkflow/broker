@@ -1690,3 +1690,69 @@ state_store "sqlite" {
   dsn env("BROKER_SQLITE_DSN", "./.broker-data/broker-state.sqlite")
 }
 ```
+
+## Production gap-fill update: SQLite message store contrib submodule
+
+`contrib/sqlitestore` is now a separate Go submodule with its own `go.mod`. It contains both control-plane and message data-plane persistence:
+
+- `sqlitestore.StateStore` persists broker/task/consumer/publisher state.
+- `sqlitestore.MessageStore` persists queues, topics, streams, leases, offsets, DLQ, and movement state by snapshotting the broker memory data-plane after every mutation.
+
+The package uses `database/sql` and accepts any registered SQLite driver. It does not force a driver into the core broker module.
+
+Example:
+
+```go
+import (
+    _ "modernc.org/sqlite"
+
+    "github.com/oarkflow/fastworker/broker"
+    "github.com/oarkflow/fastworker/contrib/sqlitestore"
+)
+
+msgStore, _ := sqlitestore.OpenMessageStore("sqlite", "./.broker-data/broker-messages.sqlite")
+stateStore, _ := sqlitestore.Open("sqlite", "./.broker-data/broker-state.sqlite")
+
+b := broker.MustNew(broker.Config{
+    Mode:       broker.ModeStandalone,
+    Store:      msgStore,
+    StateStore: stateStore,
+})
+```
+
+BCL:
+
+```bcl
+message_store "sqlite" {
+  enabled env("BROKER_SQLITE_MESSAGE_ENABLED", "false")
+  driver env("BROKER_SQLITE_DRIVER", "sqlite")
+  dsn env("BROKER_SQLITE_MESSAGE_DSN", "./.broker-data/broker-messages.sqlite")
+}
+
+state_store "sqlite" {
+  enabled env("BROKER_SQLITE_STATE_ENABLED", "false")
+  driver env("BROKER_SQLITE_DRIVER", "sqlite")
+  dsn env("BROKER_SQLITE_DSN", "./.broker-data/broker-state.sqlite")
+}
+```
+
+For the highest durable write throughput, use `wal_format "binary"`. For operational simplicity in embedded/single-node deployments, use the SQLite contrib message store.
+
+## Built-in schema registry hook
+
+The broker now includes a dependency-free `SchemaRegistry` interface and a default `MemorySchemaRegistry` implementation. It validates payloads before routing/persistence.
+
+```go
+reg := broker.NewMemorySchemaRegistry(broker.SchemaDefinition{
+    Name:     "invoice.created",
+    Version:  "v1",
+    Required: []string{"invoice_id", "amount"},
+})
+
+b := broker.MustNew(broker.Config{SchemaRegistry: reg})
+_, err := b.Publisher().Publish(ctx, "invoice.created", payload,
+    broker.WithSchema("invoice.created", "v1"),
+)
+```
+
+The built-in registry intentionally supports only lightweight JSON required-field validation. Production users can replace the interface with JSON Schema, Protobuf descriptors, Avro compatibility checks, or an external schema-registry service.

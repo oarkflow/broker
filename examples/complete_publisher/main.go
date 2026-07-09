@@ -17,7 +17,7 @@ import (
 )
 
 func main() {
-	configPath := flag.String("config", "examples/complete_publisher/publisher.bcl", "BCL publisher configuration")
+	configPath := flag.String("config", "complete_publisher/publisher.bcl", "BCL publisher configuration")
 	flag.Parse()
 	root, err := exconfig.Load(*configPath)
 	if err != nil {

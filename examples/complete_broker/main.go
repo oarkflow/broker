@@ -20,7 +20,7 @@ import (
 )
 
 func main() {
-	configPath := flag.String("config", "examples/complete_broker/broker.bcl", "BCL broker configuration")
+	configPath := flag.String("config", "complete_broker/broker.bcl", "BCL broker configuration")
 	flag.Parse()
 
 	root, err := exconfig.Load(*configPath)
@@ -34,7 +34,16 @@ func main() {
 
 	frameCodec := exconfig.FrameCodec(bc)
 	var store broker.Store
-	if wal := bc.String("wal", ""); wal != "" {
+	if ms := bc.Block("message_store", "sqlite"); ms != nil && ms.Bool("enabled", false) {
+		driver := ms.String("driver", "sqlite")
+		dsn := ms.String("dsn", "./.broker-data/broker-messages.sqlite")
+		st, err := sqlitestore.OpenMessageStore(driver, dsn)
+		if err != nil {
+			logger.Log.Fatal("open sqlite message store", zlog.String("driver", driver), zlog.String("dsn", dsn), zlog.Err(err))
+		}
+		store = st
+		logger.Log.Info("configured sqlite message store", zlog.String("driver", driver), zlog.String("dsn", dsn))
+	} else if wal := bc.String("wal", ""); wal != "" {
 		format := strings.ToLower(bc.String("wal_format", "binary"))
 		if format == "json" || format == "jsonl" {
 			st, err := broker.NewFileWALStore(wal)

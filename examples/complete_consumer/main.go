@@ -20,7 +20,7 @@ import (
 )
 
 func main() {
-	configPath := flag.String("config", "examples/complete_consumer/consumer.bcl", "BCL consumer configuration")
+	configPath := flag.String("config", "complete_consumer/consumer.bcl", "BCL consumer configuration")
 	flag.Parse()
 	root, err := exconfig.Load(*configPath)
 	if err != nil {

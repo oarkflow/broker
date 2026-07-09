@@ -10,7 +10,7 @@ var (
 	Log = zlog.New(zlog.Options{
 		Level:     zlog.DebugLevel,
 		Sink:      zlog.NewWriterSink(os.Stderr, zlog.NewConsoleEncoder(), zlog.TraceLevel),
-		AddCaller: true,
+		AddCaller: false,
 	})
 	StdLog = Log.StandardLogger(zlog.InfoLevel)
 )

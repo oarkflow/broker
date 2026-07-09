@@ -8,6 +8,8 @@ type PublishOptions struct {
 	RoutingKey          string
 	Type                string
 	ContentType         string
+	Schema              string
+	SchemaVersion       string
 	Headers             map[string]string
 	Metadata            map[string]string
 	TraceID             string
@@ -51,6 +53,9 @@ func WithKey(v string) PublishOption         { return func(o *PublishOptions) { 
 func WithRoutingKey(v string) PublishOption  { return func(o *PublishOptions) { o.RoutingKey = v } }
 func WithType(v string) PublishOption        { return func(o *PublishOptions) { o.Type = v } }
 func WithContentType(v string) PublishOption { return func(o *PublishOptions) { o.ContentType = v } }
+func WithSchema(name, version string) PublishOption {
+	return func(o *PublishOptions) { o.Schema = name; o.SchemaVersion = version }
+}
 func WithHeader(k, v string) PublishOption {
 	return func(o *PublishOptions) {
 		if o.Headers == nil {

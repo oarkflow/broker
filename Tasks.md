@@ -469,3 +469,28 @@ These are implemented as interfaces/metadata so they can be backed by more advan
 - [x] Integrated state-store persistence into broker lifecycle, task lifecycle, remote consumer lifecycle/events, and publisher operation records.
 - [x] Added `contrib/sqlitestore` persistent SQL/SQLite-backed state-store implementation using `database/sql`.
 - [x] Added optional BCL `state_store "sqlite"` configuration in the complete broker example.
+
+## Production gap-fill pass: persistent stores and submodule contrib
+
+### Done
+
+- Added exported `broker.MemoryStoreSnapshot` support.
+- Added `MemoryStore.Snapshot()` and `MemoryStore.Restore()`.
+- Restore converts in-flight leased/processing/progressing messages back to queued for safe redelivery after crash/restart.
+- Added `contrib/sqlitestore/go.mod` so contrib is a standalone submodule.
+- Added `contrib/sqlitestore.MessageStore` implementing `broker.Store` and `broker.AtomicStore`.
+- SQLite contrib now supports both:
+  - control-plane state store: broker/task/consumer/publisher records
+  - message data-plane store: queues/topics/streams/leases/offsets/DLQ/movement snapshots
+- Added `message_store "sqlite"` BCL block support in `examples/complete_broker`.
+- Added `cmd/brokerd -store sqlite -sqlite-driver ... -sqlite-dsn ...` support.
+- Added documentation for SQLite state and message stores.
+- Added snapshot redelivery test for crashed/in-flight messages.
+
+### Production notes
+
+- Binary WAL remains the recommended high-throughput durable store.
+- SQLite `MessageStore` is production-useful for embedded/single-node deployments that value operational simplicity over maximum write throughput.
+- True broker-node Raft/quorum replication remains outside this pass and is not falsely claimed.
+- Added broker `SchemaRegistry` interface, `MemorySchemaRegistry`, `SchemaDefinition`, and publish-time schema validation.
+- Added `WithSchema(name, version)` publish option and tests for required JSON fields.

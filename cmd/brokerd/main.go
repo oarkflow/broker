@@ -12,12 +12,16 @@ import (
 	"time"
 
 	"github.com/oarkflow/fastworker/broker"
+	"github.com/oarkflow/fastworker/contrib/sqlitestore"
 	"github.com/oarkflow/fastworker/logger"
 	"github.com/oarkflow/zlog"
 )
 
 func main() {
 	addr := flag.String("addr", env("BROKER_ADDR", ":8090"), "HTTP listen address")
+	storeKind := flag.String("store", env("BROKER_STORE", ""), "message store: memory, wal, sqlite; empty auto-selects wal when -wal is set")
+	sqliteDriver := flag.String("sqlite-driver", env("BROKER_SQLITE_DRIVER", "sqlite"), "database/sql driver for sqlite message store")
+	sqliteDSN := flag.String("sqlite-dsn", env("BROKER_SQLITE_DSN", "./.broker-data/broker-messages.sqlite"), "SQLite DSN for message store")
 	wal := flag.String("wal", env("BROKER_WAL", ""), "WAL directory; empty uses in-memory store")
 	walFormat := flag.String("wal-format", env("BROKER_WAL_FORMAT", "binary"), "WAL format: binary or json")
 	frameSigningKey := flag.String("frame-signing-key", env("BROKER_FRAME_SIGNING_KEY", ""), "optional FWB1 frame HMAC signing key")
@@ -47,7 +51,23 @@ func main() {
 
 	frameCodec := broker.NewBinaryMessageCodec(frameCodecOptions(*frameSigningKey, *frameEncryptionKey, *frameCompress, int(*maxBody)+1<<20)...)
 	var store broker.Store
-	if *wal != "" {
+	kind := strings.ToLower(strings.TrimSpace(*storeKind))
+	if kind == "" && *wal != "" {
+		kind = "wal"
+	}
+	switch kind {
+	case "", "memory":
+		// broker.New will install the default in-memory message store.
+	case "sqlite":
+		st, err := sqlitestore.OpenMessageStore(*sqliteDriver, *sqliteDSN)
+		if err != nil {
+			logger.Log.Fatal("open sqlite message store", zlog.String("driver", *sqliteDriver), zlog.String("dsn", *sqliteDSN), zlog.Err(err))
+		}
+		store = st
+	case "wal", "filewal", "file-wal":
+		if *wal == "" {
+			logger.Log.Fatal("-wal is required when -store=wal")
+		}
 		if strings.EqualFold(*walFormat, "json") || strings.EqualFold(*walFormat, "jsonl") {
 			st, err := broker.NewFileWALStore(*wal)
 			if err != nil {
@@ -61,6 +81,8 @@ func main() {
 			}
 			store = st
 		}
+	default:
+		logger.Log.Fatal("unsupported store", zlog.String("store", *storeKind))
 	}
 
 	b, err := broker.New(broker.Config{Mode: broker.ModeStandalone, Store: store, DefaultQueue: *queue, FrameCodec: frameCodec})
@@ -104,18 +126,21 @@ func main() {
 		}
 	case <-time.After(200 * time.Millisecond):
 	}
-	logger.Log.Info("fastworker broker listening", zlog.String("addr", *addr))
+	fmt.Printf("fastworker broker listening on %s\n", *addr)
 	if *insecureDev {
-		logger.Log.Warn("authentication disabled by --insecure-dev")
+		fmt.Println("WARNING: authentication disabled by --insecure-dev")
 	}
 	if *tlsCert != "" {
-		logger.Log.Info("TLS enabled")
+		fmt.Println("TLS enabled")
 	}
 	if *requireClientCert {
-		logger.Log.Info("mTLS client certificate verification enabled")
+		fmt.Println("mTLS client certificate verification enabled")
 	}
-	if *wal != "" {
-		logger.Log.Info("durable WAL", zlog.String("wal", *wal), zlog.String("format", *walFormat))
+	if kind == "sqlite" {
+		fmt.Printf("durable sqlite message store: driver=%s dsn=%s\n", *sqliteDriver, *sqliteDSN)
+	}
+	if kind == "wal" || kind == "filewal" || kind == "file-wal" {
+		fmt.Printf("durable WAL: %s format=%s\n", *wal, *walFormat)
 	}
 
 	sig := make(chan os.Signal, 1)

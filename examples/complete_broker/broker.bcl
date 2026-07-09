@@ -12,6 +12,16 @@ broker "complete" {
   default_visibility "30s"
   remote_consumer_timeout "45s"
 
+  # Optional persistent message data-plane store for queues/topics/streams/DLQ/leases.
+  # This is provided by contrib/sqlitestore as a separate Go submodule. Disabled
+  # by default so examples run without requiring a SQLite driver in this module.
+  # When enabled, this takes precedence over wal/wal_format.
+  message_store "sqlite" {
+    enabled env("BROKER_SQLITE_MESSAGE_ENABLED", "false")
+    driver env("BROKER_SQLITE_DRIVER", "sqlite")
+    dsn env("BROKER_SQLITE_MESSAGE_DSN", "./.broker-data/broker-messages.sqlite")
+  }
+
 
   # Optional persistent control-plane state store for broker/task/consumer/publisher state.
   # It accepts any database/sql SQLite driver registered by your app. The example is

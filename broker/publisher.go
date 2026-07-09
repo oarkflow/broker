@@ -139,7 +139,7 @@ func (p *Publisher) preparePublish(ctx context.Context, topic string, payload an
 		}
 		meta["_dedup_window_ns"] = fmt.Sprintf("%d", o.DeduplicationWindow.Nanoseconds())
 	}
-	msg := Message{ID: id, Topic: topic, Queue: o.Queue, Stream: o.Stream, Key: o.Key, RoutingKey: o.RoutingKey, Type: o.Type, ContentType: firstNonEmpty(o.ContentType, p.b.codec.ContentType()), Payload: body, Headers: cloneMap(o.Headers), Metadata: meta, TraceID: o.TraceID, CorrelationID: o.CorrelationID, CausationID: o.CausationID, IdempotencyKey: o.IdempotencyKey, DeduplicationID: o.DeduplicationID, Priority: o.Priority, CreatedAt: now, AvailableAt: available, TenantID: o.TenantID, ProducerID: o.ProducerID, Status: status, MaxAttempts: o.MaxAttempts}
+	msg := Message{ID: id, Topic: topic, Queue: o.Queue, Stream: o.Stream, Key: o.Key, RoutingKey: o.RoutingKey, Type: o.Type, ContentType: firstNonEmpty(o.ContentType, p.b.codec.ContentType()), Schema: o.Schema, SchemaVersion: o.SchemaVersion, Payload: body, Headers: cloneMap(o.Headers), Metadata: meta, TraceID: o.TraceID, CorrelationID: o.CorrelationID, CausationID: o.CausationID, IdempotencyKey: o.IdempotencyKey, DeduplicationID: o.DeduplicationID, Priority: o.Priority, CreatedAt: now, AvailableAt: available, TenantID: o.TenantID, ProducerID: o.ProducerID, Status: status, MaxAttempts: o.MaxAttempts}
 	if msg.Headers != nil {
 		msg.TaskID = msg.Headers["x-task-id"]
 		msg.TaskName = msg.Headers["x-task-name"]
@@ -149,6 +149,11 @@ func (p *Publisher) preparePublish(ctx context.Context, topic string, payload an
 	}
 	if msg.MaxAttempts <= 0 {
 		msg.MaxAttempts = p.b.cfg.DefaultRetry.MaxAttempts
+	}
+	if p.b.cfg.SchemaRegistry != nil {
+		if err := p.b.cfg.SchemaRegistry.Validate(ctx, msg); err != nil {
+			return preparedPublish{}, err
+		}
 	}
 	ev := PublishEvent{Message: msg, Time: now}
 	if p.b.cfg.Hooks.BeforePublish != nil {

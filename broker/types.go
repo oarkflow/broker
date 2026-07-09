@@ -296,6 +296,7 @@ type Config struct {
 	OwnPool               bool                `json:"own_pool"`
 	Codec                 Codec               `json:"-"`
 	FrameCodec            *BinaryMessageCodec `json:"-"`
+	SchemaRegistry        SchemaRegistry      `json:"-"`
 	DefaultQueue          string              `json:"default_queue"`
 	DefaultVisibility     time.Duration       `json:"default_visibility"`
 	DefaultRetry          RetryPolicy         `json:"default_retry"`
