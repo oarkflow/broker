@@ -52,6 +52,8 @@ type ConsumerInfo struct {
 	LastHeartbeat time.Time            `json:"last_heartbeat"`
 	Paused        bool                 `json:"paused"`
 	Draining      bool                 `json:"draining"`
+	Banned        bool                 `json:"banned"`
+	BannedReason  string               `json:"banned_reason,omitempty"`
 	InFlight      int                  `json:"inflight"`
 	Leased        int64                `json:"leased"`
 	Acked         int64                `json:"acked"`
@@ -151,13 +153,40 @@ func (r *ConsumerRegistry) SetState(id string, st ConsumerState, reason string) 
 	if st == ConsumerReady {
 		c.Paused = false
 		c.Draining = false
+		c.Banned = false
+		c.BannedReason = ""
 	}
 	if st == ConsumerDraining {
 		c.Draining = true
 	}
+	if st == ConsumerBanned {
+		c.Banned = true
+		c.BannedReason = reason
+		c.Paused = false
+		c.Draining = false
+	}
 	if reason != "" {
 		c.LastError = reason
 	}
+	return cloneConsumerInfo(*c), true
+}
+
+func (r *ConsumerRegistry) Ban(id string, reason string) (ConsumerInfo, bool) {
+	return r.SetState(id, ConsumerBanned, reason)
+}
+
+func (r *ConsumerRegistry) Unban(id string) (ConsumerInfo, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	c := r.consumers[id]
+	if c == nil {
+		return ConsumerInfo{}, false
+	}
+	c.State = ConsumerReady
+	c.Banned = false
+	c.BannedReason = ""
+	c.Paused = false
+	c.Draining = false
 	return cloneConsumerInfo(*c), true
 }
 func (r *ConsumerRegistry) AddStats(id string, leased, acked, nacked, failed int64, lastErr string) {
@@ -270,6 +299,9 @@ func (b *Broker) Consumers() *ConsumerRegistry {
 func (b *Broker) RegisterRemoteConsumer(ctx context.Context, reg ConsumerRegistration) (ConsumerInfo, error) {
 	info := b.Consumers().Register(reg)
 	b.persistConsumer(ctx, info)
+	if info.Group != "" {
+		b.ConsumerJoinGroup(ctx, info.ConsumerID, info.Group)
+	}
 	if b.cfg.Hooks.OnConsumerRegistered != nil {
 		b.cfg.Hooks.OnConsumerRegistered(ctx, ConsumerEvent{Consumer: info.ConsumerID, Group: info.Group, State: ConsumerRegistered, Time: time.Now()})
 	}
@@ -371,14 +403,53 @@ func (b *Broker) SetRemoteConsumerState(ctx context.Context, id string, st Consu
 		if b.cfg.Hooks.OnConsumerStopped != nil {
 			b.cfg.Hooks.OnConsumerStopped(ctx, ce)
 		}
+	case ConsumerBanned:
+		if b.cfg.Hooks.OnConsumerBanned != nil {
+			b.cfg.Hooks.OnConsumerBanned(ctx, ce)
+		}
 	}
-	b.emitConsumerNotification(id, Notification{Type: "consumer." + string(st), Source: b.cfg.Name, Severity: SeverityInfo, Consumer: id, ConsumerGroup: info.Group, Timestamp: time.Now(), Data: map[string]any{"reason": reason}})
+	eventType := "consumer." + string(st)
+	if st == ConsumerReady && info.BannedReason == "" && info.Banned {
+		eventType = "consumer.unbanned"
+	}
+	b.emitConsumerNotification(id, Notification{Type: eventType, Source: b.cfg.Name, Severity: SeverityInfo, Consumer: id, ConsumerGroup: info.Group, Timestamp: time.Now(), Data: map[string]any{"reason": reason}})
+	return info, nil
+}
+
+func (b *Broker) BanRemoteConsumer(ctx context.Context, id string, reason string) (ConsumerInfo, error) {
+	info, ok := b.Consumers().Ban(id, reason)
+	if !ok {
+		return ConsumerInfo{}, ErrMessageNotFound
+	}
+	b.persistConsumer(ctx, info)
+	ce := ConsumerEvent{Consumer: id, Group: info.Group, State: ConsumerBanned, Error: errf(ErrPermanent, reason), Time: time.Now()}
+	if b.cfg.Hooks.OnConsumerBanned != nil {
+		b.cfg.Hooks.OnConsumerBanned(ctx, ce)
+	}
+	b.emitConsumerNotification(id, Notification{Type: "consumer.banned", Source: b.cfg.Name, Severity: SeverityWarn, Consumer: id, ConsumerGroup: info.Group, Timestamp: time.Now(), Data: map[string]any{"reason": reason}})
+	return info, nil
+}
+
+func (b *Broker) UnbanRemoteConsumer(ctx context.Context, id string) (ConsumerInfo, error) {
+	info, ok := b.Consumers().Unban(id)
+	if !ok {
+		return ConsumerInfo{}, ErrMessageNotFound
+	}
+	b.persistConsumer(ctx, info)
+	ce := ConsumerEvent{Consumer: id, Group: info.Group, State: ConsumerReady, Time: time.Now()}
+	if b.cfg.Hooks.OnConsumerUnbanned != nil {
+		b.cfg.Hooks.OnConsumerUnbanned(ctx, ce)
+	}
+	b.emitConsumerNotification(id, Notification{Type: "consumer.unbanned", Source: b.cfg.Name, Severity: SeverityInfo, Consumer: id, ConsumerGroup: info.Group, Timestamp: time.Now()})
 	return info, nil
 }
 func (b *Broker) UnregisterRemoteConsumer(ctx context.Context, id string) error {
 	info, ok := b.Consumers().Unregister(id)
 	if !ok {
 		return ErrMessageNotFound
+	}
+	if info.Group != "" {
+		b.ConsumerLeaveGroup(ctx, id, info.Group)
 	}
 	if b.stateStore != nil {
 		_ = b.stateStore.DeleteConsumer(ctx, id)

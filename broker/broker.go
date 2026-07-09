@@ -32,10 +32,12 @@ type Broker struct {
 	taskMu     sync.RWMutex
 	tasks      map[string]*TaskInfo
 	taskWait   map[string][]chan TaskResult
-	notify     *NotificationBus
-	cluster    *Cluster
-	consumers  *ConsumerRegistry
-	wg         sync.WaitGroup
+	notify          *NotificationBus
+	cluster         *Cluster
+	consumers       *ConsumerRegistry
+	groupRebalancer *GroupRebalancer
+	sagaEngine      *SagaEngine
+	wg              sync.WaitGroup
 }
 
 func New(cfg Config) (*Broker, error) {
@@ -95,6 +97,7 @@ func New(cfg Config) (*Broker, error) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	b := &Broker{cfg: cfg, store: cfg.Store, stateStore: cfg.StateStore, router: NewRouter(), codec: cfg.Codec, frameCodec: cfg.FrameCodec, pool: pool, ownPool: own, ctx: ctx, cancel: cancel, subs: map[string]*Subscription{}, waiters: map[string]chan Response{}, tasks: map[string]*TaskInfo{}, taskWait: map[string][]chan TaskResult{}, notify: NewNotificationBus(1024), consumers: NewConsumerRegistry(512), cluster: NewCluster(firstNonEmpty(cfg.NodeID, "node-1"))}
+	b.sagaEngine = NewSagaEngine(b)
 	b.state.Store(BrokerConfigured)
 	_ = b.store.DeclareQueue(context.Background(), QueueConfig{Name: cfg.DefaultQueue, VisibilityTimeout: cfg.DefaultVisibility, RetryPolicy: cfg.DefaultRetry, DLQ: cfg.DefaultDLQ})
 	_ = b.store.DeclareQueue(context.Background(), QueueConfig{Name: cfg.DefaultDLQ, VisibilityTimeout: cfg.DefaultVisibility, RetryPolicy: cfg.DefaultRetry})
@@ -129,6 +132,7 @@ func (b *Broker) Start(ctx context.Context) error {
 	go b.leaseSweeper()
 	b.wg.Add(1)
 	go b.consumerSweeper()
+	b.startGroupRebalancer()
 	return nil
 }
 
@@ -252,7 +256,7 @@ func (b *Broker) sweepRemoteConsumers(now time.Time) {
 		return
 	}
 	for _, c := range b.Consumers().List() {
-		if c.State == ConsumerStopped || c.State == ConsumerDisconnected || c.State == ConsumerDraining || c.State == ConsumerPaused {
+		if c.State == ConsumerStopped || c.State == ConsumerDisconnected || c.State == ConsumerDraining || c.State == ConsumerPaused || c.State == ConsumerBanned {
 			continue
 		}
 		if !c.LastHeartbeat.IsZero() && now.Sub(c.LastHeartbeat) > b.cfg.RemoteConsumerTimeout {
@@ -346,6 +350,7 @@ func (b *Broker) ConsumerOffset(ctx context.Context, commit OffsetCommit) (uint6
 	return b.store.ConsumerOffset(ctx, commit)
 }
 
+func (b *Broker) SagaEngine() *SagaEngine { return b.sagaEngine }
 func (b *Broker) AddRoute(route Route) { b.router.Add(route) }
 
 func (b *Broker) nextID(prefix string) string {

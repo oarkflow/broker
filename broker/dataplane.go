@@ -71,6 +71,24 @@ func (a AdminServer) dataPlane(w http.ResponseWriter, r *http.Request) {
 		a.dlqQueue(w, r)
 	case path == "/events":
 		a.events(w, r)
+	case path == "/sagas":
+		if r.Method == http.MethodPost {
+			a.v1SagaCreate(w, r)
+		} else {
+			writeBrokerJSON(w, a.Broker.SagaEngine().ListSagas())
+		}
+	case strings.HasPrefix(path, "/sagas/"):
+		a.v1Saga(w, r, strings.TrimPrefix(path, "/sagas/"))
+	case path == "/groups":
+		writeBrokerJSON(w, a.Broker.GroupRebalancer().ListGroups())
+	case strings.HasPrefix(path, "/groups/"):
+		group := strings.TrimPrefix(path, "/groups/")
+		g := a.Broker.GroupRebalancer().GetGroup(group)
+		if g == nil {
+			http.NotFound(w, r)
+			return
+		}
+		writeBrokerJSON(w, g)
 	default:
 		http.NotFound(w, r)
 	}
@@ -280,6 +298,24 @@ func (a AdminServer) v1Consumer(w http.ResponseWriter, r *http.Request, tail str
 			return
 		}
 		writeBrokerJSON(w, info)
+	case "ban":
+		reason := r.URL.Query().Get("reason")
+		if reason == "" {
+			reason = "remote ban"
+		}
+		info, err := a.Broker.BanRemoteConsumer(r.Context(), id, reason)
+		if err != nil {
+			http.Error(w, err.Error(), 404)
+			return
+		}
+		writeBrokerJSON(w, info)
+	case "unban":
+		info, err := a.Broker.UnbanRemoteConsumer(r.Context(), id)
+		if err != nil {
+			http.Error(w, err.Error(), 404)
+			return
+		}
+		writeBrokerJSON(w, info)
 	case "unregister":
 		if r.Method != http.MethodPost && r.Method != http.MethodDelete {
 			methodBroker(w)
@@ -411,7 +447,7 @@ func (a AdminServer) v1Poll(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "consumer_id and queue required", 400)
 		return
 	}
-	if info, ok := a.Broker.Consumers().Get(req.ConsumerID); ok && (info.Paused || info.Draining || info.State == ConsumerPaused || info.State == ConsumerDraining || info.State == ConsumerStopped) {
+	if info, ok := a.Broker.Consumers().Get(req.ConsumerID); ok && (info.Paused || info.Draining || info.Banned || info.State == ConsumerPaused || info.State == ConsumerDraining || info.State == ConsumerStopped || info.State == ConsumerBanned) {
 		writeBrokerJSON(w, []Message{})
 		return
 	}
@@ -696,6 +732,46 @@ func (a AdminServer) v1Task(w http.ResponseWriter, r *http.Request, tail string)
 		http.NotFound(w, r)
 	}
 }
+func (a AdminServer) v1SagaCreate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodBroker(w)
+		return
+	}
+	var def SagaDefinition
+	if json.NewDecoder(r.Body).Decode(&def) != nil {
+		http.Error(w, "invalid json", 400)
+		return
+	}
+	if def.Name == "" {
+		http.Error(w, "saga name required", 400)
+		return
+	}
+	if len(def.Steps) == 0 {
+		http.Error(w, "saga steps required", 400)
+		return
+	}
+	inst := a.Broker.SagaEngine().CreateSaga(r.Context(), def)
+	if err := a.Broker.SagaEngine().ExecuteSaga(r.Context(), inst.ID); err != nil {
+		http.Error(w, err.Error(), 409)
+		return
+	}
+	writeBrokerJSON(w, inst.clone())
+}
+
+func (a AdminServer) v1Saga(w http.ResponseWriter, r *http.Request, tail string) {
+	id := strings.Trim(tail, "/")
+	if id == "" {
+		http.NotFound(w, r)
+		return
+	}
+	s, ok := a.Broker.SagaEngine().GetSaga(id)
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	writeBrokerJSON(w, s)
+}
+
 func queryDuration(r *http.Request, key string, d time.Duration) time.Duration {
 	raw := r.URL.Query().Get(key)
 	if raw == "" {

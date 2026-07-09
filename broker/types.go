@@ -94,6 +94,7 @@ const (
 	ConsumerLeaving       ConsumerState = "leaving"
 	ConsumerDisconnected  ConsumerState = "disconnected"
 	ConsumerFailed        ConsumerState = "failed"
+	ConsumerBanned        ConsumerState = "banned"
 	ConsumerStopped       ConsumerState = "stopped"
 )
 

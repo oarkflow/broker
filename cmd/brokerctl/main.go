@@ -77,12 +77,46 @@ func main() {
 		err = publish(client, *addr, *token, flag.Args()[1:])
 	case "move":
 		err = move(client, *addr, *token, flag.Args()[1:])
+	case "consumers":
+		err = consumers(client, *addr, *token, flag.Args()[1:])
+	case "sagas":
+		if flag.NArg() < 2 {
+			err = request(client, *addr, *token, http.MethodGet, "/v1/sagas", nil)
+		} else {
+			err = request(client, *addr, *token, http.MethodGet, "/v1/sagas/"+flag.Arg(1), nil)
+		}
 	default:
 		usage()
 		os.Exit(2)
 	}
 	if err != nil {
 		die(err.Error())
+	}
+}
+
+func consumers(client *http.Client, addr, token string, args []string) error {
+	if len(args) == 0 {
+		return request(client, addr, token, http.MethodGet, "/v1/consumers", nil)
+	}
+	sub := args[0]
+	rest := args[1:]
+	switch sub {
+	case "ban":
+		if len(rest) < 1 {
+			return fmt.Errorf("ban requires consumer id")
+		}
+		reason := "banned via brokerctl"
+		if len(rest) >= 2 {
+			reason = rest[1]
+		}
+		return request(client, addr, token, http.MethodPost, "/v1/consumers/"+rest[0]+"/ban?reason="+reason, nil)
+	case "unban":
+		if len(rest) < 1 {
+			return fmt.Errorf("unban requires consumer id")
+		}
+		return request(client, addr, token, http.MethodPost, "/v1/consumers/"+rest[0]+"/unban", nil)
+	default:
+		return request(client, addr, token, http.MethodGet, "/v1/consumers/"+sub, nil)
 	}
 }
 
@@ -190,7 +224,9 @@ func usage() {
   resume <queue>
   purge <queue>
   publish -topic <topic> -queue <queue> -stream <stream> -type <type> -payload '<json>'
-  move -from-type queue -from <name> -to-type queue -to <name> [-mode move] [-ids id1,id2]`)
+  move -from-type queue -from <name> -to-type queue -to <name> [-mode move] [-ids id1,id2]
+  consumers [id|ban <id> [reason]|unban <id>]
+  sagas [id]`)
 }
 
 func die(msg string) {

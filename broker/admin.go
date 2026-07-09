@@ -599,6 +599,12 @@ func adminAction(r *http.Request) string {
 		return PermissionConsumerRegister
 	case strings.HasPrefix(path, "/v1/consumers"):
 		if isMutation(method) {
+			if strings.HasSuffix(path, "/ban") {
+				return PermissionConsumerBan
+			}
+			if strings.HasSuffix(path, "/unban") {
+				return PermissionConsumerUnban
+			}
 			return PermissionConsumerControl
 		}
 		return PermissionConsumerRead
@@ -612,6 +618,11 @@ func adminAction(r *http.Request) string {
 			return PermissionMessageNack
 		}
 		return PermissionMessageRead
+	case strings.HasPrefix(path, "/v1/sagas"):
+		if isMutation(method) {
+			return PermissionTaskWrite
+		}
+		return PermissionTaskRead
 	case strings.HasPrefix(path, "/v1/tasks/submit"):
 		return PermissionTaskWrite
 	case strings.HasPrefix(path, "/v1/tasks"):

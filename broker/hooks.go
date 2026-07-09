@@ -110,6 +110,8 @@ type Hooks struct {
 	OnConsumerPaused     func(context.Context, ConsumerEvent)
 	OnConsumerResumed    func(context.Context, ConsumerEvent)
 	OnConsumerDraining   func(context.Context, ConsumerEvent)
+	OnConsumerBanned     func(context.Context, ConsumerEvent)
+	OnConsumerUnbanned   func(context.Context, ConsumerEvent)
 	OnConsumerStopped    func(context.Context, ConsumerEvent)
 
 	OnTaskCreated      func(context.Context, TaskEvent)
