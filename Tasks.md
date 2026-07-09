@@ -401,10 +401,10 @@ These are implemented as interfaces/metadata so they can be backed by more advan
 ## Consolidated BCL examples pass
 
 - [x] Removed noisy scattered example folders.
-- [x] Added `examples/complete_broker` with `broker.bcl` covering broker config, WAL, ACL tokens, queues, topics, streams, routes, wildcard routing, service discovery, live logs, and broker-sent events.
-- [x] Added `examples/complete_consumer` with `consumer.bcl` covering queue/topic/wildcard handlers, polling, service discovery, broker-sent events, lifecycle hooks, progress, and DLQ demo behavior.
-- [x] Added `examples/complete_worker` with `worker.bcl` covering task, request/response, command handling, polling, auto lease extension, service discovery, broker-sent cancellation/drain events, and lifecycle hooks.
-- [x] Added `examples/complete_publisher` with `publisher.bcl` covering publish, topic route, wildcard topic, batch, async, task submit/result wait, request/response, command/response, stream publish/read/commit, and DLQ demo publish.
+- [x] Added `examples/broker` with `broker.bcl` covering broker config, WAL, ACL tokens, queues, topics, streams, routes, wildcard routing, service discovery, live logs, and broker-sent events.
+- [x] Added `examples/consumer` with `consumer.bcl` covering queue/topic/wildcard handlers, polling, service discovery, broker-sent events, lifecycle hooks, progress, and DLQ demo behavior.
+- [x] Added `examples/worker` with `worker.bcl` covering task, request/response, command handling, polling, auto lease extension, service discovery, broker-sent cancellation/drain events, and lifecycle hooks.
+- [x] Added `examples/publisher` with `publisher.bcl` covering publish, topic route, wildcard topic, batch, async, task submit/result wait, request/response, command/response, stream publish/read/commit, and DLQ demo publish.
 - [x] Added `examples/internal/exconfig` BCL loader for the examples.
 - [x] Updated `scripts/smoke_remote.sh` to use the four consolidated examples.
 - [x] Validated with `go test ./...`, `go vet ./...`, `go test -race ./broker`, and `./scripts/smoke_remote.sh`.
@@ -412,16 +412,16 @@ These are implemented as interfaces/metadata so they can be backed by more advan
 ## Complete lifecycle/hooks/notification examples pass
 
 - [x] Added `examples/internal/exobserve` with reusable broker observer, client observer, notification callback, and JSONL sink.
-- [x] Updated `examples/complete_broker` to pass explicit lifecycle hooks into `broker.Config.Hooks`.
-- [x] Updated `examples/complete_broker` to subscribe real notification callbacks to `b.Notifications()`.
-- [x] Updated `examples/complete_broker/broker.bcl` with `observer_jsonl` and `callback "live-jsonl-audit"` blocks.
-- [x] Updated `examples/complete_consumer` to use `exobserve.ClientObserver` instead of only generic logging hooks.
-- [x] Updated `examples/complete_worker` to use `exobserve.ClientObserver` instead of only generic logging hooks.
+- [x] Updated `examples/broker` to pass explicit lifecycle hooks into `broker.Config.Hooks`.
+- [x] Updated `examples/broker` to subscribe real notification callbacks to `b.Notifications()`.
+- [x] Updated `examples/broker/broker.bcl` with `observer_jsonl` and `callback "live-jsonl-audit"` blocks.
+- [x] Updated `examples/consumer` to use `exobserve.ClientObserver` instead of only generic logging hooks.
+- [x] Updated `examples/worker` to use `exobserve.ClientObserver` instead of only generic logging hooks.
 - [x] Added client `OnNotification` hook fired for every broker-sent event received from `/v1/consumers/{id}/events`.
 - [x] Updated `bclient.LoggingHooks` to log broker notification events in addition to lifecycle/message events.
-- [x] Updated `examples/complete_consumer/consumer.bcl` and `examples/complete_worker/worker.bcl` with `lifecycle_hooks` and `notification_callback` blocks.
-- [x] Updated `examples/complete_publisher` with local operation callbacks and JSONL observability sink.
-- [x] Updated `examples/complete_publisher/publisher.bcl` with `observer_jsonl` and callback configuration.
+- [x] Updated `examples/consumer/consumer.bcl` and `examples/worker/worker.bcl` with `lifecycle_hooks` and `notification_callback` blocks.
+- [x] Updated `examples/publisher` with local operation callbacks and JSONL observability sink.
+- [x] Updated `examples/publisher/publisher.bcl` with `observer_jsonl` and callback configuration.
 - [x] Updated `README.md` with the complete lifecycle/hooks/notification example implementation and BCL snippets.
 - [x] Updated `scripts/smoke_remote.sh` to assert broker hooks, broker notification callbacks, consumer/worker broker-event callbacks, and non-empty JSONL observability files.
 
@@ -453,11 +453,11 @@ These are implemented as interfaces/metadata so they can be backed by more advan
 
 - [x] Added BCL-driven publisher service-discovery preflight for task/request/command operations.
 - [x] Publisher now fails fast with a clear missing-worker/subscription error instead of waiting for task/request timeout when no matching worker is registered.
-- [x] Added `require_consumers` and `discovery_wait` to `examples/complete_publisher/publisher.bcl`.
+- [x] Added `require_consumers` and `discovery_wait` to `examples/publisher/publisher.bcl`.
 - [x] Added worker handler queue override support through `HandleTaskQueue`, `HandleRequestQueue`, and `HandleCommandQueue`.
-- [x] Updated `examples/complete_worker` to honor `queue` values from BCL handler blocks.
+- [x] Updated `examples/worker` to honor `queue` values from BCL handler blocks.
 - [x] Added `docs/CODEC_FORMAT.md` with the complete FWB1 binary frame layout, flags, TLV fields, security behavior, endpoints, and Go usage.
-- [x] Added `examples/complete_codec` with BCL-configured encode/decode/header-peek/tamper-detection example.
+- [x] Added `examples/codec` with BCL-configured encode/decode/header-peek/tamper-detection example.
 - [x] Updated README with service discovery troubleshooting and codec documentation/example instructions.
 
 
@@ -482,7 +482,7 @@ These are implemented as interfaces/metadata so they can be backed by more advan
 - SQLite contrib now supports both:
   - control-plane state store: broker/task/consumer/publisher records
   - message data-plane store: queues/topics/streams/leases/offsets/DLQ/movement snapshots
-- Added `message_store "sqlite"` BCL block support in `examples/complete_broker`.
+- Added `message_store "sqlite"` BCL block support in `examples/broker`.
 - Added `cmd/brokerd -store sqlite -sqlite-driver ... -sqlite-dsn ...` support.
 - Added documentation for SQLite state and message stores.
 - Added snapshot redelivery test for crashed/in-flight messages.

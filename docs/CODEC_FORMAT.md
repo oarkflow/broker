@@ -150,7 +150,7 @@ Publish one frame:
 
 ```text
 POST /v1/publish/frame
-Content-Type: application/vnd.fastworker.broker.frame
+Content-Type: application/vnd.pool.broker.frame
 Body: raw FWB1 frame bytes
 ```
 

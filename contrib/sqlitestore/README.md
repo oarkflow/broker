@@ -19,8 +19,8 @@ package main
 import (
     _ "modernc.org/sqlite" // or github.com/mattn/go-sqlite3
 
-    "github.com/oarkflow/fastworker/broker"
-    "github.com/oarkflow/fastworker/contrib/sqlitestore"
+    "github.com/oarkflow/broker"
+    "github.com/oarkflow/broker/contrib/sqlitestore"
 )
 
 func main() {
@@ -49,6 +49,6 @@ For very high write throughput, prefer the broker binary WAL store. For enterpri
 The root module has a `replace` entry so examples can import this contrib module locally. For your own application, either keep this submodule path or copy the same pattern:
 
 ```go
-require github.com/oarkflow/fastworker/contrib/sqlitestore v0.0.0
-replace github.com/oarkflow/fastworker/contrib/sqlitestore => ./contrib/sqlitestore
+require github.com/oarkflow/broker/contrib/sqlitestore v0.0.0
+replace github.com/oarkflow/broker/contrib/sqlitestore => ./contrib/sqlitestore
 ```

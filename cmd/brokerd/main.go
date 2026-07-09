@@ -11,9 +11,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/oarkflow/fastworker/broker"
-	"github.com/oarkflow/fastworker/contrib/sqlitestore"
-	"github.com/oarkflow/fastworker/logger"
+	"github.com/oarkflow/broker"
+	"github.com/oarkflow/broker/contrib/sqlitestore"
+	"github.com/oarkflow/broker/pkg/logger"
 	"github.com/oarkflow/zlog"
 )
 

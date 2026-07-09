@@ -1,6 +1,6 @@
 package exconfig
 
-import "github.com/oarkflow/fastworker/broker"
+import "github.com/oarkflow/broker"
 
 func FrameCodec(node *Node) *broker.BinaryMessageCodec {
 	if node == nil {

@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/oarkflow/fastworker/broker"
+	"github.com/oarkflow/broker"
 )
 
 // MessageStore is a SQLite/database-sql backed broker.Store. It uses the

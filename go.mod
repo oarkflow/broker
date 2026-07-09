@@ -1,4 +1,4 @@
-module github.com/oarkflow/fastworker
+module github.com/oarkflow/broker
 
 go 1.23.2
 

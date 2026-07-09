@@ -127,19 +127,19 @@ Run the consolidated BCL-driven examples:
 
 ```bash
 # Terminal 1: broker with BCL routes, queues, streams, ACL tokens, logs, service discovery, and broker-sent events
-go run ./examples/complete_broker -config examples/complete_broker/broker.bcl
+go run ./examples/broker -config examples/broker/broker.bcl
 
 # Terminal 2: consumer for queue/topic/wildcard message handling
-go run ./examples/complete_consumer -config examples/complete_consumer/consumer.bcl
+go run ./examples/consumer -config examples/consumer/consumer.bcl
 
 # Terminal 3: worker for task/request/command handling
-go run ./examples/complete_worker -config examples/complete_worker/worker.bcl
+go run ./examples/worker -config examples/worker/worker.bcl
 
 # Terminal 4: publisher covering publish, async, batch, task, request, command, stream, codec frames, and DLQ demo
-go run ./examples/complete_publisher -config examples/complete_publisher/publisher.bcl
+go run ./examples/publisher -config examples/publisher/publisher.bcl
 
 # Optional: standalone codec encode/decode/tamper-detection demo
-go run ./examples/complete_codec -config examples/complete_codec/codec.bcl
+go run ./examples/codec -config examples/codec/codec.bcl
 ```
 
 Or run the full smoke flow:
@@ -150,15 +150,15 @@ Or run the full smoke flow:
 
 ### Required process order for task/request/command operations
 
-`complete_publisher` intentionally performs task, request/response, and command operations. Those modes require a live worker service subscribed to the configured queues. Start `complete_worker` before running the publisher. If no matching worker is discoverable, the publisher now fails fast with a clear service-discovery error instead of waiting until a task/request timeout.
+`publisher` intentionally performs task, request/response, and command operations. Those modes require a live worker service subscribed to the configured queues. Start `worker` before running the publisher. If no matching worker is discoverable, the publisher now fails fast with a clear service-discovery error instead of waiting until a task/request timeout.
 
 Required mapping from the default BCL files:
 
 | Operation | Required queue | Required process |
 |---|---|---|
-| `submit-task` | `tasks.pdf.generate` | `examples/complete_worker` |
-| `request-response` | `request.payment.authorize` | `examples/complete_worker` |
-| `command-response` | `command.payment.capture` | `examples/complete_worker` |
+| `submit-task` | `tasks.pdf.generate` | `examples/worker` |
+| `request-response` | `request.payment.authorize` | `examples/worker` |
+| `command-response` | `command.payment.capture` | `examples/worker` |
 
 The publisher config controls this behavior:
 
@@ -203,7 +203,7 @@ import (
     "fmt"
     "time"
 
-    "github.com/oarkflow/fastworker/broker"
+    "github.com/oarkflow/broker"
 )
 
 func main() {
@@ -1160,11 +1160,11 @@ broker/
 cmd/brokerd/        Standalone broker server
 cmd/broker-worker/  Generic remote worker CLI
 cmd/brokerctl/      CLI client
-examples/complete_broker/     Complete BCL-driven broker example
-examples/complete_consumer/   Complete BCL-driven consumer example
-examples/complete_worker/     Complete BCL-driven worker/task service example
-examples/complete_publisher/  Complete BCL-driven publisher example
-examples/complete_codec/      Complete FWB1 codec encode/decode/tamper example
+examples/broker/     Complete BCL-driven broker example
+examples/consumer/   Complete BCL-driven consumer example
+examples/worker/     Complete BCL-driven worker/task service example
+examples/publisher/  Complete BCL-driven publisher example
+examples/codec/      Complete FWB1 codec encode/decode/tamper example
 examples/internal/exconfig/   Small BCL loader used by the examples
 Tasks.md            Implementation tracker
 ```
@@ -1183,19 +1183,19 @@ The examples folder has been intentionally reduced to four complete examples plu
 
 ```text
 examples/
-  complete_broker/
+  broker/
     broker.bcl
     main.go
-  complete_consumer/
+  consumer/
     consumer.bcl
     main.go
-  complete_worker/
+  worker/
     worker.bcl
     main.go
-  complete_publisher/
+  publisher/
     publisher.bcl
     main.go
-  complete_codec/
+  codec/
     codec.bcl
     main.go
   internal/exconfig/
@@ -1206,7 +1206,7 @@ The old scattered examples were removed to avoid noise. The four remaining examp
 
 ### 1. Complete broker example
 
-`examples/complete_broker/broker.bcl` configures:
+`examples/broker/broker.bcl` configures:
 
 - listen address
 - standalone mode
@@ -1232,7 +1232,7 @@ The old scattered examples were removed to avoid noise. The four remaining examp
 Run:
 
 ```bash
-go run ./examples/complete_broker -config examples/complete_broker/broker.bcl
+go run ./examples/broker -config examples/broker/broker.bcl
 ```
 
 Production-style token run:
@@ -1242,12 +1242,12 @@ BROKER_INSECURE_DEV=false \
 BROKER_TOKEN='admin-secret' \
 BROKER_PUBLISHER_TOKEN='publisher-secret' \
 BROKER_WORKER_TOKEN='worker-secret' \
-go run ./examples/complete_broker -config examples/complete_broker/broker.bcl
+go run ./examples/broker -config examples/broker/broker.bcl
 ```
 
 ### 2. Complete consumer example
 
-`examples/complete_consumer/consumer.bcl` configures:
+`examples/consumer/consumer.bcl` configures:
 
 - broker URL/failover URL list
 - worker token
@@ -1270,12 +1270,12 @@ go run ./examples/complete_broker -config examples/complete_broker/broker.bcl
 Run:
 
 ```bash
-go run ./examples/complete_consumer -config examples/complete_consumer/consumer.bcl
+go run ./examples/consumer -config examples/consumer/consumer.bcl
 ```
 
 ### 3. Complete worker example
 
-`examples/complete_worker/worker.bcl` configures the task/RPC/command worker service:
+`examples/worker/worker.bcl` configures the task/RPC/command worker service:
 
 - broker URL/failover URL list
 - worker token
@@ -1294,12 +1294,12 @@ go run ./examples/complete_consumer -config examples/complete_consumer/consumer.
 Run:
 
 ```bash
-go run ./examples/complete_worker -config examples/complete_worker/worker.bcl
+go run ./examples/worker -config examples/worker/worker.bcl
 ```
 
 ### 4. Complete publisher example
 
-`examples/complete_publisher/publisher.bcl` configures publisher operations for all primary modes:
+`examples/publisher/publisher.bcl` configures publisher operations for all primary modes:
 
 - direct queue publish
 - topic publish routed by broker route
@@ -1315,7 +1315,7 @@ go run ./examples/complete_worker -config examples/complete_worker/worker.bcl
 Run:
 
 ```bash
-go run ./examples/complete_publisher -config examples/complete_publisher/publisher.bcl
+go run ./examples/publisher -config examples/publisher/publisher.bcl
 ```
 
 ### Complete local flow
@@ -1324,16 +1324,16 @@ Use four terminals:
 
 ```bash
 # terminal 1
-go run ./examples/complete_broker -config examples/complete_broker/broker.bcl
+go run ./examples/broker -config examples/broker/broker.bcl
 
 # terminal 2
-go run ./examples/complete_consumer -config examples/complete_consumer/consumer.bcl
+go run ./examples/consumer -config examples/consumer/consumer.bcl
 
 # terminal 3
-go run ./examples/complete_worker -config examples/complete_worker/worker.bcl
+go run ./examples/worker -config examples/worker/worker.bcl
 
 # terminal 4
-go run ./examples/complete_publisher -config examples/complete_publisher/publisher.bcl
+go run ./examples/publisher -config examples/publisher/publisher.bcl
 ```
 
 Automated smoke:
@@ -1493,7 +1493,7 @@ This implementation is hardened for embedded and single-node standalone broker u
 
 ## Native FWB1 binary message codec
 
-The complete wire/storage format is documented in [`docs/CODEC_FORMAT.md`](docs/CODEC_FORMAT.md). Run `go run ./examples/complete_codec -config examples/complete_codec/codec.bcl` for a standalone BCL-driven encode/decode/tamper-detection demo.
+The complete wire/storage format is documented in [`docs/CODEC_FORMAT.md`](docs/CODEC_FORMAT.md). Run `go run ./examples/codec -config examples/codec/codec.bcl` for a standalone BCL-driven encode/decode/tamper-detection demo.
 
 BCL payload examples use native BCL object blocks. The example loader converts these blocks to JSON payload bytes, so payloads are readable and are not escaped strings:
 
@@ -1634,13 +1634,13 @@ codec "fwb1" {
 }
 ```
 
-`examples/complete_broker/broker.bcl` also supports:
+`examples/broker/broker.bcl` also supports:
 
 ```bcl
 wal_format "binary"
 ```
 
-`examples/complete_publisher/publisher.bcl` includes `frame_publish` and `frame_poll` operations to demonstrate binary frame transport. `examples/complete_codec` shows direct local codec usage without a running broker.
+`examples/publisher/publisher.bcl` includes `frame_publish` and `frame_poll` operations to demonstrate binary frame transport. `examples/codec` shows direct local codec usage without a running broker.
 
 
 ## Control-plane state store interfaces and SQLite contrib
@@ -1668,8 +1668,8 @@ import (
     "database/sql"
 
     _ "modernc.org/sqlite" // or your preferred SQLite driver
-    "github.com/oarkflow/fastworker/broker"
-    "github.com/oarkflow/fastworker/contrib/sqlitestore"
+    "github.com/oarkflow/broker"
+    "github.com/oarkflow/broker/contrib/sqlitestore"
 )
 
 db, _ := sql.Open("sqlite", "./broker-state.sqlite")
@@ -1706,8 +1706,8 @@ Example:
 import (
     _ "modernc.org/sqlite"
 
-    "github.com/oarkflow/fastworker/broker"
-    "github.com/oarkflow/fastworker/contrib/sqlitestore"
+    "github.com/oarkflow/broker"
+    "github.com/oarkflow/broker/contrib/sqlitestore"
 )
 
 msgStore, _ := sqlitestore.OpenMessageStore("sqlite", "./.broker-data/broker-messages.sqlite")

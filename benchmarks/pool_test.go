@@ -5,7 +5,7 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/oarkflow/fastworker"
+	"github.com/oarkflow/broker/pkg/pool"
 )
 
 func addAtomic(_ context.Context, done *atomic.Int64) error {
@@ -21,7 +21,7 @@ type atomicTask struct {
 func (j atomicTask) Run(ctx context.Context) error { return j.fn(ctx, j.done) }
 
 func BenchmarkSubmitRun(b *testing.B) {
-	p := fastworker.MustNew(fastworker.Config{MinWorkers: 16, MaxWorkers: 16, QueueSize: b.N, Backpressure: fastworker.BackpressureBlock, DisableStats: true})
+	p := pool.MustNew(pool.Config{MinWorkers: 16, MaxWorkers: 16, QueueSize: b.N, Backpressure: pool.BackpressureBlock, DisableStats: true})
 	_ = p.Start()
 	var done atomic.Int64
 	job := &atomicTask{done: &done, fn: addAtomic}
@@ -41,7 +41,7 @@ type atomicJob struct{ done *atomic.Int64 }
 func (j atomicJob) Run(context.Context) error { j.done.Add(1); return nil }
 
 func BenchmarkSubmitRunReusableJob(b *testing.B) {
-	p := fastworker.MustNew(fastworker.Config{MinWorkers: 16, MaxWorkers: 16, QueueSize: b.N, Backpressure: fastworker.BackpressureBlock, DisableStats: true})
+	p := pool.MustNew(pool.Config{MinWorkers: 16, MaxWorkers: 16, QueueSize: b.N, Backpressure: pool.BackpressureBlock, DisableStats: true})
 	_ = p.Start()
 	var done atomic.Int64
 	job := atomicJob{done: &done}

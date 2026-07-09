@@ -24,13 +24,13 @@ cleanup() {
 }
 trap cleanup EXIT
 
-go build -o "$TMPDIR/complete-broker" ./examples/complete_broker
-go build -o "$TMPDIR/complete-consumer" ./examples/complete_consumer
-go build -o "$TMPDIR/complete-worker" ./examples/complete_worker
-go build -o "$TMPDIR/complete-publisher" ./examples/complete_publisher
+go build -o "$TMPDIR/complete-broker" ./examples/broker
+go build -o "$TMPDIR/complete-consumer" ./examples/consumer
+go build -o "$TMPDIR/complete-worker" ./examples/worker
+go build -o "$TMPDIR/complete-publisher" ./examples/publisher
 
 BROKER_ADDR="$ADDR" BROKER_WAL="$WAL_DIR" BROKER_INSECURE_DEV=true BROKER_OBSERVER_JSONL="$TMPDIR/broker-events.jsonl" \
-  "$TMPDIR/complete-broker" -config examples/complete_broker/broker.bcl > "$TMPDIR/broker.log" 2>&1 &
+  "$TMPDIR/complete-broker" -config examples/broker/broker.bcl > "$TMPDIR/broker.log" 2>&1 &
 BPID=$!
 sleep 1.5
 if ! kill -0 "$BPID" 2>/dev/null; then
@@ -39,13 +39,13 @@ if ! kill -0 "$BPID" 2>/dev/null; then
   exit 1
 fi
 
-BROKER_URL="$URL" CONSUMER_OBSERVER_JSONL="$TMPDIR/consumer-events.jsonl" "$TMPDIR/complete-consumer" -config examples/complete_consumer/consumer.bcl > "$TMPDIR/consumer.log" 2>&1 &
+BROKER_URL="$URL" CONSUMER_OBSERVER_JSONL="$TMPDIR/consumer-events.jsonl" "$TMPDIR/complete-consumer" -config examples/consumer/consumer.bcl > "$TMPDIR/consumer.log" 2>&1 &
 CPID=$!
-BROKER_URL="$URL" WORKER_OBSERVER_JSONL="$TMPDIR/worker-events.jsonl" "$TMPDIR/complete-worker" -config examples/complete_worker/worker.bcl > "$TMPDIR/worker.log" 2>&1 &
+BROKER_URL="$URL" WORKER_OBSERVER_JSONL="$TMPDIR/worker-events.jsonl" "$TMPDIR/complete-worker" -config examples/worker/worker.bcl > "$TMPDIR/worker.log" 2>&1 &
 WPID=$!
 sleep 1.5
 
-BROKER_URL="$URL" PUBLISHER_OBSERVER_JSONL="$TMPDIR/publisher-events.jsonl" "$TMPDIR/complete-publisher" -config examples/complete_publisher/publisher.bcl | tee "$TMPDIR/publisher.log"
+BROKER_URL="$URL" PUBLISHER_OBSERVER_JSONL="$TMPDIR/publisher-events.jsonl" "$TMPDIR/complete-publisher" -config examples/publisher/publisher.bcl | tee "$TMPDIR/publisher.log"
 
 grep -q "task status=succeeded" "$TMPDIR/publisher.log"
 grep -q "request response=" "$TMPDIR/publisher.log"

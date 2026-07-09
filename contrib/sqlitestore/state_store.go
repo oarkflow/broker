@@ -10,7 +10,7 @@ import (
 	"encoding/json"
 	"time"
 
-	"github.com/oarkflow/fastworker/broker"
+	"github.com/oarkflow/broker"
 )
 
 type StateStore struct {

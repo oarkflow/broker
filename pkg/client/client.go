@@ -1,0 +1,711 @@
+package client
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"encoding/binary"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/oarkflow/broker"
+	fw "github.com/oarkflow/broker/pkg/pool"
+)
+
+type Config struct {
+	BrokerURL, Token, ConsumerID, Group, Name, Version string
+	BrokerURLs                                         []string
+	Concurrency, MaxInFlight, PollLimit                int
+	HeartbeatInterval, VisibilityTimeout, PollWait     time.Duration
+	DisableAutoExtendLeases                            bool
+	LeaseExtensionInterval                             time.Duration
+	MaxLeaseExtensions                                 int
+	HTTPClient                                         *http.Client
+	Pool                                               *fw.Pool
+	Hooks                                              Hooks
+	FrameCodec                                         *broker.BinaryMessageCodec
+}
+type Hooks struct {
+	OnConnecting, OnConnected, OnAuthenticated, OnRegistered, OnSubscribed, OnPollStart, OnHeartbeat, OnReconnect, OnDrain, OnStopped func(Event)
+	OnNotification                                                                                                                    func(NotificationEvent)
+	OnMessageReceived, AfterHandle, OnHandlerError, OnAck, OnNack, OnReject, OnProgress, OnLeaseExtended                              func(MessageEvent)
+	BeforeHandle                                                                                                                      func(MessageEvent) error
+}
+type Event struct {
+	ConsumerID, Group string
+	State             broker.ConsumerState
+	Error             error
+	Time              time.Time
+}
+type MessageEvent struct {
+	Message broker.Message
+	Queue   string
+	Error   error
+	Time    time.Time
+}
+type NotificationEvent struct {
+	Notification broker.Notification
+	Time         time.Time
+}
+type Client struct {
+	cfg    Config
+	http   *http.Client
+	mu     sync.RWMutex
+	urls   []string
+	active int
+}
+
+func New(cfg Config) *Client {
+	if cfg.BrokerURL == "" && len(cfg.BrokerURLs) == 0 {
+		cfg.BrokerURL = "http://127.0.0.1:8090"
+	}
+	urls := normalizeBrokerURLs(cfg.BrokerURL, cfg.BrokerURLs)
+	if len(urls) == 0 {
+		urls = []string{"http://127.0.0.1:8090"}
+	}
+	cfg.BrokerURL = urls[0]
+	cfg.BrokerURLs = urls
+	if cfg.ConsumerID == "" {
+		cfg.ConsumerID = hostnameID()
+	}
+	if cfg.Group == "" {
+		cfg.Group = cfg.ConsumerID
+	}
+	if cfg.Name == "" {
+		cfg.Name = cfg.ConsumerID
+	}
+	if cfg.Concurrency <= 0 {
+		cfg.Concurrency = 1
+	}
+	if cfg.MaxInFlight <= 0 {
+		cfg.MaxInFlight = cfg.Concurrency
+	}
+	if cfg.HeartbeatInterval <= 0 {
+		cfg.HeartbeatInterval = 10 * time.Second
+	}
+	if cfg.VisibilityTimeout <= 0 {
+		cfg.VisibilityTimeout = 30 * time.Second
+	}
+	if cfg.PollWait <= 0 {
+		cfg.PollWait = 30 * time.Second
+	}
+	if cfg.PollLimit <= 0 {
+		cfg.PollLimit = 1
+	}
+	if cfg.FrameCodec == nil {
+		cfg.FrameCodec = broker.NewBinaryMessageCodec()
+	}
+	if cfg.LeaseExtensionInterval <= 0 {
+		cfg.LeaseExtensionInterval = cfg.VisibilityTimeout / 2
+		if cfg.FrameCodec == nil {
+			cfg.FrameCodec = broker.NewBinaryMessageCodec()
+		}
+		if cfg.LeaseExtensionInterval <= 0 {
+			cfg.LeaseExtensionInterval = 10 * time.Second
+		}
+	}
+	c := cfg.HTTPClient
+	if c == nil {
+		c = &http.Client{Timeout: cfg.PollWait + 10*time.Second}
+	}
+	return &Client{cfg: cfg, http: c, urls: urls}
+}
+func (c *Client) Config() Config { return c.cfg }
+func (c *Client) Register(ctx context.Context, reg broker.ConsumerRegistration) (broker.ConsumerInfo, error) {
+	if reg.ConsumerID == "" {
+		reg.ConsumerID = c.cfg.ConsumerID
+	}
+	if reg.Group == "" {
+		reg.Group = c.cfg.Group
+	}
+	if reg.Name == "" {
+		reg.Name = c.cfg.Name
+	}
+	if reg.Concurrency <= 0 {
+		reg.Concurrency = c.cfg.Concurrency
+	}
+	if reg.MaxInFlight <= 0 {
+		reg.MaxInFlight = c.cfg.MaxInFlight
+	}
+	if reg.HeartbeatEveryNS <= 0 {
+		reg.HeartbeatEveryNS = c.cfg.HeartbeatInterval.Nanoseconds()
+	}
+	if reg.VisibilityTimeout <= 0 {
+		reg.VisibilityTimeout = c.cfg.VisibilityTimeout.Nanoseconds()
+	}
+	var out broker.ConsumerInfo
+	err := c.doJSON(ctx, http.MethodPost, "/v1/consumers/register", reg, &out)
+	if err == nil && c.cfg.Hooks.OnRegistered != nil {
+		c.cfg.Hooks.OnRegistered(Event{ConsumerID: out.ConsumerID, Group: out.Group, State: out.State, Time: time.Now()})
+	}
+	return out, err
+}
+func (c *Client) Heartbeat(ctx context.Context) (broker.ConsumerInfo, error) {
+	var out broker.ConsumerInfo
+	err := c.doJSON(ctx, http.MethodPost, "/v1/consumers/"+c.cfg.ConsumerID+"/heartbeat", nil, &out)
+	if err == nil && c.cfg.Hooks.OnHeartbeat != nil {
+		c.cfg.Hooks.OnHeartbeat(Event{ConsumerID: out.ConsumerID, Group: out.Group, State: out.State, Time: time.Now()})
+	}
+	return out, err
+}
+func (c *Client) Subscribe(ctx context.Context, sub broker.RemoteSubscription) (broker.ConsumerInfo, error) {
+	if !sub.AutoCreate {
+		sub.AutoCreate = true
+	}
+	var out broker.ConsumerInfo
+	err := c.doJSON(ctx, http.MethodPost, "/v1/consumers/"+c.cfg.ConsumerID+"/subscribe", sub, &out)
+	if err == nil && c.cfg.Hooks.OnSubscribed != nil {
+		c.cfg.Hooks.OnSubscribed(Event{ConsumerID: out.ConsumerID, Group: out.Group, State: out.State, Time: time.Now()})
+	}
+	return out, err
+}
+func (c *Client) Poll(ctx context.Context, queue string, limit int) ([]broker.Message, error) {
+	if limit <= 0 {
+		limit = c.cfg.PollLimit
+	}
+	req := broker.PollRequest{Queue: queue, ConsumerID: c.cfg.ConsumerID, ConsumerGroup: c.cfg.Group, Limit: limit, WaitNS: c.cfg.PollWait.Nanoseconds(), VisibilityTimeoutNS: c.cfg.VisibilityTimeout.Nanoseconds()}
+	if c.cfg.Hooks.OnPollStart != nil {
+		c.cfg.Hooks.OnPollStart(Event{ConsumerID: c.cfg.ConsumerID, Group: c.cfg.Group, State: broker.ConsumerPolling, Time: time.Now()})
+	}
+	var out []broker.Message
+	err := c.doJSON(ctx, http.MethodPost, "/v1/poll", req, &out)
+	return out, err
+}
+func (c *Client) Ack(ctx context.Context, m broker.Message) error {
+	body := broker.AckRequest{MessageID: m.ID, Queue: m.Queue, LeaseToken: m.LeaseToken, ConsumerID: c.cfg.ConsumerID}
+	err := c.doJSON(ctx, http.MethodPost, "/v1/messages/"+m.ID+"/ack", body, nil)
+	if err == nil && c.cfg.Hooks.OnAck != nil {
+		c.cfg.Hooks.OnAck(MessageEvent{Message: m, Queue: m.Queue, Time: time.Now()})
+	}
+	return err
+}
+func (c *Client) Nack(ctx context.Context, m broker.Message, opts ...NackOption) error {
+	o := NackOptions{Action: broker.NackRetry, Delay: time.Second, Reason: "handler_error"}
+	for _, fn := range opts {
+		if fn != nil {
+			fn(&o)
+		}
+	}
+	body := broker.NackRequest{MessageID: m.ID, Queue: m.Queue, LeaseToken: m.LeaseToken, ConsumerID: c.cfg.ConsumerID, Action: o.Action, Reason: o.Reason, Error: o.Error, Delay: o.Delay, DLQ: o.DLQ}
+	err := c.doJSON(ctx, http.MethodPost, "/v1/messages/"+m.ID+"/nack", body, nil)
+	if err == nil && c.cfg.Hooks.OnNack != nil {
+		c.cfg.Hooks.OnNack(MessageEvent{Message: m, Queue: m.Queue, Error: errors.New(o.Error), Time: time.Now()})
+	}
+	return err
+}
+func (c *Client) Reject(ctx context.Context, m broker.Message, reason string) error {
+	body := broker.NackRequest{MessageID: m.ID, Queue: m.Queue, LeaseToken: m.LeaseToken, ConsumerID: c.cfg.ConsumerID, Action: broker.NackReject, Reason: reason, Error: reason}
+	err := c.doJSON(ctx, http.MethodPost, "/v1/messages/"+m.ID+"/reject", body, nil)
+	if err == nil && c.cfg.Hooks.OnReject != nil {
+		c.cfg.Hooks.OnReject(MessageEvent{Message: m, Queue: m.Queue, Error: errors.New(reason), Time: time.Now()})
+	}
+	return err
+}
+func (c *Client) Extend(ctx context.Context, m broker.Message, d time.Duration) error {
+	body := broker.LeaseRequest{MessageID: m.ID, Queue: m.Queue, LeaseToken: m.LeaseToken, ConsumerID: c.cfg.ConsumerID, VisibilityTimeout: d}
+	err := c.doJSON(ctx, http.MethodPost, "/v1/messages/"+m.ID+"/extend", body, nil)
+	if err == nil && c.cfg.Hooks.OnLeaseExtended != nil {
+		c.cfg.Hooks.OnLeaseExtended(MessageEvent{Message: m, Queue: m.Queue, Time: time.Now()})
+	}
+	return err
+}
+func (c *Client) Progress(ctx context.Context, m broker.Message, p broker.Progress) error {
+	body := map[string]any{"lease_token": m.LeaseToken, "consumer_id": c.cfg.ConsumerID, "queue": m.Queue, "progress": p}
+	err := c.doJSON(ctx, http.MethodPost, "/v1/messages/"+m.ID+"/progress", body, nil)
+	if err == nil && c.cfg.Hooks.OnProgress != nil {
+		c.cfg.Hooks.OnProgress(MessageEvent{Message: m, Queue: m.Queue, Time: time.Now()})
+	}
+	return err
+}
+func (c *Client) Respond(ctx context.Context, m broker.Message, response any, ack bool) error {
+	raw, err := json.Marshal(response)
+	if err != nil {
+		return err
+	}
+	body := map[string]any{"lease_token": m.LeaseToken, "consumer_id": c.cfg.ConsumerID, "queue": m.Queue, "correlation_id": m.CorrelationID, "payload": json.RawMessage(raw), "ack": ack}
+	return c.doJSON(ctx, http.MethodPost, "/v1/messages/"+m.ID+"/respond", body, nil)
+}
+func (c *Client) RespondError(ctx context.Context, m broker.Message, e error, ack bool) error {
+	if e == nil {
+		e = errors.New("handler error")
+	}
+	body := map[string]any{"lease_token": m.LeaseToken, "consumer_id": c.cfg.ConsumerID, "queue": m.Queue, "correlation_id": m.CorrelationID, "error": broker.BrokerError{Code: "handler_error", Message: e.Error(), Retryable: true}, "ack": ack}
+	return c.doJSON(ctx, http.MethodPost, "/v1/messages/"+m.ID+"/respond", body, nil)
+}
+
+func (c *Client) Complete(ctx context.Context, m broker.Message, result any) error {
+	raw, err := json.Marshal(result)
+	if err != nil {
+		return err
+	}
+	body := map[string]any{"lease_token": m.LeaseToken, "consumer_id": c.cfg.ConsumerID, "queue": m.Queue, "correlation_id": m.CorrelationID, "payload": json.RawMessage(raw), "ack": true}
+	return c.doJSON(ctx, http.MethodPost, "/v1/messages/"+m.ID+"/complete", body, nil)
+}
+
+func (c *Client) Fail(ctx context.Context, m broker.Message, e error) error {
+	if e == nil {
+		e = errors.New("handler error")
+	}
+	body := map[string]any{"lease_token": m.LeaseToken, "consumer_id": c.cfg.ConsumerID, "queue": m.Queue, "correlation_id": m.CorrelationID, "error": broker.BrokerError{Code: "handler_error", Message: e.Error(), Retryable: true}, "ack": true}
+	return c.doJSON(ctx, http.MethodPost, "/v1/messages/"+m.ID+"/fail", body, nil)
+}
+
+func (c *Client) PublishFrame(ctx context.Context, msg broker.Message) (broker.PublishResult, error) {
+	frame, err := c.cfg.FrameCodec.EncodeMessage(nil, msg)
+	if err != nil {
+		return broker.PublishResult{}, err
+	}
+	var out broker.PublishResult
+	err = c.doRaw(ctx, http.MethodPost, "/v1/publish/frame", "application/vnd.pool.broker.frame", frame, &out)
+	return out, err
+}
+
+func (c *Client) PollFrames(ctx context.Context, queue string, limit int) ([]broker.Message, error) {
+	if limit <= 0 {
+		limit = c.cfg.PollLimit
+	}
+	req := broker.PollRequest{Queue: queue, ConsumerID: c.cfg.ConsumerID, ConsumerGroup: c.cfg.Group, Limit: limit, WaitNS: c.cfg.PollWait.Nanoseconds(), VisibilityTimeoutNS: c.cfg.VisibilityTimeout.Nanoseconds()}
+	data, err := c.doRawBytes(ctx, http.MethodPost, "/v1/poll/frame", "application/json", mustMarshal(req))
+	if err != nil {
+		return nil, err
+	}
+	return decodeFrameBatch(data, c.cfg.FrameCodec)
+}
+
+func mustMarshal(v any) []byte {
+	b, _ := json.Marshal(v)
+	return b
+}
+
+func decodeFrameBatch(data []byte, codec *broker.BinaryMessageCodec) ([]broker.Message, error) {
+	r := bufio.NewReader(bytes.NewReader(data))
+	var out []broker.Message
+	for {
+		l, err := binary.ReadUvarint(r)
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return out, nil
+			}
+			return nil, err
+		}
+		buf := make([]byte, int(l))
+		if _, err := io.ReadFull(r, buf); err != nil {
+			return nil, err
+		}
+		var msg broker.Message
+		if err := codec.DecodeMessage(buf, &msg); err != nil {
+			return nil, err
+		}
+		out = append(out, msg)
+	}
+}
+func (c *Client) Publish(ctx context.Context, topic string, payload any, opts ...PublishOption) (broker.PublishResult, error) {
+	var o PublishOptions
+	for _, fn := range opts {
+		if fn != nil {
+			fn(&o)
+		}
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return broker.PublishResult{}, err
+	}
+	req := broker.PublishHTTPPayload{Topic: topic, Queue: o.Queue, Stream: o.Stream, Type: o.Type, Payload: json.RawMessage(raw), Headers: o.Headers, Metadata: o.Metadata, Key: o.Key, RoutingKey: o.RoutingKey, Priority: o.Priority, TenantID: o.TenantID, IdempotencyKey: o.IdempotencyKey}
+	var out broker.PublishResult
+	err = c.doJSON(ctx, http.MethodPost, "/v1/publish", req, &out)
+	return out, err
+}
+
+func (c *Client) PublishAsync(ctx context.Context, topic string, payload any, opts ...PublishOption) <-chan AsyncPublishResult {
+	ch := make(chan AsyncPublishResult, 1)
+	go func() {
+		r, err := c.Publish(ctx, topic, payload, opts...)
+		ch <- AsyncPublishResult{Result: r, Error: err}
+		close(ch)
+	}()
+	return ch
+}
+
+type AsyncPublishResult struct {
+	Result broker.PublishResult
+	Error  error
+}
+
+func (c *Client) PublishBatch(ctx context.Context, topic string, payloads []any, opts ...PublishOption) (broker.BatchPublishResult, error) {
+	var o PublishOptions
+	for _, fn := range opts {
+		if fn != nil {
+			fn(&o)
+		}
+	}
+	req := struct {
+		Messages []broker.PublishHTTPPayload `json:"messages"`
+	}{Messages: make([]broker.PublishHTTPPayload, 0, len(payloads))}
+	for _, p := range payloads {
+		raw, err := json.Marshal(p)
+		if err != nil {
+			return broker.BatchPublishResult{}, err
+		}
+		req.Messages = append(req.Messages, broker.PublishHTTPPayload{Topic: topic, Queue: o.Queue, Stream: o.Stream, Type: o.Type, Payload: json.RawMessage(raw), Headers: o.Headers, Metadata: o.Metadata, Key: o.Key, RoutingKey: o.RoutingKey, Priority: o.Priority, TenantID: o.TenantID, IdempotencyKey: o.IdempotencyKey})
+	}
+	var out broker.BatchPublishResult
+	err := c.doJSON(ctx, http.MethodPost, "/v1/publish/batch", req, &out)
+	return out, err
+}
+
+func (c *Client) Command(ctx context.Context, subject string, payload any, response any, timeout time.Duration) error {
+	return c.Request(ctx, subject, payload, response, timeout)
+}
+
+type AsyncResponse struct {
+	Error error
+}
+
+func (c *Client) RequestAsync(ctx context.Context, subject string, payload any, response any, timeout time.Duration) <-chan AsyncResponse {
+	ch := make(chan AsyncResponse, 1)
+	go func() {
+		ch <- AsyncResponse{Error: c.Request(ctx, subject, payload, response, timeout)}
+		close(ch)
+	}()
+	return ch
+}
+func (c *Client) Request(ctx context.Context, subject string, payload any, response any, timeout time.Duration) error {
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	req := broker.PublishHTTPPayload{Topic: subject, Payload: json.RawMessage(raw), TimeoutNS: timeout.Nanoseconds()}
+	var resp broker.Response
+	if err := c.doJSON(ctx, http.MethodPost, "/v1/request", req, &resp); err != nil {
+		return err
+	}
+	if resp.Error != nil {
+		return resp.Error
+	}
+	if response != nil {
+		return json.Unmarshal(resp.Payload, response)
+	}
+	return nil
+}
+func (c *Client) SubmitTask(ctx context.Context, name string, payload any, opts ...TaskOption) (broker.TaskInfo, error) {
+	var o TaskOptions
+	for _, fn := range opts {
+		if fn != nil {
+			fn(&o)
+		}
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return broker.TaskInfo{}, err
+	}
+	req := map[string]any{"name": name, "queue": o.Queue, "payload": json.RawMessage(raw), "tenant_id": o.TenantID, "priority": o.Priority, "max_attempts": o.MaxAttempts, "metadata": o.Metadata}
+	var out broker.TaskInfo
+	err = c.doJSON(ctx, http.MethodPost, "/v1/tasks/submit", req, &out)
+	return out, err
+}
+func (c *Client) Task(ctx context.Context, id string) (broker.TaskInfo, error) {
+	var out broker.TaskInfo
+	err := c.doJSON(ctx, http.MethodGet, "/v1/tasks/"+id, nil, &out)
+	return out, err
+}
+func (c *Client) TaskResult(ctx context.Context, id string) (broker.TaskInfo, []byte, error) {
+	var out struct {
+		Task    broker.TaskInfo `json:"task"`
+		Payload json.RawMessage `json:"payload"`
+	}
+	err := c.doJSON(ctx, http.MethodGet, "/v1/tasks/"+id+"/result", nil, &out)
+	return out.Task, []byte(out.Payload), err
+}
+
+func (c *Client) CancelTask(ctx context.Context, id, reason string) error {
+	return c.doJSON(ctx, http.MethodPost, "/v1/tasks/"+id+"/cancel", map[string]string{"reason": reason}, nil)
+}
+
+func (c *Client) RetryTask(ctx context.Context, id string) error {
+	return c.doJSON(ctx, http.MethodPost, "/v1/tasks/"+id+"/retry", nil, nil)
+}
+
+func (c *Client) DLQ(ctx context.Context, queue string, limit int) ([]broker.Message, error) {
+	path := "/v1/dlq"
+	if queue != "" {
+		path += "/" + queue + "/messages"
+	}
+	if limit > 0 {
+		path += fmt.Sprintf("?limit=%d", limit)
+	}
+	var out []broker.Message
+	err := c.doJSON(ctx, http.MethodGet, path, nil, &out)
+	return out, err
+}
+
+func (c *Client) ReplayDLQ(ctx context.Context, queue string) error {
+	if queue == "" {
+		return errors.New("queue required")
+	}
+	return c.doJSON(ctx, http.MethodPost, "/v1/dlq/"+queue+"/replay", nil, nil)
+}
+
+func (c *Client) ReadStream(ctx context.Context, stream, group string, after uint64, limit int) ([]broker.Message, error) {
+	path := fmt.Sprintf("/v1/streams/%s/messages?after_offset=%d", stream, after)
+	if group != "" {
+		path += "&consumer_group=" + group
+	}
+	if limit > 0 {
+		path += fmt.Sprintf("&limit=%d", limit)
+	}
+	var out []broker.Message
+	err := c.doJSON(ctx, http.MethodGet, path, nil, &out)
+	return out, err
+}
+
+func (c *Client) CommitStreamOffset(ctx context.Context, stream, group string, offset uint64) error {
+	return c.doJSON(ctx, http.MethodPost, "/v1/streams/"+stream+"/commit", broker.OffsetCommit{Stream: stream, ConsumerGroup: group, Offset: offset}, nil)
+}
+
+func (c *Client) StreamOffset(ctx context.Context, stream, group string) (uint64, error) {
+	var out struct {
+		Offset uint64 `json:"offset"`
+	}
+	err := c.doJSON(ctx, http.MethodGet, "/v1/streams/"+stream+"/offset?consumer_group="+group, nil, &out)
+	return out.Offset, err
+}
+func (c *Client) Consumers(ctx context.Context) ([]broker.ConsumerInfo, error) {
+	var out []broker.ConsumerInfo
+	err := c.doJSON(ctx, http.MethodGet, "/v1/consumers", nil, &out)
+	return out, err
+}
+func (c *Client) Events(ctx context.Context, after string, wait time.Duration) ([]broker.Notification, error) {
+	path := "/v1/consumers/" + c.cfg.ConsumerID + "/events"
+	qs := []string{}
+	if after != "" {
+		qs = append(qs, "after="+after)
+	}
+	if wait > 0 {
+		qs = append(qs, fmt.Sprintf("wait=%d", wait.Nanoseconds()))
+	}
+	if len(qs) > 0 {
+		path += "?" + strings.Join(qs, "&")
+	}
+	var out []broker.Notification
+	err := c.doJSON(ctx, http.MethodGet, path, nil, &out)
+	return out, err
+}
+
+func (c *Client) doRaw(ctx context.Context, method, path, contentType string, bodyBytes []byte, out any) error {
+	data, err := c.doRawBytes(ctx, method, path, contentType, bodyBytes)
+	if err != nil {
+		return err
+	}
+	if out != nil && len(data) > 0 {
+		return json.Unmarshal(data, out)
+	}
+	return nil
+}
+
+func (c *Client) doRawBytes(ctx context.Context, method, path, contentType string, bodyBytes []byte) ([]byte, error) {
+	urls := c.orderedURLs()
+	var last error
+	for i, base := range urls {
+		req, err := http.NewRequestWithContext(ctx, method, strings.TrimRight(base, "/")+path, bytes.NewReader(bodyBytes))
+		if err != nil {
+			last = err
+			continue
+		}
+		if contentType != "" {
+			req.Header.Set("Content-Type", contentType)
+		}
+		if c.cfg.Token != "" {
+			req.Header.Set("Authorization", "Bearer "+c.cfg.Token)
+		}
+		resp, err := c.http.Do(req)
+		if err != nil {
+			last = err
+			if i == 0 && c.cfg.Hooks.OnReconnect != nil && len(urls) > 1 {
+				c.cfg.Hooks.OnReconnect(Event{ConsumerID: c.cfg.ConsumerID, Group: c.cfg.Group, Error: err, Time: time.Now()})
+			}
+			continue
+		}
+		data, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if resp.StatusCode >= 500 && len(urls) > 1 {
+			last = fmt.Errorf("broker %s: %s", resp.Status, strings.TrimSpace(string(data)))
+			continue
+		}
+		c.markActive(base)
+		if resp.StatusCode >= 300 {
+			return nil, fmt.Errorf("broker %s: %s", resp.Status, strings.TrimSpace(string(data)))
+		}
+		return data, nil
+	}
+	if last == nil {
+		last = errors.New("broker unavailable")
+	}
+	return nil, last
+}
+func (c *Client) doJSON(ctx context.Context, method, path string, in, out any) error {
+	var bodyBytes []byte
+	var err error
+	if in != nil {
+		bodyBytes, err = json.Marshal(in)
+		if err != nil {
+			return err
+		}
+	}
+	urls := c.orderedURLs()
+	var last error
+	for i, base := range urls {
+		var body io.Reader
+		if bodyBytes != nil {
+			body = bytes.NewReader(bodyBytes)
+		}
+		req, err := http.NewRequestWithContext(ctx, method, strings.TrimRight(base, "/")+path, body)
+		if err != nil {
+			last = err
+			continue
+		}
+		if in != nil {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		if c.cfg.Token != "" {
+			req.Header.Set("Authorization", "Bearer "+c.cfg.Token)
+		}
+		resp, err := c.http.Do(req)
+		if err != nil {
+			last = err
+			if i == 0 && c.cfg.Hooks.OnReconnect != nil && len(urls) > 1 {
+				c.cfg.Hooks.OnReconnect(Event{ConsumerID: c.cfg.ConsumerID, Group: c.cfg.Group, Error: err, Time: time.Now()})
+			}
+			continue
+		}
+		data, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if resp.StatusCode >= 500 && len(urls) > 1 {
+			last = fmt.Errorf("broker %s: %s", resp.Status, strings.TrimSpace(string(data)))
+			continue
+		}
+		c.markActive(base)
+		if resp.StatusCode >= 300 {
+			return fmt.Errorf("broker %s: %s", resp.Status, strings.TrimSpace(string(data)))
+		}
+		if out != nil && len(data) > 0 {
+			return json.Unmarshal(data, out)
+		}
+		return nil
+	}
+	if last == nil {
+		last = errors.New("broker unavailable")
+	}
+	return last
+}
+
+func (c *Client) orderedURLs() []string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if len(c.urls) == 0 {
+		return []string{strings.TrimRight(c.cfg.BrokerURL, "/")}
+	}
+	out := make([]string, 0, len(c.urls))
+	for i := 0; i < len(c.urls); i++ {
+		out = append(out, c.urls[(c.active+i)%len(c.urls)])
+	}
+	return out
+}
+
+func (c *Client) markActive(base string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for i, u := range c.urls {
+		if u == base {
+			c.active = i
+			c.cfg.BrokerURL = base
+			return
+		}
+	}
+}
+
+func normalizeBrokerURLs(primary string, more []string) []string {
+	seen := map[string]struct{}{}
+	out := []string{}
+	add := func(v string) {
+		v = strings.TrimRight(strings.TrimSpace(v), "/")
+		if v == "" {
+			return
+		}
+		if _, ok := seen[v]; ok {
+			return
+		}
+		seen[v] = struct{}{}
+		out = append(out, v)
+	}
+	add(primary)
+	for _, v := range more {
+		add(v)
+	}
+	return out
+}
+func hostnameID() string {
+	h, _ := os.Hostname()
+	if h == "" {
+		h = "worker"
+	}
+	return h + "-" + fmt.Sprint(time.Now().UnixNano())
+}
+
+type PublishOptions struct {
+	Queue, Stream, Type, Key, RoutingKey, TenantID, IdempotencyKey string
+	Headers, Metadata                                              map[string]string
+	Priority                                                       int
+}
+type PublishOption func(*PublishOptions)
+
+func WithQueue(v string) PublishOption              { return func(o *PublishOptions) { o.Queue = v } }
+func WithStream(v string) PublishOption             { return func(o *PublishOptions) { o.Stream = v } }
+func WithType(v string) PublishOption               { return func(o *PublishOptions) { o.Type = v } }
+func WithHeaders(v map[string]string) PublishOption { return func(o *PublishOptions) { o.Headers = v } }
+func WithMetadata(v map[string]string) PublishOption {
+	return func(o *PublishOptions) { o.Metadata = v }
+}
+func WithRoutingKey(v string) PublishOption { return func(o *PublishOptions) { o.RoutingKey = v } }
+func WithKey(v string) PublishOption        { return func(o *PublishOptions) { o.Key = v } }
+func WithPriority(v int) PublishOption      { return func(o *PublishOptions) { o.Priority = v } }
+func WithTenantID(v string) PublishOption   { return func(o *PublishOptions) { o.TenantID = v } }
+func WithIdempotencyKey(v string) PublishOption {
+	return func(o *PublishOptions) { o.IdempotencyKey = v }
+}
+
+type TaskOptions struct {
+	Queue, TenantID       string
+	Priority, MaxAttempts int
+	Metadata              map[string]string
+}
+type TaskOption func(*TaskOptions)
+
+func WithTaskQueue(v string) TaskOption               { return func(o *TaskOptions) { o.Queue = v } }
+func WithTaskTenantID(v string) TaskOption            { return func(o *TaskOptions) { o.TenantID = v } }
+func WithTaskPriority(v int) TaskOption               { return func(o *TaskOptions) { o.Priority = v } }
+func WithTaskMaxAttempts(v int) TaskOption            { return func(o *TaskOptions) { o.MaxAttempts = v } }
+func WithTaskMetadata(v map[string]string) TaskOption { return func(o *TaskOptions) { o.Metadata = v } }
+
+type NackOptions struct {
+	Action             broker.NackAction
+	Delay              time.Duration
+	DLQ, Reason, Error string
+}
+type NackOption func(*NackOptions)
+
+func NackDelay(v time.Duration) NackOption { return func(o *NackOptions) { o.Delay = v } }
+func NackDLQ(v string) NackOption {
+	return func(o *NackOptions) { o.Action = broker.NackDLQ; o.DLQ = v }
+}
+func NackReason(v string) NackOption { return func(o *NackOptions) { o.Reason = v } }
+func NackError(v string) NackOption  { return func(o *NackOptions) { o.Error = v } }

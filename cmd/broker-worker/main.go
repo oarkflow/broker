@@ -11,9 +11,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/oarkflow/fastworker/broker"
-	bclient "github.com/oarkflow/fastworker/broker/client"
-	"github.com/oarkflow/fastworker/logger"
+	"github.com/oarkflow/broker"
+	bclient "github.com/oarkflow/broker/pkg/client"
+	"github.com/oarkflow/broker/pkg/logger"
 	"github.com/oarkflow/zlog"
 )
 
