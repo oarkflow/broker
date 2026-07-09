@@ -90,7 +90,7 @@ func main() {
 		logger.Log.Fatal("create broker", zlog.Err(err))
 	}
 	if !*quiet {
-		broker.LogNotifications(b.Notifications(), "brokerd-stdout", *debugEvents, logger.Logf)
+		broker.LogNotifications(b.Notifications(), "brokerd-stdout", *debugEvents)
 	}
 	if err := b.Start(context.Background()); err != nil {
 		logger.Log.Fatal("start broker", zlog.Err(err))

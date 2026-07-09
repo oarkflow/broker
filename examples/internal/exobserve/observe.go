@@ -12,6 +12,7 @@ import (
 	"github.com/oarkflow/fastworker/broker"
 	bclient "github.com/oarkflow/fastworker/broker/client"
 	"github.com/oarkflow/fastworker/logger"
+	"github.com/oarkflow/zlog"
 )
 
 type JSONLSink struct {
@@ -56,103 +57,169 @@ type BrokerObserver struct {
 	Sink   *JSONLSink
 }
 
-func (o BrokerObserver) logf(format string, args ...any) {
-	prefix := o.Prefix
-	if prefix == "" {
-		prefix = "broker-observer"
+func (o BrokerObserver) prefix() string {
+	if o.Prefix == "" {
+		return "broker-observer"
 	}
-	logger.StdLog.Printf(prefix+" "+format, args...)
+	return o.Prefix
 }
 
 func (o BrokerObserver) Hooks() broker.Hooks {
+	prefix := o.prefix()
 	return broker.Hooks{
 		OnStarted: func(_ context.Context, e broker.BrokerEvent) {
-			o.logf("HOOK broker.started state=%s", e.State)
+			logger.Log.Info("hook", hookAttrs(prefix, "broker.started", zlog.String("state", string(e.State)))...)
 			o.Sink.Write("broker.hook.started", e)
 		},
 		OnReady: func(_ context.Context, e broker.BrokerEvent) {
-			o.logf("HOOK broker.ready state=%s", e.State)
+			logger.Log.Info("hook", hookAttrs(prefix, "broker.ready", zlog.String("state", string(e.State)))...)
 			o.Sink.Write("broker.hook.ready", e)
 		},
 		OnStopped: func(_ context.Context, e broker.BrokerEvent) {
-			o.logf("HOOK broker.stopped state=%s", e.State)
+			logger.Log.Info("hook", hookAttrs(prefix, "broker.stopped", zlog.String("state", string(e.State)))...)
 			o.Sink.Write("broker.hook.stopped", e)
 		},
 		BeforePublish: func(_ context.Context, e broker.PublishEvent) error {
-			o.logf("HOOK before_publish message=%s topic=%s queue=%s type=%s", e.Message.ID, e.Message.Topic, e.Message.Queue, e.Message.Type)
+			logger.Log.Info("hook", hookAttrs(prefix, "before_publish",
+				strAttr("message_id", e.Message.ID),
+				strAttr("topic", e.Message.Topic),
+				strAttr("queue", e.Message.Queue),
+				strAttr("type", e.Message.Type),
+			)...)
 			o.Sink.Write("broker.hook.before_publish", e)
 			return nil
 		},
 		AfterPublish: func(_ context.Context, e broker.PublishEvent) {
-			o.logf("HOOK after_publish message=%s destinations=%d", e.Message.ID, len(e.Destinations))
+			logger.Log.Info("hook", hookAttrs(prefix, "after_publish",
+				strAttr("message_id", e.Message.ID),
+				zlog.Int("destinations", len(e.Destinations)),
+			)...)
 			o.Sink.Write("broker.hook.after_publish", e)
 		},
 		OnPublishConfirmed: func(_ context.Context, e broker.PublishEvent) {
-			o.logf("HOOK publish_confirmed message=%s", e.Message.ID)
+			logger.Log.Info("hook", hookAttrs(prefix, "publish_confirmed", strAttr("message_id", e.Message.ID))...)
 			o.Sink.Write("broker.hook.publish_confirmed", e)
 		},
 		OnConsumerRegistered: func(_ context.Context, e broker.ConsumerEvent) {
-			o.logf("HOOK consumer.registered consumer=%s group=%s state=%s", e.Consumer, e.Group, e.State)
+			logger.Log.Info("hook", hookAttrs(prefix, "consumer.registered",
+				strAttr("consumer", e.Consumer),
+				strAttr("group", e.Group),
+				strAttr("state", string(e.State)),
+			)...)
 			o.Sink.Write("broker.hook.consumer_registered", e)
 		},
 		OnConsumerAssigned: func(_ context.Context, e broker.ConsumerEvent) {
-			o.logf("HOOK consumer.assigned consumer=%s group=%s queue=%s", e.Consumer, e.Group, e.Queue)
+			logger.Log.Info("hook", hookAttrs(prefix, "consumer.assigned",
+				strAttr("consumer", e.Consumer),
+				strAttr("group", e.Group),
+				strAttr("queue", e.Queue),
+			)...)
 			o.Sink.Write("broker.hook.consumer_assigned", e)
 		},
 		OnConsumerPaused: func(_ context.Context, e broker.ConsumerEvent) {
-			o.logf("HOOK consumer.paused consumer=%s group=%s", e.Consumer, e.Group)
+			logger.Log.Info("hook", hookAttrs(prefix, "consumer.paused",
+				strAttr("consumer", e.Consumer),
+				strAttr("group", e.Group),
+			)...)
 			o.Sink.Write("broker.hook.consumer_paused", e)
 		},
 		OnConsumerResumed: func(_ context.Context, e broker.ConsumerEvent) {
-			o.logf("HOOK consumer.resumed consumer=%s group=%s", e.Consumer, e.Group)
+			logger.Log.Info("hook", hookAttrs(prefix, "consumer.resumed",
+				strAttr("consumer", e.Consumer),
+				strAttr("group", e.Group),
+			)...)
 			o.Sink.Write("broker.hook.consumer_resumed", e)
 		},
 		OnConsumerDraining: func(_ context.Context, e broker.ConsumerEvent) {
-			o.logf("HOOK consumer.draining consumer=%s group=%s", e.Consumer, e.Group)
+			logger.Log.Info("hook", hookAttrs(prefix, "consumer.draining",
+				strAttr("consumer", e.Consumer),
+				strAttr("group", e.Group),
+			)...)
 			o.Sink.Write("broker.hook.consumer_draining", e)
 		},
 		OnConsumerStopped: func(_ context.Context, e broker.ConsumerEvent) {
-			o.logf("HOOK consumer.stopped consumer=%s group=%s state=%s", e.Consumer, e.Group, e.State)
+			logger.Log.Info("hook", hookAttrs(prefix, "consumer.stopped",
+				strAttr("consumer", e.Consumer),
+				strAttr("group", e.Group),
+				strAttr("state", string(e.State)),
+			)...)
 			o.Sink.Write("broker.hook.consumer_stopped", e)
 		},
 		OnTaskCreated: func(_ context.Context, e broker.TaskEvent) {
-			o.logf("HOOK task.created task=%s name=%s status=%s", e.Task.ID, e.Task.Name, e.Task.Status)
+			logger.Log.Info("hook", hookAttrs(prefix, "task.created",
+				strAttr("task_id", e.Task.ID),
+				strAttr("task_name", e.Task.Name),
+				strAttr("status", string(e.Task.Status)),
+			)...)
 			o.Sink.Write("broker.hook.task_created", e)
 		},
 		OnTaskQueued: func(_ context.Context, e broker.TaskEvent) {
-			o.logf("HOOK task.queued task=%s queue=%s", e.Task.ID, e.Task.Queue)
+			logger.Log.Info("hook", hookAttrs(prefix, "task.queued",
+				strAttr("task_id", e.Task.ID),
+				strAttr("queue", e.Task.Queue),
+			)...)
 			o.Sink.Write("broker.hook.task_queued", e)
 		},
 		OnTaskStarted: func(_ context.Context, e broker.TaskEvent) {
-			o.logf("HOOK task.started task=%s", e.Task.ID)
+			logger.Log.Info("hook", hookAttrs(prefix, "task.started", strAttr("task_id", e.Task.ID))...)
 			o.Sink.Write("broker.hook.task_started", e)
 		},
 		OnTaskProgress: func(_ context.Context, e broker.TaskEvent) {
-			o.logf("HOOK task.progress task=%s percent=%.0f message=%s", e.Task.ID, e.Task.Progress.Percent, e.Task.Progress.Message)
+			logger.Log.Info("hook", hookAttrs(prefix, "task.progress",
+				strAttr("task_id", e.Task.ID),
+				zlog.Float64("percent", e.Task.Progress.Percent),
+				strAttr("message", e.Task.Progress.Message),
+			)...)
 			o.Sink.Write("broker.hook.task_progress", e)
 		},
 		OnTaskSucceeded: func(_ context.Context, e broker.TaskEvent) {
-			o.logf("HOOK task.succeeded task=%s", e.Task.ID)
+			logger.Log.Info("hook", hookAttrs(prefix, "task.succeeded", strAttr("task_id", e.Task.ID))...)
 			o.Sink.Write("broker.hook.task_succeeded", e)
 		},
 		OnTaskFailed: func(_ context.Context, e broker.TaskEvent) {
-			o.logf("HOOK task.failed task=%s error=%v", e.Task.ID, e.Error)
+			attrs := hookAttrs(prefix, "task.failed", strAttr("task_id", e.Task.ID))
+			if e.Error != nil {
+				attrs = append(attrs, zlog.Err(e.Error))
+			}
+			logger.Log.Warn("hook", attrs...)
 			o.Sink.Write("broker.hook.task_failed", e)
 		},
 		OnTaskCancelled: func(_ context.Context, e broker.TaskEvent) {
-			o.logf("HOOK task.cancelled task=%s error=%v", e.Task.ID, e.Error)
+			attrs := hookAttrs(prefix, "task.cancelled", strAttr("task_id", e.Task.ID))
+			if e.Error != nil {
+				attrs = append(attrs, zlog.Err(e.Error))
+			}
+			logger.Log.Warn("hook", attrs...)
 			o.Sink.Write("broker.hook.task_cancelled", e)
 		},
 		OnRetryScheduled: func(_ context.Context, e broker.RetryEvent) {
-			o.logf("HOOK retry.scheduled message=%s delay=%s error=%v", e.Message.ID, e.Delay, e.Error)
+			attrs := hookAttrs(prefix, "retry.scheduled",
+				strAttr("message_id", e.Message.ID),
+				zlog.String("delay", e.Delay.String()),
+			)
+			if e.Error != nil {
+				attrs = append(attrs, zlog.Err(e.Error))
+			}
+			logger.Log.Warn("hook", attrs...)
 			o.Sink.Write("broker.hook.retry_scheduled", e)
 		},
 		OnDeadLettered: func(_ context.Context, e broker.DLQEvent) {
-			o.logf("HOOK dlq.dead_lettered message=%s queue=%s reason=%s error=%v", e.Message.ID, e.Queue, e.Reason, e.Error)
+			attrs := hookAttrs(prefix, "dlq.dead_lettered",
+				strAttr("message_id", e.Message.ID),
+				strAttr("queue", e.Queue),
+				strAttr("reason", e.Reason),
+			)
+			if e.Error != nil {
+				attrs = append(attrs, zlog.Err(e.Error))
+			}
+			logger.Log.Error("hook", attrs...)
 			o.Sink.Write("broker.hook.dead_lettered", e)
 		},
 		OnDLQReplay: func(_ context.Context, e broker.DLQEvent) {
-			o.logf("HOOK dlq.replay queue=%s message=%s", e.Queue, e.Message.ID)
+			logger.Log.Info("hook", hookAttrs(prefix, "dlq.replay",
+				strAttr("queue", e.Queue),
+				strAttr("message_id", e.Message.ID),
+			)...)
 			o.Sink.Write("broker.hook.dlq_replay", e)
 		},
 	}
@@ -162,8 +229,31 @@ func (o BrokerObserver) NotificationCallback(name string) broker.Callback {
 	if name == "" {
 		name = "notification-callback"
 	}
+	prefix := o.prefix()
 	return broker.CallbackFunc(func(_ context.Context, n broker.Notification) error {
-		o.logf("CALLBACK %s notification=%s severity=%s message=%s task=%s queue=%s topic=%s consumer=%s", name, n.Type, n.Severity, n.MessageID, n.TaskID, n.Queue, n.Topic, n.Consumer)
+		attrs := make([]zlog.Attr, 0, 8)
+		attrs = append(attrs,
+			zlog.String("prefix", prefix),
+			zlog.String("name", name),
+			zlog.String("type", n.Type),
+			zlog.String("severity", string(n.Severity)),
+		)
+		if n.MessageID != "" {
+			attrs = append(attrs, zlog.String("message_id", n.MessageID))
+		}
+		if n.TaskID != "" {
+			attrs = append(attrs, zlog.String("task_id", n.TaskID))
+		}
+		if n.Queue != "" {
+			attrs = append(attrs, zlog.String("queue", n.Queue))
+		}
+		if n.Topic != "" {
+			attrs = append(attrs, zlog.String("topic", n.Topic))
+		}
+		if n.Consumer != "" {
+			attrs = append(attrs, zlog.String("consumer", n.Consumer))
+		}
+		logger.Log.Info("callback", attrs...)
 		o.Sink.Write("broker.notification."+name, n)
 		return nil
 	})
@@ -174,16 +264,15 @@ type ClientObserver struct {
 	Sink   *JSONLSink
 }
 
-func (o ClientObserver) logf(format string, args ...any) {
-	prefix := o.Prefix
-	if prefix == "" {
-		prefix = "client-observer"
+func (o ClientObserver) prefix() string {
+	if o.Prefix == "" {
+		return "client-observer"
 	}
-	logger.StdLog.Printf(prefix+" "+format, args...)
+	return o.Prefix
 }
 
 func (o ClientObserver) Hooks() bclient.Hooks {
-	base := bclient.LoggingHooksWith(o.Prefix, logger.StdLog.Printf)
+	base := bclient.LoggingHooksWith(o.Prefix)
 	wrapEvent := func(kind string, next func(bclient.Event)) func(bclient.Event) {
 		return func(e bclient.Event) {
 			if next != nil {
@@ -215,7 +304,24 @@ func (o ClientObserver) Hooks() bclient.Hooks {
 			if base.OnNotification != nil {
 				base.OnNotification(e)
 			}
-			o.logf("CALLBACK broker_event type=%s severity=%s message=%s task=%s queue=%s", e.Notification.Type, e.Notification.Severity, e.Notification.MessageID, e.Notification.TaskID, e.Notification.Queue)
+			prefix := o.prefix()
+			attrs := make([]zlog.Attr, 0, 6)
+			attrs = append(attrs,
+				zlog.String("prefix", prefix),
+				zlog.String("name", "broker_event"),
+				zlog.String("type", e.Notification.Type),
+				zlog.String("severity", string(e.Notification.Severity)),
+			)
+			if e.Notification.MessageID != "" {
+				attrs = append(attrs, zlog.String("message_id", e.Notification.MessageID))
+			}
+			if e.Notification.TaskID != "" {
+				attrs = append(attrs, zlog.String("task_id", e.Notification.TaskID))
+			}
+			if e.Notification.Queue != "" {
+				attrs = append(attrs, zlog.String("queue", e.Notification.Queue))
+			}
+			logger.Log.Info("callback", attrs...)
 			o.Sink.Write("client.notification.broker_event", e)
 		},
 		OnMessageReceived: wrapMsg("client.hook.message_received", base.OnMessageReceived),
@@ -236,6 +342,27 @@ func (o ClientObserver) Hooks() bclient.Hooks {
 		OnProgress:      wrapMsg("client.hook.progress", base.OnProgress),
 		OnLeaseExtended: wrapMsg("client.hook.lease_extended", base.OnLeaseExtended),
 	}
+}
+
+func hookAttrs(prefix, name string, extra ...zlog.Attr) []zlog.Attr {
+	attrs := make([]zlog.Attr, 0, 3+len(extra))
+	attrs = append(attrs,
+		zlog.String("prefix", prefix),
+		zlog.String("name", name),
+	)
+	for _, a := range extra {
+		if a.Kind != zlog.KindInvalid {
+			attrs = append(attrs, a)
+		}
+	}
+	return attrs
+}
+
+func strAttr(k, v string) zlog.Attr {
+	if v == "" {
+		return zlog.Attr{}
+	}
+	return zlog.String(k, v)
 }
 
 func PrintJSON(title string, v any) {

@@ -97,7 +97,7 @@ func main() {
 		logger.Log.Fatal("create broker", zlog.Err(err))
 	}
 	if bc.Bool("log_events", true) {
-		broker.LogNotifications(b.Notifications(), "complete-broker", bc.Bool("debug_events", false), logger.Logf)
+		broker.LogNotifications(b.Notifications(), "complete-broker", bc.Bool("debug_events", false))
 	}
 	for _, cb := range bc.Blocks("callback") {
 		if !cb.Bool("enabled", true) {

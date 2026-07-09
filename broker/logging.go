@@ -2,56 +2,51 @@ package broker
 
 import (
 	"context"
-	"fmt"
-	"sort"
-	"strings"
-	"time"
 
 	"github.com/oarkflow/fastworker/logger"
+	"github.com/oarkflow/zlog"
 )
 
-// LogNotifications writes broker notifications as compact live operational logs.
+// LogNotifications writes broker notifications as structured log entries.
 // Debug heartbeat events are intentionally skipped unless includeDebug is true.
-func LogNotifications(bus *NotificationBus, id string, includeDebug bool, logf func(string, ...any)) {
+func LogNotifications(bus *NotificationBus, id string, includeDebug bool) {
 	if bus == nil {
 		return
 	}
 	if id == "" {
 		id = "broker-live-log"
 	}
-	if logf == nil {
-		logf = logger.StdLog.Printf
-	}
 	bus.Subscribe(id, CallbackFunc(func(_ context.Context, n Notification) error {
 		if n.Severity == SeverityDebug && !includeDebug {
 			return nil
 		}
-		logf("broker event=%s severity=%s message=%s task=%s topic=%s queue=%s consumer=%s group=%s data=%s", n.Type, n.Severity, n.MessageID, n.TaskID, n.Topic, n.Queue, n.Consumer, n.ConsumerGroup, formatNotificationData(n.Data))
+		attrs := make([]zlog.Attr, 0, 6)
+		attrs = append(attrs,
+			zlog.String("type", n.Type),
+			zlog.String("severity", string(n.Severity)),
+		)
+		if n.MessageID != "" {
+			attrs = append(attrs, zlog.String("message_id", n.MessageID))
+		}
+		if n.TaskID != "" {
+			attrs = append(attrs, zlog.String("task_id", n.TaskID))
+		}
+		if n.Topic != "" {
+			attrs = append(attrs, zlog.String("topic", n.Topic))
+		}
+		if n.Queue != "" {
+			attrs = append(attrs, zlog.String("queue", n.Queue))
+		}
+		if n.Consumer != "" {
+			attrs = append(attrs, zlog.String("consumer", n.Consumer))
+		}
+		if n.ConsumerGroup != "" {
+			attrs = append(attrs, zlog.String("group", n.ConsumerGroup))
+		}
+		if len(n.Data) > 0 {
+			attrs = append(attrs, zlog.Any("data", n.Data))
+		}
+		logger.Log.Info("broker_event", attrs...)
 		return nil
 	}))
-}
-
-func formatNotificationData(data map[string]any) string {
-	if len(data) == 0 {
-		return "{}"
-	}
-	keys := make([]string, 0, len(data))
-	for k := range data {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	parts := make([]string, 0, len(keys))
-	for _, k := range keys {
-		parts = append(parts, fmt.Sprintf("%s=%v", k, formatNotificationValue(data[k])))
-	}
-	return "{" + strings.Join(parts, ",") + "}"
-}
-
-func formatNotificationValue(v any) any {
-	switch x := v.(type) {
-	case time.Time:
-		return x.Format(time.RFC3339Nano)
-	default:
-		return x
-	}
 }

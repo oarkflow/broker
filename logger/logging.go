@@ -14,8 +14,3 @@ var (
 	})
 	StdLog = Log.StandardLogger(zlog.InfoLevel)
 )
-
-// Logf is a Printf-style adapter compatible with broker logf func(string, ...any).
-func Logf(format string, args ...any) {
-	StdLog.Printf(format, args...)
-}

@@ -33,7 +33,7 @@ func main() {
 	disableAutoExtend := flag.Bool("disable-auto-extend", envBool("BROKER_DISABLE_AUTO_EXTEND"), "disable automatic lease extension while handlers run")
 	flag.Parse()
 
-	worker, err := bclient.NewWorker(bclient.Config{BrokerURL: *brokerURL, BrokerURLs: csv(*brokerURLs), Token: *token, ConsumerID: *id, Group: *group, Concurrency: *concurrency, MaxInFlight: *concurrency * 4, PollLimit: 1, PollWait: 30 * time.Second, VisibilityTimeout: 30 * time.Second, DisableAutoExtendLeases: *disableAutoExtend, Hooks: bclient.LoggingHooksWith("worker", logger.Logf)})
+	worker, err := bclient.NewWorker(bclient.Config{BrokerURL: *brokerURL, BrokerURLs: csv(*brokerURLs), Token: *token, ConsumerID: *id, Group: *group, Concurrency: *concurrency, MaxInFlight: *concurrency * 4, PollLimit: 1, PollWait: 30 * time.Second, VisibilityTimeout: 30 * time.Second, DisableAutoExtendLeases: *disableAutoExtend, 	Hooks: bclient.LoggingHooksWith("worker")})
 	if err != nil {
 		logger.Log.Fatal("create worker", zlog.Err(err))
 	}
