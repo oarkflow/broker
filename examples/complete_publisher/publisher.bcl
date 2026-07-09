@@ -4,6 +4,8 @@ publisher "complete-publisher" {
   request_timeout "10s"
   task_wait_timeout "20s"
   stream_group "publisher-demo"
+  require_consumers true
+  discovery_wait "5s"
   codec "fwb1" {
     max_frame_size env("BROKER_FRAME_MAX", "128MB")
     compress_threshold env("BROKER_FRAME_COMPRESS_THRESHOLD", "1KB")

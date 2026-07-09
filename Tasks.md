@@ -448,3 +448,14 @@ These are implemented as interfaces/metadata so they can be backed by more advan
 - [x] Integrated frame publish/poll helpers into remote client.
 - [x] Integrated BCL codec configuration into broker, consumer, worker, and publisher examples.
 - [x] Added tests for secure round-trip, tamper detection, binary WAL recovery, and remote frame publish/poll.
+
+## Publishing/task/request reliability and codec documentation pass
+
+- [x] Added BCL-driven publisher service-discovery preflight for task/request/command operations.
+- [x] Publisher now fails fast with a clear missing-worker/subscription error instead of waiting for task/request timeout when no matching worker is registered.
+- [x] Added `require_consumers` and `discovery_wait` to `examples/complete_publisher/publisher.bcl`.
+- [x] Added worker handler queue override support through `HandleTaskQueue`, `HandleRequestQueue`, and `HandleCommandQueue`.
+- [x] Updated `examples/complete_worker` to honor `queue` values from BCL handler blocks.
+- [x] Added `docs/CODEC_FORMAT.md` with the complete FWB1 binary frame layout, flags, TLV fields, security behavior, endpoints, and Go usage.
+- [x] Added `examples/complete_codec` with BCL-configured encode/decode/header-peek/tamper-detection example.
+- [x] Updated README with service discovery troubleshooting and codec documentation/example instructions.

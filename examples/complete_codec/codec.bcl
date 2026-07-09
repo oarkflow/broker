@@ -1,0 +1,9 @@
+codec_example "complete-codec" {
+  max_frame_size "16MB"
+  compress_threshold "32B"
+  signing_key env("BROKER_FRAME_SIGNING_KEY", "dev-frame-signing-key")
+  encryption_key env("BROKER_FRAME_ENCRYPTION_KEY", "dev-frame-encryption-key")
+  topic "codec.demo"
+  queue "codec.frames"
+  payload "{\"hello\":\"world\",\"mode\":\"fwb1\",\"note\":\"compressed, signed and encrypted when configured\"}"
+}

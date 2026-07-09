@@ -135,14 +135,36 @@ go run ./examples/complete_consumer -config examples/complete_consumer/consumer.
 # Terminal 3: worker for task/request/command handling
 go run ./examples/complete_worker -config examples/complete_worker/worker.bcl
 
-# Terminal 4: publisher covering publish, async, batch, task, request, command, stream, and DLQ demo
+# Terminal 4: publisher covering publish, async, batch, task, request, command, stream, codec frames, and DLQ demo
 go run ./examples/complete_publisher -config examples/complete_publisher/publisher.bcl
+
+# Optional: standalone codec encode/decode/tamper-detection demo
+go run ./examples/complete_codec -config examples/complete_codec/codec.bcl
 ```
 
 Or run the full smoke flow:
 
 ```bash
 ./scripts/smoke_remote.sh
+```
+
+### Required process order for task/request/command operations
+
+`complete_publisher` intentionally performs task, request/response, and command operations. Those modes require a live worker service subscribed to the configured queues. Start `complete_worker` before running the publisher. If no matching worker is discoverable, the publisher now fails fast with a clear service-discovery error instead of waiting until a task/request timeout.
+
+Required mapping from the default BCL files:
+
+| Operation | Required queue | Required process |
+|---|---|---|
+| `submit-task` | `tasks.pdf.generate` | `examples/complete_worker` |
+| `request-response` | `request.payment.authorize` | `examples/complete_worker` |
+| `command-response` | `command.payment.capture` | `examples/complete_worker` |
+
+The publisher config controls this behavior:
+
+```bcl
+require_consumers true
+discovery_wait "15s"
 ```
 
 The smoke script also asserts:
@@ -1142,6 +1164,7 @@ examples/complete_broker/     Complete BCL-driven broker example
 examples/complete_consumer/   Complete BCL-driven consumer example
 examples/complete_worker/     Complete BCL-driven worker/task service example
 examples/complete_publisher/  Complete BCL-driven publisher example
+examples/complete_codec/      Complete FWB1 codec encode/decode/tamper example
 examples/internal/exconfig/   Small BCL loader used by the examples
 Tasks.md            Implementation tracker
 ```
@@ -1171,6 +1194,9 @@ examples/
     main.go
   complete_publisher/
     publisher.bcl
+    main.go
+  complete_codec/
+    codec.bcl
     main.go
   internal/exconfig/
     bcl.go
@@ -1467,6 +1493,8 @@ This implementation is hardened for embedded and single-node standalone broker u
 
 ## Native FWB1 binary message codec
 
+The complete wire/storage format is documented in [`docs/CODEC_FORMAT.md`](docs/CODEC_FORMAT.md). Run `go run ./examples/complete_codec -config examples/complete_codec/codec.bcl` for a standalone BCL-driven encode/decode/tamper-detection demo.
+
 The broker now includes a native binary message frame codec named **FWB1**. It is intended for the broker hot path, binary WAL, remote worker data-plane traffic, and future replication streams. JSON remains available for the public HTTP/admin API and examples, but FWB1 is the recommended format for high-throughput broker-to-broker and broker-to-worker transport.
 
 ### Features
@@ -1598,4 +1626,4 @@ codec "fwb1" {
 wal_format "binary"
 ```
 
-`examples/complete_publisher/publisher.bcl` includes `frame_publish` and `frame_poll` operations to demonstrate binary frame transport.
+`examples/complete_publisher/publisher.bcl` includes `frame_publish` and `frame_poll` operations to demonstrate binary frame transport. `examples/complete_codec` shows direct local codec usage without a running broker.

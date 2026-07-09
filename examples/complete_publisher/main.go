@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/oarkflow/fastworker/broker"
@@ -36,10 +37,19 @@ func main() {
 	reqTimeout := pc.Duration("request_timeout", 10*time.Second)
 	taskWait := pc.Duration("task_wait_timeout", 20*time.Second)
 	streamGroup := pc.String("stream_group", "publisher-demo")
+	requireConsumers := pc.Bool("require_consumers", true)
+	discoveryWait := pc.Duration("discovery_wait", 15*time.Second)
 	fmt.Printf("complete publisher started config=%s\n", *configPath)
 
 	for _, op := range pc.Blocks("operation") {
 		obsSink.Write("publisher.operation.start", map[string]any{"name": op.Name, "mode": op.String("mode", "publish")})
+		if requireConsumers {
+			if err := ensureOperationReady(ctx, c, op, discoveryWait); err != nil {
+				log.Printf("CALLBACK publisher.operation.failed operation=%s error=%v", op.Name, err)
+				obsSink.Write("publisher.operation.failed", map[string]any{"name": op.Name, "error": err.Error()})
+				continue
+			}
+		}
 		if err := runOperation(ctx, c, op, reqTimeout, taskWait, streamGroup); err != nil {
 			log.Printf("CALLBACK publisher.operation.failed operation=%s error=%v", op.Name, err)
 			obsSink.Write("publisher.operation.failed", map[string]any{"name": op.Name, "error": err.Error()})
@@ -48,6 +58,97 @@ func main() {
 			obsSink.Write("publisher.operation.succeeded", map[string]any{"name": op.Name})
 		}
 	}
+}
+
+func ensureOperationReady(ctx context.Context, c *bclient.Client, op *exconfig.Node, timeout time.Duration) error {
+	mode := op.String("mode", "publish")
+	switch mode {
+	case "task":
+		queue := op.String("queue", "")
+		if queue == "" {
+			queue = "tasks." + op.String("name", op.Name)
+		}
+		return waitForConsumerQueue(ctx, c, queue, timeout, "task worker")
+	case "request":
+		queue := op.String("queue", "")
+		if queue == "" {
+			queue = "request." + sanitizeSubject(op.String("subject", op.Name))
+		}
+		return waitForConsumerQueue(ctx, c, queue, timeout, "request worker")
+	case "command":
+		queue := op.String("queue", "")
+		if queue == "" {
+			queue = "command." + sanitizeSubject(op.String("subject", op.Name))
+		}
+		return waitForConsumerQueue(ctx, c, queue, timeout, "command worker")
+	}
+	return nil
+}
+
+func waitForConsumerQueue(ctx context.Context, c *bclient.Client, queue string, timeout time.Duration, role string) error {
+	if timeout <= 0 {
+		timeout = 15 * time.Second
+	}
+	deadline := time.Now().Add(timeout)
+	var last []broker.ConsumerInfo
+	for {
+		consumers, err := c.Consumers(ctx)
+		if err == nil {
+			last = consumers
+			for _, info := range consumers {
+				if consumerReadyForQueue(info, queue) {
+					fmt.Printf("discovery ok role=%s queue=%s consumer=%s group=%s\n", role, queue, info.ConsumerID, info.Group)
+					return nil
+				}
+			}
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("no live %s is subscribed to queue %q; start examples/complete_worker with matching worker.bcl before running this operation (registered_consumers=%s)", role, queue, consumerSummary(last))
+		}
+		select {
+		case <-time.After(250 * time.Millisecond):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+func consumerReadyForQueue(info broker.ConsumerInfo, queue string) bool {
+	if info.Paused || info.Draining || info.State == broker.ConsumerPaused || info.State == broker.ConsumerDraining || info.State == broker.ConsumerStopped || info.State == broker.ConsumerFailed || info.State == broker.ConsumerDisconnected {
+		return false
+	}
+	for _, q := range info.Queues {
+		if q == queue {
+			return true
+		}
+	}
+	for _, sub := range info.Subscriptions {
+		if sub.Queue == queue || sub.Name == queue {
+			return true
+		}
+	}
+	return false
+}
+
+func consumerSummary(consumers []broker.ConsumerInfo) string {
+	if len(consumers) == 0 {
+		return "none"
+	}
+	parts := make([]string, 0, len(consumers))
+	for _, c := range consumers {
+		queues := append([]string{}, c.Queues...)
+		for _, s := range c.Subscriptions {
+			if s.Queue != "" {
+				queues = append(queues, s.Queue)
+			}
+		}
+		parts = append(parts, fmt.Sprintf("%s(state=%s,queues=%v)", c.ConsumerID, c.State, queues))
+	}
+	return strings.Join(parts, "; ")
+}
+
+func sanitizeSubject(s string) string {
+	return strings.NewReplacer("#", "all", "*", "star", "/", "_", " ", "_", ":", "_").Replace(s)
 }
 
 func runOperation(ctx context.Context, c *bclient.Client, op *exconfig.Node, reqTimeout, taskWait time.Duration, streamGroup string) error {

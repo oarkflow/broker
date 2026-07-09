@@ -82,7 +82,7 @@ func registerWorkerHandler(w *bclient.Worker, h *exconfig.Node) {
 		if len(steps) == 0 {
 			steps = []string{"received", "working", "complete"}
 		}
-		w.HandleTask(name, func(ctx context.Context, d bclient.Delivery) (any, error) {
+		w.HandleTaskQueue(name, h.String("queue", ""), func(ctx context.Context, d bclient.Delivery) (any, error) {
 			log.Printf("task started name=%s task_id=%s message=%s payload=%s", name, d.Message.TaskID, d.Message.ID, string(d.Message.Payload))
 			for i, step := range steps {
 				select {
@@ -97,14 +97,14 @@ func registerWorkerHandler(w *bclient.Worker, h *exconfig.Node) {
 			return map[string]any{"ok": true, "task": name, "task_id": d.Message.TaskID, "url": "file://generated/example.pdf"}, nil
 		})
 	case "request":
-		w.HandleRequest(name, func(ctx context.Context, d bclient.Delivery) (any, error) {
+		w.HandleRequestQueue(name, h.String("queue", ""), func(ctx context.Context, d bclient.Delivery) (any, error) {
 			var req map[string]any
 			_ = json.Unmarshal(d.Message.Payload, &req)
 			log.Printf("request handled subject=%s correlation=%s payload=%v", name, d.Message.CorrelationID, req)
 			return map[string]any{"authorized": true, "subject": name, "auth_id": "auth-demo-001", "request": req}, nil
 		})
 	case "command":
-		w.HandleCommand(name, func(ctx context.Context, d bclient.Delivery) (any, error) {
+		w.HandleCommandQueue(name, h.String("queue", ""), func(ctx context.Context, d bclient.Delivery) (any, error) {
 			var req map[string]any
 			_ = json.Unmarshal(d.Message.Payload, &req)
 			log.Printf("command handled subject=%s correlation=%s payload=%v", name, d.Message.CorrelationID, req)

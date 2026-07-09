@@ -60,6 +60,9 @@ type Worker struct {
 	taskHandlers    map[string]TaskHandler
 	requestHandlers map[string]RequestHandler
 	commandHandlers map[string]RequestHandler
+	taskQueues      map[string]string
+	requestQueues   map[string]string
+	commandQueues   map[string]string
 	pollQueues      map[string]struct{}
 	inflight        chan struct{}
 	activeMu        sync.Mutex
@@ -75,7 +78,7 @@ func NewWorker(cfg Config) (*Worker, error) {
 		pool = fw.MustNew(fw.Config{MinWorkers: cfg.Concurrency, MaxWorkers: maxInt(cfg.Concurrency*8, cfg.Concurrency), QueueSize: maxInt(cfg.MaxInFlight*8, 1024), RecoverPanics: true})
 		own = true
 	}
-	return &Worker{client: c, pool: pool, ownPool: own, queueHandlers: map[string]Handler{}, topicHandlers: map[string]Handler{}, patternHandlers: map[string]Handler{}, taskHandlers: map[string]TaskHandler{}, requestHandlers: map[string]RequestHandler{}, commandHandlers: map[string]RequestHandler{}, pollQueues: map[string]struct{}{}, inflight: make(chan struct{}, c.cfg.MaxInFlight), active: map[string]context.CancelFunc{}}, nil
+	return &Worker{client: c, pool: pool, ownPool: own, queueHandlers: map[string]Handler{}, topicHandlers: map[string]Handler{}, patternHandlers: map[string]Handler{}, taskHandlers: map[string]TaskHandler{}, requestHandlers: map[string]RequestHandler{}, commandHandlers: map[string]RequestHandler{}, taskQueues: map[string]string{}, requestQueues: map[string]string{}, commandQueues: map[string]string{}, pollQueues: map[string]struct{}{}, inflight: make(chan struct{}, c.cfg.MaxInFlight), active: map[string]context.CancelFunc{}}, nil
 }
 func (w *Worker) Client() *Client { return w.client }
 func (w *Worker) HandleQueue(q string, h Handler) {
@@ -96,23 +99,38 @@ func (w *Worker) HandlePattern(p string, h Handler) {
 	w.patternHandlers[p] = h
 	w.pollQueues["sub."+w.client.cfg.ConsumerID+"."+sanitize(p)] = struct{}{}
 }
-func (w *Worker) HandleTask(n string, h TaskHandler) {
+func (w *Worker) HandleTask(n string, h TaskHandler) { w.HandleTaskQueue(n, "", h) }
+func (w *Worker) HandleTaskQueue(n, queue string, h TaskHandler) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if queue == "" {
+		queue = "tasks." + n
+	}
 	w.taskHandlers[n] = h
-	w.pollQueues["tasks."+n] = struct{}{}
+	w.taskQueues[n] = queue
+	w.pollQueues[queue] = struct{}{}
 }
-func (w *Worker) HandleRequest(s string, h RequestHandler) {
+func (w *Worker) HandleRequest(s string, h RequestHandler) { w.HandleRequestQueue(s, "", h) }
+func (w *Worker) HandleRequestQueue(s, queue string, h RequestHandler) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if queue == "" {
+		queue = "request." + sanitize(s)
+	}
 	w.requestHandlers[s] = h
-	w.pollQueues["request."+sanitize(s)] = struct{}{}
+	w.requestQueues[s] = queue
+	w.pollQueues[queue] = struct{}{}
 }
-func (w *Worker) HandleCommand(s string, h RequestHandler) {
+func (w *Worker) HandleCommand(s string, h RequestHandler) { w.HandleCommandQueue(s, "", h) }
+func (w *Worker) HandleCommandQueue(s, queue string, h RequestHandler) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if queue == "" {
+		queue = "command." + sanitize(s)
+	}
 	w.commandHandlers[s] = h
-	w.pollQueues["command."+sanitize(s)] = struct{}{}
+	w.commandQueues[s] = queue
+	w.pollQueues[queue] = struct{}{}
 }
 func (w *Worker) Run(ctx context.Context) error {
 	if w.ownPool {
@@ -120,7 +138,7 @@ func (w *Worker) Run(ctx context.Context) error {
 			return err
 		}
 	}
-	queues, topics, patterns, tasks, requests, commands := w.snapshotNames()
+	queues, topics, patterns, tasks, requests, commands, taskQueues, requestQueues, commandQueues := w.snapshotNames()
 	reg := broker.ConsumerRegistration{ConsumerID: w.client.cfg.ConsumerID, Group: w.client.cfg.Group, Name: w.client.cfg.Name, Version: w.client.cfg.Version, Queues: queues, Topics: topics, Patterns: patterns, TaskTypes: tasks, RequestSubjects: requests, CommandTypes: commands, Concurrency: w.client.cfg.Concurrency, MaxInFlight: w.client.cfg.MaxInFlight, AckMode: broker.AckManual, HeartbeatEveryNS: w.client.cfg.HeartbeatInterval.Nanoseconds(), VisibilityTimeout: w.client.cfg.VisibilityTimeout.Nanoseconds(), Capabilities: []string{"poll", "ack", "nack", "progress", "respond", "task", "request", "command", "dlq", "auto_extend"}}
 	if _, err := w.client.Register(ctx, reg); err != nil {
 		return err
@@ -135,13 +153,13 @@ func (w *Worker) Run(ctx context.Context) error {
 		_, _ = w.client.Subscribe(ctx, broker.RemoteSubscription{Type: "pattern", Name: p, Pattern: p, AutoCreate: true})
 	}
 	for _, t := range tasks {
-		_, _ = w.client.Subscribe(ctx, broker.RemoteSubscription{Type: "task", Name: t, Queue: "tasks." + t, AutoCreate: true})
+		_, _ = w.client.Subscribe(ctx, broker.RemoteSubscription{Type: "task", Name: t, Queue: firstNonEmpty(taskQueues[t], "tasks."+t), AutoCreate: true})
 	}
 	for _, r := range requests {
-		_, _ = w.client.Subscribe(ctx, broker.RemoteSubscription{Type: "request", Name: r, Queue: "request." + sanitize(r), AutoCreate: true})
+		_, _ = w.client.Subscribe(ctx, broker.RemoteSubscription{Type: "request", Name: r, Queue: firstNonEmpty(requestQueues[r], "request."+sanitize(r)), AutoCreate: true})
 	}
 	for _, c := range commands {
-		_, _ = w.client.Subscribe(ctx, broker.RemoteSubscription{Type: "command", Name: c, Queue: "command." + sanitize(c), AutoCreate: true})
+		_, _ = w.client.Subscribe(ctx, broker.RemoteSubscription{Type: "command", Name: c, Queue: firstNonEmpty(commandQueues[c], "command."+sanitize(c)), AutoCreate: true})
 	}
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -356,9 +374,12 @@ func (w *Worker) findHandler(m broker.Message) (any, string) {
 	}
 	return nil, ""
 }
-func (w *Worker) snapshotNames() (queues, topics, patterns, tasks, requests, commands []string) {
+func (w *Worker) snapshotNames() (queues, topics, patterns, tasks, requests, commands []string, taskQueues, requestQueues, commandQueues map[string]string) {
 	w.mu.RLock()
 	defer w.mu.RUnlock()
+	taskQueues = map[string]string{}
+	requestQueues = map[string]string{}
+	commandQueues = map[string]string{}
 	for k := range w.queueHandlers {
 		queues = append(queues, k)
 	}
@@ -376,6 +397,15 @@ func (w *Worker) snapshotNames() (queues, topics, patterns, tasks, requests, com
 	}
 	for k := range w.commandHandlers {
 		commands = append(commands, k)
+	}
+	for k, v := range w.taskQueues {
+		taskQueues[k] = v
+	}
+	for k, v := range w.requestQueues {
+		requestQueues[k] = v
+	}
+	for k, v := range w.commandQueues {
+		commandQueues[k] = v
 	}
 	return
 }
