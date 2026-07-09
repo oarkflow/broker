@@ -1,0 +1,82 @@
+publisher "complete-publisher" {
+  broker_urls [env("BROKER_URL", "http://127.0.0.1:8090")]
+  token env("BROKER_PUBLISHER_TOKEN", env("BROKER_TOKEN", "dev-publisher-token"))
+  request_timeout "10s"
+  task_wait_timeout "20s"
+  stream_group "publisher-demo"
+  observer_jsonl env("PUBLISHER_OBSERVER_JSONL", "./.broker-data/observability/publisher-events.jsonl")
+
+  callback "operation-jsonl" {
+    enabled true
+    type "local"
+    sink "jsonl"
+    events ["publisher.operation.start", "publisher.operation.succeeded", "publisher.operation.failed"]
+  }
+
+  operation "publish-queue" {
+    mode "publish"
+    topic "email.created"
+    queue "email.send"
+    payload "{\"to\":\"queue@example.com\",\"message\":\"hello queue\"}"
+  }
+
+  operation "publish-topic-route" {
+    mode "publish"
+    topic "email.created"
+    payload "{\"to\":\"topic@example.com\",\"message\":\"routed by broker route\"}"
+  }
+
+  operation "publish-wildcard" {
+    mode "publish"
+    topic "tenant.123.invoice.created"
+    payload "{\"tenant\":\"123\",\"invoice_id\":\"inv-001\",\"amount\":1499}"
+  }
+
+  operation "publish-batch" {
+    mode "batch"
+    topic "email.created"
+    queue "email.send"
+    payloads ["{\"to\":\"batch1@example.com\"}", "{\"to\":\"batch2@example.com\"}"]
+  }
+
+  operation "publish-async" {
+    mode "async"
+    topic "email.created"
+    queue "email.send"
+    payload "{\"to\":\"async@example.com\"}"
+  }
+
+  operation "submit-task" {
+    mode "task"
+    name "pdf.generate"
+    queue "tasks.pdf.generate"
+    payload "{\"template\":\"invoice\",\"invoice_id\":\"inv-001\"}"
+    wait true
+  }
+
+  operation "request-response" {
+    mode "request"
+    subject "payment.authorize"
+    payload "{\"order_id\":\"ord-001\",\"amount\":1499}"
+  }
+
+  operation "command-response" {
+    mode "command"
+    subject "payment.capture"
+    payload "{\"authorization_id\":\"auth-demo-001\",\"amount\":1499}"
+  }
+
+  operation "stream-audit" {
+    mode "stream"
+    topic "audit.manual"
+    stream "audit.events"
+    payload "{\"event\":\"manual audit event from publisher example\"}"
+  }
+
+  operation "dlq-demo" {
+    mode "publish"
+    topic "email.created"
+    queue "email.send"
+    payload "{\"to\":\"dlq@example.com\",\"force_dlq\":true}"
+  }
+}

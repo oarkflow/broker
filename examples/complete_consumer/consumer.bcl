@@ -1,0 +1,47 @@
+consumer "complete-consumer" {
+  broker_urls [env("BROKER_URL", "http://127.0.0.1:8090")]
+  token env("BROKER_WORKER_TOKEN", env("BROKER_TOKEN", "dev-worker-token"))
+  consumer_id env("CONSUMER_ID", "complete-consumer-1")
+  group "complete-consumers"
+  concurrency 4
+  max_inflight 16
+  poll_wait "5s"
+  heartbeat "5s"
+  visibility_timeout "30s"
+  auto_extend true
+  log_hooks true
+  observer_jsonl env("CONSUMER_OBSERVER_JSONL", "./.broker-data/observability/consumer-events.jsonl")
+
+  lifecycle_hooks "all" {
+    enabled true
+    callbacks ["jsonl", "console"]
+    events ["connecting", "registered", "subscribed", "polling", "message_received", "before_handle", "progress", "ack", "nack", "reject", "broker_notification", "stopped"]
+  }
+
+  notification_callback "broker-events" {
+    enabled true
+    source "broker"
+    transport "long-poll"
+    sink "jsonl"
+  }
+
+  # Uses polling for message delivery and SSE/long-poll broker events for lifecycle/cancel/drain.
+  service_discovery true
+  broker_events true
+
+  handler "email-queue" {
+    type "queue"
+    name "email.send"
+    fail_on_contains "force_dlq"
+  }
+
+  handler "invoice-wildcard" {
+    type "pattern"
+    name "tenant.*.invoice.created"
+  }
+
+  handler "invoice-queue" {
+    type "queue"
+    name "invoice.events"
+  }
+}

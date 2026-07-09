@@ -1,0 +1,99 @@
+broker "complete" {
+  # Production should set insecure_dev false and provide real tokens/TLS.
+  addr env("BROKER_ADDR", ":8090")
+  mode "standalone"
+  default_queue "default"
+  wal env("BROKER_WAL", "./.broker-data/wal")
+  insecure_dev env("BROKER_INSECURE_DEV", "true")
+  log_events true
+  debug_events false
+  max_body "4MB"
+  default_visibility "30s"
+  remote_consumer_timeout "45s"
+
+  # Complete lifecycle/hooks/notification example output.
+  # The broker example writes hook callbacks and notification callbacks here.
+  observer_jsonl env("BROKER_OBSERVER_JSONL", "./.broker-data/observability/broker-events.jsonl")
+
+  callback "live-jsonl-audit" {
+    enabled true
+    type "notification"
+    sink "jsonl"
+    path env("BROKER_OBSERVER_JSONL", "./.broker-data/observability/broker-events.jsonl")
+    events ["broker.*", "consumer.*", "message.*", "task.*", "queue.*", "stream.*", "dlq.*", "admin.*"]
+  }
+
+  token "admin" {
+    value env("BROKER_TOKEN", "dev-admin-token")
+    permissions ["admin:*"]
+  }
+
+  token "publisher" {
+    value env("BROKER_PUBLISHER_TOKEN", "dev-publisher-token")
+    permissions ["publish", "task:write", "task:read", "broker:read", "stream:read", "message:read", "dlq:read"]
+  }
+
+  token "worker" {
+    value env("BROKER_WORKER_TOKEN", "dev-worker-token")
+    permissions ["broker:read", "consumer:register", "consumer:read", "consumer:control", "consumer:poll", "message:read", "message:ack", "message:nack", "task:read", "task:write", "dlq:read", "notification"]
+  }
+
+  topic "email.created" {
+    partitions 1
+    retention "24h"
+  }
+
+  topic "tenant.*.invoice.created" {
+    partitions 4
+    retention "24h"
+  }
+
+  queue "email.send" {
+    dlq "email.send.dlq"
+    visibility_timeout "30s"
+    max_attempts 3
+    max_depth 100000
+    backpressure "reject"
+  }
+
+  queue "invoice.events" {
+    dlq "invoice.events.dlq"
+    visibility_timeout "30s"
+    max_attempts 3
+  }
+
+  queue "tasks.pdf.generate" {
+    dlq "tasks.pdf.generate.dlq"
+    visibility_timeout "45s"
+    max_attempts 3
+  }
+
+  queue "request.payment.authorize" {
+    dlq "request.payment.authorize.dlq"
+    visibility_timeout "20s"
+    max_attempts 3
+  }
+
+  queue "command.payment.capture" {
+    dlq "command.payment.capture.dlq"
+    visibility_timeout "20s"
+    max_attempts 3
+  }
+
+  stream "audit.events" {
+    partitions 1
+    retention "24h"
+  }
+
+  route "email-created-to-send-queue" {
+    match "email.created"
+    to queue "email.send"
+    copy_to stream "audit.events"
+  }
+
+  route "invoice-wildcard-to-consumer-queue" {
+    match "tenant.*.invoice.created"
+    to queue "invoice.events"
+    copy_to stream "audit.events"
+  }
+}

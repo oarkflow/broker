@@ -1,0 +1,52 @@
+worker "complete-worker" {
+  broker_urls [env("BROKER_URL", "http://127.0.0.1:8090")]
+  token env("BROKER_WORKER_TOKEN", env("BROKER_TOKEN", "dev-worker-token"))
+  consumer_id env("WORKER_ID", "complete-worker-1")
+  group "complete-workers"
+  concurrency 8
+  max_inflight 32
+  poll_wait "5s"
+  heartbeat "5s"
+  visibility_timeout "45s"
+  lease_extension_interval "10s"
+  max_lease_extensions 12
+  auto_extend true
+  log_hooks true
+  observer_jsonl env("WORKER_OBSERVER_JSONL", "./.broker-data/observability/worker-events.jsonl")
+
+  lifecycle_hooks "all" {
+    enabled true
+    callbacks ["jsonl", "console"]
+    events ["connecting", "registered", "subscribed", "polling", "message_received", "before_handle", "progress", "ack", "nack", "reject", "broker_notification", "stopped"]
+  }
+
+  notification_callback "broker-events" {
+    enabled true
+    source "broker"
+    transport "long-poll"
+    sink "jsonl"
+  }
+
+  # Uses polling to claim work and broker-sent events for cancel/drain/lease lifecycle.
+  service_discovery true
+  broker_events true
+
+  handler "pdf.generate" {
+    type "task"
+    name "pdf.generate"
+    queue "tasks.pdf.generate"
+    steps ["received", "rendering", "uploading", "complete"]
+  }
+
+  handler "payment.authorize" {
+    type "request"
+    name "payment.authorize"
+    queue "request.payment.authorize"
+  }
+
+  handler "payment.capture" {
+    type "command"
+    name "payment.capture"
+    queue "command.payment.capture"
+  }
+}
