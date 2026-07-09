@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"log"
 	"os"
 	"os/signal"
 	"strings"
@@ -14,6 +13,8 @@ import (
 
 	"github.com/oarkflow/fastworker/broker"
 	bclient "github.com/oarkflow/fastworker/broker/client"
+	"github.com/oarkflow/fastworker/logger"
+	"github.com/oarkflow/zlog"
 )
 
 func main() {
@@ -32,14 +33,14 @@ func main() {
 	disableAutoExtend := flag.Bool("disable-auto-extend", envBool("BROKER_DISABLE_AUTO_EXTEND"), "disable automatic lease extension while handlers run")
 	flag.Parse()
 
-	worker, err := bclient.NewWorker(bclient.Config{BrokerURL: *brokerURL, BrokerURLs: csv(*brokerURLs), Token: *token, ConsumerID: *id, Group: *group, Concurrency: *concurrency, MaxInFlight: *concurrency * 4, PollLimit: 1, PollWait: 30 * time.Second, VisibilityTimeout: 30 * time.Second, DisableAutoExtendLeases: *disableAutoExtend, Hooks: bclient.LoggingHooks("worker")})
+	worker, err := bclient.NewWorker(bclient.Config{BrokerURL: *brokerURL, BrokerURLs: csv(*brokerURLs), Token: *token, ConsumerID: *id, Group: *group, Concurrency: *concurrency, MaxInFlight: *concurrency * 4, PollLimit: 1, PollWait: 30 * time.Second, VisibilityTimeout: 30 * time.Second, DisableAutoExtendLeases: *disableAutoExtend, Hooks: bclient.LoggingHooksWith("worker", logger.Logf)})
 	if err != nil {
-		log.Fatal(err)
+		logger.Log.Fatal("create worker", zlog.Err(err))
 	}
 	for _, q := range csv(*queues) {
 		queue := q
 		worker.HandleQueue(queue, func(ctx context.Context, d bclient.Delivery) error {
-			log.Printf("queue=%s message=%s type=%s", queue, d.Message.ID, d.Message.Type)
+			logger.Log.Info("queue message", zlog.String("queue", queue), zlog.String("message", d.Message.ID), zlog.String("type", d.Message.Type))
 			if *fail {
 				return fmt.Errorf("forced failure")
 			}
@@ -49,14 +50,14 @@ func main() {
 	for _, p := range csv(*patterns) {
 		pattern := p
 		worker.HandlePattern(pattern, func(ctx context.Context, d bclient.Delivery) error {
-			log.Printf("pattern=%s topic=%s message=%s", pattern, d.Message.Topic, d.Message.ID)
+			logger.Log.Info("pattern match", zlog.String("pattern", pattern), zlog.String("topic", d.Message.Topic), zlog.String("message", d.Message.ID))
 			return nil
 		})
 	}
 	for _, t := range csv(*tasks) {
 		task := t
 		worker.HandleTask(task, func(ctx context.Context, d bclient.Delivery) (any, error) {
-			log.Printf("task=%s message=%s", task, d.Message.ID)
+			logger.Log.Info("task received", zlog.String("task", task), zlog.String("message", d.Message.ID))
 			_ = d.Progress(ctx, broker.Progress{Percent: 50, Message: "working", UpdatedAt: time.Now()})
 			if *fail {
 				return nil, fmt.Errorf("forced task failure")
@@ -69,7 +70,7 @@ func main() {
 		worker.HandleRequest(subject, func(ctx context.Context, d bclient.Delivery) (any, error) {
 			var payload any
 			_ = json.Unmarshal(d.Message.Payload, &payload)
-			log.Printf("request=%s message=%s", subject, d.Message.ID)
+			logger.Log.Info("request received", zlog.String("subject", subject), zlog.String("message", d.Message.ID))
 			if *fail {
 				return nil, fmt.Errorf("forced request failure")
 			}
@@ -81,7 +82,7 @@ func main() {
 		worker.HandleCommand(subject, func(ctx context.Context, d bclient.Delivery) (any, error) {
 			var payload any
 			_ = json.Unmarshal(d.Message.Payload, &payload)
-			log.Printf("command=%s message=%s", subject, d.Message.ID)
+			logger.Log.Info("command received", zlog.String("subject", subject), zlog.String("message", d.Message.ID))
 			if *fail {
 				return nil, fmt.Errorf("forced command failure")
 			}
@@ -89,14 +90,14 @@ func main() {
 		})
 	}
 	if *queues == "" && *patterns == "" && *tasks == "" && *requests == "" && *commands == "" {
-		log.Fatal("no handlers configured; provide -queue, -pattern, -task, -request, or -command")
+		logger.Log.Fatal("no handlers configured; provide -queue, -pattern, -task, -request, or -command")
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	log.Printf("remote worker starting broker=%s group=%s", *brokerURL, *group)
+	logger.Log.Info("remote worker starting", zlog.String("broker", *brokerURL), zlog.String("group", *group))
 	if err := worker.Run(ctx); err != nil && ctx.Err() == nil {
-		log.Fatal(err)
+		logger.Log.Fatal("worker run failed", zlog.Err(err))
 	}
 }
 

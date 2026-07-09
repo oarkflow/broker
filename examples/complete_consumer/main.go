@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"log"
 	"os"
 	"os/signal"
 	"strings"
@@ -16,6 +15,8 @@ import (
 	bclient "github.com/oarkflow/fastworker/broker/client"
 	"github.com/oarkflow/fastworker/examples/internal/exconfig"
 	"github.com/oarkflow/fastworker/examples/internal/exobserve"
+	"github.com/oarkflow/fastworker/logger"
+	"github.com/oarkflow/zlog"
 )
 
 func main() {
@@ -23,15 +24,15 @@ func main() {
 	flag.Parse()
 	root, err := exconfig.Load(*configPath)
 	if err != nil {
-		log.Fatalf("load config: %v", err)
+		logger.Log.Fatal("load config", zlog.Err(err))
 	}
 	cc := exconfig.FirstBlock(root, "consumer")
 	if cc == nil {
-		log.Fatal("missing consumer block")
+		logger.Log.Fatal("missing consumer block")
 	}
 	obsSink, err := exobserve.NewJSONLSink(cc.String("observer_jsonl", "./.broker-data/observability/consumer-events.jsonl"))
 	if err != nil {
-		log.Fatalf("open observability sink: %v", err)
+		logger.Log.Fatal("open observability sink", zlog.Err(err))
 	}
 	defer obsSink.Close()
 	observer := exobserve.ClientObserver{Prefix: "complete-consumer", Sink: obsSink}
@@ -55,7 +56,7 @@ func main() {
 	}
 	w, err := bclient.NewWorker(cfg)
 	if err != nil {
-		log.Fatalf("create worker: %v", err)
+		logger.Log.Fatal("create worker", zlog.Err(err))
 	}
 
 	for _, h := range cc.Blocks("handler") {
@@ -67,7 +68,7 @@ func main() {
 	fmt.Printf("complete consumer started config=%s consumer=%s group=%s\n", *configPath, cfg.ConsumerID, cfg.Group)
 	fmt.Println("delivery=polling, broker-events=SSE/long-poll, service-discovery=/v1/consumers")
 	if err := w.Run(ctx); err != nil && ctx.Err() == nil {
-		log.Fatal(err)
+		logger.Log.Fatal("consumer run failed", zlog.Err(err))
 	}
 }
 
@@ -78,7 +79,7 @@ func registerConsumerHandler(w *bclient.Worker, h *exconfig.Node) {
 	handler := func(ctx context.Context, d bclient.Delivery) error {
 		var payload map[string]any
 		_ = json.Unmarshal(d.Message.Payload, &payload)
-		log.Printf("consumer received kind=%s name=%s message=%s topic=%s queue=%s payload=%s", typ, name, d.Message.ID, d.Message.Topic, d.Message.Queue, string(d.Message.Payload))
+		logger.Log.Info("consumer received", zlog.String("kind", typ), zlog.String("name", name), zlog.String("message", d.Message.ID), zlog.String("topic", d.Message.Topic), zlog.String("queue", d.Message.Queue), zlog.String("payload", string(d.Message.Payload)))
 		if failText != "" && strings.Contains(string(d.Message.Payload), failText) {
 			return fmt.Errorf("configured failure matched %q", failText)
 		}
@@ -93,7 +94,7 @@ func registerConsumerHandler(w *bclient.Worker, h *exconfig.Node) {
 	case "pattern", "wildcard":
 		w.HandlePattern(name, handler)
 	default:
-		log.Fatalf("unsupported consumer handler type %q", typ)
+		logger.Log.Fatal("unsupported consumer handler type", zlog.String("type", typ))
 	}
-	log.Printf("configured consumer handler type=%s name=%s", typ, name)
+	logger.Log.Info("configured consumer handler", zlog.String("type", typ), zlog.String("name", name))
 }

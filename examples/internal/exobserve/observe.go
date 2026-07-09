@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"os"
 	"path/filepath"
 	"sync"
@@ -12,6 +11,7 @@ import (
 
 	"github.com/oarkflow/fastworker/broker"
 	bclient "github.com/oarkflow/fastworker/broker/client"
+	"github.com/oarkflow/fastworker/logger"
 )
 
 type JSONLSink struct {
@@ -61,7 +61,7 @@ func (o BrokerObserver) logf(format string, args ...any) {
 	if prefix == "" {
 		prefix = "broker-observer"
 	}
-	log.Printf(prefix+" "+format, args...)
+	logger.StdLog.Printf(prefix+" "+format, args...)
 }
 
 func (o BrokerObserver) Hooks() broker.Hooks {
@@ -179,11 +179,11 @@ func (o ClientObserver) logf(format string, args ...any) {
 	if prefix == "" {
 		prefix = "client-observer"
 	}
-	log.Printf(prefix+" "+format, args...)
+	logger.StdLog.Printf(prefix+" "+format, args...)
 }
 
 func (o ClientObserver) Hooks() bclient.Hooks {
-	base := bclient.LoggingHooksWith(o.Prefix, log.Printf)
+	base := bclient.LoggingHooksWith(o.Prefix, logger.StdLog.Printf)
 	wrapEvent := func(kind string, next func(bclient.Event)) func(bclient.Event) {
 		return func(e bclient.Event) {
 			if next != nil {

@@ -4,7 +4,6 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"log"
 	"net/http"
 	"os"
 	"os/signal"
@@ -13,6 +12,8 @@ import (
 	"time"
 
 	"github.com/oarkflow/fastworker/broker"
+	"github.com/oarkflow/fastworker/logger"
+	"github.com/oarkflow/zlog"
 )
 
 func main() {
@@ -38,10 +39,10 @@ func main() {
 	flag.Parse()
 
 	if !*insecureDev && *token == "" {
-		log.Fatal("BROKER_TOKEN or -token is required. Use --insecure-dev only for local development.")
+		logger.Log.Fatal("BROKER_TOKEN or -token is required. Use --insecure-dev only for local development.")
 	}
 	if (*tlsCert == "") != (*tlsKey == "") {
-		log.Fatal("both -tls-cert and -tls-key must be provided together")
+		logger.Log.Fatal("both -tls-cert and -tls-key must be provided together")
 	}
 
 	frameCodec := broker.NewBinaryMessageCodec(frameCodecOptions(*frameSigningKey, *frameEncryptionKey, *frameCompress, int(*maxBody)+1<<20)...)
@@ -50,13 +51,13 @@ func main() {
 		if strings.EqualFold(*walFormat, "json") || strings.EqualFold(*walFormat, "jsonl") {
 			st, err := broker.NewFileWALStore(*wal)
 			if err != nil {
-				log.Fatalf("open JSON WAL store: %v", err)
+				logger.Log.Fatal("open JSON WAL store", zlog.Err(err))
 			}
 			store = st
 		} else {
 			st, err := broker.NewBinaryFileWALStore(*wal, frameCodecOptions(*frameSigningKey, *frameEncryptionKey, *frameCompress, int(*maxBody)+1<<20)...)
 			if err != nil {
-				log.Fatalf("open binary WAL store: %v", err)
+				logger.Log.Fatal("open binary WAL store", zlog.Err(err))
 			}
 			store = st
 		}
@@ -64,13 +65,13 @@ func main() {
 
 	b, err := broker.New(broker.Config{Mode: broker.ModeStandalone, Store: store, DefaultQueue: *queue, FrameCodec: frameCodec})
 	if err != nil {
-		log.Fatalf("create broker: %v", err)
+		logger.Log.Fatal("create broker", zlog.Err(err))
 	}
 	if !*quiet {
-		broker.LogNotifications(b.Notifications(), "brokerd-stdout", *debugEvents, log.Printf)
+		broker.LogNotifications(b.Notifications(), "brokerd-stdout", *debugEvents, logger.Logf)
 	}
 	if err := b.Start(context.Background()); err != nil {
-		log.Fatalf("start broker: %v", err)
+		logger.Log.Fatal("start broker", zlog.Err(err))
 	}
 
 	tokens := []broker.AdminToken{}
@@ -99,22 +100,22 @@ func main() {
 	select {
 	case err := <-serverErr:
 		if err != nil && err != http.ErrServerClosed {
-			log.Fatalf("broker listen failed on %s: %v", *addr, err)
+			logger.Log.Fatal("broker listen failed", zlog.String("addr", *addr), zlog.Err(err))
 		}
 	case <-time.After(200 * time.Millisecond):
 	}
-	fmt.Printf("fastworker broker listening on %s\n", *addr)
+	logger.Log.Info("fastworker broker listening", zlog.String("addr", *addr))
 	if *insecureDev {
-		fmt.Println("WARNING: authentication disabled by --insecure-dev")
+		logger.Log.Warn("authentication disabled by --insecure-dev")
 	}
 	if *tlsCert != "" {
-		fmt.Println("TLS enabled")
+		logger.Log.Info("TLS enabled")
 	}
 	if *requireClientCert {
-		fmt.Println("mTLS client certificate verification enabled")
+		logger.Log.Info("mTLS client certificate verification enabled")
 	}
 	if *wal != "" {
-		fmt.Printf("durable WAL: %s format=%s\n", *wal, *walFormat)
+		logger.Log.Info("durable WAL", zlog.String("wal", *wal), zlog.String("format", *walFormat))
 	}
 
 	sig := make(chan os.Signal, 1)
@@ -126,12 +127,12 @@ func main() {
 	_ = srv.Shutdown(ctx)
 	_ = b.Stop(ctx)
 	if srvErr := srv.Close(); srvErr != nil && srvErr != http.ErrServerClosed {
-		log.Printf("server close: %v", srvErr)
+		logger.Log.Warn("server close", zlog.Err(srvErr))
 	}
 	select {
 	case err := <-serverErr:
 		if err != nil && err != http.ErrServerClosed {
-			log.Printf("server error: %v", err)
+			logger.Log.Warn("server error", zlog.Err(err))
 		}
 	default:
 	}

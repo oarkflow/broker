@@ -1,13 +1,14 @@
 package client
 
 import (
-	"log"
 	"time"
+
+	fw "github.com/oarkflow/fastworker/logger"
 )
 
 // LoggingHooks returns lifecycle hooks that print compact, useful remote-consumer logs.
 func LoggingHooks(prefix string) Hooks {
-	return LoggingHooksWith(prefix, log.Printf)
+	return LoggingHooksWith(prefix, fw.StdLog.Printf)
 }
 
 func LoggingHooksWith(prefix string, logf func(string, ...any)) Hooks {
@@ -15,7 +16,7 @@ func LoggingHooksWith(prefix string, logf func(string, ...any)) Hooks {
 		prefix = "worker"
 	}
 	if logf == nil {
-		logf = log.Printf
+		logf = fw.StdLog.Printf
 	}
 	p := func(format string, args ...any) {
 		logf(prefix+" "+format, args...)

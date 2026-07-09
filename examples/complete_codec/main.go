@@ -4,11 +4,12 @@ import (
 	"encoding/hex"
 	"flag"
 	"fmt"
-	"log"
 	"time"
 
 	"github.com/oarkflow/fastworker/broker"
 	"github.com/oarkflow/fastworker/examples/internal/exconfig"
+	"github.com/oarkflow/fastworker/logger"
+	"github.com/oarkflow/zlog"
 )
 
 func main() {
@@ -16,11 +17,11 @@ func main() {
 	flag.Parse()
 	root, err := exconfig.Load(*configPath)
 	if err != nil {
-		log.Fatalf("load config: %v", err)
+		logger.Log.Fatal("load config", zlog.Err(err))
 	}
 	cc := exconfig.FirstBlock(root, "codec_example")
 	if cc == nil {
-		log.Fatal("missing codec_example block")
+		logger.Log.Fatal("missing codec_example block")
 	}
 	codec := broker.NewBinaryMessageCodec(
 		broker.WithFrameMaxSize(int(exconfig.ParseBytes(cc.String("max_frame_size", "16MB"), 16<<20))),
@@ -42,15 +43,15 @@ func main() {
 	}
 	frame, err := codec.EncodeMessage(nil, msg)
 	if err != nil {
-		log.Fatal(err)
+		logger.Log.Fatal("encode failed", zlog.Err(err))
 	}
 	var header broker.Message
 	if err := codec.PeekHeader(frame, &header); err != nil {
-		log.Fatal(err)
+		logger.Log.Fatal("peek failed", zlog.Err(err))
 	}
 	var decoded broker.Message
 	if err := codec.DecodeMessage(frame, &decoded); err != nil {
-		log.Fatal(err)
+		logger.Log.Fatal("decode failed", zlog.Err(err))
 	}
 	fmt.Printf("FWB1 frame bytes=%d fingerprint=%s\n", len(frame), broker.FrameFingerprint(frame))
 	fmt.Printf("peek id=%s topic=%s queue=%s type=%s payload_len=%d\n", header.ID, header.Topic, header.Queue, header.Type, len(header.Payload))
@@ -62,9 +63,9 @@ func main() {
 		tampered[len(tampered)-1] ^= 0x01
 	}
 	if err := codec.DecodeMessage(tampered, &decoded); err != nil {
-		fmt.Printf("tamper_detected=%v\n", err)
+		logger.Log.Info("tamper detected", zlog.Err(err))
 	} else {
-		log.Fatal("tamper was not detected")
+		logger.Log.Fatal("tamper was not detected")
 	}
 }
 

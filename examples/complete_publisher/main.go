@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"log"
 	"strings"
 	"time"
 
@@ -13,6 +12,8 @@ import (
 	bclient "github.com/oarkflow/fastworker/broker/client"
 	"github.com/oarkflow/fastworker/examples/internal/exconfig"
 	"github.com/oarkflow/fastworker/examples/internal/exobserve"
+	"github.com/oarkflow/fastworker/logger"
+	"github.com/oarkflow/zlog"
 )
 
 func main() {
@@ -20,15 +21,15 @@ func main() {
 	flag.Parse()
 	root, err := exconfig.Load(*configPath)
 	if err != nil {
-		log.Fatalf("load config: %v", err)
+		logger.Log.Fatal("load config", zlog.Err(err))
 	}
 	pc := exconfig.FirstBlock(root, "publisher")
 	if pc == nil {
-		log.Fatal("missing publisher block")
+		logger.Log.Fatal("missing publisher block")
 	}
 	obsSink, err := exobserve.NewJSONLSink(pc.String("observer_jsonl", "./.broker-data/observability/publisher-events.jsonl"))
 	if err != nil {
-		log.Fatalf("open observability sink: %v", err)
+		logger.Log.Fatal("open observability sink", zlog.Err(err))
 	}
 	defer obsSink.Close()
 
@@ -45,16 +46,16 @@ func main() {
 		obsSink.Write("publisher.operation.start", map[string]any{"name": op.Name, "mode": op.String("mode", "publish")})
 		if requireConsumers {
 			if err := ensureOperationReady(ctx, c, op, discoveryWait); err != nil {
-				log.Printf("CALLBACK publisher.operation.failed operation=%s error=%v", op.Name, err)
+				logger.Log.Warn("CALLBACK publisher.operation.failed", zlog.String("operation", op.Name), zlog.Err(err))
 				obsSink.Write("publisher.operation.failed", map[string]any{"name": op.Name, "error": err.Error()})
 				continue
 			}
 		}
 		if err := runOperation(ctx, c, op, reqTimeout, taskWait, streamGroup); err != nil {
-			log.Printf("CALLBACK publisher.operation.failed operation=%s error=%v", op.Name, err)
+			logger.Log.Warn("CALLBACK publisher.operation.failed", zlog.String("operation", op.Name), zlog.Err(err))
 			obsSink.Write("publisher.operation.failed", map[string]any{"name": op.Name, "error": err.Error()})
 		} else {
-			log.Printf("CALLBACK publisher.operation.succeeded operation=%s", op.Name)
+			logger.Log.Info("CALLBACK publisher.operation.succeeded", zlog.String("operation", op.Name))
 			obsSink.Write("publisher.operation.succeeded", map[string]any{"name": op.Name})
 		}
 	}

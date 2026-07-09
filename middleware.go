@@ -2,8 +2,10 @@ package fastworker
 
 import (
 	"context"
-	"log"
 	"time"
+
+	"github.com/oarkflow/fastworker/logger"
+	"github.com/oarkflow/zlog"
 )
 
 // Timeout wraps each job with a context timeout. JobOptions.Timeout is usually
@@ -27,11 +29,12 @@ func Logger(prefix string) Middleware {
 		return JobFunc(func(ctx context.Context) error {
 			start := time.Now()
 			err := next.Run(ctx)
-			if err != nil {
-				log.Printf("%s job_error duration=%s error=%v", prefix, time.Since(start), err)
-			} else {
-				log.Printf("%s job_success duration=%s", prefix, time.Since(start))
-			}
+		attrs := []zlog.Attr{zlog.String("prefix", prefix), zlog.Duration("duration", time.Since(start))}
+		if err != nil {
+			logger.Log.Error("job_error", append(attrs, zlog.Err(err))...)
+		} else {
+			logger.Log.Info("job_success", attrs...)
+		}
 			return err
 		})
 	}

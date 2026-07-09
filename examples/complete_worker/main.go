@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"log"
 	"os"
 	"os/signal"
 	"strings"
@@ -16,6 +15,8 @@ import (
 	bclient "github.com/oarkflow/fastworker/broker/client"
 	"github.com/oarkflow/fastworker/examples/internal/exconfig"
 	"github.com/oarkflow/fastworker/examples/internal/exobserve"
+	"github.com/oarkflow/fastworker/logger"
+	"github.com/oarkflow/zlog"
 )
 
 func main() {
@@ -23,15 +24,15 @@ func main() {
 	flag.Parse()
 	root, err := exconfig.Load(*configPath)
 	if err != nil {
-		log.Fatalf("load config: %v", err)
+		logger.Log.Fatal("load config", zlog.Err(err))
 	}
 	wc := exconfig.FirstBlock(root, "worker")
 	if wc == nil {
-		log.Fatal("missing worker block")
+		logger.Log.Fatal("missing worker block")
 	}
 	obsSink, err := exobserve.NewJSONLSink(wc.String("observer_jsonl", "./.broker-data/observability/worker-events.jsonl"))
 	if err != nil {
-		log.Fatalf("open observability sink: %v", err)
+		logger.Log.Fatal("open observability sink", zlog.Err(err))
 	}
 	defer obsSink.Close()
 	observer := exobserve.ClientObserver{Prefix: "complete-worker", Sink: obsSink}
@@ -57,7 +58,7 @@ func main() {
 	}
 	w, err := bclient.NewWorker(cfg)
 	if err != nil {
-		log.Fatalf("create worker: %v", err)
+		logger.Log.Fatal("create worker", zlog.Err(err))
 	}
 
 	for _, h := range wc.Blocks("handler") {
@@ -69,7 +70,7 @@ func main() {
 	fmt.Printf("complete worker started config=%s consumer=%s group=%s\n", *configPath, cfg.ConsumerID, cfg.Group)
 	fmt.Println("task/request/command handlers registered; delivery=polling; broker-events=SSE/long-poll")
 	if err := w.Run(ctx); err != nil && ctx.Err() == nil {
-		log.Fatal(err)
+		logger.Log.Fatal("worker run failed", zlog.Err(err))
 	}
 }
 
@@ -83,7 +84,7 @@ func registerWorkerHandler(w *bclient.Worker, h *exconfig.Node) {
 			steps = []string{"received", "working", "complete"}
 		}
 		w.HandleTaskQueue(name, h.String("queue", ""), func(ctx context.Context, d bclient.Delivery) (any, error) {
-			log.Printf("task started name=%s task_id=%s message=%s payload=%s", name, d.Message.TaskID, d.Message.ID, string(d.Message.Payload))
+			logger.Log.Info("task started", zlog.String("name", name), zlog.String("task_id", d.Message.TaskID), zlog.String("message", d.Message.ID), zlog.String("payload", string(d.Message.Payload)))
 			for i, step := range steps {
 				select {
 				case <-ctx.Done():
@@ -92,7 +93,7 @@ func registerWorkerHandler(w *bclient.Worker, h *exconfig.Node) {
 				}
 				pct := float64((i + 1) * 100 / len(steps))
 				_ = d.Progress(ctx, broker.Progress{Percent: pct, Message: step, UpdatedAt: time.Now()})
-				log.Printf("task progress name=%s task_id=%s percent=%.0f step=%s", name, d.Message.TaskID, pct, step)
+				logger.Log.Info("task progress", zlog.String("name", name), zlog.String("task_id", d.Message.TaskID), zlog.Float64("percent", pct), zlog.String("step", step))
 			}
 			return map[string]any{"ok": true, "task": name, "task_id": d.Message.TaskID, "url": "file://generated/example.pdf"}, nil
 		})
@@ -100,18 +101,18 @@ func registerWorkerHandler(w *bclient.Worker, h *exconfig.Node) {
 		w.HandleRequestQueue(name, h.String("queue", ""), func(ctx context.Context, d bclient.Delivery) (any, error) {
 			var req map[string]any
 			_ = json.Unmarshal(d.Message.Payload, &req)
-			log.Printf("request handled subject=%s correlation=%s payload=%v", name, d.Message.CorrelationID, req)
+			logger.Log.Info("request handled", zlog.String("subject", name), zlog.String("correlation", d.Message.CorrelationID), zlog.Any("payload", req))
 			return map[string]any{"authorized": true, "subject": name, "auth_id": "auth-demo-001", "request": req}, nil
 		})
 	case "command":
 		w.HandleCommandQueue(name, h.String("queue", ""), func(ctx context.Context, d bclient.Delivery) (any, error) {
 			var req map[string]any
 			_ = json.Unmarshal(d.Message.Payload, &req)
-			log.Printf("command handled subject=%s correlation=%s payload=%v", name, d.Message.CorrelationID, req)
+			logger.Log.Info("command handled", zlog.String("subject", name), zlog.String("correlation", d.Message.CorrelationID), zlog.Any("payload", req))
 			return map[string]any{"captured": true, "subject": name, "capture_id": "cap-demo-001", "request": req}, nil
 		})
 	default:
-		log.Fatalf("unsupported worker handler type %q", typ)
+		logger.Log.Fatal("unsupported worker handler type", zlog.String("type", typ))
 	}
-	log.Printf("configured worker handler type=%s name=%s", typ, name)
+	logger.Log.Info("configured worker handler", zlog.String("type", typ), zlog.String("name", name))
 }

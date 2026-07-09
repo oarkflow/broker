@@ -4,7 +4,6 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"log"
 	"net/http"
 	"os"
 	"os/signal"
@@ -16,6 +15,8 @@ import (
 	"github.com/oarkflow/fastworker/contrib/sqlitestore"
 	"github.com/oarkflow/fastworker/examples/internal/exconfig"
 	"github.com/oarkflow/fastworker/examples/internal/exobserve"
+	"github.com/oarkflow/fastworker/logger"
+	"github.com/oarkflow/zlog"
 )
 
 func main() {
@@ -24,11 +25,11 @@ func main() {
 
 	root, err := exconfig.Load(*configPath)
 	if err != nil {
-		log.Fatalf("load config: %v", err)
+		logger.Log.Fatal("load config", zlog.Err(err))
 	}
 	bc := exconfig.FirstBlock(root, "broker")
 	if bc == nil {
-		log.Fatal("missing broker block")
+		logger.Log.Fatal("missing broker block")
 	}
 
 	frameCodec := exconfig.FrameCodec(bc)
@@ -38,13 +39,13 @@ func main() {
 		if format == "json" || format == "jsonl" {
 			st, err := broker.NewFileWALStore(wal)
 			if err != nil {
-				log.Fatalf("open JSON WAL store: %v", err)
+				logger.Log.Fatal("open JSON WAL store", zlog.Err(err))
 			}
 			store = st
 		} else {
 			st, err := broker.NewBinaryFileWALStore(wal, exconfig.FrameCodecOptions(bc)...)
 			if err != nil {
-				log.Fatalf("open binary WAL store: %v", err)
+				logger.Log.Fatal("open binary WAL store", zlog.Err(err))
 			}
 			store = st
 		}
@@ -56,15 +57,15 @@ func main() {
 		dsn := ss.String("dsn", "./.broker-data/broker-state.sqlite")
 		st, err := sqlitestore.Open(driver, dsn)
 		if err != nil {
-			log.Fatalf("open sqlite state store driver=%s dsn=%s: %v", driver, dsn, err)
+			logger.Log.Fatal("open sqlite state store", zlog.String("driver", driver), zlog.String("dsn", dsn), zlog.Err(err))
 		}
 		stateStore = st
-		log.Printf("configured sqlite state_store driver=%s dsn=%s", driver, dsn)
+		logger.Log.Info("configured sqlite state_store", zlog.String("driver", driver), zlog.String("dsn", dsn))
 	}
 
 	obsSink, err := exobserve.NewJSONLSink(bc.String("observer_jsonl", "./.broker-data/observability/broker-events.jsonl"))
 	if err != nil {
-		log.Fatalf("open observability sink: %v", err)
+		logger.Log.Fatal("open observability sink", zlog.Err(err))
 	}
 	defer obsSink.Close()
 	observer := exobserve.BrokerObserver{Prefix: "complete-broker", Sink: obsSink}
@@ -84,10 +85,10 @@ func main() {
 		Hooks:                 observer.Hooks(),
 	})
 	if err != nil {
-		log.Fatalf("create broker: %v", err)
+		logger.Log.Fatal("create broker", zlog.Err(err))
 	}
 	if bc.Bool("log_events", true) {
-		broker.LogNotifications(b.Notifications(), "complete-broker", bc.Bool("debug_events", false), log.Printf)
+		broker.LogNotifications(b.Notifications(), "complete-broker", bc.Bool("debug_events", false), logger.Logf)
 	}
 	for _, cb := range bc.Blocks("callback") {
 		if !cb.Bool("enabled", true) {
@@ -95,10 +96,10 @@ func main() {
 		}
 		name := first(cb.Name, "observer")
 		b.Notifications().Subscribe("example-"+name, observer.NotificationCallback(name))
-		log.Printf("configured notification callback=%s sink=%s", name, bc.String("observer_jsonl", "./.broker-data/observability/broker-events.jsonl"))
+		logger.Log.Info("configured notification callback", zlog.String("name", name), zlog.String("sink", bc.String("observer_jsonl", "./.broker-data/observability/broker-events.jsonl")))
 	}
 	if err := b.Start(context.Background()); err != nil {
-		log.Fatalf("start broker: %v", err)
+		logger.Log.Fatal("start broker", zlog.Err(err))
 	}
 
 	declareConfiguredResources(context.Background(), b, bc)
@@ -117,12 +118,10 @@ func main() {
 	select {
 	case err := <-serverErr:
 		if err != nil && err != http.ErrServerClosed {
-			log.Fatalf("listen %s: %v", addr, err)
+			logger.Log.Fatal("listen", zlog.String("addr", addr), zlog.Err(err))
 		}
 	case <-time.After(200 * time.Millisecond):
 	}
-	fmt.Printf("complete broker listening on %s config=%s\n", addr, *configPath)
-	fmt.Println("data-plane: /v1, admin: /queues /topics /streams /dlq /routes, consumer discovery: /v1/consumers, broker-sent events: /v1/consumers/{id}/events")
 	if admin.InsecureDev {
 		fmt.Println("WARNING: insecure_dev enabled by BCL; use tokens/TLS for production")
 	}
@@ -147,21 +146,21 @@ func declareConfiguredResources(ctx context.Context, b *broker.Broker, bc *excon
 			RetryPolicy:       broker.RetryPolicy{MaxAttempts: q.Int("max_attempts", 3), Initial: 100 * time.Millisecond, Max: 5 * time.Second, Factor: 2, Jitter: true},
 		}
 		if err := b.DeclareQueue(ctx, cfg); err != nil {
-			log.Fatalf("declare queue %s: %v", q.Name, err)
+			logger.Log.Fatal("declare queue", zlog.String("name", q.Name), zlog.Err(err))
 		}
-		log.Printf("configured queue=%s dlq=%s", cfg.Name, cfg.DLQ)
+		logger.Log.Info("configured queue", zlog.String("name", cfg.Name), zlog.String("dlq", cfg.DLQ))
 	}
 	for _, t := range bc.Blocks("topic") {
 		if err := b.DeclareTopic(ctx, broker.TopicConfig{Name: t.Name, Partitions: t.Int("partitions", 1), Retention: t.Duration("retention", 24*time.Hour)}); err != nil {
-			log.Fatalf("declare topic %s: %v", t.Name, err)
+			logger.Log.Fatal("declare topic", zlog.String("name", t.Name), zlog.Err(err))
 		}
-		log.Printf("configured topic=%s", t.Name)
+		logger.Log.Info("configured topic", zlog.String("name", t.Name))
 	}
 	for _, s := range bc.Blocks("stream") {
 		if err := b.DeclareStream(ctx, broker.StreamConfig{Name: s.Name, Partitions: s.Int("partitions", 1), Retention: s.Duration("retention", 24*time.Hour)}); err != nil {
-			log.Fatalf("declare stream %s: %v", s.Name, err)
+			logger.Log.Fatal("declare stream", zlog.String("name", s.Name), zlog.Err(err))
 		}
-		log.Printf("configured stream=%s", s.Name)
+		logger.Log.Info("configured stream", zlog.String("name", s.Name))
 	}
 	for _, r := range bc.Blocks("route") {
 		route := broker.Route{Name: r.Name, Mode: broker.RouteTopic, Match: r.String("match", ""), Enabled: true}
@@ -172,7 +171,7 @@ func declareConfiguredResources(ctx context.Context, b *broker.Broker, bc *excon
 			route.CopyTo = append(route.CopyTo, destination(cto[0], cto[1]))
 		}
 		b.AddRoute(route)
-		log.Printf("configured route=%s match=%s to=%v copy_to=%v", route.Name, route.Match, route.To, route.CopyTo)
+		logger.Log.Info("configured route", zlog.String("name", route.Name), zlog.String("match", route.Match), zlog.Any("to", route.To), zlog.Any("copy_to", route.CopyTo))
 	}
 }
 

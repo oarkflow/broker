@@ -3,10 +3,11 @@ package broker
 import (
 	"context"
 	"fmt"
-	"log"
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/oarkflow/fastworker/logger"
 )
 
 // LogNotifications writes broker notifications as compact live operational logs.
@@ -19,7 +20,7 @@ func LogNotifications(bus *NotificationBus, id string, includeDebug bool, logf f
 		id = "broker-live-log"
 	}
 	if logf == nil {
-		logf = log.Printf
+		logf = logger.StdLog.Printf
 	}
 	bus.Subscribe(id, CallbackFunc(func(_ context.Context, n Notification) error {
 		if n.Severity == SeverityDebug && !includeDebug {
