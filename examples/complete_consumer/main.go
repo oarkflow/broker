@@ -47,6 +47,7 @@ func main() {
 		PollWait:                cc.Duration("poll_wait", 5*time.Second),
 		HeartbeatInterval:       cc.Duration("heartbeat", 5*time.Second),
 		VisibilityTimeout:       cc.Duration("visibility_timeout", 30*time.Second),
+		FrameCodec:              exconfig.FrameCodec(cc),
 		DisableAutoExtendLeases: !cc.Bool("auto_extend", true),
 	}
 	if cc.Bool("log_hooks", true) {

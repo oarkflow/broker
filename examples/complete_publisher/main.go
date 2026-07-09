@@ -31,7 +31,7 @@ func main() {
 	}
 	defer obsSink.Close()
 
-	c := bclient.New(bclient.Config{BrokerURLs: pc.Strings("broker_urls"), Token: pc.String("token", ""), PollWait: 5 * time.Second})
+	c := bclient.New(bclient.Config{BrokerURLs: pc.Strings("broker_urls"), Token: pc.String("token", ""), PollWait: 5 * time.Second, FrameCodec: exconfig.FrameCodec(pc)})
 	ctx := context.Background()
 	reqTimeout := pc.Duration("request_timeout", 10*time.Second)
 	taskWait := pc.Duration("task_wait_timeout", 20*time.Second)
@@ -70,6 +70,18 @@ func runOperation(ctx context.Context, c *bclient.Client, op *exconfig.Node, req
 		}
 		res, err := c.PublishBatch(ctx, op.String("topic", op.Name), payloads, publishOpts(op)...)
 		fmt.Printf("batch published count=%d errors=%d err=%v\n", len(res.Results), len(res.Errors), err)
+		return err
+	case "frame_publish":
+		msg := broker.Message{ID: op.String("id", ""), Topic: op.String("topic", op.Name), Queue: op.String("queue", ""), Stream: op.String("stream", ""), Type: op.String("type", "frame"), ContentType: "application/json", Payload: []byte(exconfig.MustJSONPayload(op.String("payload", `{}`))), Headers: map[string]string{"x-codec": "fwb1"}, CreatedAt: time.Now(), Status: broker.MessageQueued}
+		res, err := c.PublishFrame(ctx, msg)
+		fmt.Printf("frame published message_id=%s destinations=%d err=%v\n", res.MessageID, len(res.Destinations), err)
+		return err
+	case "frame_poll":
+		msgs, err := c.PollFrames(ctx, op.String("queue", "default"), op.Int("limit", 1))
+		fmt.Printf("frame poll count=%d err=%v\n", len(msgs), err)
+		for _, m := range msgs {
+			fmt.Printf("frame message id=%s topic=%s queue=%s payload=%s\n", m.ID, m.Topic, m.Queue, string(m.Payload))
+		}
 		return err
 	case "task":
 		task, err := c.SubmitTask(ctx, op.String("name", op.Name), json.RawMessage(exconfig.MustJSONPayload(op.String("payload", `{}`))), taskOpts(op)...)

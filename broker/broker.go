@@ -13,27 +13,28 @@ import (
 )
 
 type Broker struct {
-	cfg       Config
-	store     Store
-	router    *Router
-	codec     Codec
-	pool      *fastworker.Pool
-	ownPool   bool
-	ctx       context.Context
-	cancel    context.CancelFunc
-	state     atomic.Value
-	seq       atomic.Uint64
-	subsMu    sync.RWMutex
-	subs      map[string]*Subscription
-	waitMu    sync.Mutex
-	waiters   map[string]chan Response
-	taskMu    sync.RWMutex
-	tasks     map[string]*TaskInfo
-	taskWait  map[string][]chan TaskResult
-	notify    *NotificationBus
-	cluster   *Cluster
-	consumers *ConsumerRegistry
-	wg        sync.WaitGroup
+	cfg        Config
+	store      Store
+	router     *Router
+	codec      Codec
+	frameCodec *BinaryMessageCodec
+	pool       *fastworker.Pool
+	ownPool    bool
+	ctx        context.Context
+	cancel     context.CancelFunc
+	state      atomic.Value
+	seq        atomic.Uint64
+	subsMu     sync.RWMutex
+	subs       map[string]*Subscription
+	waitMu     sync.Mutex
+	waiters    map[string]chan Response
+	taskMu     sync.RWMutex
+	tasks      map[string]*TaskInfo
+	taskWait   map[string][]chan TaskResult
+	notify     *NotificationBus
+	cluster    *Cluster
+	consumers  *ConsumerRegistry
+	wg         sync.WaitGroup
 }
 
 func New(cfg Config) (*Broker, error) {
@@ -76,6 +77,9 @@ func New(cfg Config) (*Broker, error) {
 	if cfg.Codec == nil {
 		cfg.Codec = JSONCodec{}
 	}
+	if cfg.FrameCodec == nil {
+		cfg.FrameCodec = NewBinaryMessageCodec(WithFrameMaxSize(cfg.MaxMessageSize + (1 << 20)))
+	}
 	if cfg.Store == nil {
 		cfg.Store = NewMemoryStore()
 	}
@@ -86,13 +90,19 @@ func New(cfg Config) (*Broker, error) {
 		own = true
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	b := &Broker{cfg: cfg, store: cfg.Store, router: NewRouter(), codec: cfg.Codec, pool: pool, ownPool: own, ctx: ctx, cancel: cancel, subs: map[string]*Subscription{}, waiters: map[string]chan Response{}, tasks: map[string]*TaskInfo{}, taskWait: map[string][]chan TaskResult{}, notify: NewNotificationBus(1024), consumers: NewConsumerRegistry(512), cluster: NewCluster(firstNonEmpty(cfg.NodeID, "node-1"))}
+	b := &Broker{cfg: cfg, store: cfg.Store, router: NewRouter(), codec: cfg.Codec, frameCodec: cfg.FrameCodec, pool: pool, ownPool: own, ctx: ctx, cancel: cancel, subs: map[string]*Subscription{}, waiters: map[string]chan Response{}, tasks: map[string]*TaskInfo{}, taskWait: map[string][]chan TaskResult{}, notify: NewNotificationBus(1024), consumers: NewConsumerRegistry(512), cluster: NewCluster(firstNonEmpty(cfg.NodeID, "node-1"))}
 	b.state.Store(BrokerConfigured)
 	_ = b.store.DeclareQueue(context.Background(), QueueConfig{Name: cfg.DefaultQueue, VisibilityTimeout: cfg.DefaultVisibility, RetryPolicy: cfg.DefaultRetry, DLQ: cfg.DefaultDLQ})
 	_ = b.store.DeclareQueue(context.Background(), QueueConfig{Name: cfg.DefaultDLQ, VisibilityTimeout: cfg.DefaultVisibility, RetryPolicy: cfg.DefaultRetry})
 	return b, nil
 }
 
+func (b *Broker) FrameCodec() *BinaryMessageCodec {
+	if b == nil || b.frameCodec == nil {
+		return NewBinaryMessageCodec()
+	}
+	return b.frameCodec
+}
 func MustNew(cfg Config) *Broker {
 	b, err := New(cfg)
 	if err != nil {

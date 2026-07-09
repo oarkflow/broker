@@ -47,6 +47,7 @@ func main() {
 		PollWait:                wc.Duration("poll_wait", 5*time.Second),
 		HeartbeatInterval:       wc.Duration("heartbeat", 5*time.Second),
 		VisibilityTimeout:       wc.Duration("visibility_timeout", 45*time.Second),
+		FrameCodec:              exconfig.FrameCodec(wc),
 		LeaseExtensionInterval:  wc.Duration("lease_extension_interval", 10*time.Second),
 		MaxLeaseExtensions:      wc.Int("max_lease_extensions", 12),
 		DisableAutoExtendLeases: !wc.Bool("auto_extend", true),

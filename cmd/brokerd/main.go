@@ -18,6 +18,10 @@ import (
 func main() {
 	addr := flag.String("addr", env("BROKER_ADDR", ":8090"), "HTTP listen address")
 	wal := flag.String("wal", env("BROKER_WAL", ""), "WAL directory; empty uses in-memory store")
+	walFormat := flag.String("wal-format", env("BROKER_WAL_FORMAT", "binary"), "WAL format: binary or json")
+	frameSigningKey := flag.String("frame-signing-key", env("BROKER_FRAME_SIGNING_KEY", ""), "optional FWB1 frame HMAC signing key")
+	frameEncryptionKey := flag.String("frame-encryption-key", env("BROKER_FRAME_ENCRYPTION_KEY", ""), "optional FWB1 frame AES-GCM payload encryption key")
+	frameCompress := flag.Int("frame-compress-threshold", int(envInt64("BROKER_FRAME_COMPRESS_THRESHOLD", 0)), "gzip payloads in FWB1 frames at or above this size; 0 disables")
 	token := flag.String("token", env("BROKER_TOKEN", ""), "required bearer token for admin/API unless --insecure-dev is set")
 	readToken := flag.String("read-token", env("BROKER_READ_TOKEN", ""), "optional read-only bearer token")
 	workerToken := flag.String("worker-token", env("BROKER_WORKER_TOKEN", ""), "optional remote worker bearer token with consumer/message/task permissions")
@@ -40,16 +44,25 @@ func main() {
 		log.Fatal("both -tls-cert and -tls-key must be provided together")
 	}
 
+	frameCodec := broker.NewBinaryMessageCodec(frameCodecOptions(*frameSigningKey, *frameEncryptionKey, *frameCompress, int(*maxBody)+1<<20)...)
 	var store broker.Store
 	if *wal != "" {
-		st, err := broker.NewFileWALStore(*wal)
-		if err != nil {
-			log.Fatalf("open WAL store: %v", err)
+		if strings.EqualFold(*walFormat, "json") || strings.EqualFold(*walFormat, "jsonl") {
+			st, err := broker.NewFileWALStore(*wal)
+			if err != nil {
+				log.Fatalf("open JSON WAL store: %v", err)
+			}
+			store = st
+		} else {
+			st, err := broker.NewBinaryFileWALStore(*wal, frameCodecOptions(*frameSigningKey, *frameEncryptionKey, *frameCompress, int(*maxBody)+1<<20)...)
+			if err != nil {
+				log.Fatalf("open binary WAL store: %v", err)
+			}
+			store = st
 		}
-		store = st
 	}
 
-	b, err := broker.New(broker.Config{Mode: broker.ModeStandalone, Store: store, DefaultQueue: *queue})
+	b, err := broker.New(broker.Config{Mode: broker.ModeStandalone, Store: store, DefaultQueue: *queue, FrameCodec: frameCodec})
 	if err != nil {
 		log.Fatalf("create broker: %v", err)
 	}
@@ -101,7 +114,7 @@ func main() {
 		fmt.Println("mTLS client certificate verification enabled")
 	}
 	if *wal != "" {
-		fmt.Printf("durable WAL: %s\n", *wal)
+		fmt.Printf("durable WAL: %s format=%s\n", *wal, *walFormat)
 	}
 
 	sig := make(chan os.Signal, 1)
@@ -144,4 +157,21 @@ func envInt64(k string, d int64) int64 {
 		}
 	}
 	return d
+}
+
+func frameCodecOptions(signingKey, encryptionKey string, compressThreshold int, maxFrame int) []broker.BinaryMessageCodecOption {
+	var opts []broker.BinaryMessageCodecOption
+	if maxFrame > 0 {
+		opts = append(opts, broker.WithFrameMaxSize(maxFrame))
+	}
+	if compressThreshold > 0 {
+		opts = append(opts, broker.WithFrameCompressionThreshold(compressThreshold))
+	}
+	if signingKey != "" {
+		opts = append(opts, broker.WithFrameSigningKey([]byte(signingKey)))
+	}
+	if encryptionKey != "" {
+		opts = append(opts, broker.WithFrameEncryptionKey([]byte(encryptionKey)))
+	}
+	return opts
 }

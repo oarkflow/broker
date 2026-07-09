@@ -1,8 +1,10 @@
 package client
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -28,6 +30,7 @@ type Config struct {
 	HTTPClient                                         *http.Client
 	Pool                                               *fw.Pool
 	Hooks                                              Hooks
+	FrameCodec                                         *broker.BinaryMessageCodec
 }
 type Hooks struct {
 	OnConnecting, OnConnected, OnAuthenticated, OnRegistered, OnSubscribed, OnPollStart, OnHeartbeat, OnReconnect, OnDrain, OnStopped func(Event)
@@ -96,8 +99,14 @@ func New(cfg Config) *Client {
 	if cfg.PollLimit <= 0 {
 		cfg.PollLimit = 1
 	}
+	if cfg.FrameCodec == nil {
+		cfg.FrameCodec = broker.NewBinaryMessageCodec()
+	}
 	if cfg.LeaseExtensionInterval <= 0 {
 		cfg.LeaseExtensionInterval = cfg.VisibilityTimeout / 2
+		if cfg.FrameCodec == nil {
+			cfg.FrameCodec = broker.NewBinaryMessageCodec()
+		}
 		if cfg.LeaseExtensionInterval <= 0 {
 			cfg.LeaseExtensionInterval = 10 * time.Second
 		}
@@ -246,6 +255,56 @@ func (c *Client) Fail(ctx context.Context, m broker.Message, e error) error {
 	}
 	body := map[string]any{"lease_token": m.LeaseToken, "consumer_id": c.cfg.ConsumerID, "queue": m.Queue, "correlation_id": m.CorrelationID, "error": broker.BrokerError{Code: "handler_error", Message: e.Error(), Retryable: true}, "ack": true}
 	return c.doJSON(ctx, http.MethodPost, "/v1/messages/"+m.ID+"/fail", body, nil)
+}
+
+func (c *Client) PublishFrame(ctx context.Context, msg broker.Message) (broker.PublishResult, error) {
+	frame, err := c.cfg.FrameCodec.EncodeMessage(nil, msg)
+	if err != nil {
+		return broker.PublishResult{}, err
+	}
+	var out broker.PublishResult
+	err = c.doRaw(ctx, http.MethodPost, "/v1/publish/frame", "application/vnd.fastworker.broker.frame", frame, &out)
+	return out, err
+}
+
+func (c *Client) PollFrames(ctx context.Context, queue string, limit int) ([]broker.Message, error) {
+	if limit <= 0 {
+		limit = c.cfg.PollLimit
+	}
+	req := broker.PollRequest{Queue: queue, ConsumerID: c.cfg.ConsumerID, ConsumerGroup: c.cfg.Group, Limit: limit, WaitNS: c.cfg.PollWait.Nanoseconds(), VisibilityTimeoutNS: c.cfg.VisibilityTimeout.Nanoseconds()}
+	data, err := c.doRawBytes(ctx, http.MethodPost, "/v1/poll/frame", "application/json", mustMarshal(req))
+	if err != nil {
+		return nil, err
+	}
+	return decodeFrameBatch(data, c.cfg.FrameCodec)
+}
+
+func mustMarshal(v any) []byte {
+	b, _ := json.Marshal(v)
+	return b
+}
+
+func decodeFrameBatch(data []byte, codec *broker.BinaryMessageCodec) ([]broker.Message, error) {
+	r := bufio.NewReader(bytes.NewReader(data))
+	var out []broker.Message
+	for {
+		l, err := binary.ReadUvarint(r)
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return out, nil
+			}
+			return nil, err
+		}
+		buf := make([]byte, int(l))
+		if _, err := io.ReadFull(r, buf); err != nil {
+			return nil, err
+		}
+		var msg broker.Message
+		if err := codec.DecodeMessage(buf, &msg); err != nil {
+			return nil, err
+		}
+		out = append(out, msg)
+	}
 }
 func (c *Client) Publish(ctx context.Context, topic string, payload any, opts ...PublishOption) (broker.PublishResult, error) {
 	var o PublishOptions
@@ -440,6 +499,58 @@ func (c *Client) Events(ctx context.Context, after string, wait time.Duration) (
 	var out []broker.Notification
 	err := c.doJSON(ctx, http.MethodGet, path, nil, &out)
 	return out, err
+}
+
+func (c *Client) doRaw(ctx context.Context, method, path, contentType string, bodyBytes []byte, out any) error {
+	data, err := c.doRawBytes(ctx, method, path, contentType, bodyBytes)
+	if err != nil {
+		return err
+	}
+	if out != nil && len(data) > 0 {
+		return json.Unmarshal(data, out)
+	}
+	return nil
+}
+
+func (c *Client) doRawBytes(ctx context.Context, method, path, contentType string, bodyBytes []byte) ([]byte, error) {
+	urls := c.orderedURLs()
+	var last error
+	for i, base := range urls {
+		req, err := http.NewRequestWithContext(ctx, method, strings.TrimRight(base, "/")+path, bytes.NewReader(bodyBytes))
+		if err != nil {
+			last = err
+			continue
+		}
+		if contentType != "" {
+			req.Header.Set("Content-Type", contentType)
+		}
+		if c.cfg.Token != "" {
+			req.Header.Set("Authorization", "Bearer "+c.cfg.Token)
+		}
+		resp, err := c.http.Do(req)
+		if err != nil {
+			last = err
+			if i == 0 && c.cfg.Hooks.OnReconnect != nil && len(urls) > 1 {
+				c.cfg.Hooks.OnReconnect(Event{ConsumerID: c.cfg.ConsumerID, Group: c.cfg.Group, Error: err, Time: time.Now()})
+			}
+			continue
+		}
+		data, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if resp.StatusCode >= 500 && len(urls) > 1 {
+			last = fmt.Errorf("broker %s: %s", resp.Status, strings.TrimSpace(string(data)))
+			continue
+		}
+		c.markActive(base)
+		if resp.StatusCode >= 300 {
+			return nil, fmt.Errorf("broker %s: %s", resp.Status, strings.TrimSpace(string(data)))
+		}
+		return data, nil
+	}
+	if last == nil {
+		last = errors.New("broker unavailable")
+	}
+	return nil, last
 }
 func (c *Client) doJSON(ctx context.Context, method, path string, in, out any) error {
 	var bodyBytes []byte

@@ -430,3 +430,21 @@ These are implemented as interfaces/metadata so they can be backed by more advan
 - [x] `go vet ./...`
 - [x] `go test -race ./broker`
 - [x] `./scripts/smoke_remote.sh`
+
+### Native broker message codec
+- [x] Added FWB1 binary message frame codec.
+- [x] Added versioned binary envelope with TLV metadata.
+- [x] Added CRC32C frame integrity validation.
+- [x] Added optional HMAC-SHA256 frame authentication.
+- [x] Added optional AES-GCM payload encryption.
+- [x] Added optional gzip compression threshold.
+- [x] Added max frame-size enforcement.
+- [x] Added header-only peek support.
+- [x] Added base64 helpers for HTTP/debug compatibility.
+- [x] Added binary length-prefixed frame batch support.
+- [x] Added binary FWB WAL store with recovery.
+- [x] Integrated frame codec with Broker config.
+- [x] Integrated binary frame publish/poll endpoints.
+- [x] Integrated frame publish/poll helpers into remote client.
+- [x] Integrated BCL codec configuration into broker, consumer, worker, and publisher examples.
+- [x] Added tests for secure round-trip, tamper detection, binary WAL recovery, and remote frame publish/poll.

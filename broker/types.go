@@ -287,27 +287,28 @@ type ConsumerConfig struct {
 }
 
 type Config struct {
-	Name                  string             `json:"name"`
-	Mode                  Mode               `json:"mode"`
-	NodeID                string             `json:"node_id"`
-	Store                 Store              `json:"-"`
-	Pool                  *fastworker.Pool   `json:"-"`
-	OwnPool               bool               `json:"own_pool"`
-	Codec                 Codec              `json:"-"`
-	DefaultQueue          string             `json:"default_queue"`
-	DefaultVisibility     time.Duration      `json:"default_visibility"`
-	DefaultRetry          RetryPolicy        `json:"default_retry"`
-	DefaultDLQ            string             `json:"default_dlq"`
-	MaxMessageSize        int                `json:"max_message_size"`
-	Backpressure          BackpressurePolicy `json:"backpressure"`
-	EnableNotifications   bool               `json:"enable_notifications"`
-	EnableRequestResponse bool               `json:"enable_request_response"`
-	EnableTaskTracking    bool               `json:"enable_task_tracking"`
-	DrainTimeout          time.Duration      `json:"drain_timeout"`
-	PollInterval          time.Duration      `json:"poll_interval"`
-	LeaseSweepInterval    time.Duration      `json:"lease_sweep_interval"`
-	RemoteConsumerTimeout time.Duration      `json:"remote_consumer_timeout"`
-	Hooks                 Hooks              `json:"-"`
+	Name                  string              `json:"name"`
+	Mode                  Mode                `json:"mode"`
+	NodeID                string              `json:"node_id"`
+	Store                 Store               `json:"-"`
+	Pool                  *fastworker.Pool    `json:"-"`
+	OwnPool               bool                `json:"own_pool"`
+	Codec                 Codec               `json:"-"`
+	FrameCodec            *BinaryMessageCodec `json:"-"`
+	DefaultQueue          string              `json:"default_queue"`
+	DefaultVisibility     time.Duration       `json:"default_visibility"`
+	DefaultRetry          RetryPolicy         `json:"default_retry"`
+	DefaultDLQ            string              `json:"default_dlq"`
+	MaxMessageSize        int                 `json:"max_message_size"`
+	Backpressure          BackpressurePolicy  `json:"backpressure"`
+	EnableNotifications   bool                `json:"enable_notifications"`
+	EnableRequestResponse bool                `json:"enable_request_response"`
+	EnableTaskTracking    bool                `json:"enable_task_tracking"`
+	DrainTimeout          time.Duration       `json:"drain_timeout"`
+	PollInterval          time.Duration       `json:"poll_interval"`
+	LeaseSweepInterval    time.Duration       `json:"lease_sweep_interval"`
+	RemoteConsumerTimeout time.Duration       `json:"remote_consumer_timeout"`
+	Hooks                 Hooks               `json:"-"`
 }
 
 type Handler func(context.Context, Delivery) error

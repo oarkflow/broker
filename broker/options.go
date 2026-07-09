@@ -46,10 +46,11 @@ const (
 	ConfirmProcessed  ConfirmLevel = "processed"
 )
 
-func WithMessageID(v string) PublishOption  { return func(o *PublishOptions) { o.MessageID = v } }
-func WithKey(v string) PublishOption        { return func(o *PublishOptions) { o.Key = v } }
-func WithRoutingKey(v string) PublishOption { return func(o *PublishOptions) { o.RoutingKey = v } }
-func WithType(v string) PublishOption       { return func(o *PublishOptions) { o.Type = v } }
+func WithMessageID(v string) PublishOption   { return func(o *PublishOptions) { o.MessageID = v } }
+func WithKey(v string) PublishOption         { return func(o *PublishOptions) { o.Key = v } }
+func WithRoutingKey(v string) PublishOption  { return func(o *PublishOptions) { o.RoutingKey = v } }
+func WithType(v string) PublishOption        { return func(o *PublishOptions) { o.Type = v } }
+func WithContentType(v string) PublishOption { return func(o *PublishOptions) { o.ContentType = v } }
 func WithHeader(k, v string) PublishOption {
 	return func(o *PublishOptions) {
 		if o.Headers == nil {

@@ -4,6 +4,13 @@ publisher "complete-publisher" {
   request_timeout "10s"
   task_wait_timeout "20s"
   stream_group "publisher-demo"
+  codec "fwb1" {
+    max_frame_size env("BROKER_FRAME_MAX", "128MB")
+    compress_threshold env("BROKER_FRAME_COMPRESS_THRESHOLD", "1KB")
+    signing_key env("BROKER_FRAME_SIGNING_KEY", "dev-frame-signing-key")
+    encryption_key env("BROKER_FRAME_ENCRYPTION_KEY", "")
+  }
+
   observer_jsonl env("PUBLISHER_OBSERVER_JSONL", "./.broker-data/observability/publisher-events.jsonl")
 
   callback "operation-jsonl" {
@@ -79,4 +86,18 @@ publisher "complete-publisher" {
     queue "email.send"
     payload "{\"to\":\"dlq@example.com\",\"force_dlq\":true}"
   }
+  operation "native-frame-publish" {
+    mode "frame_publish"
+    topic "email.created"
+    queue "codec.frames"
+    type "codec.demo"
+    payload "{\"to\":\"frame@example.com\",\"body\":\"published through FWB1 binary frame\"}"
+  }
+
+  operation "native-frame-poll" {
+    mode "frame_poll"
+    queue "codec.frames"
+    limit 1
+  }
+
 }

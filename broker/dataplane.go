@@ -1,7 +1,9 @@
 package broker
 
 import (
+	"encoding/binary"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -33,6 +35,8 @@ func (a AdminServer) dataPlane(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case path == "/publish":
 		a.v1Publish(w, r)
+	case path == "/publish/frame":
+		a.v1PublishFrame(w, r)
 	case path == "/publish/batch":
 		a.v1PublishBatch(w, r)
 	case path == "/request":
@@ -45,6 +49,8 @@ func (a AdminServer) dataPlane(w http.ResponseWriter, r *http.Request) {
 		a.v1Consumer(w, r, strings.TrimPrefix(path, "/consumers/"))
 	case path == "/poll" || path == "/poll/batch":
 		a.v1Poll(w, r)
+	case path == "/poll/frame":
+		a.v1PollFrame(w, r)
 	case strings.HasPrefix(path, "/messages/"):
 		a.v1Message(w, r, strings.TrimPrefix(path, "/messages/"))
 	case path == "/tasks/submit":
@@ -68,6 +74,43 @@ func (a AdminServer) dataPlane(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.NotFound(w, r)
 	}
+}
+
+func (a AdminServer) v1PublishFrame(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodBroker(w)
+		return
+	}
+	data, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+	var msg Message
+	if err := a.Broker.FrameCodec().DecodeMessage(data, &msg); err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+	topic := msg.Topic
+	opts := []PublishOption{WithMessageID(msg.ID), WithHeaders(msg.Headers), WithMetadata(msg.Metadata), WithType(msg.Type), WithContentType(msg.ContentType), WithKey(msg.Key), WithRoutingKey(msg.RoutingKey), WithPriority(msg.Priority), WithTenantID(msg.TenantID), WithProducerID(msg.ProducerID), WithCorrelationID(msg.CorrelationID), WithCausationID(msg.CausationID), WithIdempotencyKey(msg.IdempotencyKey)}
+	if msg.Queue != "" {
+		opts = append(opts, WithQueue(msg.Queue))
+	}
+	if msg.Stream != "" {
+		opts = append(opts, WithStream(msg.Stream))
+	}
+	if !msg.AvailableAt.IsZero() && msg.AvailableAt.After(time.Now()) {
+		opts = append(opts, WithRunAt(msg.AvailableAt))
+	}
+	if !msg.ExpiresAt.IsZero() && msg.ExpiresAt.After(time.Now()) {
+		opts = append(opts, WithTTL(time.Until(msg.ExpiresAt)))
+	}
+	res, err := a.Broker.Publisher().Publish(r.Context(), topic, msg.Payload, opts...)
+	if err != nil {
+		http.Error(w, err.Error(), 409)
+		return
+	}
+	writeBrokerJSON(w, res)
 }
 func (a AdminServer) v1Publish(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -265,6 +308,82 @@ func (a AdminServer) v1Consumer(w http.ResponseWriter, r *http.Request, tail str
 		}
 	default:
 		http.NotFound(w, r)
+	}
+}
+
+func (a AdminServer) v1PollFrame(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost && r.Method != http.MethodGet {
+		methodBroker(w)
+		return
+	}
+	var req PollRequest
+	if r.Method == http.MethodPost && r.Body != nil {
+		_ = json.NewDecoder(r.Body).Decode(&req)
+	}
+	if req.Queue == "" {
+		req.Queue = r.URL.Query().Get("queue")
+	}
+	if req.ConsumerID == "" {
+		req.ConsumerID = firstNonEmpty(r.URL.Query().Get("consumer_id"), r.URL.Query().Get("consumer"))
+	}
+	if req.ConsumerGroup == "" {
+		req.ConsumerGroup = firstNonEmpty(r.URL.Query().Get("consumer_group"), r.URL.Query().Get("group"))
+	}
+	if req.Limit <= 0 {
+		req.Limit = queryLimit(r, 1)
+	}
+	if req.ConsumerID == "" || req.Queue == "" {
+		http.Error(w, "consumer_id and queue required", 400)
+		return
+	}
+	wait := time.Duration(req.WaitNS)
+	if wait <= 0 {
+		wait = queryDuration(r, "wait", 0)
+	}
+	deadline := time.Now().Add(wait)
+	vis := time.Duration(req.VisibilityTimeoutNS)
+	if vis <= 0 {
+		vis = queryDuration(r, "visibility_timeout", 0)
+	}
+	for {
+		msgs, err := a.Broker.store.Lease(r.Context(), LeaseRequest{Queue: req.Queue, ConsumerID: req.ConsumerID, ConsumerGroup: firstNonEmpty(req.ConsumerGroup, req.ConsumerID), Limit: req.Limit, VisibilityTimeout: vis})
+		if err != nil {
+			http.Error(w, err.Error(), 409)
+			return
+		}
+		if len(msgs) > 0 || wait <= 0 || time.Now().After(deadline) {
+			if len(msgs) > 0 {
+				a.Broker.Consumers().AddStats(req.ConsumerID, int64(len(msgs)), 0, 0, 0, "")
+				for i := range msgs {
+					msgs[i].ConsumerID = req.ConsumerID
+					msgs[i].ConsumerGroup = firstNonEmpty(req.ConsumerGroup, req.ConsumerID)
+					msgs[i].Status = MessageProcessing
+					_ = a.Broker.store.Update(r.Context(), msgs[i])
+				}
+			}
+			writeFrameBatch(w, a.Broker.FrameCodec(), msgs)
+			return
+		}
+		select {
+		case <-time.After(25 * time.Millisecond):
+		case <-r.Context().Done():
+			return
+		}
+	}
+}
+
+func writeFrameBatch(w http.ResponseWriter, codec *BinaryMessageCodec, msgs []Message) {
+	w.Header().Set("Content-Type", "application/vnd.fastworker.broker.frames")
+	for _, msg := range msgs {
+		frame, err := codec.EncodeMessage(nil, msg)
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		var buf [binary.MaxVarintLen64]byte
+		n := binary.PutUvarint(buf[:], uint64(len(frame)))
+		_, _ = w.Write(buf[:n])
+		_, _ = w.Write(frame)
 	}
 }
 func (a AdminServer) v1Poll(w http.ResponseWriter, r *http.Request) {

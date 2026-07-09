@@ -1464,3 +1464,138 @@ non-empty broker/consumer/worker/publisher JSONL observability files
 ## Final notes
 
 This implementation is hardened for embedded and single-node standalone broker usage with distributed remote consumers/workers. The examples now demonstrate the intended production shape without noisy scattered demos. True broker-node Raft/quorum replication remains an explicit future phase and is not falsely claimed as complete.
+
+## Native FWB1 binary message codec
+
+The broker now includes a native binary message frame codec named **FWB1**. It is intended for the broker hot path, binary WAL, remote worker data-plane traffic, and future replication streams. JSON remains available for the public HTTP/admin API and examples, but FWB1 is the recommended format for high-throughput broker-to-broker and broker-to-worker transport.
+
+### Features
+
+- `FWB1` magic/versioned binary frame.
+- Compact TLV metadata for message headers and broker fields.
+- Opaque payload bytes; payload can still be JSON, raw bytes, protobuf, msgpack, etc.
+- CRC32C integrity check for every frame.
+- Optional HMAC-SHA256 frame authentication.
+- Optional AES-GCM payload encryption.
+- Optional gzip compression with threshold.
+- Maximum frame-size enforcement.
+- Header-only peek without materializing payload.
+- Base64 helpers for HTTP-compatible transport/debugging.
+- Length-prefixed frame batch support for polling.
+- Binary WAL store using the same frame codec.
+
+### Go usage
+
+```go
+codec := broker.NewBinaryMessageCodec(
+    broker.WithFrameMaxSize(128<<20),
+    broker.WithFrameCompressionThreshold(1024),
+    broker.WithFrameSigningKey([]byte(os.Getenv("BROKER_FRAME_SIGNING_KEY"))),
+    broker.WithFrameEncryptionKey([]byte(os.Getenv("BROKER_FRAME_ENCRYPTION_KEY"))),
+)
+
+msg := broker.Message{
+    ID:          "msg-1",
+    Topic:       "email.created",
+    Queue:       "email.send",
+    Type:        "email",
+    ContentType: "application/json",
+    Payload:     []byte(`{"to":"user@example.com"}`),
+    Headers:     map[string]string{"tenant": "tenant-a"},
+    CreatedAt:   time.Now(),
+    Status:      broker.MessageQueued,
+}
+
+frame, err := codec.EncodeMessage(nil, msg)
+var decoded broker.Message
+err = codec.DecodeMessage(frame, &decoded)
+```
+
+### Binary WAL
+
+Use the new binary WAL store for compact, frame-protected local durability:
+
+```go
+st, err := broker.NewBinaryFileWALStore("./.broker-data/wal",
+    broker.WithFrameSigningKey([]byte("change-me")),
+    broker.WithFrameCompressionThreshold(1024),
+)
+b := broker.MustNew(broker.Config{
+    Store:      st,
+    FrameCodec: broker.NewBinaryMessageCodec(broker.WithFrameSigningKey([]byte("change-me"))),
+})
+```
+
+The binary WAL file is:
+
+```text
+broker.wal.fwb
+```
+
+The legacy JSONL WAL is still available through `NewFileWALStore` for debugging and compatibility.
+
+### brokerd flags
+
+```bash
+BROKER_TOKEN=admin \
+BROKER_FRAME_SIGNING_KEY='change-this-signing-key' \
+BROKER_FRAME_ENCRYPTION_KEY='optional-encryption-key' \
+go run ./cmd/brokerd \
+  -addr :8090 \
+  -wal ./.broker-data/wal \
+  -wal-format binary \
+  -frame-compress-threshold 1024
+```
+
+Useful flags/env:
+
+| Flag | Env | Description |
+|---|---|---|
+| `-wal-format` | `BROKER_WAL_FORMAT` | `binary` or `json` |
+| `-frame-signing-key` | `BROKER_FRAME_SIGNING_KEY` | Optional HMAC key |
+| `-frame-encryption-key` | `BROKER_FRAME_ENCRYPTION_KEY` | Optional AES-GCM key |
+| `-frame-compress-threshold` | `BROKER_FRAME_COMPRESS_THRESHOLD` | gzip threshold in bytes |
+
+### Remote client frame publish/poll
+
+```go
+c := bclient.New(bclient.Config{
+    BrokerURL:  "http://127.0.0.1:8090",
+    Token:      os.Getenv("BROKER_TOKEN"),
+    ConsumerID: "worker-1",
+    Group:      "workers",
+    FrameCodec: broker.NewBinaryMessageCodec(
+        broker.WithFrameSigningKey([]byte(os.Getenv("BROKER_FRAME_SIGNING_KEY"))),
+    ),
+})
+
+_, err := c.PublishFrame(ctx, broker.Message{
+    ID:      "frame-msg-1",
+    Topic:   "email.created",
+    Queue:   "email.send",
+    Payload: []byte(`{"to":"frame@example.com"}`),
+})
+
+msgs, err := c.PollFrames(ctx, "email.send", 10)
+```
+
+### BCL example configuration
+
+The consolidated examples now configure the frame codec from BCL:
+
+```bcl
+codec "fwb1" {
+  max_frame_size "128MB"
+  compress_threshold "1KB"
+  signing_key env("BROKER_FRAME_SIGNING_KEY", "dev-frame-signing-key")
+  encryption_key env("BROKER_FRAME_ENCRYPTION_KEY", "")
+}
+```
+
+`examples/complete_broker/broker.bcl` also supports:
+
+```bcl
+wal_format "binary"
+```
+
+`examples/complete_publisher/publisher.bcl` includes `frame_publish` and `frame_poll` operations to demonstrate binary frame transport.

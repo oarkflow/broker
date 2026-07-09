@@ -4,12 +4,21 @@ broker "complete" {
   mode "standalone"
   default_queue "default"
   wal env("BROKER_WAL", "./.broker-data/wal")
+  wal_format env("BROKER_WAL_FORMAT", "binary")
   insecure_dev env("BROKER_INSECURE_DEV", "true")
   log_events true
   debug_events false
   max_body "4MB"
   default_visibility "30s"
   remote_consumer_timeout "45s"
+
+  codec "fwb1" {
+    # Native broker frame codec used by binary WAL and /v1/publish/frame + /v1/poll/frame.
+    max_frame_size env("BROKER_FRAME_MAX", "128MB")
+    compress_threshold env("BROKER_FRAME_COMPRESS_THRESHOLD", "1KB")
+    signing_key env("BROKER_FRAME_SIGNING_KEY", "dev-frame-signing-key")
+    encryption_key env("BROKER_FRAME_ENCRYPTION_KEY", "")
+  }
 
   # Complete lifecycle/hooks/notification example output.
   # The broker example writes hook callbacks and notification callbacks here.
@@ -65,6 +74,13 @@ broker "complete" {
   queue "tasks.pdf.generate" {
     dlq "tasks.pdf.generate.dlq"
     visibility_timeout "45s"
+    max_attempts 3
+  }
+
+
+  queue "codec.frames" {
+    dlq "codec.frames.dlq"
+    visibility_timeout "30s"
     max_attempts 3
   }
 

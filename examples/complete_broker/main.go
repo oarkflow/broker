@@ -30,13 +30,23 @@ func main() {
 		log.Fatal("missing broker block")
 	}
 
+	frameCodec := exconfig.FrameCodec(bc)
 	var store broker.Store
 	if wal := bc.String("wal", ""); wal != "" {
-		st, err := broker.NewFileWALStore(wal)
-		if err != nil {
-			log.Fatalf("open WAL store: %v", err)
+		format := strings.ToLower(bc.String("wal_format", "binary"))
+		if format == "json" || format == "jsonl" {
+			st, err := broker.NewFileWALStore(wal)
+			if err != nil {
+				log.Fatalf("open JSON WAL store: %v", err)
+			}
+			store = st
+		} else {
+			st, err := broker.NewBinaryFileWALStore(wal, exconfig.FrameCodecOptions(bc)...)
+			if err != nil {
+				log.Fatalf("open binary WAL store: %v", err)
+			}
+			store = st
 		}
-		store = st
 	}
 
 	obsSink, err := exobserve.NewJSONLSink(bc.String("observer_jsonl", "./.broker-data/observability/broker-events.jsonl"))
@@ -50,6 +60,7 @@ func main() {
 		Name:                  first(bc.Name, "complete"),
 		Mode:                  broker.ModeStandalone,
 		Store:                 store,
+		FrameCodec:            frameCodec,
 		DefaultQueue:          bc.String("default_queue", "default"),
 		DefaultVisibility:     bc.Duration("default_visibility", 30*time.Second),
 		RemoteConsumerTimeout: bc.Duration("remote_consumer_timeout", 45*time.Second),
