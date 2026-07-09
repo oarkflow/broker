@@ -1,0 +1,70 @@
+# Order processing pipeline executed by the pipeline_consumer example.
+#
+# validate -> enrich -> (branch on order total) -> review|fulfill -> notify
+#
+# Each node's Go handler is registered in handlers.go under the "order:*"
+# names referenced below via engine.RegisterHandlers.
+workflow "order_pipeline" {
+  name "Order Processing Pipeline"
+  description "Validates, enriches, branches on order value, then fulfills or routes to review before notifying"
+  first "validate"
+  mode inline
+
+  node "validate" {
+    type function
+    handler "order:validate"
+  }
+
+  node "enrich" {
+    type function
+    handler "order:enrich"
+  }
+
+  node "review" {
+    type function
+    handler "order:review"
+  }
+
+  node "fulfill" {
+    type function
+    handler "order:fulfill"
+  }
+
+  node "notify" {
+    type function
+    handler "order:notify"
+    last true
+  }
+
+  edge "validate_to_enrich" {
+    from "validate"
+    to "enrich"
+    type simple
+  }
+
+  edge "enrich_to_review" {
+    from "enrich"
+    to "review"
+    type branch
+    condition "input.total > 500"
+  }
+
+  edge "enrich_to_fulfill" {
+    from "enrich"
+    to "fulfill"
+    type branch
+    condition "input.total <= 500"
+  }
+
+  edge "review_to_notify" {
+    from "review"
+    to "notify"
+    type simple
+  }
+
+  edge "fulfill_to_notify" {
+    from "fulfill"
+    to "notify"
+    type simple
+  }
+}

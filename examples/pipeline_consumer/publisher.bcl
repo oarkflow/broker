@@ -1,0 +1,55 @@
+publisher "pipeline-publisher" {
+  broker_urls [env("BROKER_URL", "http://127.0.0.1:8090")]
+  token env("BROKER_PUBLISHER_TOKEN", env("BROKER_TOKEN", "dev-publisher-token"))
+  request_timeout "10s"
+  task_wait_timeout "20s"
+  require_consumers true
+  discovery_wait "5s"
+  codec "fwb1" {
+    max_frame_size env("BROKER_FRAME_MAX", "128MB")
+    compress_threshold env("BROKER_FRAME_COMPRESS_THRESHOLD", "1KB")
+    signing_key env("BROKER_FRAME_SIGNING_KEY", "dev-frame-signing-key")
+    encryption_key env("BROKER_FRAME_ENCRYPTION_KEY", "")
+  }
+
+  observer_jsonl env("PUBLISHER_OBSERVER_JSONL", "./.broker-data/observability/pipeline-publisher-events.jsonl")
+
+  # Small order: total = 2 * 100 = 200 <= 500, takes the auto-fulfill branch.
+  operation "publish-auto-fulfill-order" {
+    mode "publish"
+    topic "order.created"
+    queue "order.pipeline"
+    payload {
+      order_id "ord-1001"
+      customer_id "cust-1"
+      item "widget"
+      quantity 2
+      unit_price 100
+    }
+  }
+
+  # Large order: total = 4 * 200 = 800 > 500, takes the manual-review branch.
+  operation "publish-review-order" {
+    mode "publish"
+    topic "order.created"
+    queue "order.pipeline"
+    payload {
+      order_id "ord-1002"
+      customer_id "cust-2"
+      item "gizmo"
+      quantity 4
+      unit_price 200
+    }
+  }
+
+  # Missing required fields: dagflow's validate node rejects it with a
+  # permanent error, which the broker eventually dead-letters.
+  operation "publish-invalid-order" {
+    mode "publish"
+    topic "order.created"
+    queue "order.pipeline"
+    payload {
+      customer_id "cust-3"
+    }
+  }
+}

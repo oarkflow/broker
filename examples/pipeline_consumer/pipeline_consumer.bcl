@@ -1,0 +1,35 @@
+consumer "pipeline-consumer" {
+  broker_urls [env("BROKER_URL", "http://127.0.0.1:8090")]
+  token env("BROKER_WORKER_TOKEN", env("BROKER_TOKEN", "dev-worker-token"))
+  consumer_id env("CONSUMER_ID", "pipeline-consumer-1")
+  group "pipeline-consumers"
+  concurrency 4
+  max_inflight 16
+  poll_wait "5s"
+  heartbeat "5s"
+  visibility_timeout "30s"
+  auto_extend true
+  log_hooks true
+  codec "fwb1" {
+    max_frame_size env("BROKER_FRAME_MAX", "128MB")
+    compress_threshold env("BROKER_FRAME_COMPRESS_THRESHOLD", "1KB")
+    signing_key env("BROKER_FRAME_SIGNING_KEY", "dev-frame-signing-key")
+    encryption_key env("BROKER_FRAME_ENCRYPTION_KEY", "")
+  }
+
+  observer_jsonl env("CONSUMER_OBSERVER_JSONL", "./.broker-data/observability/pipeline-consumer-events.jsonl")
+
+  lifecycle_hooks "all" {
+    enabled true
+    callbacks ["jsonl", "console"]
+    events ["connecting", "registered", "subscribed", "polling", "message_received", "before_handle", "progress", "ack", "nack", "reject", "broker_notification", "stopped"]
+  }
+
+  # Each message on this queue is run through the dagflow "order_pipeline"
+  # workflow (see bcl/workflow.bcl) instead of a single inline handler.
+  handler "order-queue" {
+    type "queue"
+    name "order.pipeline"
+    workflow "order_pipeline"
+  }
+}
