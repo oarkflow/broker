@@ -40,7 +40,7 @@ func main() {
 	streamGroup := pc.String("stream_group", "publisher-demo")
 	requireConsumers := pc.Bool("require_consumers", true)
 	discoveryWait := pc.Duration("discovery_wait", 15*time.Second)
-	fmt.Printf("complete publisher started config=%s\n", *configPath)
+	logger.Log.Info("publisher started", zlog.String("config", *configPath))
 
 	for _, op := range pc.Blocks("operation") {
 		obsSink.Write("publisher.operation.start", map[string]any{"name": op.Name, "mode": op.String("mode", "publish")})
@@ -98,7 +98,12 @@ func waitForConsumerQueue(ctx context.Context, c *bclient.Client, queue string, 
 			last = consumers
 			for _, info := range consumers {
 				if consumerReadyForQueue(info, queue) {
-					fmt.Printf("discovery ok role=%s queue=%s consumer=%s group=%s\n", role, queue, info.ConsumerID, info.Group)
+					logger.Log.Info("discovery ok",
+						zlog.String("role", role),
+						zlog.String("queue", queue),
+						zlog.String("consumer", info.ConsumerID),
+						zlog.String("group", info.Group),
+					)
 					return nil
 				}
 			}
@@ -154,16 +159,24 @@ func sanitizeSubject(s string) string {
 
 func runOperation(ctx context.Context, c *bclient.Client, op *exconfig.Node, reqTimeout, taskWait time.Duration, streamGroup string) error {
 	mode := op.String("mode", "publish")
-	fmt.Printf("\n== operation %s mode=%s ==\n", op.Name, mode)
+	logger.Log.Info("operation", zlog.String("name", op.Name), zlog.String("mode", mode))
 	switch mode {
 	case "publish":
 		res, err := c.Publish(ctx, op.String("topic", op.Name), json.RawMessage(exconfig.PayloadJSON(op, `{}`)), publishOpts(op)...)
-		fmt.Printf("published message_id=%s destinations=%d err=%v\n", res.MessageID, len(res.Destinations), err)
+		if err != nil {
+			logger.Log.Warn("publish failed", zlog.String("message_id", res.MessageID), zlog.Int("destinations", len(res.Destinations)), zlog.Err(err))
+		} else {
+			logger.Log.Info("published", zlog.String("message_id", res.MessageID), zlog.Int("destinations", len(res.Destinations)))
+		}
 		return err
 	case "async":
 		ch := c.PublishAsync(ctx, op.String("topic", op.Name), json.RawMessage(exconfig.PayloadJSON(op, `{}`)), publishOpts(op)...)
 		res := <-ch
-		fmt.Printf("async published message_id=%s destinations=%d err=%v\n", res.Result.MessageID, len(res.Result.Destinations), res.Error)
+		if res.Error != nil {
+			logger.Log.Warn("async publish failed", zlog.String("message_id", res.Result.MessageID), zlog.Int("destinations", len(res.Result.Destinations)), zlog.Err(res.Error))
+		} else {
+			logger.Log.Info("async published", zlog.String("message_id", res.Result.MessageID), zlog.Int("destinations", len(res.Result.Destinations)))
+		}
 		return res.Error
 	case "batch":
 		var payloads []any
@@ -171,18 +184,35 @@ func runOperation(ctx context.Context, c *bclient.Client, op *exconfig.Node, req
 			payloads = append(payloads, json.RawMessage(exconfig.MustJSONPayload(p)))
 		}
 		res, err := c.PublishBatch(ctx, op.String("topic", op.Name), payloads, publishOpts(op)...)
-		fmt.Printf("batch published count=%d errors=%d err=%v\n", len(res.Results), len(res.Errors), err)
+		if err != nil {
+			logger.Log.Warn("batch publish failed", zlog.Int("count", len(res.Results)), zlog.Int("errors", len(res.Errors)), zlog.Err(err))
+		} else {
+			logger.Log.Info("batch published", zlog.Int("count", len(res.Results)), zlog.Int("errors", len(res.Errors)))
+		}
 		return err
 	case "frame_publish":
 		msg := broker.Message{ID: op.String("id", ""), Topic: op.String("topic", op.Name), Queue: op.String("queue", ""), Stream: op.String("stream", ""), Type: op.String("type", "frame"), ContentType: "application/json", Payload: []byte(exconfig.PayloadJSON(op, `{}`)), Headers: map[string]string{"x-codec": "fwb1"}, CreatedAt: time.Now(), Status: broker.MessageQueued}
 		res, err := c.PublishFrame(ctx, msg)
-		fmt.Printf("frame published message_id=%s destinations=%d err=%v\n", res.MessageID, len(res.Destinations), err)
+		if err != nil {
+			logger.Log.Warn("frame publish failed", zlog.String("message_id", res.MessageID), zlog.Int("destinations", len(res.Destinations)), zlog.Err(err))
+		} else {
+			logger.Log.Info("frame published", zlog.String("message_id", res.MessageID), zlog.Int("destinations", len(res.Destinations)))
+		}
 		return err
 	case "frame_poll":
 		msgs, err := c.PollFrames(ctx, op.String("queue", "default"), op.Int("limit", 1))
-		fmt.Printf("frame poll count=%d err=%v\n", len(msgs), err)
-		for _, m := range msgs {
-			fmt.Printf("frame message id=%s topic=%s queue=%s payload=%s\n", m.ID, m.Topic, m.Queue, string(m.Payload))
+		if err != nil {
+			logger.Log.Warn("frame poll failed", zlog.Err(err))
+		} else {
+			logger.Log.Info("frame poll", zlog.Int("count", len(msgs)))
+			for _, m := range msgs {
+				logger.Log.Info("frame message",
+					zlog.String("message_id", m.ID),
+					zlog.String("topic", m.Topic),
+					zlog.String("queue", m.Queue),
+					zlog.String("payload", string(m.Payload)),
+				)
+			}
 		}
 		return err
 	case "task":
@@ -190,7 +220,7 @@ func runOperation(ctx context.Context, c *bclient.Client, op *exconfig.Node, req
 		if err != nil {
 			return err
 		}
-		fmt.Printf("submitted task id=%s status=%s\n", task.ID, task.Status)
+		logger.Log.Info("submitted task", zlog.String("task_id", task.ID), zlog.String("status", string(task.Status)))
 		if op.Bool("wait", true) {
 			return waitTask(ctx, c, task.ID, taskWait)
 		}
@@ -198,12 +228,20 @@ func runOperation(ctx context.Context, c *bclient.Client, op *exconfig.Node, req
 	case "request":
 		var resp map[string]any
 		err := c.Request(ctx, op.String("subject", op.Name), json.RawMessage(exconfig.PayloadJSON(op, `{}`)), &resp, reqTimeout)
-		fmt.Printf("request response=%s err=%v\n", mustJSON(resp), err)
+		if err != nil {
+			logger.Log.Warn("request failed", zlog.String("subject", op.String("subject", op.Name)), zlog.Err(err))
+		} else {
+			logger.Log.Info("request completed", zlog.String("subject", op.String("subject", op.Name)), zlog.Any("response", resp))
+		}
 		return err
 	case "command":
 		var resp map[string]any
 		err := c.Command(ctx, op.String("subject", op.Name), json.RawMessage(exconfig.PayloadJSON(op, `{}`)), &resp, reqTimeout)
-		fmt.Printf("command response=%s err=%v\n", mustJSON(resp), err)
+		if err != nil {
+			logger.Log.Warn("command failed", zlog.String("subject", op.String("subject", op.Name)), zlog.Err(err))
+		} else {
+			logger.Log.Info("command completed", zlog.String("subject", op.String("subject", op.Name)), zlog.Any("response", resp))
+		}
 		return err
 	case "stream":
 		res, err := c.Publish(ctx, op.String("topic", op.Name), json.RawMessage(exconfig.PayloadJSON(op, `{}`)), publishOpts(op)...)
@@ -212,10 +250,14 @@ func runOperation(ctx context.Context, c *bclient.Client, op *exconfig.Node, req
 		}
 		stream := op.String("stream", "audit.events")
 		msgs, rerr := c.ReadStream(ctx, stream, streamGroup, 0, 10)
-		fmt.Printf("stream publish=%s read=%d err=%v\n", res.MessageID, len(msgs), rerr)
+		if rerr != nil {
+			logger.Log.Warn("stream read failed", zlog.String("message_id", res.MessageID), zlog.Int("read", len(msgs)), zlog.Err(rerr))
+		} else {
+			logger.Log.Info("stream publish", zlog.String("message_id", res.MessageID), zlog.Int("read", len(msgs)))
+		}
 		if rerr == nil && len(msgs) > 0 {
 			_ = c.CommitStreamOffset(ctx, stream, streamGroup, msgs[len(msgs)-1].Offset)
-			fmt.Printf("stream committed offset=%d group=%s\n", msgs[len(msgs)-1].Offset, streamGroup)
+			logger.Log.Info("stream committed", zlog.Int64("offset", int64(msgs[len(msgs)-1].Offset)), zlog.String("group", streamGroup))
 		}
 		return rerr
 	default:
@@ -262,14 +304,24 @@ func waitTask(ctx context.Context, c *bclient.Client, id string, timeout time.Du
 	for time.Now().Before(deadline) {
 		info, raw, err := c.TaskResult(ctx, id)
 		if err == nil && (info.Status == broker.TaskSucceeded || info.Status == broker.TaskFailed || info.Status == broker.TaskCancelled || info.Status == broker.TaskDeadLettered) {
-			fmt.Printf("task status=%s progress=%.0f result=%s error=%s\n", info.Status, info.Progress.Percent, string(raw), info.LastError)
+			logger.Log.Info("task ended",
+				zlog.String("task_id", id),
+				zlog.String("status", string(info.Status)),
+				zlog.Float64("progress", info.Progress.Percent),
+				zlog.String("result", string(raw)),
+				zlog.String("error", info.LastError),
+			)
 			if info.Status != broker.TaskSucceeded {
 				return fmt.Errorf("task ended with status %s: %s", info.Status, info.LastError)
 			}
 			return nil
 		}
 		if err == nil {
-			fmt.Printf("task status=%s progress=%.0f message=%s\n", info.Status, info.Progress.Percent, info.Progress.Message)
+			logger.Log.Info("task status",
+				zlog.String("task_id", id),
+				zlog.String("status", string(info.Status)),
+				zlog.Float64("progress", info.Progress.Percent),
+			)
 		}
 		time.Sleep(300 * time.Millisecond)
 	}
