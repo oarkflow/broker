@@ -459,3 +459,13 @@ These are implemented as interfaces/metadata so they can be backed by more advan
 - [x] Added `docs/CODEC_FORMAT.md` with the complete FWB1 binary frame layout, flags, TLV fields, security behavior, endpoints, and Go usage.
 - [x] Added `examples/complete_codec` with BCL-configured encode/decode/header-peek/tamper-detection example.
 - [x] Updated README with service discovery troubleshooting and codec documentation/example instructions.
+
+
+## BCL payload blocks and control-plane storage pass
+- [x] Replaced escaped/raw-string payload examples with native BCL `payload { ... }` object blocks.
+- [x] Added BCL block-to-JSON conversion for single payloads and `payloads { item { ... } }` batches.
+- [x] Added `broker.StateStore` split into broker/task/consumer/publisher state-store interfaces.
+- [x] Added concurrency-safe `MemoryStateStore` as the default state store.
+- [x] Integrated state-store persistence into broker lifecycle, task lifecycle, remote consumer lifecycle/events, and publisher operation records.
+- [x] Added `contrib/sqlitestore` persistent SQL/SQLite-backed state-store implementation using `database/sql`.
+- [x] Added optional BCL `state_store "sqlite"` configuration in the complete broker example.

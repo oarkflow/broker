@@ -88,6 +88,7 @@ func (p *Publisher) publish(ctx context.Context, topic string, payload any, opts
 			prep.event.Error = err
 			p.b.cfg.Hooks.OnPublishFailed(ctx, prep.event)
 		}
+		p.b.recordPublisher(ctx, PublisherRecord{ID: prep.msg.ID, Operation: "publish", Topic: prep.msg.Topic, Queue: prep.msg.Queue, Stream: prep.msg.Stream, MessageID: prep.msg.ID, Status: "failed", Error: err.Error(), CreatedAt: prep.msg.CreatedAt, UpdatedAt: time.Now()})
 		return PublishResult{}, err
 	}
 	res := PublishResult{MessageID: prep.msg.ID, Messages: stored, Destinations: prep.dests, Confirmed: firstConfirm(prep.opts.ConfirmLevel, ConfirmPersisted)}
@@ -188,6 +189,7 @@ func (p *Publisher) afterPublish(ctx context.Context, prep preparedPublish, res 
 		p.b.cfg.Hooks.OnPublishConfirmed(ctx, prep.event)
 	}
 	p.b.notify.Publish(Notification{Type: "message.published", Source: "publisher", Severity: SeverityInfo, MessageID: prep.msg.ID, Topic: prep.msg.Topic, Queue: prep.msg.Queue, TenantID: prep.msg.TenantID, TraceID: prep.msg.TraceID, Timestamp: time.Now()})
+	p.b.recordPublisher(ctx, PublisherRecord{ID: prep.msg.ID, Operation: "publish", Topic: prep.msg.Topic, Queue: prep.msg.Queue, Stream: prep.msg.Stream, MessageID: prep.msg.ID, Status: "succeeded", CreatedAt: prep.msg.CreatedAt, UpdatedAt: time.Now()})
 }
 
 func firstConfirm(v, d ConfirmLevel) ConfirmLevel {
@@ -195,6 +197,12 @@ func firstConfirm(v, d ConfirmLevel) ConfirmLevel {
 		return v
 	}
 	return d
+}
+
+func (b *Broker) recordPublisher(ctx context.Context, rec PublisherRecord) {
+	if b != nil && b.stateStore != nil {
+		_ = b.stateStore.PutPublisherRecord(ctx, rec)
+	}
 }
 
 func (p *Publisher) Request(ctx context.Context, subject string, request any, response any, opts ...RequestOption) error {
@@ -275,12 +283,15 @@ func (p *Publisher) requestWithOptions(ctx context.Context, subject string, requ
 	pubOpts := []PublishOption{WithHeaders(o.Headers), WithCorrelationID(o.CorrelationID), WithHeader("reply_to", o.ReplyTo), WithIdempotencyKey(o.IdempotencyKey), WithTenantID(o.TenantID), WithRequireDestination(o.RequireHandler)}
 	_, err := p.Publish(ctx, subject, request, pubOpts...)
 	if err != nil {
+		p.b.recordPublisher(ctx, PublisherRecord{ID: o.CorrelationID, Operation: "request", Subject: subject, CorrelationID: o.CorrelationID, Status: "failed", Error: err.Error(), CreatedAt: time.Now(), UpdatedAt: time.Now()})
 		return Response{}, err
 	}
 	select {
 	case r := <-ch:
+		p.b.recordPublisher(ctx, PublisherRecord{ID: o.CorrelationID, Operation: "request", Subject: subject, CorrelationID: o.CorrelationID, Status: "succeeded", CreatedAt: time.Now(), UpdatedAt: time.Now()})
 		return r, nil
 	case <-ctx.Done():
+		p.b.recordPublisher(ctx, PublisherRecord{ID: o.CorrelationID, Operation: "request", Subject: subject, CorrelationID: o.CorrelationID, Status: "timeout", Error: ErrRequestTimeout.Error(), CreatedAt: time.Now(), UpdatedAt: time.Now()})
 		return Response{CorrelationID: o.CorrelationID, Status: ResponseTimeout, Error: &BrokerError{Code: "request_timeout", Message: ErrRequestTimeout.Error(), Temporary: true, Retryable: true}}, ErrRequestTimeout
 	}
 }

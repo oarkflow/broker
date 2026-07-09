@@ -1495,6 +1495,20 @@ This implementation is hardened for embedded and single-node standalone broker u
 
 The complete wire/storage format is documented in [`docs/CODEC_FORMAT.md`](docs/CODEC_FORMAT.md). Run `go run ./examples/complete_codec -config examples/complete_codec/codec.bcl` for a standalone BCL-driven encode/decode/tamper-detection demo.
 
+BCL payload examples use native BCL object blocks. The example loader converts these blocks to JSON payload bytes, so payloads are readable and are not escaped strings:
+
+```bcl
+payload {
+  hello "world"
+  mode "fwb1"
+}
+
+payloads {
+  item { to "batch1@example.com" }
+  item { to "batch2@example.com" }
+}
+```
+
 The broker now includes a native binary message frame codec named **FWB1**. It is intended for the broker hot path, binary WAL, remote worker data-plane traffic, and future replication streams. JSON remains available for the public HTTP/admin API and examples, but FWB1 is the recommended format for high-throughput broker-to-broker and broker-to-worker transport.
 
 ### Features
@@ -1627,3 +1641,52 @@ wal_format "binary"
 ```
 
 `examples/complete_publisher/publisher.bcl` includes `frame_publish` and `frame_poll` operations to demonstrate binary frame transport. `examples/complete_codec` shows direct local codec usage without a running broker.
+
+
+## Control-plane state store interfaces and SQLite contrib
+
+The broker now separates the hot message data-plane store from control-plane state. `broker.Store` remains responsible for queues, topics, streams, WAL, leases, movement, and DLQ. The new `broker.StateStore` persists broker/task/consumer/publisher state:
+
+- `BrokerStateStore`: broker mode/node/state snapshots.
+- `TaskStateStore`: task lifecycle, progress, result, and status.
+- `ConsumerStateStore`: remote consumer registrations, subscriptions, lifecycle state, and broker-sent events.
+- `PublisherStateStore`: publish/request/task operation records for audit and troubleshooting.
+
+Memory is the default:
+
+```go
+b, _ := broker.New(broker.Config{
+    Store:      broker.NewMemoryStore(),
+    StateStore: broker.NewMemoryStateStore(),
+})
+```
+
+A persistent SQLite control-plane state implementation is available in `contrib/sqlitestore`. It uses `database/sql` and accepts any registered SQLite driver, so the core broker does not force a SQLite dependency:
+
+```go
+import (
+    "database/sql"
+
+    _ "modernc.org/sqlite" // or your preferred SQLite driver
+    "github.com/oarkflow/fastworker/broker"
+    "github.com/oarkflow/fastworker/contrib/sqlitestore"
+)
+
+db, _ := sql.Open("sqlite", "./broker-state.sqlite")
+stateStore, _ := sqlitestore.NewStateStore(db)
+
+b, _ := broker.New(broker.Config{
+    Store:      broker.NewMemoryStore(),
+    StateStore: stateStore,
+})
+```
+
+The complete broker BCL has an optional SQLite state-store block, disabled by default so examples run without external dependencies:
+
+```bcl
+state_store "sqlite" {
+  enabled env("BROKER_SQLITE_STATE_ENABLED", "false")
+  driver env("BROKER_SQLITE_DRIVER", "sqlite")
+  dsn env("BROKER_SQLITE_DSN", "./.broker-data/broker-state.sqlite")
+}
+```

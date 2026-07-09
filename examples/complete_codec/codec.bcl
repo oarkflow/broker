@@ -5,5 +5,11 @@ codec_example "complete-codec" {
   encryption_key env("BROKER_FRAME_ENCRYPTION_KEY", "dev-frame-encryption-key")
   topic "codec.demo"
   queue "codec.frames"
-  payload "{\"hello\":\"world\",\"mode\":\"fwb1\",\"note\":\"compressed, signed and encrypted when configured\"}"
+
+  # Native BCL object payload. The example converts this block to JSON bytes.
+  payload {
+    hello "world"
+    mode "fwb1"
+    note "compressed, signed and encrypted when configured"
+  }
 }

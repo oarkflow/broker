@@ -15,6 +15,7 @@ import (
 type Broker struct {
 	cfg        Config
 	store      Store
+	stateStore StateStore
 	router     *Router
 	codec      Codec
 	frameCodec *BinaryMessageCodec
@@ -83,6 +84,9 @@ func New(cfg Config) (*Broker, error) {
 	if cfg.Store == nil {
 		cfg.Store = NewMemoryStore()
 	}
+	if cfg.StateStore == nil {
+		cfg.StateStore = NewMemoryStateStore()
+	}
 	pool := cfg.Pool
 	own := cfg.OwnPool
 	if pool == nil {
@@ -90,7 +94,7 @@ func New(cfg Config) (*Broker, error) {
 		own = true
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	b := &Broker{cfg: cfg, store: cfg.Store, router: NewRouter(), codec: cfg.Codec, frameCodec: cfg.FrameCodec, pool: pool, ownPool: own, ctx: ctx, cancel: cancel, subs: map[string]*Subscription{}, waiters: map[string]chan Response{}, tasks: map[string]*TaskInfo{}, taskWait: map[string][]chan TaskResult{}, notify: NewNotificationBus(1024), consumers: NewConsumerRegistry(512), cluster: NewCluster(firstNonEmpty(cfg.NodeID, "node-1"))}
+	b := &Broker{cfg: cfg, store: cfg.Store, stateStore: cfg.StateStore, router: NewRouter(), codec: cfg.Codec, frameCodec: cfg.FrameCodec, pool: pool, ownPool: own, ctx: ctx, cancel: cancel, subs: map[string]*Subscription{}, waiters: map[string]chan Response{}, tasks: map[string]*TaskInfo{}, taskWait: map[string][]chan TaskResult{}, notify: NewNotificationBus(1024), consumers: NewConsumerRegistry(512), cluster: NewCluster(firstNonEmpty(cfg.NodeID, "node-1"))}
 	b.state.Store(BrokerConfigured)
 	_ = b.store.DeclareQueue(context.Background(), QueueConfig{Name: cfg.DefaultQueue, VisibilityTimeout: cfg.DefaultVisibility, RetryPolicy: cfg.DefaultRetry, DLQ: cfg.DefaultDLQ})
 	_ = b.store.DeclareQueue(context.Background(), QueueConfig{Name: cfg.DefaultDLQ, VisibilityTimeout: cfg.DefaultVisibility, RetryPolicy: cfg.DefaultRetry})
@@ -155,6 +159,11 @@ func (b *Broker) Stop(ctx context.Context) error {
 	if err := b.store.Close(); err != nil {
 		return err
 	}
+	if b.stateStore != nil {
+		if err := b.stateStore.Close(); err != nil {
+			return err
+		}
+	}
 	b.notify.Close()
 	b.setState(ctx, BrokerStopped, nil)
 	return nil
@@ -175,6 +184,7 @@ func (b *Broker) State() BrokerState {
 	return BrokerConfigured
 }
 func (b *Broker) Store() Store                    { return b.store }
+func (b *Broker) StateStore() StateStore          { return b.stateStore }
 func (b *Broker) Router() *Router                 { return b.router }
 func (b *Broker) Notifications() *NotificationBus { return b.notify }
 func (b *Broker) Cluster() *Cluster               { return b.cluster }
@@ -213,6 +223,9 @@ func (b *Broker) setState(ctx context.Context, st BrokerState, err error) {
 			b.cfg.Hooks.OnFailed(ctx, e)
 		}
 	}
+	if b.stateStore != nil {
+		_ = b.stateStore.PutBrokerState(ctx, BrokerStateRecord{Name: b.cfg.Name, NodeID: b.cfg.NodeID, Mode: b.cfg.Mode, State: st, UpdatedAt: time.Now()})
+	}
 	b.notify.Publish(Notification{Type: "broker." + string(st), Source: b.cfg.Name, Severity: SeverityInfo, Timestamp: time.Now()})
 }
 
@@ -247,6 +260,7 @@ func (b *Broker) sweepRemoteConsumers(now time.Time) {
 			if !ok {
 				continue
 			}
+			b.persistConsumer(b.ctx, info)
 			if b.cfg.Hooks.OnConsumerStopped != nil {
 				b.cfg.Hooks.OnConsumerStopped(b.ctx, ConsumerEvent{Consumer: c.ConsumerID, Group: c.Group, State: ConsumerDisconnected, Time: now})
 			}

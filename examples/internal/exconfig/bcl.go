@@ -1,6 +1,7 @@
 package exconfig
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"strconv"
@@ -171,6 +172,119 @@ func ParseBytes(s string, def int64) int64 {
 	return n * mul
 }
 
+// PayloadJSON returns a JSON payload from a native BCL payload block first,
+// falling back to a payload field for backwards compatibility. Prefer:
+//
+//	payload {
+//	  to "user@example.com"
+//	  amount 1499
+//	  nested { enabled true }
+//	}
+//
+// This keeps payloads represented as BCL objects instead of escaped strings.
+func PayloadJSON(n *Node, def string) string {
+	if n == nil {
+		return MustJSONPayload(def)
+	}
+	if blocks := n.Blocks("payload"); len(blocks) > 0 {
+		b, err := json.Marshal(NodeObject(blocks[0]))
+		if err == nil {
+			return string(b)
+		}
+	}
+	return MustJSONPayload(n.String("payload", def))
+}
+
+// PayloadsJSON returns a JSON payload list from a native BCL payloads block:
+//
+//	payloads {
+//	  item { to "a@example.com" }
+//	  item { to "b@example.com" }
+//	}
+func PayloadsJSON(n *Node) []string {
+	if n == nil {
+		return nil
+	}
+	if blocks := n.Blocks("payloads"); len(blocks) > 0 {
+		var out []string
+		for _, item := range blocks[0].Blocks("item") {
+			b, err := json.Marshal(NodeObject(item))
+			if err == nil {
+				out = append(out, string(b))
+			}
+		}
+		if len(out) > 0 {
+			return out
+		}
+	}
+	return n.Strings("payloads")
+}
+
+// NodeObject converts a BCL block into a JSON-compatible object. Repeated
+// fields/children become arrays. Scalar words are parsed as bool/int/float
+// where appropriate, otherwise they remain strings.
+func NodeObject(n *Node) map[string]any {
+	out := map[string]any{}
+	if n == nil {
+		return out
+	}
+	for k, vals := range n.Fields {
+		if k == "args" {
+			continue
+		}
+		if len(vals) == 1 {
+			out[k] = valueAny(vals[0])
+			continue
+		}
+		arr := make([]any, 0, len(vals))
+		for _, v := range vals {
+			arr = append(arr, valueAny(v))
+		}
+		out[k] = arr
+	}
+	children := map[string][]*Node{}
+	for _, c := range n.Children {
+		children[c.Kind] = append(children[c.Kind], c)
+	}
+	for k, list := range children {
+		if len(list) == 1 {
+			out[k] = NodeObject(list[0])
+			continue
+		}
+		arr := make([]any, 0, len(list))
+		for _, c := range list {
+			arr = append(arr, NodeObject(c))
+		}
+		out[k] = arr
+	}
+	return out
+}
+
+func valueAny(v Value) any {
+	if v.Kind == "list" {
+		arr := make([]any, 0, len(v.List))
+		for _, item := range v.List {
+			arr = append(arr, valueAny(item))
+		}
+		return arr
+	}
+	s := strings.TrimSpace(v.Text)
+	if s == "" {
+		return ""
+	}
+	ls := strings.ToLower(s)
+	if ls == "true" || ls == "false" {
+		return ls == "true"
+	}
+	if i, err := strconv.ParseInt(s, 10, 64); err == nil {
+		return i
+	}
+	if f, err := strconv.ParseFloat(s, 64); err == nil && strings.ContainsAny(s, ".eE") {
+		return f
+	}
+	return v.Text
+}
+
 func MustJSONPayload(s string) string {
 	s = strings.TrimSpace(s)
 	if s == "" {
@@ -288,6 +402,21 @@ func (l *lexer) next() token {
 			b.WriteByte(c)
 		}
 		return token{typ: tString, val: b.String(), pos: pos}
+	case '`':
+		// Raw BCL strings are intentionally not escaped. They are useful for
+		// JSON payloads, SQL, scripts, and any example/config value that should
+		// be written exactly as it is sent to the broker. A raw string may span
+		// multiple lines and is terminated by the next backtick.
+		l.i++
+		start := l.i
+		for l.i < len(l.s) && l.s[l.i] != '`' {
+			l.i++
+		}
+		val := l.s[start:l.i]
+		if l.i < len(l.s) && l.s[l.i] == '`' {
+			l.i++
+		}
+		return token{typ: tString, val: val, pos: pos}
 	default:
 		start := l.i
 		for l.i < len(l.s) {

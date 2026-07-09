@@ -156,24 +156,24 @@ func runOperation(ctx context.Context, c *bclient.Client, op *exconfig.Node, req
 	fmt.Printf("\n== operation %s mode=%s ==\n", op.Name, mode)
 	switch mode {
 	case "publish":
-		res, err := c.Publish(ctx, op.String("topic", op.Name), json.RawMessage(exconfig.MustJSONPayload(op.String("payload", `{}`))), publishOpts(op)...)
+		res, err := c.Publish(ctx, op.String("topic", op.Name), json.RawMessage(exconfig.PayloadJSON(op, `{}`)), publishOpts(op)...)
 		fmt.Printf("published message_id=%s destinations=%d err=%v\n", res.MessageID, len(res.Destinations), err)
 		return err
 	case "async":
-		ch := c.PublishAsync(ctx, op.String("topic", op.Name), json.RawMessage(exconfig.MustJSONPayload(op.String("payload", `{}`))), publishOpts(op)...)
+		ch := c.PublishAsync(ctx, op.String("topic", op.Name), json.RawMessage(exconfig.PayloadJSON(op, `{}`)), publishOpts(op)...)
 		res := <-ch
 		fmt.Printf("async published message_id=%s destinations=%d err=%v\n", res.Result.MessageID, len(res.Result.Destinations), res.Error)
 		return res.Error
 	case "batch":
 		var payloads []any
-		for _, p := range op.Strings("payloads") {
+		for _, p := range exconfig.PayloadsJSON(op) {
 			payloads = append(payloads, json.RawMessage(exconfig.MustJSONPayload(p)))
 		}
 		res, err := c.PublishBatch(ctx, op.String("topic", op.Name), payloads, publishOpts(op)...)
 		fmt.Printf("batch published count=%d errors=%d err=%v\n", len(res.Results), len(res.Errors), err)
 		return err
 	case "frame_publish":
-		msg := broker.Message{ID: op.String("id", ""), Topic: op.String("topic", op.Name), Queue: op.String("queue", ""), Stream: op.String("stream", ""), Type: op.String("type", "frame"), ContentType: "application/json", Payload: []byte(exconfig.MustJSONPayload(op.String("payload", `{}`))), Headers: map[string]string{"x-codec": "fwb1"}, CreatedAt: time.Now(), Status: broker.MessageQueued}
+		msg := broker.Message{ID: op.String("id", ""), Topic: op.String("topic", op.Name), Queue: op.String("queue", ""), Stream: op.String("stream", ""), Type: op.String("type", "frame"), ContentType: "application/json", Payload: []byte(exconfig.PayloadJSON(op, `{}`)), Headers: map[string]string{"x-codec": "fwb1"}, CreatedAt: time.Now(), Status: broker.MessageQueued}
 		res, err := c.PublishFrame(ctx, msg)
 		fmt.Printf("frame published message_id=%s destinations=%d err=%v\n", res.MessageID, len(res.Destinations), err)
 		return err
@@ -185,7 +185,7 @@ func runOperation(ctx context.Context, c *bclient.Client, op *exconfig.Node, req
 		}
 		return err
 	case "task":
-		task, err := c.SubmitTask(ctx, op.String("name", op.Name), json.RawMessage(exconfig.MustJSONPayload(op.String("payload", `{}`))), taskOpts(op)...)
+		task, err := c.SubmitTask(ctx, op.String("name", op.Name), json.RawMessage(exconfig.PayloadJSON(op, `{}`)), taskOpts(op)...)
 		if err != nil {
 			return err
 		}
@@ -196,16 +196,16 @@ func runOperation(ctx context.Context, c *bclient.Client, op *exconfig.Node, req
 		return nil
 	case "request":
 		var resp map[string]any
-		err := c.Request(ctx, op.String("subject", op.Name), json.RawMessage(exconfig.MustJSONPayload(op.String("payload", `{}`))), &resp, reqTimeout)
+		err := c.Request(ctx, op.String("subject", op.Name), json.RawMessage(exconfig.PayloadJSON(op, `{}`)), &resp, reqTimeout)
 		fmt.Printf("request response=%s err=%v\n", mustJSON(resp), err)
 		return err
 	case "command":
 		var resp map[string]any
-		err := c.Command(ctx, op.String("subject", op.Name), json.RawMessage(exconfig.MustJSONPayload(op.String("payload", `{}`))), &resp, reqTimeout)
+		err := c.Command(ctx, op.String("subject", op.Name), json.RawMessage(exconfig.PayloadJSON(op, `{}`)), &resp, reqTimeout)
 		fmt.Printf("command response=%s err=%v\n", mustJSON(resp), err)
 		return err
 	case "stream":
-		res, err := c.Publish(ctx, op.String("topic", op.Name), json.RawMessage(exconfig.MustJSONPayload(op.String("payload", `{}`))), publishOpts(op)...)
+		res, err := c.Publish(ctx, op.String("topic", op.Name), json.RawMessage(exconfig.PayloadJSON(op, `{}`)), publishOpts(op)...)
 		if err != nil {
 			return err
 		}

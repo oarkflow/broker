@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/oarkflow/fastworker/broker"
+	"github.com/oarkflow/fastworker/contrib/sqlitestore"
 	"github.com/oarkflow/fastworker/examples/internal/exconfig"
 	"github.com/oarkflow/fastworker/examples/internal/exobserve"
 )
@@ -49,6 +50,18 @@ func main() {
 		}
 	}
 
+	var stateStore broker.StateStore
+	if ss := bc.Block("state_store", "sqlite"); ss != nil && ss.Bool("enabled", false) {
+		driver := ss.String("driver", "sqlite")
+		dsn := ss.String("dsn", "./.broker-data/broker-state.sqlite")
+		st, err := sqlitestore.Open(driver, dsn)
+		if err != nil {
+			log.Fatalf("open sqlite state store driver=%s dsn=%s: %v", driver, dsn, err)
+		}
+		stateStore = st
+		log.Printf("configured sqlite state_store driver=%s dsn=%s", driver, dsn)
+	}
+
 	obsSink, err := exobserve.NewJSONLSink(bc.String("observer_jsonl", "./.broker-data/observability/broker-events.jsonl"))
 	if err != nil {
 		log.Fatalf("open observability sink: %v", err)
@@ -60,6 +73,7 @@ func main() {
 		Name:                  first(bc.Name, "complete"),
 		Mode:                  broker.ModeStandalone,
 		Store:                 store,
+		StateStore:            stateStore,
 		FrameCodec:            frameCodec,
 		DefaultQueue:          bc.String("default_queue", "default"),
 		DefaultVisibility:     bc.Duration("default_visibility", 30*time.Second),

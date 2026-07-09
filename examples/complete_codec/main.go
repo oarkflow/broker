@@ -34,7 +34,7 @@ func main() {
 		Queue:       cc.String("queue", "codec.frames"),
 		Type:        "codec.example",
 		ContentType: "application/json",
-		Payload:     []byte(exconfig.MustJSONPayload(cc.String("payload", `{}`))),
+		Payload:     []byte(exconfig.PayloadJSON(cc, `{}`)),
 		Headers:     map[string]string{"x-codec": "fwb1", "x-example": "complete_codec"},
 		Metadata:    map[string]string{"source": "examples/complete_codec"},
 		CreatedAt:   time.Now(),

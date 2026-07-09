@@ -165,6 +165,33 @@ Response: length-prefixed FWB1 frame batch
 
 Each response frame is prefixed by a uvarint frame length.
 
+
+## BCL payload syntax
+
+Example BCL files should represent payloads as native BCL object blocks, not escaped strings. The example config loader converts the block to compact JSON bytes before publishing/encoding.
+
+```bcl
+codec_example "complete-codec" {
+  topic "codec.demo"
+  queue "codec.frames"
+
+  payload {
+    hello "world"
+    mode "fwb1"
+    note "BCL object block converted to JSON payload bytes"
+  }
+}
+
+operation "publish-batch" {
+  payloads {
+    item { to "batch1@example.com" }
+    item { to "batch2@example.com" }
+  }
+}
+```
+
+The broker still receives opaque bytes. In these examples the bytes are JSON generated from the BCL block, keeping configuration readable without escaped payload strings. Raw backtick strings remain supported only for compatibility and special cases such as scripts or SQL.
+
 ## Go usage
 
 ```go
@@ -205,3 +232,29 @@ FWB1 rejects:
 - trailing bytes
 - truncated frames
 
+
+## BCL payload syntax
+
+Example BCL files should represent payloads as native BCL object blocks, not escaped strings. The example config loader converts the block to compact JSON bytes before publishing/encoding.
+
+```bcl
+codec_example "complete-codec" {
+  topic "codec.demo"
+  queue "codec.frames"
+
+  payload {
+    hello "world"
+    mode "fwb1"
+    note "BCL object block converted to JSON payload bytes"
+  }
+}
+
+operation "publish-batch" {
+  payloads {
+    item { to "batch1@example.com" }
+    item { to "batch2@example.com" }
+  }
+}
+```
+
+The broker still receives opaque bytes. In these examples the bytes are JSON generated from the BCL block, keeping configuration readable without escaped payload strings. Raw backtick strings remain supported only for compatibility and special cases such as scripts or SQL.

@@ -26,74 +26,107 @@ publisher "complete-publisher" {
     mode "publish"
     topic "email.created"
     queue "email.send"
-    payload "{\"to\":\"queue@example.com\",\"message\":\"hello queue\"}"
+    payload {
+      to "queue@example.com"
+      message "hello queue"
+    }
   }
 
   operation "publish-topic-route" {
     mode "publish"
     topic "email.created"
-    payload "{\"to\":\"topic@example.com\",\"message\":\"routed by broker route\"}"
+    payload {
+      to "topic@example.com"
+      message "routed by broker route"
+    }
   }
 
   operation "publish-wildcard" {
     mode "publish"
     topic "tenant.123.invoice.created"
-    payload "{\"tenant\":\"123\",\"invoice_id\":\"inv-001\",\"amount\":1499}"
+    payload {
+      tenant "123"
+      invoice_id "inv-001"
+      amount 1499
+    }
   }
 
   operation "publish-batch" {
     mode "batch"
     topic "email.created"
     queue "email.send"
-    payloads ["{\"to\":\"batch1@example.com\"}", "{\"to\":\"batch2@example.com\"}"]
+    payloads {
+      item { to "batch1@example.com" }
+      item { to "batch2@example.com" }
+    }
   }
 
   operation "publish-async" {
     mode "async"
     topic "email.created"
     queue "email.send"
-    payload "{\"to\":\"async@example.com\"}"
+    payload {
+      to "async@example.com"
+    }
   }
 
   operation "submit-task" {
     mode "task"
     name "pdf.generate"
     queue "tasks.pdf.generate"
-    payload "{\"template\":\"invoice\",\"invoice_id\":\"inv-001\"}"
+    payload {
+      template "invoice"
+      invoice_id "inv-001"
+    }
     wait true
   }
 
   operation "request-response" {
     mode "request"
     subject "payment.authorize"
-    payload "{\"order_id\":\"ord-001\",\"amount\":1499}"
+    payload {
+      order_id "ord-001"
+      amount 1499
+    }
   }
 
   operation "command-response" {
     mode "command"
     subject "payment.capture"
-    payload "{\"authorization_id\":\"auth-demo-001\",\"amount\":1499}"
+    payload {
+      authorization_id "auth-demo-001"
+      amount 1499
+    }
   }
 
   operation "stream-audit" {
     mode "stream"
     topic "audit.manual"
     stream "audit.events"
-    payload "{\"event\":\"manual audit event from publisher example\"}"
+    payload {
+      event "manual audit event from publisher example"
+    }
   }
 
   operation "dlq-demo" {
     mode "publish"
     topic "email.created"
     queue "email.send"
-    payload "{\"to\":\"dlq@example.com\",\"force_dlq\":true}"
+    payload {
+      to "dlq@example.com"
+      force_dlq true
+    }
   }
+
   operation "native-frame-publish" {
     mode "frame_publish"
     topic "email.created"
     queue "codec.frames"
     type "codec.demo"
-    payload "{\"to\":\"frame@example.com\",\"body\":\"published through FWB1 binary frame\"}"
+    payload {
+      to "frame@example.com"
+      body "published through FWB1 binary frame"
+    }
   }
 
   operation "native-frame-poll" {
@@ -101,5 +134,4 @@ publisher "complete-publisher" {
     queue "codec.frames"
     limit 1
   }
-
 }

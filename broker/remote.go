@@ -269,6 +269,7 @@ func (b *Broker) Consumers() *ConsumerRegistry {
 }
 func (b *Broker) RegisterRemoteConsumer(ctx context.Context, reg ConsumerRegistration) (ConsumerInfo, error) {
 	info := b.Consumers().Register(reg)
+	b.persistConsumer(ctx, info)
 	if b.cfg.Hooks.OnConsumerRegistered != nil {
 		b.cfg.Hooks.OnConsumerRegistered(ctx, ConsumerEvent{Consumer: info.ConsumerID, Group: info.Group, State: ConsumerRegistered, Time: time.Now()})
 	}
@@ -280,6 +281,7 @@ func (b *Broker) RemoteConsumerHeartbeat(ctx context.Context, id string) (Consum
 	if !ok {
 		return ConsumerInfo{}, ErrMessageNotFound
 	}
+	b.persistConsumer(ctx, info)
 	b.emitConsumerNotification(id, Notification{Type: "consumer.heartbeat", Source: b.cfg.Name, Severity: SeverityDebug, Consumer: id, ConsumerGroup: info.Group, Timestamp: time.Now()})
 	return info, nil
 }
@@ -338,6 +340,7 @@ func (b *Broker) RemoteConsumerSubscribe(ctx context.Context, id string, sub Rem
 	if !ok {
 		return ConsumerInfo{}, ErrMessageNotFound
 	}
+	b.persistConsumer(ctx, info)
 	if b.cfg.Hooks.OnConsumerAssigned != nil {
 		b.cfg.Hooks.OnConsumerAssigned(ctx, ConsumerEvent{Consumer: id, Group: info.Group, Queue: firstNonEmpty(sub.Queue, sub.Name), State: ConsumerAssigned, Time: time.Now()})
 	}
@@ -349,6 +352,7 @@ func (b *Broker) SetRemoteConsumerState(ctx context.Context, id string, st Consu
 	if !ok {
 		return ConsumerInfo{}, ErrMessageNotFound
 	}
+	b.persistConsumer(ctx, info)
 	ce := ConsumerEvent{Consumer: id, Group: info.Group, State: st, Time: time.Now()}
 	switch st {
 	case ConsumerPaused:
@@ -376,6 +380,9 @@ func (b *Broker) UnregisterRemoteConsumer(ctx context.Context, id string) error 
 	if !ok {
 		return ErrMessageNotFound
 	}
+	if b.stateStore != nil {
+		_ = b.stateStore.DeleteConsumer(ctx, id)
+	}
 	if b.cfg.Hooks.OnConsumerStopped != nil {
 		b.cfg.Hooks.OnConsumerStopped(ctx, ConsumerEvent{Consumer: id, Group: info.Group, State: ConsumerStopped, Time: time.Now()})
 	}
@@ -386,5 +393,14 @@ func (b *Broker) emitConsumerNotification(id string, n Notification) {
 	b.notify.Publish(n)
 	if b.consumers != nil {
 		b.consumers.AddEvent(id, n)
+	}
+	if b.stateStore != nil {
+		_ = b.stateStore.AddConsumerEvent(context.Background(), id, n)
+	}
+}
+
+func (b *Broker) persistConsumer(ctx context.Context, info ConsumerInfo) {
+	if b != nil && b.stateStore != nil && info.ConsumerID != "" {
+		_ = b.stateStore.PutConsumer(ctx, info)
 	}
 }

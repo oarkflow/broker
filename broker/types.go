@@ -291,6 +291,7 @@ type Config struct {
 	Mode                  Mode                `json:"mode"`
 	NodeID                string              `json:"node_id"`
 	Store                 Store               `json:"-"`
+	StateStore            StateStore          `json:"-"`
 	Pool                  *fastworker.Pool    `json:"-"`
 	OwnPool               bool                `json:"own_pool"`
 	Codec                 Codec               `json:"-"`

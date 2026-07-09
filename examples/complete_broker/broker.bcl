@@ -12,6 +12,16 @@ broker "complete" {
   default_visibility "30s"
   remote_consumer_timeout "45s"
 
+
+  # Optional persistent control-plane state store for broker/task/consumer/publisher state.
+  # It accepts any database/sql SQLite driver registered by your app. The example is
+  # disabled by default so the repository builds without extra dependencies.
+  state_store "sqlite" {
+    enabled env("BROKER_SQLITE_STATE_ENABLED", "false")
+    driver env("BROKER_SQLITE_DRIVER", "sqlite")
+    dsn env("BROKER_SQLITE_DSN", "./.broker-data/broker-state.sqlite")
+  }
+
   codec "fwb1" {
     # Native broker frame codec used by binary WAL and /v1/publish/frame + /v1/poll/frame.
     max_frame_size env("BROKER_FRAME_MAX", "128MB")

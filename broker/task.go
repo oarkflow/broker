@@ -57,9 +57,18 @@ type taskHandle struct {
 func (h taskHandle) ID() string { return h.id }
 func (h taskHandle) Info(ctx context.Context) (TaskInfo, error) {
 	h.b.taskMu.RLock()
-	defer h.b.taskMu.RUnlock()
 	if t := h.b.tasks[h.id]; t != nil {
-		return cloneTask(*t), nil
+		out := cloneTask(*t)
+		h.b.taskMu.RUnlock()
+		return out, nil
+	}
+	h.b.taskMu.RUnlock()
+	if h.b.stateStore != nil {
+		if t, ok, err := h.b.stateStore.GetTask(ctx, h.id); err != nil {
+			return TaskInfo{}, err
+		} else if ok {
+			return t, nil
+		}
 	}
 	return TaskInfo{}, ErrMessageNotFound
 }
@@ -113,6 +122,9 @@ func (h taskHandle) Cancel(ctx context.Context, reason string) error {
 		ti = cloneTask(*t)
 	}
 	h.b.taskMu.Unlock()
+	if t != nil {
+		h.b.persistTask(ctx, ti)
+	}
 	if t != nil {
 		if msg, ok, _ := h.b.store.Get(ctx, t.MessageID); ok {
 			msg.Status = MessageCancelled
@@ -170,12 +182,14 @@ func (p *Publisher) SubmitTask(ctx context.Context, name string, payload any, op
 	p.b.taskMu.Lock()
 	p.b.tasks[id] = &info
 	p.b.taskMu.Unlock()
+	p.b.persistTask(ctx, info)
 	if p.b.cfg.Hooks.OnTaskCreated != nil {
 		p.b.cfg.Hooks.OnTaskCreated(ctx, TaskEvent{Task: info, Time: now})
 	}
 	pubOpts := []PublishOption{WithQueue(queue), WithType(name), WithTaskHeaders(id, name), WithPriority(o.Priority), WithDelay(o.Delay), WithRunAt(o.RunAt), WithTenantID(o.TenantID), WithIdempotencyKey(o.IdempotencyKey), WithMetadata(o.Metadata), WithMaxAttempts(o.MaxAttempts)}
 	res, err := p.Publish(ctx, name, payload, pubOpts...)
 	if err != nil {
+		p.b.recordPublisher(ctx, PublisherRecord{ID: id, Operation: "submit_task", Subject: name, Queue: queue, TaskID: id, Status: "failed", Error: err.Error(), CreatedAt: now, UpdatedAt: time.Now()})
 		p.b.failTask(ctx, id, err)
 		return nil, err
 	}
@@ -187,8 +201,11 @@ func (p *Publisher) SubmitTask(ctx context.Context, name string, payload any, op
 		}
 		t.MessageID = res.MessageID
 		t.UpdatedAt = time.Now()
+		info = cloneTask(*t)
 	}
 	p.b.taskMu.Unlock()
+	p.b.persistTask(ctx, info)
+	p.b.recordPublisher(ctx, PublisherRecord{ID: id, Operation: "submit_task", Subject: name, Queue: queue, MessageID: res.MessageID, TaskID: id, Status: "queued", CreatedAt: now, UpdatedAt: time.Now()})
 	if p.b.cfg.Hooks.OnTaskQueued != nil {
 		ti, _ := taskHandle{b: p.b, id: id}.Info(ctx)
 		p.b.cfg.Hooks.OnTaskQueued(ctx, TaskEvent{Task: ti, Time: time.Now()})
@@ -262,6 +279,7 @@ func (b *Broker) startTask(ctx context.Context, id string) {
 	}
 	b.taskMu.Unlock()
 	if t != nil {
+		b.persistTask(ctx, ti)
 		b.notify.Publish(Notification{Type: "task.started", Source: b.cfg.Name, Severity: SeverityInfo, MessageID: ti.MessageID, TaskID: ti.ID, Queue: ti.Queue, TenantID: ti.TenantID, Timestamp: time.Now(), Data: map[string]any{"name": ti.Name}})
 		if b.cfg.Hooks.OnTaskStarted != nil {
 			b.cfg.Hooks.OnTaskStarted(ctx, TaskEvent{Task: ti, Time: time.Now()})
@@ -282,6 +300,7 @@ func (b *Broker) updateTaskProgress(ctx context.Context, id string, p Progress) 
 	}
 	b.taskMu.Unlock()
 	if t != nil {
+		b.persistTask(ctx, ti)
 		b.notify.Publish(Notification{Type: "task.progress", Source: b.cfg.Name, Severity: SeverityInfo, MessageID: ti.MessageID, TaskID: ti.ID, Queue: ti.Queue, TenantID: ti.TenantID, Timestamp: time.Now(), Data: map[string]any{"name": ti.Name, "percent": p.Percent, "message": p.Message}})
 		if b.cfg.Hooks.OnTaskProgress != nil {
 			b.cfg.Hooks.OnTaskProgress(ctx, TaskEvent{Task: ti, Time: time.Now()})
@@ -302,6 +321,9 @@ func (b *Broker) retryTask(ctx context.Context, id string, err error) {
 		ti = cloneTask(*t)
 	}
 	b.taskMu.Unlock()
+	if t != nil {
+		b.persistTask(ctx, ti)
+	}
 	if t != nil && b.cfg.Hooks.OnTaskRetrying != nil {
 		b.cfg.Hooks.OnTaskRetrying(ctx, TaskEvent{Task: ti, Error: err, Time: time.Now()})
 	}
@@ -319,6 +341,7 @@ func (b *Broker) failTask(ctx context.Context, id string, err error) {
 	t.FinishedAt = time.Now()
 	ti := cloneTask(*t)
 	b.taskMu.Unlock()
+	b.persistTask(ctx, ti)
 	b.notify.Publish(Notification{Type: "task.failed", Source: b.cfg.Name, Severity: SeverityError, MessageID: ti.MessageID, TaskID: ti.ID, Queue: ti.Queue, TenantID: ti.TenantID, Timestamp: time.Now(), Data: map[string]any{"name": ti.Name, "error": err.Error()}})
 	if b.cfg.Hooks.OnTaskFailed != nil {
 		b.cfg.Hooks.OnTaskFailed(ctx, TaskEvent{Task: ti, Error: err, Time: time.Now()})
@@ -355,6 +378,9 @@ func (b *Broker) completeTask(ctx context.Context, m Message, result []byte, err
 		ti = cloneTask(*t)
 	}
 	b.taskMu.Unlock()
+	if t != nil {
+		b.persistTask(ctx, ti)
+	}
 	if t != nil && !alreadySucceeded {
 		b.notify.Publish(Notification{Type: "task.succeeded", Source: b.cfg.Name, Severity: SeverityInfo, MessageID: ti.MessageID, TaskID: ti.ID, Queue: ti.Queue, TenantID: ti.TenantID, Timestamp: time.Now(), Data: map[string]any{"name": ti.Name}})
 		if b.cfg.Hooks.OnTaskSucceeded != nil {
@@ -389,4 +415,10 @@ func cloneTask(t TaskInfo) TaskInfo {
 	t.Metadata = cloneMap(t.Metadata)
 	t.Result = append([]byte(nil), t.Result...)
 	return t
+}
+
+func (b *Broker) persistTask(ctx context.Context, t TaskInfo) {
+	if b != nil && b.stateStore != nil && t.ID != "" {
+		_ = b.stateStore.PutTask(ctx, t)
+	}
 }
