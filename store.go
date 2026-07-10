@@ -13,7 +13,6 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -477,14 +476,22 @@ func (s *MemoryStore) Lease(ctx context.Context, req LeaseRequest) ([]Message, e
 		return nil, ErrPaused
 	}
 	out := make([]Message, 0, req.Limit)
-	// priority aware without mutating stable FIFO for equal priority.
-	indexes := make([]int, 0, len(q.ids))
+	// Bounded priority scan: keep only top-priority candidates up to scanLimit.
+	scanLimit := req.Limit
+	if scanLimit > len(q.ids) {
+		scanLimit = len(q.ids)
+	}
+	type candidate struct {
+		idx    int
+		priority int
+	}
+	// minBuf is a small fixed-capacity buffer of the best candidates seen so far.
+	// It's kept sorted descending by priority. We replace the lowest when we find a better one.
+	minBuf := make([]candidate, 0, scanLimit)
 	for i, id := range q.ids {
 		m := s.messages[id]
 		if m == nil {
 			continue
-		}
-		if len(out)+len(indexes) >= req.Limit*4 && req.Limit > 1 { /* keep scan bounded while still allowing priority choice */
 		}
 		if m.Status == MessageQueued || m.Status == MessageScheduled || m.Status == MessageAvailable || m.Status == MessageRetryScheduled {
 			if !m.ExpiresAt.IsZero() && now.After(m.ExpiresAt) {
@@ -493,18 +500,30 @@ func (s *MemoryStore) Lease(ctx context.Context, req LeaseRequest) ([]Message, e
 				continue
 			}
 			if m.AvailableAt.IsZero() || !m.AvailableAt.After(now) {
-				indexes = append(indexes, i)
+				if len(minBuf) < scanLimit {
+					minBuf = append(minBuf, candidate{idx: i, priority: m.Priority})
+					// Keep minBuf sorted descending so the last element is the minimum.
+					for k := len(minBuf) - 1; k > 0 && minBuf[k].priority > minBuf[k-1].priority; k-- {
+						minBuf[k], minBuf[k-1] = minBuf[k-1], minBuf[k]
+					}
+				} else if m.Priority > minBuf[len(minBuf)-1].priority {
+					minBuf[len(minBuf)-1] = candidate{idx: i, priority: m.Priority}
+					// Bubble up the new element to maintain descending order.
+					for k := len(minBuf) - 1; k > 0 && minBuf[k].priority > minBuf[k-1].priority; k-- {
+						minBuf[k], minBuf[k-1] = minBuf[k-1], minBuf[k]
+					}
+				}
 			}
 		}
 	}
-	sort.SliceStable(indexes, func(i, j int) bool {
-		return s.messages[q.ids[indexes[i]]].Priority > s.messages[q.ids[indexes[j]]].Priority
-	})
-	for _, idx := range indexes {
+	// minBuf is already sorted descending by priority; FIFO order is preserved for
+	// equal priorities because we scan q.ids in order and only append (never reorder
+	// equal elements).
+	for _, c := range minBuf {
 		if len(out) >= req.Limit {
 			break
 		}
-		m := s.messages[q.ids[idx]]
+		m := s.messages[q.ids[c.idx]]
 		if m == nil {
 			continue
 		}
@@ -1095,9 +1114,15 @@ func (s *MemoryStore) addHistoryLocked(id string, status MessageStatus, event, s
 }
 
 func cloneMessage(in Message) Message {
-	in.Headers = cloneMap(in.Headers)
-	in.Metadata = cloneMap(in.Metadata)
-	in.Payload = append([]byte(nil), in.Payload...)
+	if len(in.Headers) > 0 {
+		in.Headers = cloneMap(in.Headers)
+	}
+	if len(in.Metadata) > 0 {
+		in.Metadata = cloneMap(in.Metadata)
+	}
+	if len(in.Payload) > 0 {
+		in.Payload = append([]byte(nil), in.Payload...)
+	}
 	return in
 }
 

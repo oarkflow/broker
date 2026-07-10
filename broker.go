@@ -38,6 +38,7 @@ type Broker struct {
 	groupRebalancer *GroupRebalancer
 	sagaEngine      *SagaEngine
 	wg              sync.WaitGroup
+	startedAt       time.Time
 }
 
 func New(cfg Config) (*Broker, error) {
@@ -119,6 +120,7 @@ func MustNew(cfg Config) *Broker {
 }
 
 func (b *Broker) Start(ctx context.Context) error {
+	b.startedAt = time.Now()
 	b.setState(ctx, BrokerStarting, nil)
 	if b.ownPool {
 		if err := b.pool.Start(); err != nil {
