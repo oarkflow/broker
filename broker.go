@@ -148,29 +148,40 @@ func (b *Broker) Stop(ctx context.Context) error {
 	for _, s := range subs {
 		s.Stop()
 	}
+	// Use drain timeout to prevent infinite hang on stuck handlers.
+	drainTimeout := b.cfg.DrainTimeout
+	if drainTimeout <= 0 {
+		drainTimeout = 15 * time.Second
+	}
+	drainCtx, drainCancel := context.WithTimeout(context.Background(), drainTimeout)
+	defer drainCancel()
 	done := make(chan struct{})
 	go func() { b.wg.Wait(); close(done) }()
 	select {
 	case <-done:
+	case <-drainCtx.Done():
+		// Drain timeout exceeded; force shutdown.
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+	// Always close all resources regardless of individual errors.
+	var firstErr error
 	if b.ownPool {
-		if err := b.pool.Shutdown(ctx); err != nil {
-			return err
+		if err := b.pool.Shutdown(ctx); err != nil && firstErr == nil {
+			firstErr = err
 		}
 	}
-	if err := b.store.Close(); err != nil {
-		return err
+	if err := b.store.Close(); err != nil && firstErr == nil {
+		firstErr = err
 	}
 	if b.stateStore != nil {
-		if err := b.stateStore.Close(); err != nil {
-			return err
+		if err := b.stateStore.Close(); err != nil && firstErr == nil {
+			firstErr = err
 		}
 	}
 	b.notify.Close()
 	b.setState(ctx, BrokerStopped, nil)
-	return nil
+	return firstErr
 }
 
 func (b *Broker) Pause(ctx context.Context) error {
@@ -277,10 +288,19 @@ func (b *Broker) leaseSweeper() {
 	defer b.wg.Done()
 	t := time.NewTicker(b.cfg.LeaseSweepInterval)
 	defer t.Stop()
+	// Run cleanup every 60 seconds to prevent memory leaks.
+	cleanupTicker := time.NewTicker(60 * time.Second)
+	defer cleanupTicker.Stop()
 	for {
 		select {
 		case <-t.C:
 			_, _ = b.store.SweepLeases(b.ctx, time.Now())
+		case <-cleanupTicker.C:
+			if ms, ok := b.store.(*FileWALStore); ok {
+				ms.MemoryStore.Cleanup(100)
+			} else if ms, ok := b.store.(*MemoryStore); ok {
+				ms.Cleanup(100)
+			}
 		case <-b.ctx.Done():
 			return
 		}

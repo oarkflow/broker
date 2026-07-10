@@ -3,6 +3,7 @@ package broker
 import (
 	"context"
 	"fmt"
+	"math/rand"
 	"runtime/debug"
 	"strings"
 	"sync/atomic"
@@ -528,6 +529,10 @@ func backoffDelay(p RetryPolicy, attempt int) time.Duration {
 			d = p.Max
 			break
 		}
+	}
+	// Apply full jitter [0, d) to prevent thundering herd.
+	if p.Jitter && d > 0 {
+		d = time.Duration(rand.Int63n(int64(d)))
 	}
 	return d
 }

@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"math/rand"
 	"os"
@@ -989,6 +990,35 @@ func (s *MemoryStore) SweepLeases(ctx context.Context, now time.Time) (int, erro
 
 func (s *MemoryStore) Close() error { s.mu.Lock(); s.closed = true; s.mu.Unlock(); return nil }
 
+// Cleanup removes expired dedup entries, stale idempotency keys, and truncates
+// history slices to prevent unbounded memory growth. Should be called periodically.
+func (s *MemoryStore) Cleanup(maxHistoryPerMessage int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now()
+	// Purge expired dedup entries.
+	for k, until := range s.dedup {
+		if now.After(until) {
+			delete(s.dedup, k)
+		}
+	}
+	// Purge idempotency keys for messages that no longer exist.
+	for k, msgID := range s.idemp {
+		if _, ok := s.messages[msgID]; !ok {
+			delete(s.idemp, k)
+		}
+	}
+	// Truncate history slices to prevent unbounded growth.
+	if maxHistoryPerMessage <= 0 {
+		maxHistoryPerMessage = 100
+	}
+	for id, hist := range s.history {
+		if len(hist) > maxHistoryPerMessage {
+			s.history[id] = hist[len(hist)-maxHistoryPerMessage:]
+		}
+	}
+}
+
 func (s *MemoryStore) listIDsLocked(ids []string, limit int, dlqOnly bool) []Message {
 	if limit <= 0 || limit > len(ids) {
 		limit = len(ids)
@@ -1176,10 +1206,14 @@ func (s *FileWALStore) recover() error {
 	defer f.Close()
 	r := bufio.NewReaderSize(f, 1<<20)
 	var offset int64
+	var recoveryErrors []error
 	for {
 		line, readErr := r.ReadBytes('\n')
 		if len(line) == 0 && errors.Is(readErr, io.EOF) {
 			s.normalizeRecoveredInflight()
+			if len(recoveryErrors) > 0 {
+				return fmt.Errorf("WAL recovery completed with %d errors: %w", len(recoveryErrors), errors.Join(recoveryErrors...))
+			}
 			return nil
 		}
 		trimmed := bytes.TrimSpace(line)
@@ -1191,7 +1225,10 @@ func (s *FileWALStore) recover() error {
 					s.normalizeRecoveredInflight()
 					return nil
 				}
-				return err
+				// Skip corrupted record but continue recovery.
+				recoveryErrors = append(recoveryErrors, fmt.Errorf("corrupted WAL record at offset %d: %w", offset, err))
+				offset += int64(len(line))
+				continue
 			}
 			if err := verifyWALRecord(rec); err != nil {
 				if errors.Is(readErr, io.EOF) {
@@ -1199,13 +1236,22 @@ func (s *FileWALStore) recover() error {
 					s.normalizeRecoveredInflight()
 					return nil
 				}
-				return err
+				// Skip invalid record but continue recovery.
+				recoveryErrors = append(recoveryErrors, fmt.Errorf("invalid WAL record at offset %d: %w", offset, err))
+				offset += int64(len(line))
+				continue
 			}
-			s.applyRecovered(rec)
+			if err := s.applyRecovered(rec); err != nil {
+				// Log but continue recovery; non-fatal errors (e.g., queue not found) are expected.
+				recoveryErrors = append(recoveryErrors, fmt.Errorf("replay %s at offset %d: %w", rec.Op, offset, err))
+			}
 		}
 		offset += int64(len(line))
 		if errors.Is(readErr, io.EOF) {
 			s.normalizeRecoveredInflight()
+			if len(recoveryErrors) > 0 {
+				return fmt.Errorf("WAL recovery completed with %d errors: %w", len(recoveryErrors), errors.Join(recoveryErrors...))
+			}
 			return nil
 		}
 		if readErr != nil {
@@ -1229,38 +1275,43 @@ func (s *FileWALStore) normalizeRecoveredInflight() {
 	}
 }
 
-func (s *FileWALStore) applyRecovered(r walRecord) {
+func (s *FileWALStore) applyRecovered(r walRecord) error {
 	ctx := context.Background()
 	switch r.Op {
 	case "declare_queue":
-		_ = s.MemoryStore.DeclareQueue(ctx, r.Queue)
+		return s.MemoryStore.DeclareQueue(ctx, r.Queue)
 	case "declare_topic":
-		_ = s.MemoryStore.DeclareTopic(ctx, r.Topic)
+		return s.MemoryStore.DeclareTopic(ctx, r.Topic)
 	case "declare_stream":
-		_ = s.MemoryStore.DeclareStream(ctx, r.Stream)
+		return s.MemoryStore.DeclareStream(ctx, r.Stream)
 	case "append":
-		_, _ = s.MemoryStore.Append(ctx, r.Message, r.Dests)
+		_, err := s.MemoryStore.Append(ctx, r.Message, r.Dests)
+		return err
 	case "append_atomic":
-		_, _ = s.MemoryStore.AppendAtomic(ctx, r.Entries)
+		_, err := s.MemoryStore.AppendAtomic(ctx, r.Entries)
+		return err
 	case "lease":
-		_ = s.MemoryStore.Update(ctx, r.Message)
+		return s.MemoryStore.Update(ctx, r.Message)
 	case "ack":
-		_ = s.MemoryStore.Ack(ctx, r.Ack)
+		return s.MemoryStore.Ack(ctx, r.Ack)
 	case "nack":
-		_ = s.MemoryStore.Nack(ctx, r.Nack)
+		return s.MemoryStore.Nack(ctx, r.Nack)
 	case "move":
-		_, _ = s.MemoryStore.Move(ctx, r.Move)
+		_, err := s.MemoryStore.Move(ctx, r.Move)
+		return err
 	case "pause_queue":
-		_ = s.MemoryStore.PauseQueue(ctx, r.QueueName)
+		return s.MemoryStore.PauseQueue(ctx, r.QueueName)
 	case "resume_queue":
-		_ = s.MemoryStore.ResumeQueue(ctx, r.QueueName)
+		return s.MemoryStore.ResumeQueue(ctx, r.QueueName)
 	case "purge_queue":
-		_, _ = s.MemoryStore.PurgeQueue(ctx, r.QueueName)
+		_, err := s.MemoryStore.PurgeQueue(ctx, r.QueueName)
+		return err
 	case "update":
-		_ = s.MemoryStore.Update(ctx, r.Message)
+		return s.MemoryStore.Update(ctx, r.Message)
 	case "commit_offset":
-		_ = s.MemoryStore.CommitOffset(ctx, r.Offset)
+		return s.MemoryStore.CommitOffset(ctx, r.Offset)
 	}
+	return nil
 }
 
 func (s *FileWALStore) write(r walRecord) error {
@@ -1371,14 +1422,14 @@ func (s *FileWALStore) Nack(ctx context.Context, req NackRequest) error {
 	return s.MemoryStore.Nack(ctx, req)
 }
 func (s *FileWALStore) ExtendLease(ctx context.Context, req LeaseRequest) error {
-	if err := s.MemoryStore.ExtendLease(ctx, req); err != nil {
-		return err
-	}
 	m, ok, _ := s.MemoryStore.Get(ctx, req.MessageID)
 	if !ok {
 		return ErrMessageNotFound
 	}
-	return s.write(walRecord{Op: "lease", Message: m, Lease: req})
+	if err := s.write(walRecord{Op: "lease", Message: m, Lease: req}); err != nil {
+		return err
+	}
+	return s.MemoryStore.ExtendLease(ctx, req)
 }
 
 func (s *FileWALStore) Update(ctx context.Context, msg Message) error {
@@ -1394,25 +1445,24 @@ func (s *FileWALStore) Move(ctx context.Context, req MoveRequest) (MoveResult, e
 	return s.MemoryStore.Move(ctx, req)
 }
 func (s *FileWALStore) PauseQueue(ctx context.Context, name string) error {
-	if err := s.MemoryStore.PauseQueue(ctx, name); err != nil {
+	if err := s.write(walRecord{Op: "pause_queue", QueueName: name}); err != nil {
 		return err
 	}
-	return s.write(walRecord{Op: "pause_queue", QueueName: name})
+	return s.MemoryStore.PauseQueue(ctx, name)
 }
 
 func (s *FileWALStore) ResumeQueue(ctx context.Context, name string) error {
-	if err := s.MemoryStore.ResumeQueue(ctx, name); err != nil {
+	if err := s.write(walRecord{Op: "resume_queue", QueueName: name}); err != nil {
 		return err
 	}
-	return s.write(walRecord{Op: "resume_queue", QueueName: name})
+	return s.MemoryStore.ResumeQueue(ctx, name)
 }
 
 func (s *FileWALStore) PurgeQueue(ctx context.Context, name string) (int, error) {
-	n, err := s.MemoryStore.PurgeQueue(ctx, name)
-	if err != nil {
-		return n, err
+	if err := s.write(walRecord{Op: "purge_queue", QueueName: name}); err != nil {
+		return 0, err
 	}
-	return n, s.write(walRecord{Op: "purge_queue", QueueName: name})
+	return s.MemoryStore.PurgeQueue(ctx, name)
 }
 
 func (s *FileWALStore) CommitOffset(ctx context.Context, commit OffsetCommit) error {
@@ -1427,6 +1477,8 @@ func (s *FileWALStore) Close() error {
 	defer s.mu.Unlock()
 	_ = s.MemoryStore.Close()
 	if s.file != nil {
+		// Sync before close to ensure all buffered writes are flushed to disk.
+		_ = s.file.Sync()
 		return s.file.Close()
 	}
 	return nil

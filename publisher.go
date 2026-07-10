@@ -19,7 +19,15 @@ func (p *Publisher) PublishAsync(ctx context.Context, topic string, payload any,
 	f := newFutureResult[PublishResult](p.b.nextID("pubf"))
 	cctx, cancel := context.WithCancel(ctx)
 	f.cancel = cancel
-	go func() { r, err := p.publish(cctx, topic, payload, opts...); f.complete(r, err) }()
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				f.complete(PublishResult{}, fmt.Errorf("publish panic: %v", r))
+			}
+		}()
+		r, err := p.publish(cctx, topic, payload, opts...)
+		f.complete(r, err)
+	}()
 	return f
 }
 func (p *Publisher) PublishBatch(ctx context.Context, topic string, payloads []any, opts ...PublishOption) (BatchPublishResult, error) {
@@ -42,7 +50,15 @@ func (p *Publisher) PublishBatchAsync(ctx context.Context, topic string, payload
 	f := newFutureResult[BatchPublishResult](p.b.nextID("batchf"))
 	cctx, cancel := context.WithCancel(ctx)
 	f.cancel = cancel
-	go func() { r, err := p.PublishBatch(cctx, topic, payloads, opts...); f.complete(r, err) }()
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				f.complete(BatchPublishResult{}, fmt.Errorf("batch publish panic: %v", r))
+			}
+		}()
+		r, err := p.PublishBatch(cctx, topic, payloads, opts...)
+		f.complete(r, err)
+	}()
 	return f
 }
 
@@ -340,7 +356,12 @@ func (b *Broker) completeResponse(resp Response) bool {
 		b.waitMu.Lock()
 		if b.waiters[resp.CorrelationID] == ch {
 			delete(b.waiters, resp.CorrelationID)
-			close(ch)
+			// Use recover to safely handle double-close if another goroutine
+			// already closed the channel between the check and this close.
+			func() {
+				defer func() { recover() }()
+				close(ch)
+			}()
 		}
 		b.waitMu.Unlock()
 	}
