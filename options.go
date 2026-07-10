@@ -30,6 +30,7 @@ type PublishOptions struct {
 	RequireDestination  bool
 	MaxAttempts         int
 	RetryPolicy         RetryPolicy
+	Strategy            StrategyType
 }
 
 type PublishOption func(*PublishOptions)
@@ -98,6 +99,9 @@ func WithRequireDestination(v bool) PublishOption {
 func WithMaxAttempts(v int) PublishOption { return func(o *PublishOptions) { o.MaxAttempts = v } }
 func WithRetryPolicy(v RetryPolicy) PublishOption {
 	return func(o *PublishOptions) { o.RetryPolicy = v }
+}
+func WithStrategy(v StrategyType) PublishOption {
+	return func(o *PublishOptions) { o.Strategy = v }
 }
 
 type RequestOptions struct {

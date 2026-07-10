@@ -194,6 +194,7 @@ type Subscription struct {
 	stopped      chan struct{}
 	paused       atomic.Bool
 	inFlight     atomic.Int64
+	strategy     ConsumerStrategy
 }
 
 func (s *Subscription) ID() string { return s.id }
@@ -271,7 +272,15 @@ func (b *Broker) subscribe(ctx context.Context, cfg ConsumerConfig, handler Hand
 		return nil, err
 	}
 	cctx, cancel := context.WithCancel(b.ctx)
-	s := &Subscription{id: b.nextID("sub"), b: b, cfg: cfg, handler: handler, batchHandler: batchHandler, ctx: cctx, cancel: cancel, stopped: make(chan struct{})}
+	var strategy ConsumerStrategy
+	if cfg.Strategy != "" {
+		if cfg.StrategyConfig != nil {
+			strategy = NewStrategy(*cfg.StrategyConfig)
+		} else {
+			strategy = NewStrategy(StrategyConfig{Type: cfg.Strategy})
+		}
+	}
+	s := &Subscription{id: b.nextID("sub"), b: b, cfg: cfg, handler: handler, batchHandler: batchHandler, ctx: cctx, cancel: cancel, stopped: make(chan struct{}), strategy: strategy}
 	b.subsMu.Lock()
 	b.subs[s.id] = s
 	b.subsMu.Unlock()
@@ -314,6 +323,12 @@ func (s *Subscription) loop() {
 			msgs, err := s.b.store.Lease(s.ctx, LeaseRequest{Queue: s.cfg.Queue, ConsumerID: s.cfg.Name, ConsumerGroup: s.cfg.Group, Limit: n, VisibilityTimeout: s.cfg.VisibilityTimeout})
 			if err != nil || len(msgs) == 0 {
 				continue
+			}
+			if s.strategy != nil && len(msgs) > 0 {
+				msgs = s.filterByStrategy(msgs)
+				if len(msgs) == 0 {
+					continue
+				}
 			}
 			if s.batchHandler != nil {
 				batch := append([]Message(nil), msgs...)
@@ -527,4 +542,59 @@ func firstPositive(v ...int) int {
 func sanitize(s string) string {
 	s = strings.NewReplacer("#", "all", "*", "star", "/", "_", " ", "_", ":", "_").Replace(s)
 	return s
+}
+
+func (s *Subscription) buildCandidate() ConsumerCandidate {
+	return ConsumerCandidate{
+		ConsumerID:  s.cfg.Name,
+		Group:       s.cfg.Group,
+		Weight:      1,
+		MaxInFlight: s.cfg.MaxInFlight,
+		InFlight:    int(s.inFlight.Load()),
+		Healthy:     true,
+	}
+}
+
+func (s *Subscription) filterByStrategy(msgs []Message) []Message {
+	if s.strategy == nil || len(msgs) == 0 {
+		return msgs
+	}
+	candidates := s.b.QueueCandidates(s.cfg.Queue, s.cfg.Group)
+	if len(candidates) <= 1 {
+		return msgs
+	}
+	filtered := make([]Message, 0, len(msgs))
+	for _, msg := range msgs {
+		result, err := s.strategy.Select(s.ctx, msg, candidates)
+		if err != nil || len(result) == 0 {
+			filtered = append(filtered, msg)
+			continue
+		}
+		for _, c := range result {
+			if c.ConsumerID == s.cfg.Name {
+				filtered = append(filtered, msg)
+				break
+			}
+		}
+	}
+	return filtered
+}
+
+func (b *Broker) QueueCandidates(queue, group string) []ConsumerCandidate {
+	b.subsMu.RLock()
+	defer b.subsMu.RUnlock()
+	candidates := make([]ConsumerCandidate, 0, 4)
+	for _, sub := range b.subs {
+		if sub.cfg.Queue == queue && sub.cfg.Group == group {
+			candidates = append(candidates, sub.buildCandidate())
+		}
+	}
+	if len(candidates) == 0 {
+		for _, sub := range b.subs {
+			if sub.cfg.Queue == queue {
+				candidates = append(candidates, sub.buildCandidate())
+			}
+		}
+	}
+	return candidates
 }

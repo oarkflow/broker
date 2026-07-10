@@ -251,6 +251,7 @@ type QueueConfig struct {
 	DLQ               string             `json:"dlq"`
 	Ordering          OrderMode          `json:"ordering"`
 	Backpressure      BackpressurePolicy `json:"backpressure"`
+	Strategy          StrategyType       `json:"strategy,omitempty"`
 }
 
 type TopicConfig struct {
@@ -285,6 +286,8 @@ type ConsumerConfig struct {
 	OrderBy           OrderMode     `json:"order_by"`
 	Timeout           time.Duration `json:"timeout"`
 	HeartbeatInterval time.Duration `json:"heartbeat_interval"`
+	Strategy          StrategyType  `json:"strategy,omitempty"`
+	StrategyConfig    *StrategyConfig `json:"-"`
 }
 
 type Config struct {

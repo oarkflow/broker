@@ -154,10 +154,14 @@ func declareConfiguredResources(ctx context.Context, b *broker.Broker, bc *excon
 			Backpressure:      broker.BackpressurePolicy(q.String("backpressure", string(broker.BackpressureReject))),
 			RetryPolicy:       broker.RetryPolicy{MaxAttempts: q.Int("max_attempts", 3), Initial: 100 * time.Millisecond, Max: 5 * time.Second, Factor: 2, Jitter: true},
 		}
+		// Parse strategy from BCL config if present.
+		if st := q.String("strategy", ""); st != "" {
+			cfg.Strategy = broker.StrategyType(st)
+		}
 		if err := b.DeclareQueue(ctx, cfg); err != nil {
 			logger.Log.Fatal("declare queue", zlog.String("name", q.Name), zlog.Err(err))
 		}
-		logger.Log.Info("configured queue", zlog.String("name", cfg.Name), zlog.String("dlq", cfg.DLQ))
+		logger.Log.Info("configured queue", zlog.String("name", cfg.Name), zlog.String("dlq", cfg.DLQ), zlog.String("strategy", string(cfg.Strategy)))
 	}
 	for _, t := range bc.Blocks("topic") {
 		if err := b.DeclareTopic(ctx, broker.TopicConfig{Name: t.Name, Partitions: t.Int("partitions", 1), Retention: t.Duration("retention", 24*time.Hour)}); err != nil {
@@ -179,8 +183,25 @@ func declareConfiguredResources(ctx context.Context, b *broker.Broker, bc *excon
 		if cto := r.Strings("copy_to"); len(cto) >= 2 {
 			route.CopyTo = append(route.CopyTo, destination(cto[0], cto[1]))
 		}
+		// Strategy-aware route: if BCL has strategy field, configure route strategy.
+		if st := r.String("strategy", ""); st != "" {
+			route.Strategy = broker.StrategyType(st)
+			route.Mode = broker.RouteMode(st)
+		}
+		if fb := r.String("fallback", ""); fb != "" {
+			route.Fallback = broker.StrategyType(fb)
+		}
+		if hk := r.String("hash_key", ""); hk != "" {
+			route.HashKey = hk
+		}
+		if sk := r.String("sticky_key", ""); sk != "" {
+			route.StickyKey = sk
+		}
+		if pm := r.Int("priority_min", 0); pm > 0 {
+			route.PriorityMin = pm
+		}
 		b.AddRoute(route)
-		logger.Log.Info("configured route", zlog.String("name", route.Name), zlog.String("match", route.Match), zlog.Any("to", route.To), zlog.Any("copy_to", route.CopyTo))
+		logger.Log.Info("configured route", zlog.String("name", route.Name), zlog.String("match", route.Match), zlog.String("strategy", string(route.Strategy)), zlog.Any("to", route.To), zlog.Any("copy_to", route.CopyTo))
 	}
 }
 

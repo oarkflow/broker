@@ -150,6 +150,12 @@ func (p *Publisher) preparePublish(ctx context.Context, topic string, payload an
 	if msg.MaxAttempts <= 0 {
 		msg.MaxAttempts = p.b.cfg.DefaultRetry.MaxAttempts
 	}
+	if o.Strategy != "" {
+		if msg.Headers == nil {
+			msg.Headers = map[string]string{}
+		}
+		msg.Headers["x-routing-strategy"] = string(o.Strategy)
+	}
 	if p.b.cfg.SchemaRegistry != nil {
 		if err := p.b.cfg.SchemaRegistry.Validate(ctx, msg); err != nil {
 			return preparedPublish{}, err
@@ -172,9 +178,15 @@ func (p *Publisher) preparePublish(ctx context.Context, topic string, payload an
 	if o.Stream != "" {
 		dests = append(dests, Destination{Kind: DestinationStream, Name: o.Stream})
 	}
-	rd, routes := p.b.router.Route(ctx, msg)
-	_ = routes
-	dests = append(dests, rd...)
+	if o.Strategy != "" {
+		routed, routes := p.b.router.Route(ctx, msg)
+		_ = routes
+		dests = append(dests, routed...)
+	} else {
+		rd, routes := p.b.router.Route(ctx, msg)
+		_ = routes
+		dests = append(dests, rd...)
+	}
 	if len(dests) == 0 && topic != "" {
 		dests = append(dests, Destination{Kind: DestinationTopic, Name: topic})
 	}

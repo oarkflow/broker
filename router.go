@@ -9,15 +9,24 @@ import (
 type RouteMode string
 
 const (
-	RouteDirect         RouteMode = "direct"
-	RouteTopic          RouteMode = "topic"
-	RouteFanout         RouteMode = "fanout"
-	RouteHeaders        RouteMode = "headers"
-	RouteRules          RouteMode = "rules"
-	RouteConsistentHash RouteMode = "consistent_hash"
-	RoutePriority       RouteMode = "priority"
-	RouteDelay          RouteMode = "delay"
-	RouteStream         RouteMode = "stream"
+	RouteDirect          RouteMode = "direct"
+	RouteTopic           RouteMode = "topic"
+	RouteFanout          RouteMode = "fanout"
+	RouteHeaders         RouteMode = "headers"
+	RouteRules           RouteMode = "rules"
+	RouteConsistentHash  RouteMode = "consistent_hash"
+	RoutePriority        RouteMode = "priority"
+	RouteDelay           RouteMode = "delay"
+	RouteStream          RouteMode = "stream"
+	RouteRoundRobin      RouteMode = "round_robin"
+	RouteWeighted        RouteMode = "weighted_round_robin"
+	RouteLeastLoaded     RouteMode = "least_loaded"
+	RouteRandom          RouteMode = "random"
+	RouteCapabilityBased RouteMode = "capability_based"
+	RouteAdaptive        RouteMode = "adaptive_load_balance"
+	RouteSticky          RouteMode = "sticky_session"
+	RouteP2C             RouteMode = "power_of_two_choices"
+	RouteSharded         RouteMode = "sharded"
 )
 
 type Route struct {
@@ -30,20 +39,36 @@ type Route struct {
 	To          []Destination     `json:"to,omitempty"`
 	CopyTo      []Destination     `json:"copy_to,omitempty"`
 	Enabled     bool              `json:"enabled"`
-	// Disabled lets callers keep a route present in config/admin output while
-	// making it inactive. Enabled defaults to true for backward-compatible zero
-	// value route declarations; set Disabled when an explicit off switch is
-	// required.
-	Disabled  bool               `json:"disabled,omitempty"`
-	Condition func(Message) bool `json:"-"`
+	Disabled    bool              `json:"disabled,omitempty"`
+	Condition   func(Message) bool `json:"-"`
+
+	// Strategy-based routing fields
+	Strategy       StrategyType     `json:"strategy,omitempty"`
+	Fallback       StrategyType     `json:"fallback,omitempty"`
+	Weight         int              `json:"weight,omitempty"`
+	HashKey        string           `json:"hash_key,omitempty"`
+	StickyKey      string           `json:"sticky_key,omitempty"`
+	Capabilities   []string         `json:"capabilities,omitempty"`
+	PriorityThreshold int            `json:"priority_threshold,omitempty"`
+	Rules          []RoutingRule    `json:"rules,omitempty"`
+	StrategyConfig *StrategyConfig  `json:"-"`
 }
 
 type Router struct {
-	mu     sync.RWMutex
-	routes []Route
+	mu          sync.RWMutex
+	routes      []Route
+	taskRouter  *TaskRouter
+	configLoader *RoutingConfigLoader
 }
 
-func NewRouter() *Router { return &Router{} }
+func NewRouter() *Router {
+	loader := NewRoutingConfigLoader()
+	return &Router{
+		configLoader: loader,
+		taskRouter:   NewTaskRouter(loader),
+	}
+}
+
 func (r *Router) Add(route Route) {
 	if route.Mode == "" {
 		route.Mode = RouteTopic
@@ -51,21 +76,28 @@ func (r *Router) Add(route Route) {
 	if route.Disabled {
 		route.Enabled = false
 	} else if route.Enabled == false {
-		// Preserve the original ergonomic zero-value behavior: a route literal with
-		// no Enabled field is active. Use Disabled:true for an explicit inactive
-		// route.
 		route.Enabled = true
+	}
+	if route.Strategy == "" {
+		route.Strategy = routeModeToStrategy(route.Mode)
 	}
 	r.mu.Lock()
 	r.routes = append(r.routes, route)
 	r.mu.Unlock()
 }
+
 func (r *Router) Routes() []Route {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return append([]Route(nil), r.routes...)
 }
-func (r *Router) Clear() { r.mu.Lock(); r.routes = nil; r.mu.Unlock() }
+
+func (r *Router) Clear() {
+	r.mu.Lock()
+	r.routes = nil
+	r.mu.Unlock()
+}
+
 func (r *Router) Route(ctx context.Context, msg Message) ([]Destination, []Route) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -109,6 +141,131 @@ func (r *Router) Route(ctx context.Context, msg Message) ([]Destination, []Route
 		dests = append(dests, route.CopyTo...)
 	}
 	return dedupeDestinations(dests), matched
+}
+
+// RouteWithStrategy selects consumers using the strategy assigned to the matched route.
+func (r *Router) RouteWithStrategy(ctx context.Context, msg Message, candidates []ConsumerCandidate) ([]ConsumerCandidate, []Route, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	subject := msg.RoutingKey
+	if subject == "" {
+		subject = msg.Topic
+	}
+	if subject == "" {
+		subject = msg.Queue
+	}
+	matched := make([]Route, 0, 2)
+	for _, route := range r.routes {
+		if route.Disabled || !route.Enabled {
+			continue
+		}
+		if route.Match != "" && !TopicMatch(route.Match, subject) {
+			continue
+		}
+		if route.TenantID != "" && route.TenantID != msg.TenantID {
+			continue
+		}
+		if route.PriorityMin != 0 && msg.Priority < route.PriorityMin {
+			continue
+		}
+		ok := true
+		for k, v := range route.Headers {
+			if msg.Headers[k] != v {
+				ok = false
+				break
+			}
+		}
+		if !ok {
+			continue
+		}
+		if route.Condition != nil && !route.Condition(msg) {
+			continue
+		}
+		matched = append(matched, route)
+	}
+	if len(matched) == 0 {
+		return candidates, nil, nil
+	}
+	for _, route := range matched {
+		if route.Strategy != "" {
+			strategy := r.buildStrategyForRoute(route)
+			result, err := strategy.Select(ctx, msg, candidates)
+			if err == nil && len(result) > 0 {
+				return result, matched, nil
+			}
+		}
+	}
+	return candidates, matched, nil
+}
+
+// TaskRouter returns the underlying TaskRouter for advanced configuration.
+func (r *Router) TaskRouter() *TaskRouter {
+	return r.taskRouter
+}
+
+// ConfigLoader returns the routing configuration loader.
+func (r *Router) ConfigLoader() *RoutingConfigLoader {
+	return r.configLoader
+}
+
+// AddPlan adds a routing plan to the task router.
+func (r *Router) AddPlan(plan RoutingPlan) {
+	r.taskRouter.RegisterPlan(plan)
+}
+
+// RemovePlan removes a routing plan from the task router.
+func (r *Router) RemovePlan(name string) {
+	r.taskRouter.UnregisterPlan(name)
+}
+
+// LoadRoutingConfig loads a complete routing configuration from bytes.
+func (r *Router) LoadRoutingConfig(data []byte) error {
+	return r.configLoader.LoadFromBytes(data)
+}
+
+func (r *Router) buildStrategyForRoute(route Route) ConsumerStrategy {
+	if route.StrategyConfig != nil {
+		return NewStrategy(*route.StrategyConfig)
+	}
+	cfg := StrategyConfig{
+		Type:              route.Strategy,
+		HashKey:           route.HashKey,
+		StickyKey:         route.StickyKey,
+		PriorityThreshold: route.PriorityThreshold,
+		Capabilities:      route.Capabilities,
+		FallbackStrategy:  route.Fallback,
+		Rules:             route.Rules,
+	}
+	return NewStrategy(cfg)
+}
+
+func routeModeToStrategy(mode RouteMode) StrategyType {
+	switch mode {
+	case RouteRoundRobin:
+		return StrategyRoundRobin
+	case RouteWeighted:
+		return StrategyWeightedRoundRobin
+	case RouteLeastLoaded:
+		return StrategyLeastLoaded
+	case RouteRandom:
+		return StrategyRandom
+	case RouteConsistentHash:
+		return StrategyConsistentHash
+	case RouteCapabilityBased:
+		return StrategyCapabilityBased
+	case RouteAdaptive:
+		return StrategyAdaptiveLoadBalance
+	case RouteSticky:
+		return StrategyStickySession
+	case RouteP2C:
+		return StrategyPowerOfTwoChoices
+	case RouteSharded:
+		return StrategySharded
+	case RouteFanout:
+		return StrategyFanOut
+	default:
+		return StrategyRoundRobin
+	}
 }
 
 func dedupeDestinations(in []Destination) []Destination {

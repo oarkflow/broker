@@ -350,8 +350,34 @@ func (b *Broker) ConsumerOffset(ctx context.Context, commit OffsetCommit) (uint6
 	return b.store.ConsumerOffset(ctx, commit)
 }
 
-func (b *Broker) SagaEngine() *SagaEngine { return b.sagaEngine }
-func (b *Broker) AddRoute(route Route) { b.router.Add(route) }
+func (b *Broker) SagaEngine() *SagaEngine        { return b.sagaEngine }
+func (b *Broker) TaskRouter() *TaskRouter          { return b.router.TaskRouter() }
+func (b *Broker) ConfigLoader() *RoutingConfigLoader { return b.router.ConfigLoader() }
+func (b *Broker) AddRoute(route Route)             { b.router.Add(route) }
+func (b *Broker) AddRoutingPlan(plan RoutingPlan)  { b.router.AddPlan(plan) }
+func (b *Broker) RemoveRoutingPlan(name string)     { b.router.RemovePlan(name) }
+func (b *Broker) LoadRoutingConfig(data []byte) error { return b.router.LoadRoutingConfig(data) }
+
+// SelectConsumers selects consumers for a message using the configured routing strategy.
+func (b *Broker) SelectConsumers(ctx context.Context, msg Message, candidates []ConsumerCandidate) ([]ConsumerCandidate, error) {
+	result, _, err := b.router.RouteWithStrategy(ctx, msg, candidates)
+	return result, err
+}
+
+// DefaultStrategy returns the default routing strategy type.
+func (b *Broker) DefaultStrategy() StrategyType {
+	return b.router.ConfigLoader().GetConfig().DefaultStrategy
+}
+
+// SetDefaultStrategy sets the default routing strategy type.
+func (b *Broker) SetDefaultStrategy(st StrategyType) {
+	loader := b.router.ConfigLoader()
+	cfg := loader.GetConfig()
+	cfg.DefaultStrategy = st
+	_ = loader.LoadFromMap(map[string]any{
+		"default_strategy": string(st),
+	})
+}
 
 func (b *Broker) nextID(prefix string) string {
 	return fmt.Sprintf("%s-%d-%s", prefix, b.seq.Add(1), randomHex(6))

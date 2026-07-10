@@ -13,19 +13,13 @@ broker "complete" {
   remote_consumer_timeout "45s"
 
   # Optional persistent message data-plane store for queues/topics/streams/DLQ/leases.
-  # This is provided by contrib/sqlitestore as a separate Go submodule. Disabled
-  # by default so examples run without requiring a SQLite driver in this module.
-  # When enabled, this takes precedence over wal/wal_format.
   message_store "sqlite" {
     enabled env("BROKER_SQLITE_MESSAGE_ENABLED", "false")
     driver env("BROKER_SQLITE_DRIVER", "sqlite")
     dsn env("BROKER_SQLITE_MESSAGE_DSN", "./.broker-data/broker-messages.sqlite")
   }
 
-
   # Optional persistent control-plane state store for broker/task/consumer/publisher state.
-  # It accepts any database/sql SQLite driver registered by your app. The example is
-  # disabled by default so the repository builds without extra dependencies.
   state_store "sqlite" {
     enabled env("BROKER_SQLITE_STATE_ENABLED", "false")
     driver env("BROKER_SQLITE_DRIVER", "sqlite")
@@ -33,15 +27,12 @@ broker "complete" {
   }
 
   codec "fwb1" {
-    # Native broker frame codec used by binary WAL and /v1/publish/frame + /v1/poll/frame.
     max_frame_size env("BROKER_FRAME_MAX", "128MB")
     compress_threshold env("BROKER_FRAME_COMPRESS_THRESHOLD", "1KB")
     signing_key env("BROKER_FRAME_SIGNING_KEY", "dev-frame-signing-key")
     encryption_key env("BROKER_FRAME_ENCRYPTION_KEY", "")
   }
 
-  # Complete lifecycle/hooks/notification example output.
-  # The broker example writes hook callbacks and notification callbacks here.
   observer_jsonl env("BROKER_OBSERVER_JSONL", "./.broker-data/observability/broker-events.jsonl")
 
   callback "live-jsonl-audit" {
@@ -66,6 +57,10 @@ broker "complete" {
     value env("BROKER_WORKER_TOKEN", "dev-worker-token")
     permissions ["broker:read", "consumer:register", "consumer:read", "consumer:control", "consumer:poll", "message:read", "message:ack", "message:nack", "task:read", "task:write", "dlq:read", "notification"]
   }
+
+  # =========================================================================
+  # Core resources
+  # =========================================================================
 
   topic "email.created" {
     partitions 1
@@ -96,7 +91,6 @@ broker "complete" {
     visibility_timeout "45s"
     max_attempts 3
   }
-
 
   queue "codec.frames" {
     dlq "codec.frames.dlq"
@@ -131,5 +125,142 @@ broker "complete" {
     match "tenant.*.invoice.created"
     to queue "invoice.events"
     copy_to stream "audit.events"
+  }
+
+  # =========================================================================
+  # Routing strategy queues with strategy configuration
+  # =========================================================================
+
+  queue "strategy.roundrobin" {
+    dlq "strategy.roundrobin.dlq"
+    visibility_timeout "10s"
+    max_attempts 3
+    strategy "round_robin"
+  }
+
+  queue "strategy.weighted" {
+    dlq "strategy.weighted.dlq"
+    visibility_timeout "10s"
+    max_attempts 3
+    strategy "weighted_round_robin"
+  }
+
+  queue "strategy.leastloaded" {
+    dlq "strategy.leastloaded.dlq"
+    visibility_timeout "10s"
+    max_attempts 3
+    strategy "least_loaded"
+  }
+
+  queue "strategy.random" {
+    dlq "strategy.random.dlq"
+    visibility_timeout "10s"
+    max_attempts 3
+    strategy "random"
+  }
+
+  queue "strategy.consistenthash" {
+    dlq "strategy.consistenthash.dlq"
+    visibility_timeout "10s"
+    max_attempts 3
+    strategy "consistent_hash"
+  }
+
+  queue "strategy.capability" {
+    dlq "strategy.capability.dlq"
+    visibility_timeout "10s"
+    max_attempts 3
+    strategy "capability_based"
+  }
+
+  queue "strategy.priority" {
+    dlq "strategy.priority.dlq"
+    visibility_timeout "10s"
+    max_attempts 3
+    strategy "priority_aware"
+  }
+
+  queue "strategy.adaptive" {
+    dlq "strategy.adaptive.dlq"
+    visibility_timeout "10s"
+    max_attempts 3
+    strategy "adaptive_load_balance"
+  }
+
+  queue "strategy.sticky" {
+    dlq "strategy.sticky.dlq"
+    visibility_timeout "10s"
+    max_attempts 3
+    strategy "sticky_session"
+  }
+
+  queue "strategy.fanout" {
+    dlq "strategy.fanout.dlq"
+    visibility_timeout "10s"
+    max_attempts 3
+    strategy "fan_out"
+  }
+
+  queue "strategy.p2c" {
+    dlq "strategy.p2c.dlq"
+    visibility_timeout "10s"
+    max_attempts 3
+    strategy "power_of_two_choices"
+  }
+
+  queue "strategy.sharded" {
+    dlq "strategy.sharded.dlq"
+    visibility_timeout "10s"
+    max_attempts 3
+    strategy "sharded"
+  }
+
+  queue "strategy.route.high" {
+    dlq "strategy.route.high.dlq"
+    visibility_timeout "10s"
+    max_attempts 3
+  }
+
+  queue "strategy.route.low" {
+    dlq "strategy.route.low.dlq"
+    visibility_timeout "10s"
+    max_attempts 3
+  }
+
+  queue "strategy.bcl.ml" {
+    dlq "strategy.bcl.ml.dlq"
+    visibility_timeout "10s"
+    max_attempts 3
+  }
+
+  queue "strategy.bcl.text" {
+    dlq "strategy.bcl.text.dlq"
+    visibility_timeout "10s"
+    max_attempts 3
+  }
+
+  # =========================================================================
+  # Strategy routes
+  # =========================================================================
+
+  route "strategy-high-priority" {
+    match "strategy.route.*"
+    to queue "strategy.route.high"
+    priority_min 5
+  }
+
+  route "strategy-low-priority" {
+    match "strategy.route.*"
+    to queue "strategy.route.low"
+  }
+
+  topic "strategy.events" {
+    partitions 1
+    retention "1h"
+  }
+
+  route "strategy-events-fanout" {
+    match "strategy.events.*"
+    to queue "strategy.fanout"
   }
 }
