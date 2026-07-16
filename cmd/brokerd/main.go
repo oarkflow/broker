@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"net/http"
@@ -69,7 +70,17 @@ func main() {
 			logger.Log.Fatal("-wal is required when -store=wal")
 		}
 		if strings.EqualFold(*walFormat, "json") || strings.EqualFold(*walFormat, "jsonl") {
-			st, err := broker.NewFileWALStore(*wal)
+			walCfg := broker.FileWALStoreConfig{Dir: *wal}
+			if *frameEncryptionKey != "" {
+				// Try hex decoding first, fall back to raw bytes
+				keyBytes, err := hex.DecodeString(*frameEncryptionKey)
+				if err != nil {
+					keyBytes = []byte(*frameEncryptionKey)
+				}
+				walCfg.EncryptionKey = keyBytes
+				walCfg.KeyName = "default"
+			}
+			st, err := broker.NewFileWALStoreWithConfig(walCfg)
 			if err != nil {
 				logger.Log.Fatal("open JSON WAL store", zlog.Err(err))
 			}

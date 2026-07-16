@@ -71,12 +71,9 @@ func (ws *WebSocketServer) Handler() http.Handler {
 func (ws *WebSocketServer) handleUpgrade(w http.ResponseWriter, r *http.Request) {
 	// Check authentication if token is configured
 	if ws.token != "" {
-		token := r.URL.Query().Get("token")
-		if token == "" {
-			auth := r.Header.Get("Authorization")
-			if len(auth) > 7 && auth[:7] == "Bearer " {
-				token = auth[7:]
-			}
+		token := r.Header.Get("Authorization")
+		if len(token) > 7 && token[:7] == "Bearer " {
+			token = token[7:]
 		}
 		if token != ws.token {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)

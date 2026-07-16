@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -31,6 +33,14 @@ type Config struct {
 	Pool                                               *fw.Pool
 	Hooks                                              Hooks
 	FrameCodec                                         *broker.BinaryMessageCodec
+	// TLSCertFile is the path to the client TLS certificate for mTLS.
+	TLSCertFile string
+	// TLSKeyFile is the path to the client TLS private key for mTLS.
+	TLSKeyFile string
+	// TLSCACertFile is the path to the CA certificate to verify the server.
+	TLSCACertFile string
+	// InsecureSkipVerify skips server certificate verification (dev only).
+	InsecureSkipVerify bool
 }
 type Hooks struct {
 	OnConnecting, OnConnected, OnAuthenticated, OnRegistered, OnSubscribed, OnPollStart, OnHeartbeat, OnReconnect, OnDrain, OnStopped func(Event)
@@ -77,6 +87,38 @@ func New(cfg Config) *Client {
 	}
 	if cfg.Group == "" {
 		cfg.Group = cfg.ConsumerID
+	}
+	// Build HTTP client with TLS if configured
+	if cfg.HTTPClient == nil {
+		transport := http.DefaultTransport
+		if cfg.TLSCertFile != "" && cfg.TLSKeyFile != "" {
+			cert, err := tls.LoadX509KeyPair(cfg.TLSCertFile, cfg.TLSKeyFile)
+			if err != nil {
+				panic(fmt.Sprintf("client: load TLS keypair: %v", err))
+			}
+			tlsCfg := &tls.Config{
+				Certificates:       []tls.Certificate{cert},
+				MinVersion:         tls.VersionTLS12,
+				InsecureSkipVerify: cfg.InsecureSkipVerify,
+			}
+			if cfg.TLSCACertFile != "" {
+				pem, err := os.ReadFile(cfg.TLSCACertFile)
+				if err != nil {
+					panic(fmt.Sprintf("client: load CA cert: %v", err))
+				}
+				pool := x509.NewCertPool()
+				if !pool.AppendCertsFromPEM(pem) {
+					panic("client: no valid certs in CA file")
+				}
+				tlsCfg.RootCAs = pool
+			}
+			transport = &http.Transport{TLSClientConfig: tlsCfg}
+		} else if cfg.InsecureSkipVerify {
+			transport = &http.Transport{
+				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+			}
+		}
+		cfg.HTTPClient = &http.Client{Transport: transport, Timeout: 30 * time.Second}
 	}
 	if cfg.Name == "" {
 		cfg.Name = cfg.ConsumerID

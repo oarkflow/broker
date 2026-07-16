@@ -2,11 +2,14 @@ package broker
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/binary"
 	"fmt"
 	"io"
 	"log"
 	"net"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -15,6 +18,7 @@ import (
 // MQTTConfig configures the MQTT protocol server.
 type MQTTConfig struct {
 	// ListenAddr is the TCP address to listen on. Default: ":1883".
+	// For TLS, use ":8883" or set TLSCertFile/TLSKeyFile.
 	ListenAddr string
 	// MaxConnections limits concurrent MQTT connections. Default: 1000.
 	MaxConnections int
@@ -29,6 +33,17 @@ type MQTTConfig struct {
 	// Username/Password for basic auth.
 	Username string
 	Password string
+	// TLSCertFile is the path to the TLS certificate file.
+	TLSCertFile string
+	// TLSKeyFile is the path to the TLS private key file.
+	TLSKeyFile string
+	// ClientCAFile is the path to the CA certificate for client verification (mTLS).
+	ClientCAFile string
+	// RequireClientCert requires client certificate verification (mTLS).
+	RequireClientCert bool
+	// BrokerToken is the bearer token for MQTT CONNECT authentication.
+	// If set, the MQTT password field is validated against this token.
+	BrokerToken string
 }
 
 // MQTT 3.1.1 packet types.
@@ -101,11 +116,43 @@ func NewMQTTServer(b *Broker, cfg MQTTConfig) *MQTTServer {
 // ListenAndServe starts the MQTT server.
 func (ms *MQTTServer) ListenAndServe() error {
 	var err error
-	ms.ln, err = net.Listen("tcp", ms.cfg.ListenAddr)
-	if err != nil {
-		return err
+	// Set up TLS if configured
+	if ms.cfg.TLSCertFile != "" && ms.cfg.TLSKeyFile != "" {
+		cert, err := tls.LoadX509KeyPair(ms.cfg.TLSCertFile, ms.cfg.TLSKeyFile)
+		if err != nil {
+			return fmt.Errorf("mqtt: load TLS keypair: %w", err)
+		}
+		tlsCfg := &tls.Config{
+			Certificates: []tls.Certificate{cert},
+			MinVersion:   tls.VersionTLS12,
+		}
+		if ms.cfg.ClientCAFile != "" {
+			pem, err := os.ReadFile(ms.cfg.ClientCAFile)
+			if err != nil {
+				return fmt.Errorf("mqtt: load client CA: %w", err)
+			}
+			pool := x509.NewCertPool()
+			if !pool.AppendCertsFromPEM(pem) {
+				return fmt.Errorf("mqtt: no valid certs in client CA")
+			}
+			tlsCfg.ClientCAs = pool
+		}
+		if ms.cfg.RequireClientCert {
+			tlsCfg.ClientAuth = tls.RequireAndVerifyClientCert
+		}
+		ln, err := tls.Listen("tcp", ms.cfg.ListenAddr, tlsCfg)
+		if err != nil {
+			return err
+		}
+		ms.ln = ln
+		log.Printf("[mqtt] listening on %s (TLS)", ms.cfg.ListenAddr)
+	} else {
+		ms.ln, err = net.Listen("tcp", ms.cfg.ListenAddr)
+		if err != nil {
+			return err
+		}
+		log.Printf("[mqtt] listening on %s", ms.cfg.ListenAddr)
 	}
-	log.Printf("[mqtt] listening on %s", ms.cfg.ListenAddr)
 	for {
 		conn, err := ms.ln.Accept()
 		if err != nil {
@@ -292,6 +339,7 @@ func (ms *MQTTServer) handleConnect(mc *mqttConn, payload []byte) bool {
 	}
 
 	// Username (if username flag set)
+	password := ""
 	if connectFlags&0x80 != 0 {
 		if offset+2 > len(payload) {
 			return false
@@ -303,9 +351,27 @@ func (ms *MQTTServer) handleConnect(mc *mqttConn, payload []byte) bool {
 		}
 		offset += userLen
 	}
+	// Password (if password flag set)
+	if connectFlags&0x40 != 0 {
+		if offset+2 > len(payload) {
+			return false
+		}
+		passLen := int(binary.BigEndian.Uint16(payload[offset : offset+2]))
+		offset += 2
+		if offset+passLen <= len(payload) {
+			password = string(payload[offset : offset+passLen])
+		}
+		offset += passLen
+	}
 
 	// Auth check
-	if ms.cfg.RequireAuth && mc.username != ms.cfg.Username {
+	if ms.cfg.BrokerToken != "" {
+		// Use broker token for authentication
+		if password != ms.cfg.BrokerToken {
+			ms.sendConnack(mc.conn, 0x05) // Connection Refused: not authorized
+			return false
+		}
+	} else if ms.cfg.RequireAuth && mc.username != ms.cfg.Username {
 		ms.sendConnack(mc.conn, 0x05) // Connection Refused: not authorized
 		return false
 	}

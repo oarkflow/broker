@@ -39,6 +39,10 @@ type AdminServer struct {
 	ClientCAFile      string
 	RequireClientCert bool
 
+	// AllowedOrigins is the list of allowed CORS origins.
+	// Default: same-origin only (""). Set to ["*"] for public APIs.
+	AllowedOrigins []string
+
 	Audit AdminAuditLogger
 }
 
@@ -140,9 +144,16 @@ func (a AdminServer) wrap(next http.HandlerFunc) http.HandlerFunc {
 		w.Header().Set("X-Frame-Options", "DENY")
 		w.Header().Set("X-XSS-Protection", "1; mode=block")
 		// CORS headers
-		w.Header().Set("Access-Control-Allow-Origin", "*")
+		origin := r.Header.Get("Origin")
+		if origin == "" {
+			origin = "*"
+		}
+		if a.isAllowedOrigin(origin) {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+		}
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		w.Header().Set("Access-Control-Max-Age", "86400")
 		// Handle preflight
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
@@ -683,6 +694,19 @@ func sanitizeIdentifier(s string) (string, error) {
 		}
 	}
 	return s, nil
+}
+
+func (a AdminServer) isAllowedOrigin(origin string) bool {
+	if len(a.AllowedOrigins) == 0 {
+		// Default: same-origin (no CORS header = browser default same-origin policy)
+		return false
+	}
+	for _, allowed := range a.AllowedOrigins {
+		if allowed == "*" || allowed == origin {
+			return true
+		}
+	}
+	return false
 }
 
 func adminAction(r *http.Request) string {

@@ -2,10 +2,13 @@ package broker
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net"
+	"os"
 	"sync"
 	"time"
 )
@@ -21,6 +24,17 @@ type GRPCConfig struct {
 	MaxMessageSize int
 	// KeepAlive is the keep-alive interval. Default: 60s.
 	KeepAlive time.Duration
+	// TLSCertFile is the path to the TLS certificate file.
+	TLSCertFile string
+	// TLSKeyFile is the path to the TLS private key file.
+	TLSKeyFile string
+	// ClientCAFile is the path to the CA certificate for client verification (mTLS).
+	ClientCAFile string
+	// RequireClientCert requires client certificate verification (mTLS).
+	RequireClientCert bool
+	// BrokerToken is the bearer token for authentication.
+	// If set, every request must include this token.
+	BrokerToken string
 }
 
 // GRPCServer provides a gRPC-like transport for the broker data plane.
@@ -43,9 +57,10 @@ type grpcConn struct {
 }
 
 type grpcRequest struct {
-	ID     string          `json:"id"`
-	Method string          `json:"method"`
-	Body   json.RawMessage `json:"body"`
+	ID      string          `json:"id"`
+	Method  string          `json:"method"`
+	Body    json.RawMessage `json:"body"`
+	Headers map[string]string `json:"headers,omitempty"`
 }
 
 type grpcResponse struct {
@@ -102,11 +117,43 @@ func NewGRPCServer(b *Broker, cfg GRPCConfig) *GRPCServer {
 // ListenAndServe starts the gRPC-like server.
 func (gs *GRPCServer) ListenAndServe() error {
 	var err error
-	gs.ln, err = net.Listen("tcp", gs.cfg.ListenAddr)
-	if err != nil {
-		return err
+	// Set up TLS if configured
+	if gs.cfg.TLSCertFile != "" && gs.cfg.TLSKeyFile != "" {
+		cert, err := tls.LoadX509KeyPair(gs.cfg.TLSCertFile, gs.cfg.TLSKeyFile)
+		if err != nil {
+			return fmt.Errorf("grpc: load TLS keypair: %w", err)
+		}
+		tlsCfg := &tls.Config{
+			Certificates: []tls.Certificate{cert},
+			MinVersion:   tls.VersionTLS12,
+		}
+		if gs.cfg.ClientCAFile != "" {
+			pem, err := os.ReadFile(gs.cfg.ClientCAFile)
+			if err != nil {
+				return fmt.Errorf("grpc: load client CA: %w", err)
+			}
+			pool := x509.NewCertPool()
+			if !pool.AppendCertsFromPEM(pem) {
+				return fmt.Errorf("grpc: no valid certs in client CA")
+			}
+			tlsCfg.ClientCAs = pool
+		}
+		if gs.cfg.RequireClientCert {
+			tlsCfg.ClientAuth = tls.RequireAndVerifyClientCert
+		}
+		ln, err := tls.Listen("tcp", gs.cfg.ListenAddr, tlsCfg)
+		if err != nil {
+			return err
+		}
+		gs.ln = ln
+		log.Printf("[grpc] listening on %s (TLS)", gs.cfg.ListenAddr)
+	} else {
+		gs.ln, err = net.Listen("tcp", gs.cfg.ListenAddr)
+		if err != nil {
+			return err
+		}
+		log.Printf("[grpc] listening on %s", gs.cfg.ListenAddr)
 	}
-	log.Printf("[grpc] listening on %s", gs.cfg.ListenAddr)
 	for {
 		conn, err := gs.ln.Accept()
 		if err != nil {
@@ -184,6 +231,22 @@ func (gs *GRPCServer) handleConn(conn net.Conn) {
 }
 
 func (gs *GRPCServer) handleMethod(req grpcRequest) grpcResponse {
+	// Check authentication if token is configured
+	if gs.cfg.BrokerToken != "" {
+		if req.Headers == nil {
+			return grpcResponse{ID: req.ID, Error: "unauthorized: missing auth token", Status: 401}
+		}
+		token := req.Headers["Authorization"]
+		if token == "" {
+			token = req.Headers["authorization"]
+		}
+		if len(token) > 7 && token[:7] == "Bearer " {
+			token = token[7:]
+		}
+		if token != gs.cfg.BrokerToken {
+			return grpcResponse{ID: req.ID, Error: "unauthorized: invalid token", Status: 401}
+		}
+	}
 	ctx := context.Background()
 	switch req.Method {
 	case GRPCMethodPublish:

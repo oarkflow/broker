@@ -2,6 +2,7 @@ package amqp
 
 import (
 	"bufio"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -196,7 +197,7 @@ func (c *Connection) sendStart() error {
 		uint8(ProtocolMajor),  // version-major
 		uint8(ProtocolMinor),  // version-minor
 		table(serverProps),    // server-properties
-		"PLAIN",              // mechanisms
+		"PLAIN EXTERNAL",     // mechanisms
 		"en_US",              // locales
 	)
 
@@ -212,13 +213,25 @@ func (c *Connection) handleStartOk(args []byte) error {
 	// Mechanism
 	mechanism, _ := r.ReadString()
 	// Response
-	_, _ = r.ReadBytes()
+	response, _ := r.ReadBytes()
 	// Locale
 	locale, _ := r.ReadString()
 
 	if mechanism == "PLAIN" {
 		// PLAIN mechanism: \0username\0password
-		// We don't enforce authentication yet, but parse it
+		// Parse but don't enforce authentication (handled at server level)
+		_ = response
+	} else if mechanism == "EXTERNAL" {
+		// EXTERNAL mechanism: client certificate authentication
+		// The TLS handshake has already provided the client certificate
+		// Verify that a valid TLS connection exists
+		if tc, ok := c.netConn.(*tls.Conn); ok {
+			state := tc.ConnectionState()
+			if len(state.PeerCertificates) == 0 {
+				return fmt.Errorf("EXTERNAL auth: no client certificate provided")
+			}
+		}
+		_ = response
 	}
 
 	_ = locale

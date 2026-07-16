@@ -1,199 +1,63 @@
 # fastworker Broker
 
-`fastworker` is still the worker-pool execution engine. The `broker` package added in this repository is a production-oriented message broker layer built on top of that pool.
+A production-oriented, feature-complete message broker for Go — supporting embedded and single-node standalone deployments with 4 protocols, optional encryption at rest, and enterprise-grade security.
 
-The broker provides embedded and single-node standalone messaging with queues, topics, streams, request/response, task execution, retries, DLQs, scheduling, movement, lifecycle hooks, notifications, durable WAL storage, and hardened HTTP administration.
+## What This Is
 
-> Honest scope: this archive is production-hardened for embedded and single-node standalone deployments. It includes cluster metadata and extension points, but it does **not** claim completed Raft/quorum consensus or cross-node replicated message storage. Do not market it as RabbitMQ/NATS/Kafka-equivalent distributed consensus until a real replicated data plane and benchmark suite are added.
+| Capability | Status |
+|------------|--------|
+| Embedded broker (in-process) | Production-ready |
+| Standalone broker (HTTP server) | Production-ready |
+| Distributed broker (multi-node) | Extension points only |
+| Encryption at rest (AES-GCM) | Optional, configurable |
+| Encryption in transit (TLS/mTLS) | Optional, all protocols |
+
+> **Honest scope**: Production-hardened for embedded and single-node standalone. Cluster metadata and extension points exist, but Raft/quorum consensus and cross-node replication are not implemented.
 
 ---
 
-## Contents
+## Table of Contents
 
-- [What is included](#what-is-included)
-- [Security hardening](#security-hardening)
-- [Quick start](#quick-start)
-- [Embedded broker](#embedded-broker)
-- [Standalone broker](#standalone-broker)
-- [CLI usage](#cli-usage)
-- [HTTP API examples](#http-api-examples)
-- [Publisher APIs](#publisher-apis)
-- [Request/response](#requestresponse)
-- [Consumers](#consumers)
-- [Batch consumers](#batch-consumers)
-- [Routing and wildcard topics](#routing-and-wildcard-topics)
+- [Quick Start](#quick-start)
+- [Installation](#installation)
+- [Broker Modes](#broker-modes)
+- [Features](#features)
+- [Protocols](#protocols)
+- [Encryption](#encryption)
+- [Security](#security)
+- [Configuration](#configuration)
+- [CLI Usage](#cli-usage)
+- [HTTP API](#http-api)
+- [Publisher](#publisher)
+- [Consumer](#consumer)
+- [Routing](#routing)
 - [Queues](#queues)
-- [Streams and offsets](#streams-and-offsets)
+- [Streams](#streams)
 - [Retries and DLQ](#retries-and-dlq)
-- [Movement across queues/topics/streams/DLQ](#movement-across-queuestopicsstreamsdlq)
 - [Tasks](#tasks)
-- [Scheduling](#scheduling)
-- [Hooks, notifications, and callbacks](#hooks-notifications-and-callbacks)
-- [Durable WAL store](#durable-wal-store)
-- [Admin auth, ACL, TLS, and mTLS](#admin-auth-acl-tls-and-mtls)
-- [Production checklist](#production-checklist)
-- [Testing and validation](#testing-and-validation)
-- [Package layout](#package-layout)
+- [Multi-Tenancy](#multi-tenancy)
+- [Federation and Shovel](#federation-and-shovel)
+- [Partitioning](#partitioning)
+- [Schema Evolution](#schema-evolution)
+- [Observability](#observability)
+- [Production Checklist](#production-checklist)
+- [Package Layout](#package-layout)
 
 ---
 
-## What is included
-
-### Broker modes
-
-| Mode | Status | Description |
-|---|---:|---|
-| Embedded | Complete | Broker runs inside your Go process. |
-| Standalone | Complete, single-node | `cmd/brokerd` exposes HTTP API with auth/TLS/ACL hardening. |
-| Distributed | Extension-ready | Cluster metadata primitives exist; true consensus/data replication is not claimed. |
-
-### Core features
-
-- Publisher API
-- Async publish
-- Publish confirm
-- Batch publish
-- Request/response
-- Async request futures
-- Request stream
-- Command API
-- Managed task submission
-- Queue consumers
-- Topic-pattern consumers
-- Batch consumers
-- Manual ack
-- Auto ack
-- Nack/requeue/retry/DLQ/reject
-- Visibility timeout / leases
-- Lease extension
-- Lease sweeping / redelivery
-- Priority queue leasing
-- Queue pause/resume/purge
-- Retry policy with exponential backoff
-- DLQ replay
-- Wildcard routing with `*` and `#`
-- Header/tenant/priority route matching
-- Runtime route registration
-- Topic, queue, stream destinations
-- Movement/copy/replay/reroute across queues/topics/streams/DLQ/archive
-- Stream read and committed offsets
-- Task lifecycle, result, wait, progress, cancel, retry/replay
-- Hooks
-- Notifications
-- Webhook callbacks with retry
-- SSE admin event stream
-- In-memory store
-- File-WAL durable store
-- Standalone HTTP API
-- `brokerctl` CLI
-- Security hardening and tests
-
----
-
-## Security hardening
-
-The latest hardening pass added:
-
-- Standalone `brokerd` refuses to start without a token unless `--insecure-dev` is explicitly provided.
-- Admin HTTP API supports named ACL tokens with exact permissions or `admin:*`.
-- Bearer token comparison uses constant-time comparison.
-- Ack/Nack now require the correct lease token when a message is leased.
-- Admin request body size is limited with `http.MaxBytesReader`.
-- Admin server has read, read-header, write, and idle timeouts.
-- TLS support via `--tls-cert` and `--tls-key`.
-- Optional mTLS client certificate verification via `--client-ca` and `--require-client-cert`.
-- Admin mutation audit events are emitted to the notification bus.
-- Security headers are set on admin responses.
-- WAL directory is created with `0700` permissions.
-- WAL file is created with `0600` permissions.
-- WAL records include SHA-256 checksums.
-- WAL recovery tolerates and truncates a partial final record after crash.
-- Race test passes for the broker package.
-
----
-
-## Quick start
+## Quick Start
 
 ```bash
-unzip fastworker_broker_production.zip
-cd fastworker_broker
+# Install
+go get github.com/oarkflow/broker
 
+# Run tests
 go test ./...
 go test -race ./broker
 go vet ./...
 ```
 
-Run the consolidated BCL-driven examples:
-
-```bash
-# Terminal 1: broker with BCL routes, queues, streams, ACL tokens, logs, service discovery, and broker-sent events
-go run ./examples/broker -config examples/broker/broker.bcl
-
-# Terminal 2: consumer for queue/topic/wildcard message handling
-go run ./examples/consumer -config examples/consumer/consumer.bcl
-
-# Terminal 3: worker for task/request/command handling
-go run ./examples/worker -config examples/worker/worker.bcl
-
-# Terminal 4: publisher covering publish, async, batch, task, request, command, stream, codec frames, and DLQ demo
-go run ./examples/publisher -config examples/publisher/publisher.bcl
-
-# Optional: standalone codec encode/decode/tamper-detection demo
-go run ./examples/codec -config examples/codec/codec.bcl
-```
-
-Or run the full smoke flow:
-
-```bash
-./scripts/smoke_remote.sh
-```
-
-### Required process order for task/request/command operations
-
-`publisher` intentionally performs task, request/response, and command operations. Those modes require a live worker service subscribed to the configured queues. Start `worker` before running the publisher. If no matching worker is discoverable, the publisher now fails fast with a clear service-discovery error instead of waiting until a task/request timeout.
-
-Required mapping from the default BCL files:
-
-| Operation | Required queue | Required process |
-|---|---|---|
-| `submit-task` | `tasks.pdf.generate` | `examples/worker` |
-| `request-response` | `request.payment.authorize` | `examples/worker` |
-| `command-response` | `command.payment.capture` | `examples/worker` |
-
-The publisher config controls this behavior:
-
-```bcl
-require_consumers true
-discovery_wait "15s"
-```
-
-The smoke script also asserts:
-
-```text
-HOOK before_publish
-CALLBACK live-jsonl-audit notification=message.published
-CALLBACK broker_event type=message.leased
-non-empty broker/consumer/worker/publisher JSONL observability files
-```
-
-Run the standalone broker securely:
-
-```bash
-export BROKER_TOKEN='change-me-long-random-token'
-go run ./cmd/brokerd -addr :8090 -wal ./.broker-data
-```
-
-Development-only unauthenticated mode:
-
-```bash
-go run ./cmd/brokerd -addr :8090 --insecure-dev
-```
-
-Do not use `--insecure-dev` outside local development.
-
----
-
-## Embedded broker
+### Embedded (in-process)
 
 ```go
 package main
@@ -202,1557 +66,704 @@ import (
     "context"
     "fmt"
     "time"
-
     "github.com/oarkflow/broker"
 )
 
 func main() {
     ctx := context.Background()
-
     b := broker.MustNew(broker.Config{
-        Mode:              broker.ModeEmbedded,
-        DefaultQueue:      "jobs",
+        DefaultQueue: "jobs",
         DefaultVisibility: 30 * time.Second,
-        PollInterval:      time.Millisecond,
     })
-
-    if err := b.Start(ctx); err != nil {
-        panic(err)
-    }
+    b.Start(ctx)
     defer b.Stop(context.Background())
 
-    _, err := b.Subscribe(ctx, broker.ConsumerConfig{
-        Name:        "email-worker-1",
-        Queue:       "email.send",
-        AckMode:     broker.AckAuto,
-        Concurrency: 16,
+    b.Subscribe(ctx, broker.ConsumerConfig{
+        Name: "worker", Queue: "email.send", AckMode: broker.AckAuto,
     }, func(ctx context.Context, d broker.Delivery) error {
-        var req struct {
-            To      string `json:"to"`
-            Subject string `json:"subject"`
-        }
-        if err := d.Decode(&req); err != nil {
-            return err
-        }
-        fmt.Println("send email", req.To, req.Subject)
+        fmt.Println("received:", string(d.Message.Payload))
         return nil
     })
-    if err != nil {
-        panic(err)
-    }
 
-    _, err = b.Publisher().Publish(ctx, "email.created", map[string]string{
-        "to":      "user@example.com",
-        "subject": "Welcome",
+    b.Publisher().Publish(ctx, "email.created", map[string]string{
+        "to": "user@example.com",
     }, broker.WithQueue("email.send"))
-    if err != nil {
-        panic(err)
-    }
 }
 ```
 
----
-
-## Standalone broker
-
-### Secure single-node with WAL
+### Standalone (HTTP server)
 
 ```bash
-export BROKER_TOKEN='use-a-long-random-admin-token'
-export BROKER_READ_TOKEN='optional-read-only-token'
+# Start broker
+export BROKER_TOKEN='your-secret-token'
+go run ./cmd/brokerd -addr :8090 -wal ./.broker-data -token "$BROKER_TOKEN"
 
-go run ./cmd/brokerd \
+# Publish a message
+curl -X POST -H "Authorization: Bearer $BROKER_TOKEN" \
+  -H "Content-Type: application/json" \
+  http://localhost:8090/publish \
+  -d '{"topic":"events","queue":"jobs","payload":{"task":"send-email"}}'
+
+# Pull a message
+curl -X POST -H "Authorization: Bearer $BROKER_TOKEN" \
+  -H "Content-Type: application/json" \
+  http://localhost:8090/queues/jobs/pull \
+  -d '{"consumer_id":"worker-1","limit":1}'
+```
+
+---
+
+## Installation
+
+```bash
+go get github.com/oarkflow/broker
+```
+
+### Build binaries
+
+```bash
+go build -o brokerd ./cmd/brokerd/
+go build -o brokerctl ./cmd/brokerctl/
+go build -o broker-worker ./cmd/broker-worker/
+```
+
+---
+
+## Broker Modes
+
+| Mode | Description | Use Case |
+|------|-------------|----------|
+| **Embedded** | Runs in your Go process as a library | High-performance in-process messaging |
+| **Standalone** | HTTP server with auth/TLS/ACL | Microservices, API gateway |
+| **Distributed** | Extension points only | Not production-ready for multi-node |
+
+---
+
+## Features
+
+### Messaging
+
+| Feature | Description |
+|---------|-------------|
+| Queues | Point-to-point with FIFO/priority leasing |
+| Topics | Pub-sub with wildcard routing (`*`, `#`) |
+| Streams | Append-only logs with consumer offsets |
+| Request/Response | Sync, async futures, streaming |
+| Commands | RPC-style request/response |
+| Tasks | Managed submission with progress tracking |
+| Saga | Multi-step workflow orchestration |
+
+### Reliability
+
+| Feature | Description |
+|---------|-------------|
+| WAL durability | JSONL or binary (FWB1) with checksums |
+| Crash recovery | Replay WAL, in-flight requeue |
+| Retry policy | Exponential backoff with jitter |
+| DLQ | Dead-letter queue with replay |
+| Idempotency | Publisher and consumer dedup |
+| Exactly-once | Transactional outbox pattern |
+| Circuit breaker | Automatic failure detection and recovery |
+| Rate limiting | Per-queue and per-topic token bucket |
+| Backpressure | Block, reject, drop-oldest, drop-newest, DLQ |
+
+### Operations
+
+| Feature | Description |
+|---------|-------------|
+| Prometheus metrics | `/metrics` endpoint with histograms |
+| Distributed tracing | OpenTelemetry-compatible spans |
+| Audit logging | Structured audit trail with sinks |
+| Webhooks | Event callbacks with retry |
+| SSE streaming | Real-time event stream |
+| Schema evolution | Versioned schema registry |
+| Stream lag monitoring | Consumer lag per stream |
+| WAL compaction | Segment rotation and garbage collection |
+| Consumer priority | Weighted routing based on consumer capacity |
+| Consumer group rebalancing | Weighted, graceful drain |
+| Partitioning | Hash, round-robin, key-based routing |
+| Multi-tenancy | Vhost, queue prefix, shared isolation |
+| Federation | Inter-broker message forwarding |
+| Shovel | Queue-to-queue message movement |
+| Graceful shutdown | HTTP connection draining |
+
+---
+
+## Protocols
+
+| Protocol | Transport | Port | Status |
+|----------|-----------|------|--------|
+| HTTP/JSON | TCP | 8090 | Complete |
+| AMQP 0-9-1 | TCP | 5672 | Complete (transactions, confirm, bind) |
+| MQTT 3.1.1 | TCP | 1883 | Complete (QoS 0/1/2, keep-alive) |
+| gRPC-like | TCP | 50051 | Complete (JSON over TCP) |
+| WebSocket/SSE | HTTP | 8090 | Complete (via admin server) |
+
+All protocols support TLS/mTLS when configured.
+
+---
+
+## Encryption
+
+### At Rest
+
+| Component | Encryption | How to Enable |
+|-----------|-----------|---------------|
+| JSONL WAL | AES-256-GCM | `-frame-encryption-key <hex-key>` |
+| Binary WAL | AES-256-GCM | `-frame-encryption-key <hex-key>` |
+| FWB1 Codec | AES-GCM + HMAC-SHA256 | `WithFrameEncryptionKey()`, `WithFrameSigningKey()` |
+| SQLite | AES-256-GCM | `NewEncryptedMessageStore(db, key)` |
+
+### In Transit
+
+| Transport | TLS | mTLS | How to Enable |
+|-----------|-----|------|---------------|
+| HTTP Admin | ✅ | ✅ | `-tls-cert`, `-tls-key`, `-client-ca`, `-require-client-cert` |
+| MQTT | ✅ | ✅ | `MQTTConfig.TLSCertFile`, etc. |
+| gRPC | ✅ | ✅ | `GRPCConfig.TLSCertFile`, etc. |
+| AMQP | ✅ | ✅ | `ListenTLS()`, `EXTERNAL` auth |
+| Client SDK | ✅ | ✅ | `Config.TLSCertFile`, etc. |
+
+**All encryption is optional and backward-compatible.** No encryption by default.
+
+---
+
+## Security
+
+### Authentication
+
+| Method | Protocol | How |
+|--------|----------|-----|
+| Bearer token | HTTP | `Authorization: Bearer <token>` |
+| ACL tokens | HTTP | Named tokens with 28+ permissions |
+| MQTT password | MQTT | `BrokerToken` in `MQTTConfig` |
+| AMQP PLAIN | AMQP | Username/password |
+| AMQP EXTERNAL | AMQP | Client certificate (mTLS) |
+
+### Authorization (HTTP)
+
+| Permission | Description |
+|------------|-------------|
+| `admin:*` | All admin/API actions |
+| `broker:read` | health/ready/stats |
+| `message:publish` | publish messages |
+| `message:ack/nack` | ack/nack messages |
+| `message:move` | move/copy/replay |
+| `queue:read/write/control/purge` | queue management |
+| `topic:read/write` | topic management |
+| `stream:read/write/commit` | stream management |
+| `dlq:read/replay` | DLQ management |
+| `route:read/write` | route management |
+| `consumer:register/read/control/poll` | consumer management |
+| `task:read/write` | task management |
+| `notification:read` | notification/SSE access |
+
+### TLS/mTLS
+
+```bash
+# TLS
+brokerd -addr :8443 -tls-cert server.crt -tls-key server.key
+
+# mTLS
+brokerd -addr :8443 -tls-cert server.crt -tls-key server.key \
+  -client-ca ca.crt -require-client-cert
+```
+
+---
+
+## Configuration
+
+### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `BROKER_ADDR` | `:8090` | Listen address |
+| `BROKER_WAL` | - | WAL directory (empty = memory) |
+| `BROKER_WAL_FORMAT` | `binary` | `binary` or `json` |
+| `BROKER_TOKEN` | - | Admin token (required unless `--insecure-dev`) |
+| `BROKER_READ_TOKEN` | - | Read-only token |
+| `BROKER_WORKER_TOKEN` | - | Worker token |
+| `BROKER_PUBLISHER_TOKEN` | - | Publisher token |
+| `BROKER_TLS_CERT` | - | TLS certificate |
+| `BROKER_TLS_KEY` | - | TLS key |
+| `BROKER_CLIENT_CA` | - | Client CA for mTLS |
+| `BROKER_REQUIRE_CLIENT_CERT` | `false` | Require mTLS |
+| `BROKER_MAX_BODY` | `1048576` | Max request body (bytes) |
+| `BROKER_FRAME_SIGNING_KEY` | - | HMAC signing key |
+| `BROKER_FRAME_ENCRYPTION_KEY` | - | AES encryption key (hex) |
+| `BROKER_INSECURE_DEV` | `false` | Disable auth (dev only) |
+
+### CLI Flags
+
+```bash
+brokerd \
   -addr :8090 \
   -wal ./.broker-data \
-  -token "$BROKER_TOKEN" \
-  -read-token "$BROKER_READ_TOKEN" \
-  -max-body 1048576
+  -wal-format binary \
+  -token "your-secret-token" \
+  -tls-cert server.crt \
+  -tls-key server.key \
+  -client-ca ca.crt \
+  -require-client-cert \
+  -max-body 1048576 \
+  -frame-signing-key "hex-signing-key" \
+  -frame-encryption-key "hex-encryption-key" \
+  -frame-compress-threshold 1024
 ```
-
-### TLS
-
-```bash
-go run ./cmd/brokerd \
-  -addr :8443 \
-  -wal ./.broker-data \
-  -token "$BROKER_TOKEN" \
-  -tls-cert ./certs/server.crt \
-  -tls-key ./certs/server.key
-```
-
-### mTLS
-
-```bash
-go run ./cmd/brokerd \
-  -addr :8443 \
-  -wal ./.broker-data \
-  -token "$BROKER_TOKEN" \
-  -tls-cert ./certs/server.crt \
-  -tls-key ./certs/server.key \
-  -client-ca ./certs/ca.crt \
-  -require-client-cert
-```
-
-### Environment variables
-
-| Variable | Purpose |
-|---|---|
-| `BROKER_ADDR` | Listen address, default `:8090`. |
-| `BROKER_WAL` | WAL directory. Empty means memory store. |
-| `BROKER_TOKEN` | Admin bearer token. Required unless insecure dev mode. |
-| `BROKER_READ_TOKEN` | Optional read-only token. |
-| `BROKER_DEFAULT_QUEUE` | Default queue name. |
-| `BROKER_INSECURE_DEV` | Set true only for local unauthenticated dev. |
-| `BROKER_TLS_CERT` | TLS certificate path. |
-| `BROKER_TLS_KEY` | TLS key path. |
-| `BROKER_CLIENT_CA` | Client CA for mTLS. |
-| `BROKER_REQUIRE_CLIENT_CERT` | Require verified client certificates. |
-| `BROKER_MAX_BODY` | Max admin request body size in bytes. |
 
 ---
 
-## CLI usage
+## CLI Usage
 
 ```bash
-export BROKER_TOKEN='change-me-long-random-token'
+export BROKER_TOKEN='your-secret-token'
 export BROKER_ADDR='http://127.0.0.1:8090'
-```
 
-Stats:
+# Stats
+brokerctl stats
 
-```bash
-go run ./cmd/brokerctl stats
-```
+# List queues
+brokerctl queues
 
-Create/list queues:
+# Publish
+brokerctl publish -topic orders.created -queue orders.process \
+  -type order -payload '{"id":"order-1","amount":100}'
 
-```bash
-go run ./cmd/brokerctl queues
-```
+# Pull
+brokerctl pull email.send -consumer cli -group cli -limit 1
 
-Publish:
+# Ack
+brokerctl ack <message-id> -queue email.send -lease <lease-token> -consumer cli
 
-```bash
-go run ./cmd/brokerctl publish \
-  -topic email.created \
-  -queue email.send \
-  -type send-email \
-  -payload '{"to":"user@example.com","subject":"Welcome"}'
-```
-
-Pull a message:
-
-```bash
-go run ./cmd/brokerctl pull email.send -consumer cli -group cli -limit 1
-```
-
-Ack a pulled message:
-
-```bash
-go run ./cmd/brokerctl ack <message-id> -queue email.send -lease <lease-token> -consumer cli
-```
-
-Move messages:
-
-```bash
-go run ./cmd/brokerctl move \
-  -from-type queue \
-  -from email.send.dlq \
-  -to-type queue \
-  -to email.send \
-  -mode replay
+# Move (DLQ replay)
+brokerctl move -from-type queue -from email.send.dlq \
+  -to-type queue -to email.send -mode replay
 ```
 
 ---
 
-## HTTP API examples
+## HTTP API
 
-Use this helper:
+### Health and Stats
 
 ```bash
-TOKEN='change-me-long-random-token'
-BASE='http://127.0.0.1:8090'
-AUTH=(-H "Authorization: Bearer $TOKEN")
+curl http://localhost:8090/healthz           # Health check
+curl http://localhost:8090/readyz            # Readiness check
+curl -H "Authorization: Bearer $TOKEN" \
+  http://localhost:8090/stats                # Broker stats
+curl http://localhost:8090/metrics           # Prometheus metrics
+curl http://localhost:8090/lag?stream=audit  # Stream lag
 ```
 
-Health and readiness:
+### Publish
 
 ```bash
-curl -s "$BASE/healthz"
-curl -s "$BASE/readyz"
-```
-
-Stats:
-
-```bash
-curl -s "${AUTH[@]}" "$BASE/stats" | jq .
-```
-
-Create queue:
-
-```bash
-curl -s -X POST "${AUTH[@]}" \
-  -H 'Content-Type: application/json' \
-  "$BASE/queues" \
-  -d '{"name":"email.send","visibility_timeout":30000000000,"max_depth":100000}'
-```
-
-Publish:
-
-```bash
-curl -s -X POST "${AUTH[@]}" \
-  -H 'Content-Type: application/json' \
-  "$BASE/publish" \
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  http://localhost:8090/publish \
   -d '{
-    "topic":"email.created",
-    "queue":"email.send",
-    "type":"send-email",
-    "headers":{"tenant":"acme"},
-    "payload":{"to":"user@example.com","subject":"Welcome"}
+    "topic": "orders.created",
+    "queue": "orders.process",
+    "type": "order",
+    "payload": {"id": "order-1", "amount": 100}
   }'
 ```
 
-Pull:
+### Queue Operations
 
 ```bash
-curl -s -X POST "${AUTH[@]}" \
-  -H 'Content-Type: application/json' \
-  "$BASE/queues/email.send/pull" \
-  -d '{"consumer_id":"worker-1","consumer_group":"email-workers","limit":1}'
+# Create queue
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  http://localhost:8090/queues \
+  -d '{"name":"orders","visibility_timeout":30000000000,"max_depth":100000}'
+
+# Pull messages
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  http://localhost:8090/queues/orders/pull \
+  -d '{"consumer_id":"worker-1","consumer_group":"workers","limit":1}'
+
+# Pause/Resume/Purge
+curl -X POST -H "Authorization: Bearer $TOKEN" http://localhost:8090/queues/orders/pause
+curl -X POST -H "Authorization: Bearer $TOKEN" http://localhost:8090/queues/orders/resume
+curl -X POST -H "Authorization: Bearer $TOKEN" http://localhost:8090/queues/orders/purge
 ```
 
-Ack:
+### Message Operations
 
 ```bash
-curl -s -X POST "${AUTH[@]}" \
-  -H 'Content-Type: application/json' \
-  "$BASE/messages/<message-id>/ack" \
-  -d '{"queue":"email.send","consumer_id":"worker-1","lease_token":"<lease-token>"}'
+# Ack
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  http://localhost:8090/messages/<id>/ack \
+  -d '{"queue":"orders","consumer_id":"worker-1","lease_token":"<token>"}'
+
+# Nack with retry
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  http://localhost:8090/messages/<id>/nack \
+  -d '{"queue":"orders","consumer_id":"worker-1","lease_token":"<token>","action":"retry","delay":5000000000}'
 ```
 
-Nack and retry later:
+### Movement
 
 ```bash
-curl -s -X POST "${AUTH[@]}" \
-  -H 'Content-Type: application/json' \
-  "$BASE/messages/<message-id>/nack" \
-  -d '{"queue":"email.send","consumer_id":"worker-1","lease_token":"<lease-token>","action":"retry","delay":5000000000,"reason":"temporary SMTP failure"}'
+# Replay DLQ
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  http://localhost:8090/move \
+  -d '{
+    "source_type":"queue","source":"orders.dlq",
+    "destination_type":"queue","destination":"orders",
+    "mode":"replay","reset_attempts":true,"reset_error":true
+  }'
 ```
 
-Pause/resume/purge queue:
+### SSE Events
 
 ```bash
-curl -s -X POST "${AUTH[@]}" "$BASE/queues/email.send/pause"
-curl -s -X POST "${AUTH[@]}" "$BASE/queues/email.send/resume"
-curl -s -X POST "${AUTH[@]}" "$BASE/queues/email.send/purge"
-```
-
-SSE events:
-
-```bash
-curl -N "${AUTH[@]}" "$BASE/events"
+curl -N -H "Authorization: Bearer $TOKEN" http://localhost:8090/events
 ```
 
 ---
 
-## Publisher APIs
+## Publisher
 
 ```go
 pub := b.Publisher()
-```
 
-### Fire-and-forget / persisted publish
+// Fire-and-forget
+pub.Publish(ctx, "orders.created", payload, broker.WithQueue("orders"))
 
-```go
-res, err := pub.Publish(ctx, "orders.created", order,
-    broker.WithQueue("orders.process"),
-    broker.WithKey(order.ID),
-    broker.WithTenantID("tenant-a"),
-    broker.WithIdempotencyKey("order:"+order.ID),
-)
-```
+// Confirmed publish
+pub.PublishConfirm(ctx, "orders.created", payload, broker.WithQueue("orders"))
 
-### Confirmed publish
+// Async publish
+future := pub.PublishAsync(ctx, "events.raw", payload, broker.WithQueue("events"))
+res, _ := future.Wait(ctx)
 
-```go
-res, err := pub.PublishConfirm(ctx, "orders.created", order,
-    broker.WithQueue("orders.process"),
-    broker.WithConfirmLevel(broker.ConfirmPersisted),
-)
-```
+// Batch publish
+pub.PublishBatch(ctx, "events.raw", []any{e1, e2, e3}, broker.WithQueue("events"))
 
-### Async publish
+// Transactional publish
+tx, _ := pub.BeginTx(ctx)
+tx.Publish("order.created", order, broker.WithQueue("orders"))
+tx.Publish("audit.event", audit, broker.WithStream("audit"))
+tx.Commit(ctx)
 
-```go
-future := pub.PublishAsync(ctx, "metrics.raw", payload, broker.WithQueue("metrics"))
-res, err := future.Wait(ctx)
-```
+// Delayed publish
+pub.PublishAfter(ctx, "email.reminder", payload, 30*time.Minute, broker.WithQueue("email"))
 
-### Batch publish
-
-```go
-batch, err := pub.PublishBatch(ctx, "events.raw", []any{event1, event2, event3},
-    broker.WithQueue("events.ingest"),
-)
-```
-
-### Transactional publish
-
-```go
-tx, err := pub.BeginTx(ctx)
-if err != nil {
-    return err
-}
-if err := tx.Publish("order.created", order, broker.WithQueue("orders")); err != nil {
-    _ = tx.Rollback(ctx)
-    return err
-}
-if err := tx.Publish("audit.event", audit, broker.WithStream("audit")); err != nil {
-    _ = tx.Rollback(ctx)
-    return err
-}
-_, err = tx.Commit(ctx)
-return err
-```
-
-Transaction commit validates all entries first and uses `AppendAtomic` when the store supports it, preventing partial commit on validation, deduplication, or idempotency failures.
-
----
-
-## Request/response
-
-### Consumer side
-
-```go
-_, err := b.Subscribe(ctx, broker.ConsumerConfig{
-    Name:    "user-lookup",
-    Queue:   "user.lookup",
-    AckMode: broker.AckAuto,
-}, func(ctx context.Context, d broker.Delivery) error {
-    var req struct{ ID string `json:"id"` }
-    if err := d.Decode(&req); err != nil {
-        return err
-    }
-    return d.Respond(ctx, map[string]any{
-        "id":   req.ID,
-        "name": "Sujit",
-    })
-})
-```
-
-### Publisher side
-
-```go
-var out struct {
-    ID   string `json:"id"`
-    Name string `json:"name"`
-}
-err := b.Publisher().Request(ctx, "user.lookup", map[string]string{"id":"u1"}, &out,
-    broker.WithTimeout(3*time.Second),
-)
-```
-
-### Async request
-
-```go
-future := b.Publisher().RequestAsync(ctx, "report.generate", req, broker.WithTimeout(30*time.Second))
-resp, err := future.Wait(ctx)
-```
-
-### Request stream
-
-```go
-stream, err := b.Publisher().RequestStream(ctx, "logs.query", req)
-if err != nil {
-    return err
-}
-defer stream.Close()
-for stream.Next() {
-    msg := stream.Message()
-    _ = msg
-}
-if err := stream.Err(); err != nil {
-    return err
-}
+// Scheduled publish
+pub.PublishAt(ctx, "billing.renew", payload, renewAt, broker.WithQueue("billing"))
 ```
 
 ---
 
-## Consumers
-
-### Auto-ack consumer
+## Consumer
 
 ```go
-_, err := b.Subscribe(ctx, broker.ConsumerConfig{
-    Name:        "worker-1",
-    Queue:       "jobs",
-    ConsumerGroup: "workers",
-    Concurrency: 32,
-    AckMode:     broker.AckAuto,
+// Auto-ack
+b.Subscribe(ctx, broker.ConsumerConfig{
+    Name: "worker", Queue: "jobs", AckMode: broker.AckAuto, Concurrency: 32,
 }, func(ctx context.Context, d broker.Delivery) error {
-    var payload MyPayload
-    if err := d.Decode(&payload); err != nil {
-        return err
-    }
-    return process(payload)
+    // process
+    return nil
 })
-```
 
-### Manual ack consumer
-
-```go
-_, err := b.Subscribe(ctx, broker.ConsumerConfig{
-    Name:    "manual-worker",
-    Queue:   "jobs",
-    AckMode: broker.AckManual,
+// Manual ack
+b.Subscribe(ctx, broker.ConsumerConfig{
+    Name: "worker", Queue: "jobs", AckMode: broker.AckManual,
 }, func(ctx context.Context, d broker.Delivery) error {
-    if err := processMessage(d.Message()); err != nil {
-        return d.Nack(ctx, broker.WithNackAction(broker.NackRetry), broker.WithNackDelay(5*time.Second), broker.WithNackReason(err.Error()))
+    if err := process(d); err != nil {
+        return d.Nack(ctx, broker.WithNackAction(broker.NackRetry), broker.WithNackDelay(5*time.Second))
     }
     return d.Ack(ctx)
 })
-```
 
-Ack/Nack security rule: when a message has a lease token, the correct lease token must be supplied. A caller with only a message ID cannot ack or nack a leased message.
-
----
-
-## Batch consumers
-
-```go
-_, err := b.SubscribeBatch(ctx, broker.ConsumerConfig{
-    Name:      "batcher",
-    Queue:     "events.ingest",
-    BatchSize: 500,
-    BatchWait: 50 * time.Millisecond,
-    AckMode:   broker.AckAuto,
+// Batch consumer
+b.SubscribeBatch(ctx, broker.ConsumerConfig{
+    Name: "batcher", Queue: "events", BatchSize: 500, BatchWait: 50*time.Millisecond,
 }, func(ctx context.Context, ds []broker.Delivery) error {
-    records := make([]MyRecord, 0, len(ds))
-    for _, d := range ds {
-        var r MyRecord
-        if err := d.Decode(&r); err != nil {
-            return err
-        }
-        records = append(records, r)
-    }
-    return bulkInsert(records)
+    // process batch
+    return nil
+})
+
+// Idempotent consumer (deduplicates messages)
+b.Subscribe(ctx, broker.ConsumerConfig{
+    Name: "idempotent-worker", Queue: "orders",
+    Idempotent: true, DeduplicationWindow: 5*time.Minute,
+}, func(ctx context.Context, d broker.Delivery) error {
+    // automatically deduplicates by idempotency_key
+    return nil
 })
 ```
 
 ---
 
-## Routing and wildcard topics
-
-Wildcards:
-
-| Pattern | Meaning |
-|---|---|
-| `*` | exactly one token |
-| `#` | zero or more tokens |
-
-Examples:
-
-| Pattern | Matches |
-|---|---|
-| `email.*` | `email.created`, `email.deleted` |
-| `email.#` | `email.created`, `email.marketing.sent` |
-| `tenant.*.invoice.created` | `tenant.acme.invoice.created` |
-| `tenant.#` | `tenant.acme.invoice.created`, `tenant.demo.email.sent` |
-
-### Add route in Go
+## Routing
 
 ```go
+// Wildcard routes
 b.AddRoute(broker.Route{
-    Name:  "tenant-invoices",
-    Match: "tenant.*.invoice.created",
-    To: []broker.Destination{{
-        Kind: broker.DestinationQueue,
-        Name: "invoice.process",
-    }},
+    Name: "tenant-invoices", Match: "tenant.*.invoice.created",
+    To: []broker.Destination{{Kind: broker.DestinationQueue, Name: "invoice.process"}},
 })
-```
 
-### Add route by HTTP
+// Fanout
+b.AddRoute(broker.Route{
+    Name: "all-events", Match: "events.*", Mode: broker.RouteFanout,
+    To: []broker.Destination{
+        {Kind: broker.DestinationQueue, Name: "analytics"},
+        {Kind: broker.DestinationQueue, Name: "audit"},
+    },
+})
 
-```bash
-curl -s -X POST "${AUTH[@]}" \
-  -H 'Content-Type: application/json' \
-  "$BASE/routes" \
-  -d '{
-    "name":"tenant-invoices",
-    "match":"tenant.*.invoice.created",
-    "to":[{"kind":"queue","name":"invoice.process"}]
-  }'
+// Add route via HTTP
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  http://localhost:8090/routes \
+  -d '{"name":"my-route","match":"orders.*","to":[{"kind":"queue","name":"orders.process"}]}'
 ```
 
 ---
 
 ## Queues
 
-Queue features:
-
-- FIFO/priority leasing
-- delayed availability
-- TTL expiry
-- manual and auto ack
-- visibility timeout
-- lease extension
-- redelivery after lease expiry
-- pause/resume/purge
-- max-depth backpressure
-- drop-oldest/drop-newest/reject/DLQ full-queue policies
-- retry and DLQ policy
-
-Declare queue:
-
 ```go
-err := b.DeclareQueue(ctx, broker.QueueConfig{
-    Name:              "email.send",
-    VisibilityTimeout: 30 * time.Second,
-    MaxDepth:          100000,
-    RetryPolicy:       broker.DefaultRetryPolicy(),
-    DLQ:               "email.send.dlq",
+b.DeclareQueue(ctx, broker.QueueConfig{
+    Name: "orders", VisibilityTimeout: 30*time.Second, MaxDepth: 100000,
+    RetryPolicy: broker.DefaultRetryPolicy(), DLQ: "orders.dlq",
 })
 ```
+
+Features: FIFO/priority leasing, delayed availability, TTL, manual/auto ack, visibility timeout, lease extension, redelivery, pause/resume/purge, max-depth backpressure.
 
 ---
 
-## Streams and offsets
-
-Streams are append-only logs with offsets and consumer-group commits.
+## Streams
 
 ```go
-err := b.DeclareStream(ctx, broker.StreamConfig{Name: "audit.events"})
-_, err = b.Publisher().Publish(ctx, "audit.login", event, broker.WithStream("audit.events"))
-```
+b.DeclareStream(ctx, broker.StreamConfig{Name: "audit.events"})
 
-Read from stream:
+// Publish to stream
+pub.Publish(ctx, "audit.login", event, broker.WithStream("audit.events"))
 
-```go
-msgs, err := b.ReadStream(ctx, broker.StreamReadRequest{
-    Stream:        "audit.events",
-    ConsumerGroup: "analytics",
-    Limit:         100,
-})
-```
+// Read from stream
+msgs, _ := b.ReadStream(ctx, broker.StreamReadRequest{Stream: "audit.events", ConsumerGroup: "analytics", Limit: 100})
 
-Commit offset:
+// Commit offset
+b.CommitOffset(ctx, broker.OffsetCommit{Stream: "audit.events", ConsumerGroup: "analytics", Offset: msgs[len(msgs)-1].Offset})
 
-```go
-err = b.CommitOffset(ctx, broker.OffsetCommit{
-    Stream:        "audit.events",
-    ConsumerGroup: "analytics",
-    Offset:        msgs[len(msgs)-1].Offset,
-})
-```
-
-Get committed offset:
-
-```go
-off, err := b.ConsumerOffset(ctx, broker.OffsetCommit{
-    Stream:        "audit.events",
-    ConsumerGroup: "analytics",
-})
+// Check lag
+lag, _ := b.StreamLag(ctx, "audit.events", "analytics")
 ```
 
 ---
 
 ## Retries and DLQ
 
-Return a normal error to retry based on policy:
-
 ```go
-return fmt.Errorf("temporary dependency failure")
-```
+// Retry on error
+return fmt.Errorf("temporary failure")
 
-Return a permanent error to skip retry and move to DLQ:
-
-```go
+// Permanent error (skip retry, go to DLQ)
 return broker.Permanent(fmt.Errorf("invalid payload"))
-```
 
-Manual retry via Nack:
+// Manual retry
+return d.Nack(ctx, broker.WithNackAction(broker.NackRetry), broker.WithNackDelay(10*time.Second))
 
-```go
-return d.Nack(ctx,
-    broker.WithNackAction(broker.NackRetry),
-    broker.WithNackDelay(10*time.Second),
-    broker.WithNackReason("rate limited"),
-)
-```
-
-Reject to DLQ:
-
-```go
+// Reject to DLQ
 return d.Reject(ctx, "invalid customer id")
-```
 
-Replay DLQ by HTTP:
-
-```bash
-curl -s -X POST "${AUTH[@]}" "$BASE/dlq/email.send.dlq/replay?queue=email.send"
-```
-
----
-
-## Movement across queues/topics/streams/DLQ
-
-The movement manager supports:
-
-- move
-- copy
-- replay
-- reroute-ready mode
-- quarantine
-- park
-- archive
-- dry-run
-- reset attempts
-- reset lease
-- reset error
-- filter by status/type/tenant/headers
-
-Go API:
-
-```go
-res, err := b.Store().Move(ctx, broker.MoveRequest{
-    SourceType:      broker.DestinationQueue,
-    Source:          "email.send.dlq",
-    DestinationType: broker.DestinationQueue,
-    Destination:     "email.send",
-    Mode:            broker.MoveReplay,
-    ResetAttempts:   true,
-    ResetLease:      true,
-    ResetError:      true,
-    Reason:          "manual replay after SMTP fix",
-    Actor:           "admin",
-})
-```
-
-HTTP API:
-
-```bash
-curl -s -X POST "${AUTH[@]}" \
-  -H 'Content-Type: application/json' \
-  "$BASE/move" \
-  -d '{
-    "source_type":"queue",
-    "source":"email.send.dlq",
-    "destination_type":"queue",
-    "destination":"email.send",
-    "mode":"replay",
-    "reset_attempts":true,
-    "reset_lease":true,
-    "reset_error":true,
-    "reason":"manual replay",
-    "actor":"admin"
-  }'
+// Replay DLQ
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  http://localhost:8090/dlq/orders.dlq/replay?queue=orders
 ```
 
 ---
 
 ## Tasks
 
-Register a task worker:
-
 ```go
-_, err := b.RegisterTask(ctx, "image.resize", func(ctx context.Context, d broker.TaskDelivery) (any, error) {
-    var req ResizeRequest
-    if err := d.Decode(&req); err != nil {
-        return nil, err
-    }
-    _ = d.Progress(ctx, broker.Progress{Current: 1, Total: 2, Percent: 50, Message: "resizing"})
-    out, err := resize(req)
-    if err != nil {
-        return nil, err
-    }
-    return out, nil
+// Register task handler
+b.RegisterTask(ctx, "image.resize", func(ctx context.Context, d broker.TaskDelivery) (any, error) {
+    d.Progress(ctx, broker.Progress{Current: 1, Total: 2, Percent: 50})
+    return resize(d.Message.Payload)
 })
-```
 
-Submit and wait:
-
-```go
-h, err := b.Publisher().SubmitTask(ctx, "image.resize", ResizeRequest{FileID: "f1"},
-    broker.WithTaskQueue("image.jobs"),
-    broker.WithTaskMaxAttempts(3),
-)
-if err != nil {
-    return err
-}
-res, err := h.Wait(ctx)
-```
-
-Inspect:
-
-```go
-info, err := h.Info(ctx)
-progress, err := h.Progress(ctx)
-result, err := h.Result(ctx)
-```
-
-Cancel:
-
-```go
-err := h.Cancel(ctx, "user requested cancellation")
+// Submit task
+h, _ := pub.SubmitTask(ctx, "image.resize", req, broker.WithTaskQueue("image.jobs"))
+result, _ := h.Wait(ctx)
 ```
 
 ---
 
-## Scheduling
-
-Delayed publish:
-
-```go
-_, err := b.Publisher().PublishAfter(ctx, "email.reminder", payload, 30*time.Minute,
-    broker.WithQueue("email.send"),
-)
-```
-
-Publish at timestamp:
-
-```go
-_, err := b.Publisher().PublishAt(ctx, "subscription.renew", payload, renewAt,
-    broker.WithQueue("billing.jobs"),
-)
-```
-
-Internally, scheduled messages are stored with `AvailableAt` in the future and become leaseable after that time.
-
----
-
-## Hooks, notifications, and callbacks
-
-### Hooks
+## Multi-Tenancy
 
 ```go
 b := broker.MustNew(broker.Config{
-    Hooks: broker.Hooks{
-        BeforePublish: func(ctx context.Context, e broker.PublishEvent) error {
-            // validate, enrich, authorize, etc.
-            return nil
-        },
-        AfterPublish: func(ctx context.Context, e broker.PublishEvent) {
-            // custom audit
-        },
-        OnHandlerError: func(ctx context.Context, e broker.MessageEvent) {
-            // alert
-        },
+    Tenancy: &broker.TenancyConfig{
+        Enabled: true, IsolationLevel: broker.IsolationQueuePrefix, QueuePrefix: "t.",
     },
 })
+
+tenantMgr := b.TenantManager()
+tenantMgr.EnsureTenant("tenant-a")
+
+// Tenant-isolated publish
+tenantMgr.TenantAwarePublish(ctx, "tenant-a", "orders.created", payload)
+
+// Tenant-isolated subscribe
+tenantMgr.TenantAwareSubscribe(ctx, "tenant-a", broker.ConsumerConfig{Queue: "orders"}, handler)
 ```
 
-### Notifications
+---
+
+## Federation and Shovel
 
 ```go
-b.Notifications().Subscribe("logger", broker.CallbackFunc(func(ctx context.Context, n broker.Notification) error {
-    fmt.Println(n.Type, n.MessageID, n.Queue)
-    return nil
-}))
-```
+// Shovel: move messages from queue A to queue B
+b.ShovelManager().StartShovel(broker.ShovelConfig{
+    Source: "source-queue", Destination: "dest-queue", BatchSize: 100,
+})
 
-### Webhook callbacks
-
-```go
-b.Notifications().Subscribe("webhook", broker.WebhookCallback{
-    URL:         "https://ops.example.com/broker-events",
-    Token:       "webhook-secret",
-    Timeout:     3 * time.Second,
-    MaxAttempts: 3,
-    RetryDelay:  250 * time.Millisecond,
+// Federation: link to upstream broker
+b.FederationManager().AddLink(broker.FederationConfig{
+    Upstream: "http://upstream:8090", Queues: []string{"orders"},
 })
 ```
 
 ---
 
-## Durable WAL store
-
-Create a durable single-node store:
+## Partitioning
 
 ```go
-st, err := broker.NewFileWALStore("./.broker-data")
-if err != nil {
-    panic(err)
-}
-b := broker.MustNew(broker.Config{Store: st})
-```
+b := broker.MustNew(broker.Config{
+    Partition: &broker.PartitionConfig{Partitions: 4, Strategy: broker.PartitionHash},
+})
 
-WAL behavior:
-
-- append-only JSONL mutations
-- file permissions `0600`
-- directory permissions `0700`
-- SHA-256 checksum per new record
-- legacy WAL records without checksums are accepted for upgrade
-- crash recovery replays records into memory indexes
-- partial final record is truncated during recovery
-- in-flight leased/processing/progressing messages are made queueable again after restart
-- stream offsets are persisted and recovered
-
-Operational notes:
-
-- Put the WAL directory on reliable local disk.
-- Back it up like a database.
-- Avoid sharing the same WAL directory between multiple broker processes.
-- For multi-node production, implement a real replicated store or an external database-backed store.
-
----
-
-## Admin auth, ACL, TLS, and mTLS
-
-### Single admin token
-
-```go
-srv := broker.AdminServer{
-    Broker:       b,
-    Token:        "long-random-admin-token",
-    MaxBodyBytes: 1 << 20,
-}.ListenAndServe(":8090")
-```
-
-`Token` is a convenience option that grants `admin:*`.
-
-### Named ACL tokens
-
-```go
-srv := broker.AdminServer{
-    Broker: b,
-    ACL: broker.NewACL(
-        broker.AdminToken{
-            Name:        "admin",
-            Token:       "long-random-admin-token",
-            Permissions: []string{broker.PermissionAdminAll},
-        },
-        broker.AdminToken{
-            Name:  "reader",
-            Token: "read-only-token",
-            Permissions: []string{
-                broker.PermissionBrokerRead,
-                broker.PermissionQueueRead,
-                broker.PermissionTopicRead,
-                broker.PermissionStreamRead,
-                broker.PermissionMessageRead,
-                broker.PermissionDLQRead,
-                broker.PermissionRouteRead,
-                broker.PermissionNotification,
-            },
-        },
-    ),
-}.ListenAndServe(":8090")
-```
-
-### Permission constants
-
-| Permission | Meaning |
-|---|---|
-| `admin:*` | All admin/API actions |
-| `broker:read` | health/ready/stats |
-| `message:publish` | publish messages |
-| `message:read` | inspect messages/history |
-| `message:ack` | ack messages |
-| `message:nack` | nack messages |
-| `message:move` | move/copy/replay messages |
-| `queue:read` | list/pull/read queue messages |
-| `queue:write` | create queues |
-| `queue:control` | pause/resume queues |
-| `queue:purge` | purge queues |
-| `topic:read` | list topics |
-| `topic:write` | create topics |
-| `stream:read` | list/read streams |
-| `stream:write` | create streams |
-| `stream:commit` | commit stream offsets |
-| `dlq:read` | inspect DLQ |
-| `dlq:replay` | replay DLQ |
-| `route:read` | list routes |
-| `route:write` | create routes |
-| `notification:read` | read/SSE notification events |
-
-### TLS/mTLS in Go
-
-```go
-srv := broker.AdminServer{
-    Broker:            b,
-    Token:             "long-random-admin-token",
-    TLSCertFile:       "./certs/server.crt",
-    TLSKeyFile:        "./certs/server.key",
-    ClientCAFile:      "./certs/ca.crt",
-    RequireClientCert: true,
-}.ListenAndServe(":8443")
+router := broker.NewPartitionRouter(broker.PartitionConfig{Partitions: 4, Strategy: broker.PartitionHash})
+partition := router.SelectPartition(broker.Message{Key: "user-123"})
+queue := fmt.Sprintf("events.p%d", partition)
+pub.Publish(ctx, "events.user", payload, broker.WithQueue(queue))
 ```
 
 ---
 
-## Production checklist
+## Schema Evolution
 
-Before using standalone broker in production:
+```go
+registry := broker.NewMemorySchemaRegistry(
+    broker.SchemaDefinition{Name: "invoice", Version: "v1", Required: []string{"id", "amount"}},
+    broker.SchemaDefinition{Name: "invoice", Version: "v2", Required: []string{"id", "amount", "currency"}, CompatibleWith: "v1"},
+)
+b := broker.MustNew(broker.Config{SchemaRegistry: registry})
 
-- [ ] Run with `BROKER_TOKEN` or `-token`; never use `--insecure-dev`.
-- [ ] Use TLS; use mTLS for sensitive environments.
-- [ ] Use named ACL tokens and least-privilege permissions.
-- [ ] Set `-max-body` to a sane value for your workload.
-- [ ] Put WAL on reliable storage and back it up.
-- [ ] Ensure WAL directory permissions are restricted.
-- [ ] Configure OS service restart policy.
-- [ ] Run behind a private network or authenticated ingress.
-- [ ] Monitor `/stats`, `/notifications`, queue depth, DLQ count, and oldest message age.
-- [ ] Alert on DLQ growth and repeated callback failure.
-- [ ] Use idempotency keys for unsafe operations.
-- [ ] Use manual ack for operations that must be confirmed after durable side effects.
-- [ ] Keep visibility timeout longer than expected handler time or extend leases.
-- [ ] Use task cancellation and deadlines for long-running work.
-- [ ] Run `go test ./...`, `go test -race ./broker`, and `go vet ./...` in CI.
-- [ ] Add your own soak/load benchmarks for your payload sizes and durability settings.
-
-For distributed production:
-
-- [ ] Implement a consensus-backed metadata plane or use an external coordinator.
-- [ ] Implement replicated message storage or database-backed transactional store.
-- [ ] Add partition leadership, failover, split-brain protection, and cross-node consumer rebalancing.
+pub.Publish(ctx, "invoice.created", payload, broker.WithSchema("invoice", "v2"))
+```
 
 ---
 
-## Testing and validation
+## Observability
 
-Commands run during this package build:
+### Prometheus Metrics
 
 ```bash
-go test ./...
-go test -race ./broker
-go vet ./...
+curl http://localhost:8090/metrics
 ```
 
-Important test coverage added:
+Metrics: `broker_messages_published_total`, `broker_messages_delivered_total`, `broker_messages_acked_total`, `broker_queue_depth{queue}`, `broker_topic_published_total{topic}`, latency histograms.
 
-- lease-token enforcement for ack/nack
-- admin authentication and ACL authorization
-- admin body-size limits
-- WAL permissions
-- WAL checksum and partial-tail recovery
-- stream read and committed offsets
-- WAL stream offset recovery
-- task progress propagation
-- admin pull/ack/stream endpoints
-- webhook retry behavior
-- disabled routes
-- batch consumers
-- atomic transactions
-- backpressure and queue pause/resume
-- in-flight WAL redelivery after restart
+### Tracing
+
+```go
+b := broker.MustNew(broker.Config{
+    EnableTracing: true,
+    TracerConfig: &broker.TracerConfig{ServiceName: "my-service"},
+})
+```
+
+### Audit Logging
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" http://localhost:8090/audit
+```
 
 ---
 
-## Package layout
+## Production Checklist
 
-```text
+- [ ] Set `BROKER_TOKEN` or `-token`; never use `--insecure-dev`
+- [ ] Enable TLS; use mTLS for sensitive environments
+- [ ] Use named ACL tokens with least-privilege permissions
+- [ ] Set `-max-body` to a sane value
+- [ ] Put WAL on reliable storage and back it up
+- [ ] Enable encryption at rest if storing sensitive data
+- [ ] Run behind a private network or authenticated ingress
+- [ ] Monitor `/stats`, `/metrics`, `/lag`, queue depth, DLQ count
+- [ ] Alert on DLQ growth and callback failure
+- [ ] Use idempotency keys for unsafe operations
+- [ ] Use manual ack for operations requiring confirmation
+- [ ] Keep visibility timeout longer than handler time or extend leases
+- [ ] Run `go test ./...`, `go test -race`, `go vet ./...` in CI
+
+---
+
+## Package Layout
+
+```
 broker/
-  admin.go          HTTP admin/standalone API
-  broker.go         Broker runtime
-  publisher.go      Publisher/request/task APIs
-  consumer.go       Consumers, delivery, ack/nack/respond/progress
-  router.go         Routes and wildcard matching
-  store.go          Store interface, memory store, file WAL store
-  task.go           Task state/result/wait/progress
-  notification.go   Notification bus and webhook callbacks
-  security.go       Admin auth, ACL, audit, constant-time token checks
-  hooks.go          Lifecycle hook surfaces
-  types.go          Message/config/lifecycle types
+  broker.go              Core broker runtime
+  publisher.go           Publisher/request/task APIs
+  consumer.go            Consumers, delivery, ack/nack
+  router.go              Routes and wildcard matching
+  store.go               Store interface, memory store, WAL stores
+  task.go                Task state/result/wait/progress
+  saga.go                Saga orchestration
+  notification.go        Notification bus and webhooks
+  security.go            Auth, ACL, audit
+  hooks.go               Lifecycle hooks
+  types.go               Types and config
+  health.go              Health checks, metrics
+  admin.go               HTTP admin/API server
+  dataplane.go           /v1/* data-plane endpoints
+  remote.go              Remote consumer registry
+  distributed.go         Distributed broker (extension points)
+  rebalance.go           Consumer group rebalancing
+  strategy.go            14 routing strategies
+  schema.go              Schema registry
+  errors.go              Error types
+  mqtt.go                MQTT 3.1.1 server
+  grpc_transport.go      gRPC-like transport
+  websocket.go           WebSocket/SSE transport
+  federation.go          Federation and shovel
+  tenancy.go             Multi-tenancy
+  exactly_once.go        Transactional outbox, replay
+  partition_ordering.go  Partition routing
+  wal_compaction.go      WAL segment management
+  metrics.go             Prometheus metrics
+  tracing.go             Distributed tracing
+  ratelimit.go           Rate limiting
+  circuit_breaker.go     Circuit breaker
+  audit.go               Audit logging
+  frame_codec.go         FWB1 binary codec
+  binary_wal_store.go    Binary WAL store
 
-cmd/brokerd/        Standalone broker server
-cmd/broker-worker/  Generic remote worker CLI
-cmd/brokerctl/      CLI client
-examples/broker/     Complete BCL-driven broker example
-examples/consumer/   Complete BCL-driven consumer example
-examples/worker/     Complete BCL-driven worker/task service example
-examples/publisher/  Complete BCL-driven publisher example
-examples/codec/      Complete FWB1 codec encode/decode/tamper example
-examples/internal/exconfig/   Small BCL loader used by the examples
-Tasks.md            Implementation tracker
+  amqp/                  AMQP 0-9-1 protocol server
+  cluster/               Raft consensus (extension points)
+  contrib/sqlitestore/   SQLite state + message stores
+  cmd/brokerd/           Standalone broker server
+  cmd/brokerctl/         CLI client
+  cmd/broker-worker/     Remote worker process
+  pkg/client/            Client SDK
+  pkg/pool/              Worker pool (execution engine)
+  examples/              BCL-driven examples
 ```
 
 ---
 
-## Final notes
+## License
 
-This implementation is now hardened for serious embedded and single-node standalone usage. It is intentionally honest about remaining distributed-system scope: true Raft/quorum replication and cross-node data-plane guarantees require a separate implementation phase and cannot be safely faked with metadata alone.
-
----
-
-## Consolidated BCL-driven examples
-
-The examples folder has been intentionally reduced to four complete examples plus a tiny internal BCL loader used by those examples:
-
-```text
-examples/
-  broker/
-    broker.bcl
-    main.go
-  consumer/
-    consumer.bcl
-    main.go
-  worker/
-    worker.bcl
-    main.go
-  publisher/
-    publisher.bcl
-    main.go
-  codec/
-    codec.bcl
-    main.go
-  internal/exconfig/
-    bcl.go
-```
-
-The old scattered examples were removed to avoid noise. The four remaining examples cover the complete standalone flow with configuration-first setup.
-
-### 1. Complete broker example
-
-`examples/broker/broker.bcl` configures:
-
-- listen address
-- standalone mode
-- durable WAL path
-- insecure local-dev mode or token-based ACL mode
-- named admin/publisher/worker tokens
-- queue declarations
-- topic declarations
-- stream declarations
-- wildcard routes
-- topic-to-queue routes
-- topic-to-stream archive copies
-- default visibility timeout
-- remote consumer heartbeat timeout
-- live broker logs
-- explicit broker lifecycle hooks
-- explicit publish/task/consumer/DLQ hook callbacks
-- broker notification callback subscriber
-- JSONL observability sink configured by BCL
-- broker-sent notification/event channel
-- consumer service discovery through `/v1/consumers`
-
-Run:
-
-```bash
-go run ./examples/broker -config examples/broker/broker.bcl
-```
-
-Production-style token run:
-
-```bash
-BROKER_INSECURE_DEV=false \
-BROKER_TOKEN='admin-secret' \
-BROKER_PUBLISHER_TOKEN='publisher-secret' \
-BROKER_WORKER_TOKEN='worker-secret' \
-go run ./examples/broker -config examples/broker/broker.bcl
-```
-
-### 2. Complete consumer example
-
-`examples/consumer/consumer.bcl` configures:
-
-- broker URL/failover URL list
-- worker token
-- consumer ID
-- consumer group
-- local concurrency
-- max in-flight
-- heartbeat interval
-- visibility timeout
-- auto lease extension
-- hook/lifecycle logs
-- polling delivery
-- broker-sent events
-- service discovery registration
-- queue handler for `email.send`
-- wildcard handler for `tenant.*.invoice.created`
-- queue handler for `invoice.events`
-- DLQ demo behavior through `fail_on_contains "force_dlq"`
-
-Run:
-
-```bash
-go run ./examples/consumer -config examples/consumer/consumer.bcl
-```
-
-### 3. Complete worker example
-
-`examples/worker/worker.bcl` configures the task/RPC/command worker service:
-
-- broker URL/failover URL list
-- worker token
-- worker/consumer ID
-- group
-- concurrency
-- heartbeat
-- visibility timeout
-- auto lease extension
-- lifecycle hook logs
-- broker-sent cancellation/drain events
-- task handler `pdf.generate`
-- request handler `payment.authorize`
-- command handler `payment.capture`
-
-Run:
-
-```bash
-go run ./examples/worker -config examples/worker/worker.bcl
-```
-
-### 4. Complete publisher example
-
-`examples/publisher/publisher.bcl` configures publisher operations for all primary modes:
-
-- direct queue publish
-- topic publish routed by broker route
-- wildcard topic publish
-- batch publish
-- async publish
-- task submission and result wait
-- request/response
-- command/response
-- stream publish/read/commit
-- DLQ demonstration message
-
-Run:
-
-```bash
-go run ./examples/publisher -config examples/publisher/publisher.bcl
-```
-
-### Complete local flow
-
-Use four terminals:
-
-```bash
-# terminal 1
-go run ./examples/broker -config examples/broker/broker.bcl
-
-# terminal 2
-go run ./examples/consumer -config examples/consumer/consumer.bcl
-
-# terminal 3
-go run ./examples/worker -config examples/worker/worker.bcl
-
-# terminal 4
-go run ./examples/publisher -config examples/publisher/publisher.bcl
-```
-
-Automated smoke:
-
-```bash
-./scripts/smoke_remote.sh
-```
-
-The smoke script also asserts:
-
-```text
-HOOK before_publish
-CALLBACK live-jsonl-audit notification=message.published
-CALLBACK broker_event type=message.leased
-non-empty broker/consumer/worker/publisher JSONL observability files
-```
-
-Successful publisher output includes:
-
-```text
-published message_id=msg-... destinations=...
-batch published count=2 errors=0 err=<nil>
-async published message_id=msg-... destinations=... err=<nil>
-task status=succeeded progress=100 result={...}
-request response={...} err=<nil>
-command response={...} err=<nil>
-stream committed offset=... group=publisher-demo
-```
-
-### BCL configuration notes
-
-The examples use BCL files instead of hardcoded setup. The example loader supports the subset used by these files:
-
-- named blocks: `broker "complete" { ... }`
-- nested blocks: `queue "email.send" { ... }`
-- string, int, bool, duration, and list values
-- environment values: `env("BROKER_TOKEN", "dev-token")`
-- route expressions such as `to queue "email.send"` and `copy_to stream "audit.events"`
-
-This keeps the examples self-contained and dependency-light while still using BCL-style configuration for broker, consumer, worker, and publisher setup.
-
-### Broker-sent events and service discovery
-
-Remote consumers and workers register with the broker and are discoverable through:
-
-```text
-GET /v1/consumers
-GET /v1/consumers/{id}
-GET /v1/consumers/{id}/events
-```
-
-The worker runtime consumes the event endpoint for lifecycle signals such as:
-
-- `task.cancelled`
-- `consumer.draining`
-- `broker.draining`
-- `broker.stopping`
-
-The examples attach `exobserve.ClientObserver`, which wraps `bclient.LoggingHooks(...)` and also writes every hook/callback event to JSONL. Consumer and worker examples print and persist lifecycle, poll, heartbeat, broker notification, receive, before-handle, progress, ack/nack/reject, lease-extension, error, drain, and stop events.
-
-### Complete lifecycle/hooks/notification implementation
-
-The examples now include real code paths for the observability surfaces instead of comments-only configuration:
-
-```text
-examples/internal/exobserve/
-  observe.go   Broker hooks, client hooks, notification callbacks, JSONL sink
-```
-
-Broker example implementation:
-
-- creates `exobserve.BrokerObserver` from `broker.bcl`
-- passes `observer.Hooks()` into `broker.Config.Hooks`
-- subscribes `observer.NotificationCallback(...)` to `b.Notifications()`
-- writes hook and notification callback events to `BROKER_OBSERVER_JSONL`
-- logs hook events such as `HOOK before_publish`, `HOOK task.progress`, `HOOK dlq.dead_lettered`
-- logs notification callbacks such as `CALLBACK live-jsonl-audit notification=message.published`
-
-Consumer and worker implementation:
-
-- create `exobserve.ClientObserver` from `consumer.bcl` / `worker.bcl`
-- pass `observer.Hooks()` into `bclient.Config.Hooks`
-- consume broker-sent events through `/v1/consumers/{id}/events`
-- invoke `OnNotification` for each broker event received
-- write hook/callback events to `CONSUMER_OBSERVER_JSONL` and `WORKER_OBSERVER_JSONL`
-- log callback events such as `CALLBACK broker_event type=message.leased`
-
-Publisher implementation:
-
-- configures a local callback sink with `PUBLISHER_OBSERVER_JSONL`
-- records `publisher.operation.start`, `publisher.operation.succeeded`, and `publisher.operation.failed`
-
-Example BCL observability fields:
-
-```bcl
-observer_jsonl env("BROKER_OBSERVER_JSONL", "./.broker-data/observability/broker-events.jsonl")
-
-callback "live-jsonl-audit" {
-  enabled true
-  type "notification"
-  sink "jsonl"
-  events ["broker.*", "consumer.*", "message.*", "task.*", "queue.*", "stream.*", "dlq.*"]
-}
-
-lifecycle_hooks "all" {
-  enabled true
-  callbacks ["jsonl", "console"]
-  events ["connecting", "registered", "subscribed", "polling", "message_received", "before_handle", "progress", "ack", "nack", "reject", "broker_notification", "stopped"]
-}
-```
-
-The smoke script validates these logs and JSONL sinks, not only message success.
-
-### Data-plane paths used by the examples
-
-```text
-POST /v1/publish
-POST /v1/publish/batch
-POST /v1/request
-POST /v1/tasks/submit
-GET  /v1/tasks/{id}/result
-POST /v1/consumers/register
-POST /v1/consumers/{id}/subscribe
-POST /v1/poll
-POST /v1/messages/{id}/ack
-POST /v1/messages/{id}/nack
-POST /v1/messages/{id}/progress
-POST /v1/messages/{id}/respond
-GET  /v1/streams/{stream}/messages
-POST /v1/streams/{stream}/commit
-GET  /v1/dlq/{queue}/messages
-```
-
-### Validation
-
-The consolidated examples were validated with:
-
-```bash
-go test ./...
-go vet ./...
-go test -race ./broker
-./scripts/smoke_remote.sh
-```
-
-The smoke script also asserts:
-
-```text
-HOOK before_publish
-CALLBACK live-jsonl-audit notification=message.published
-CALLBACK broker_event type=message.leased
-non-empty broker/consumer/worker/publisher JSONL observability files
-```
-
-## Final notes
-
-This implementation is hardened for embedded and single-node standalone broker usage with distributed remote consumers/workers. The examples now demonstrate the intended production shape without noisy scattered demos. True broker-node Raft/quorum replication remains an explicit future phase and is not falsely claimed as complete.
-
-## Native FWB1 binary message codec
-
-The complete wire/storage format is documented in [`docs/CODEC_FORMAT.md`](docs/CODEC_FORMAT.md). Run `go run ./examples/codec -config examples/codec/codec.bcl` for a standalone BCL-driven encode/decode/tamper-detection demo.
-
-BCL payload examples use native BCL object blocks. The example loader converts these blocks to JSON payload bytes, so payloads are readable and are not escaped strings:
-
-```bcl
-payload {
-  hello "world"
-  mode "fwb1"
-}
-
-payloads {
-  item { to "batch1@example.com" }
-  item { to "batch2@example.com" }
-}
-```
-
-The broker now includes a native binary message frame codec named **FWB1**. It is intended for the broker hot path, binary WAL, remote worker data-plane traffic, and future replication streams. JSON remains available for the public HTTP/admin API and examples, but FWB1 is the recommended format for high-throughput broker-to-broker and broker-to-worker transport.
-
-### Features
-
-- `FWB1` magic/versioned binary frame.
-- Compact TLV metadata for message headers and broker fields.
-- Opaque payload bytes; payload can still be JSON, raw bytes, protobuf, msgpack, etc.
-- CRC32C integrity check for every frame.
-- Optional HMAC-SHA256 frame authentication.
-- Optional AES-GCM payload encryption.
-- Optional gzip compression with threshold.
-- Maximum frame-size enforcement.
-- Header-only peek without materializing payload.
-- Base64 helpers for HTTP-compatible transport/debugging.
-- Length-prefixed frame batch support for polling.
-- Binary WAL store using the same frame codec.
-
-### Go usage
-
-```go
-codec := broker.NewBinaryMessageCodec(
-    broker.WithFrameMaxSize(128<<20),
-    broker.WithFrameCompressionThreshold(1024),
-    broker.WithFrameSigningKey([]byte(os.Getenv("BROKER_FRAME_SIGNING_KEY"))),
-    broker.WithFrameEncryptionKey([]byte(os.Getenv("BROKER_FRAME_ENCRYPTION_KEY"))),
-)
-
-msg := broker.Message{
-    ID:          "msg-1",
-    Topic:       "email.created",
-    Queue:       "email.send",
-    Type:        "email",
-    ContentType: "application/json",
-    Payload:     []byte(`{"to":"user@example.com"}`),
-    Headers:     map[string]string{"tenant": "tenant-a"},
-    CreatedAt:   time.Now(),
-    Status:      broker.MessageQueued,
-}
-
-frame, err := codec.EncodeMessage(nil, msg)
-var decoded broker.Message
-err = codec.DecodeMessage(frame, &decoded)
-```
-
-### Binary WAL
-
-Use the new binary WAL store for compact, frame-protected local durability:
-
-```go
-st, err := broker.NewBinaryFileWALStore("./.broker-data/wal",
-    broker.WithFrameSigningKey([]byte("change-me")),
-    broker.WithFrameCompressionThreshold(1024),
-)
-b := broker.MustNew(broker.Config{
-    Store:      st,
-    FrameCodec: broker.NewBinaryMessageCodec(broker.WithFrameSigningKey([]byte("change-me"))),
-})
-```
-
-The binary WAL file is:
-
-```text
-broker.wal.fwb
-```
-
-The legacy JSONL WAL is still available through `NewFileWALStore` for debugging and compatibility.
-
-### brokerd flags
-
-```bash
-BROKER_TOKEN=admin \
-BROKER_FRAME_SIGNING_KEY='change-this-signing-key' \
-BROKER_FRAME_ENCRYPTION_KEY='optional-encryption-key' \
-go run ./cmd/brokerd \
-  -addr :8090 \
-  -wal ./.broker-data/wal \
-  -wal-format binary \
-  -frame-compress-threshold 1024
-```
-
-Useful flags/env:
-
-| Flag | Env | Description |
-|---|---|---|
-| `-wal-format` | `BROKER_WAL_FORMAT` | `binary` or `json` |
-| `-frame-signing-key` | `BROKER_FRAME_SIGNING_KEY` | Optional HMAC key |
-| `-frame-encryption-key` | `BROKER_FRAME_ENCRYPTION_KEY` | Optional AES-GCM key |
-| `-frame-compress-threshold` | `BROKER_FRAME_COMPRESS_THRESHOLD` | gzip threshold in bytes |
-
-### Remote client frame publish/poll
-
-```go
-c := bclient.New(bclient.Config{
-    BrokerURL:  "http://127.0.0.1:8090",
-    Token:      os.Getenv("BROKER_TOKEN"),
-    ConsumerID: "worker-1",
-    Group:      "workers",
-    FrameCodec: broker.NewBinaryMessageCodec(
-        broker.WithFrameSigningKey([]byte(os.Getenv("BROKER_FRAME_SIGNING_KEY"))),
-    ),
-})
-
-_, err := c.PublishFrame(ctx, broker.Message{
-    ID:      "frame-msg-1",
-    Topic:   "email.created",
-    Queue:   "email.send",
-    Payload: []byte(`{"to":"frame@example.com"}`),
-})
-
-msgs, err := c.PollFrames(ctx, "email.send", 10)
-```
-
-### BCL example configuration
-
-The consolidated examples now configure the frame codec from BCL:
-
-```bcl
-codec "fwb1" {
-  max_frame_size "128MB"
-  compress_threshold "1KB"
-  signing_key env("BROKER_FRAME_SIGNING_KEY", "dev-frame-signing-key")
-  encryption_key env("BROKER_FRAME_ENCRYPTION_KEY", "")
-}
-```
-
-`examples/broker/broker.bcl` also supports:
-
-```bcl
-wal_format "binary"
-```
-
-`examples/publisher/publisher.bcl` includes `frame_publish` and `frame_poll` operations to demonstrate binary frame transport. `examples/codec` shows direct local codec usage without a running broker.
-
-
-## Control-plane state store interfaces and SQLite contrib
-
-The broker now separates the hot message data-plane store from control-plane state. `broker.Store` remains responsible for queues, topics, streams, WAL, leases, movement, and DLQ. The new `broker.StateStore` persists broker/task/consumer/publisher state:
-
-- `BrokerStateStore`: broker mode/node/state snapshots.
-- `TaskStateStore`: task lifecycle, progress, result, and status.
-- `ConsumerStateStore`: remote consumer registrations, subscriptions, lifecycle state, and broker-sent events.
-- `PublisherStateStore`: publish/request/task operation records for audit and troubleshooting.
-
-Memory is the default:
-
-```go
-b, _ := broker.New(broker.Config{
-    Store:      broker.NewMemoryStore(),
-    StateStore: broker.NewMemoryStateStore(),
-})
-```
-
-A persistent SQLite control-plane state implementation is available in `contrib/sqlitestore`. It uses `database/sql` and accepts any registered SQLite driver, so the core broker does not force a SQLite dependency:
-
-```go
-import (
-    "database/sql"
-
-    _ "modernc.org/sqlite" // or your preferred SQLite driver
-    "github.com/oarkflow/broker"
-    "github.com/oarkflow/broker/contrib/sqlitestore"
-)
-
-db, _ := sql.Open("sqlite", "./broker-state.sqlite")
-stateStore, _ := sqlitestore.NewStateStore(db)
-
-b, _ := broker.New(broker.Config{
-    Store:      broker.NewMemoryStore(),
-    StateStore: stateStore,
-})
-```
-
-The complete broker BCL has an optional SQLite state-store block, disabled by default so examples run without external dependencies:
-
-```bcl
-state_store "sqlite" {
-  enabled env("BROKER_SQLITE_STATE_ENABLED", "false")
-  driver env("BROKER_SQLITE_DRIVER", "sqlite")
-  dsn env("BROKER_SQLITE_DSN", "./.broker-data/broker-state.sqlite")
-}
-```
-
-## Production gap-fill update: SQLite message store contrib submodule
-
-`contrib/sqlitestore` is now a separate Go submodule with its own `go.mod`. It contains both control-plane and message data-plane persistence:
-
-- `sqlitestore.StateStore` persists broker/task/consumer/publisher state.
-- `sqlitestore.MessageStore` persists queues, topics, streams, leases, offsets, DLQ, and movement state by snapshotting the broker memory data-plane after every mutation.
-
-The package uses `database/sql` and accepts any registered SQLite driver. It does not force a driver into the core broker module.
-
-Example:
-
-```go
-import (
-    _ "modernc.org/sqlite"
-
-    "github.com/oarkflow/broker"
-    "github.com/oarkflow/broker/contrib/sqlitestore"
-)
-
-msgStore, _ := sqlitestore.OpenMessageStore("sqlite", "./.broker-data/broker-messages.sqlite")
-stateStore, _ := sqlitestore.Open("sqlite", "./.broker-data/broker-state.sqlite")
-
-b := broker.MustNew(broker.Config{
-    Mode:       broker.ModeStandalone,
-    Store:      msgStore,
-    StateStore: stateStore,
-})
-```
-
-BCL:
-
-```bcl
-message_store "sqlite" {
-  enabled env("BROKER_SQLITE_MESSAGE_ENABLED", "false")
-  driver env("BROKER_SQLITE_DRIVER", "sqlite")
-  dsn env("BROKER_SQLITE_MESSAGE_DSN", "./.broker-data/broker-messages.sqlite")
-}
-
-state_store "sqlite" {
-  enabled env("BROKER_SQLITE_STATE_ENABLED", "false")
-  driver env("BROKER_SQLITE_DRIVER", "sqlite")
-  dsn env("BROKER_SQLITE_DSN", "./.broker-data/broker-state.sqlite")
-}
-```
-
-For the highest durable write throughput, use `wal_format "binary"`. For operational simplicity in embedded/single-node deployments, use the SQLite contrib message store.
-
-## Built-in schema registry hook
-
-The broker now includes a dependency-free `SchemaRegistry` interface and a default `MemorySchemaRegistry` implementation. It validates payloads before routing/persistence.
-
-```go
-reg := broker.NewMemorySchemaRegistry(broker.SchemaDefinition{
-    Name:     "invoice.created",
-    Version:  "v1",
-    Required: []string{"invoice_id", "amount"},
-})
-
-b := broker.MustNew(broker.Config{SchemaRegistry: reg})
-_, err := b.Publisher().Publish(ctx, "invoice.created", payload,
-    broker.WithSchema("invoice.created", "v1"),
-)
-```
-
-The built-in registry intentionally supports only lightweight JSON required-field validation. Production users can replace the interface with JSON Schema, Protobuf descriptors, Avro compatibility checks, or an external schema-registry service.
+See [LICENSE](LICENSE) for details.

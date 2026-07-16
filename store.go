@@ -4,13 +4,17 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
+	cryptorand "crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"math/rand"
+	mathrand "math/rand"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -192,12 +196,12 @@ type MemoryStore struct {
 	offsets  map[string]map[string]uint64
 	dedup    map[string]time.Time
 	idemp    map[string]string
-	rand     *rand.Rand
+	rand     *mathrand.Rand
 	closed   bool
 }
 
 func NewMemoryStore() *MemoryStore {
-	return &MemoryStore{queues: map[string]*memoryQueue{}, topics: map[string]*memoryTopic{}, streams: map[string]*memoryStream{}, messages: map[string]*Message{}, history: map[string][]MessageHistory{}, offsets: map[string]map[string]uint64{}, dedup: map[string]time.Time{}, idemp: map[string]string{}, rand: rand.New(rand.NewSource(time.Now().UnixNano()))}
+	return &MemoryStore{queues: map[string]*memoryQueue{}, topics: map[string]*memoryTopic{}, streams: map[string]*memoryStream{}, messages: map[string]*Message{}, history: map[string][]MessageHistory{}, offsets: map[string]map[string]uint64{}, dedup: map[string]time.Time{}, idemp: map[string]string{}, rand: mathrand.New(mathrand.NewSource(time.Now().UnixNano()))}
 }
 
 func (s *MemoryStore) DeclareQueue(ctx context.Context, cfg QueueConfig) error {
@@ -1220,12 +1224,22 @@ func strconvFormatInt(i int64) string { return strconv.FormatInt(i, 36) }
 
 // FileWALStore is a durable local store that appends every mutation to JSONL and
 // rebuilds the in-memory indexes on startup. It is intended for embedded and
-// single-node standalone deployments.
+// single-node standalone deployments. Encryption is optional — set EncryptionKey
+// in the config to enable AES-GCM encryption of all WAL records at rest.
 type FileWALStore struct {
 	*MemoryStore
-	mu   sync.Mutex
-	path string
-	file *os.File
+	mu      sync.Mutex
+	path    string
+	file    *os.File
+	gcm     cipher.AEAD
+	keyName string
+}
+
+// FileWALStoreConfig configures the FileWALStore.
+type FileWALStoreConfig struct {
+	Dir           string
+	EncryptionKey []byte
+	KeyName       string
 }
 
 type walRecord struct {
@@ -1247,11 +1261,30 @@ type walRecord struct {
 }
 
 func NewFileWALStore(dir string) (*FileWALStore, error) {
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	return NewFileWALStoreWithConfig(FileWALStoreConfig{Dir: dir})
+}
+
+// NewFileWALStoreWithConfig creates a FileWALStore with optional encryption.
+// If EncryptionKey is nil or empty, WAL records are stored in plaintext.
+// If EncryptionKey is provided (16, 24, or 32 bytes), all records are AES-GCM encrypted.
+func NewFileWALStoreWithConfig(cfg FileWALStoreConfig) (*FileWALStore, error) {
+	if err := os.MkdirAll(cfg.Dir, 0o700); err != nil {
 		return nil, err
 	}
-	path := filepath.Join(dir, "broker.wal.jsonl")
-	st := &FileWALStore{MemoryStore: NewMemoryStore(), path: path}
+	path := filepath.Join(cfg.Dir, "broker.wal.jsonl")
+	st := &FileWALStore{MemoryStore: NewMemoryStore(), path: path, keyName: cfg.KeyName}
+	// Set up optional encryption
+	if len(cfg.EncryptionKey) > 0 {
+		block, err := aes.NewCipher(cfg.EncryptionKey)
+		if err != nil {
+			return nil, fmt.Errorf("wal: invalid encryption key: %w", err)
+		}
+		gcm, err := cipher.NewGCM(block)
+		if err != nil {
+			return nil, fmt.Errorf("wal: init GCM: %w", err)
+		}
+		st.gcm = gcm
+	}
 	if err := st.recover(); err != nil {
 		return nil, err
 	}
@@ -1286,8 +1319,38 @@ func (s *FileWALStore) recover() error {
 		}
 		trimmed := bytes.TrimSpace(line)
 		if len(trimmed) > 0 {
+			// Handle encrypted records
+			data := trimmed
+			if bytes.HasPrefix(data, []byte("ENC:")) {
+				if s.gcm == nil {
+					recoveryErrors = append(recoveryErrors, fmt.Errorf("encrypted WAL record at offset %d but no encryption key configured", offset))
+					offset += int64(len(line))
+					continue
+				}
+				encoded := data[4:] // strip "ENC:" prefix
+				encrypted, err := base64.StdEncoding.DecodeString(string(encoded))
+				if err != nil {
+					recoveryErrors = append(recoveryErrors, fmt.Errorf("base64 decode WAL record at offset %d: %w", offset, err))
+					offset += int64(len(line))
+					continue
+				}
+				if len(encrypted) < s.gcm.NonceSize() {
+					recoveryErrors = append(recoveryErrors, fmt.Errorf("encrypted WAL record too short at offset %d", offset))
+					offset += int64(len(line))
+					continue
+				}
+				nonce := encrypted[:s.gcm.NonceSize()]
+				ciphertext := encrypted[s.gcm.NonceSize():]
+				plaintext, err := s.gcm.Open(nil, nonce, ciphertext, nil)
+				if err != nil {
+					recoveryErrors = append(recoveryErrors, fmt.Errorf("decrypt WAL record at offset %d: %w", offset, err))
+					offset += int64(len(line))
+					continue
+				}
+				data = plaintext
+			}
 			var rec walRecord
-			if err := json.Unmarshal(trimmed, &rec); err != nil {
+			if err := json.Unmarshal(data, &rec); err != nil {
 				if errors.Is(readErr, io.EOF) {
 					_ = os.Truncate(s.path, offset)
 					s.normalizeRecoveredInflight()
@@ -1399,6 +1462,18 @@ func (s *FileWALStore) write(r walRecord) error {
 	line, err := json.Marshal(r)
 	if err != nil {
 		return err
+	}
+	// Optional AES-GCM encryption at rest
+	if s.gcm != nil {
+		nonce := make([]byte, s.gcm.NonceSize())
+		if _, err := io.ReadFull(cryptorand.Reader, nonce); err != nil {
+			return fmt.Errorf("wal: generate nonce: %w", err)
+		}
+		encrypted := s.gcm.Seal(nonce, nonce, line, nil)
+		// Base64-encode to avoid newlines in binary data breaking line-based reading
+		encoded := make([]byte, base64.StdEncoding.EncodedLen(len(encrypted)))
+		base64.StdEncoding.Encode(encoded, encrypted)
+		line = append([]byte("ENC:"), encoded...)
 	}
 	line = append(line, '\n')
 	if _, err := s.file.Write(line); err != nil {
