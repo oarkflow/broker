@@ -364,7 +364,13 @@ func (b *Broker) registerWaiter(corr string, ch chan Response) {
 }
 func (b *Broker) unregisterWaiter(corr string) {
 	b.waitMu.Lock()
-	delete(b.waiters, corr)
+	if ch, ok := b.waiters[corr]; ok {
+		delete(b.waiters, corr)
+		func() {
+			defer func() { recover() }()
+			close(ch)
+		}()
+	}
 	b.waitMu.Unlock()
 }
 func (b *Broker) completeResponse(resp Response) bool {

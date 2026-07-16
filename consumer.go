@@ -367,10 +367,22 @@ func (s *Subscription) loop() {
 	}()
 	t := time.NewTicker(s.b.cfg.PollInterval)
 	defer t.Stop()
+	// Cleanup dedup map periodically
+	var dedupTicker *time.Ticker
+	var dedupTick <-chan time.Time
+	if s.dedup != nil {
+		dedupTicker = time.NewTicker(60 * time.Second)
+		dedupTick = dedupTicker.C
+		defer dedupTicker.Stop()
+	}
 	for {
 		select {
 		case <-s.ctx.Done():
 			return
+		case <-dedupTick:
+			if s.dedup != nil {
+				s.dedup.Cleanup()
+			}
 		case <-t.C:
 			if s.paused.Load() {
 				continue

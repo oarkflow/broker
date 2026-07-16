@@ -710,6 +710,67 @@ The fastworker broker is **production-ready for embedded and single-node standal
 
 ---
 
+## Staged Examples
+
+All new features have comprehensive staged examples in `examples/`:
+
+| Stage | Directory | Feature |
+|-------|-----------|---------|
+| 1 | `examples/stage1_idempotent/` | Idempotent consumers with deduplication window |
+| 2 | `examples/stage2_metrics/` | Prometheus metrics endpoint (`/metrics`) |
+| 3 | `examples/stage3_ratelimit/` | Per-queue rate limiting and circuit breaker |
+| 4 | `examples/stage4_websocket/` | WebSocket/SSE transport for real-time API |
+| 5 | `examples/stage5_federation/` | Federation links and shovel manager |
+| 6 | `examples/stage6_tenancy/` | Multi-tenancy with queue prefix isolation |
+| 7 | `examples/stage7_exactly_once/` | Transactional outbox and idempotent consumers |
+| 8 | `examples/stage8_partitioning/` | Partitioning/sharding and message ordering |
+| 9 | `examples/stage9_mqtt/` | MQTT 3.1.1 protocol server |
+| 10 | `examples/stage10_grpc/` | gRPC-like transport server |
+| 11 | `examples/stage11_schema/` | Schema evolution with versioning |
+| 12 | `examples/stage12_audit/` | Structured audit logging |
+
+### Running Examples
+
+```bash
+# Stage 1: Idempotent consumers
+go run ./examples/stage1_idempotent/
+
+# Stage 2: Metrics (access http://localhost:9090/metrics)
+go run ./examples/stage2_metrics/
+
+# Stage 3: Rate limiting
+go run ./examples/stage3_ratelimit/
+
+# Stage 4: WebSocket transport (access http://localhost:8080/ws)
+go run ./examples/stage4_websocket/
+
+# Stage 5: Federation/shovel
+go run ./examples/stage5_federation/
+
+# Stage 6: Multi-tenancy
+go run ./examples/stage6_tenancy/
+
+# Stage 7: Exactly-once delivery
+go run ./examples/stage7_exactly_once/
+
+# Stage 8: Partitioning/ordering
+go run ./examples/stage8_partitioning/
+
+# Stage 9: MQTT server (connect with any MQTT client to localhost:1883)
+go run ./examples/stage9_mqtt/
+
+# Stage 10: gRPC transport (connect via TCP on :50051)
+go run ./examples/stage10_grpc/
+
+# Stage 11: Schema evolution
+go run ./examples/stage11_schema/
+
+# Stage 12: Audit logging (access http://localhost:9091/audit)
+go run ./examples/stage12_audit/
+```
+
+---
+
 ## Summary
 
 ### What fastworker broker IS

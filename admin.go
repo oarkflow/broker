@@ -6,6 +6,7 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"strconv"
@@ -133,6 +134,20 @@ func (a AdminServer) wrap(next http.HandlerFunc) http.HandlerFunc {
 		if r.Body != nil {
 			r.Body = http.MaxBytesReader(w, r.Body, maxBody)
 		}
+		// Security headers
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("X-XSS-Protection", "1; mode=block")
+		// CORS headers
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		// Handle preflight
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
 		audit := a.Audit
 		if audit == nil && a.Broker != nil {
 			audit = NotificationAuditLogger{Bus: a.Broker.Notifications()}
@@ -171,6 +186,7 @@ func (a AdminServer) authenticate(r *http.Request) (AdminPrincipal, bool) {
 		return AdminPrincipal{Name: "probe", Permissions: []string{PermissionBrokerRead}}, true
 	}
 	if a.InsecureDev {
+		log.Printf("[SECURITY WARNING] InsecureDev mode is active - all requests authenticated as admin. Do NOT use in production!")
 		return AdminPrincipal{Name: "insecure-dev", Permissions: []string{PermissionAdminAll}}, true
 	}
 	acl := a.effectiveACL()
@@ -600,6 +616,9 @@ func (a AdminServer) routes(w http.ResponseWriter, r *http.Request) {
 func queryLimit(r *http.Request, d int) int {
 	if raw := r.URL.Query().Get("limit"); raw != "" {
 		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+			if n > 10000 {
+				n = 10000
+			}
 			return n
 		}
 	}

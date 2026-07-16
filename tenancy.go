@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -248,7 +249,7 @@ const (
 // PartitionRouter routes messages to specific partitions.
 type PartitionRouter struct {
 	config  PartitionConfig
-	counter uint64
+	counter atomic.Uint64
 }
 
 // NewPartitionRouter creates a new partition router.
@@ -266,8 +267,8 @@ func NewPartitionRouter(cfg PartitionConfig) *PartitionRouter {
 func (pr *PartitionRouter) SelectPartition(msg Message) int {
 	switch pr.config.Strategy {
 	case PartitionRoundRobin:
-		pr.counter++
-		return int(pr.counter % uint64(pr.config.Partitions))
+		idx := pr.counter.Add(1) - 1
+		return int(idx % uint64(pr.config.Partitions))
 	case PartitionRandom:
 		return int(time.Now().UnixNano() % int64(pr.config.Partitions))
 	case PartitionKey:

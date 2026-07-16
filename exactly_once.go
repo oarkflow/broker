@@ -83,15 +83,17 @@ func (to *TransactionalOutbox) Publish(ctx context.Context, topic string, payloa
 		event.Headers = cloneMap(o.Headers)
 	}
 	to.events = append(to.events, event)
+	// Find the event in the slice to update it directly
+	lastIdx := len(to.events) - 1
 	res, err := to.broker.Publisher().Publish(ctx, topic, payload, opts...)
 	if err != nil {
-		event.Status = "failed"
-		event.LastError = err.Error()
+		to.events[lastIdx].Status = "failed"
+		to.events[lastIdx].LastError = err.Error()
 		return res, err
 	}
 	now := time.Now()
-	event.Status = "published"
-	event.PublishedAt = &now
+	to.events[lastIdx].Status = "published"
+	to.events[lastIdx].PublishedAt = &now
 	return res, nil
 }
 

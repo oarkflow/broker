@@ -148,19 +148,21 @@ func New(cfg Config) (*Broker, error) {
 	}
 	if cfg.Partition != nil {
 		b.partitionRouter = NewPartitionRouter(*cfg.Partition)
+	} else {
+		b.partitionRouter = NewPartitionRouter(PartitionConfig{})
 	}
 	if cfg.WebSocket != nil {
 		b.wsServer = NewWebSocketServer(b, *cfg.WebSocket)
+	} else {
+		b.wsServer = NewWebSocketServer(b, WebSocketConfig{})
 	}
 	b.sagaEngine = NewSagaEngine(b)
-	b.wsServer = NewWebSocketServer(b, WebSocketConfig{})
 	b.federationMgr = NewFederationManager(b)
 	b.shovelMgr = NewShovelManager(b)
 	b.outbox = NewTransactionalOutbox(b)
 	b.offsetMgr = NewConsumerOffsetManager(b)
 	b.messageReplay = NewMessageReplay(b)
 	b.logCompaction = NewStreamLogCompaction(b)
-	b.partitionRouter = NewPartitionRouter(PartitionConfig{})
 	b.partitionOrdering = NewPartitionOrdering(b)
 	b.partitionReassignment = NewPartitionReassignment(b)
 	b.state.Store(BrokerConfigured)
@@ -286,6 +288,9 @@ func (b *Broker) Router() *Router                 { return b.router }
 func (b *Broker) Notifications() *NotificationBus { return b.notify }
 func (b *Broker) Cluster() *Cluster               { return b.cluster }
 func (b *Broker) Publisher() *Publisher           { return &Publisher{b: b} }
+func (b *Broker) AuditLogger() *AuditLogger       { return b.auditLogger }
+func (b *Broker) PrometheusMetrics() *PrometheusMetrics { return b.promMetrics }
+func (b *Broker) Tracer() *Tracer                 { return b.tracer }
 
 func (b *Broker) setState(ctx context.Context, st BrokerState, err error) {
 	b.state.Store(st)
@@ -382,6 +387,10 @@ func (b *Broker) leaseSweeper() {
 				ms.MemoryStore.Cleanup(100)
 			} else if ms, ok := b.store.(*MemoryStore); ok {
 				ms.Cleanup(100)
+			}
+			// Cleanup stale sagas (older than 1 hour)
+			if b.sagaEngine != nil {
+				b.sagaEngine.CleanupSagas(time.Hour)
 			}
 		case <-b.ctx.Done():
 			return

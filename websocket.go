@@ -28,6 +28,7 @@ type WebSocketServer struct {
 	clients map[string]*wsClient
 	mu     sync.RWMutex
 	wg     sync.WaitGroup
+	token  string
 }
 
 type wsClient struct {
@@ -50,6 +51,11 @@ func NewWebSocketServer(b *Broker, cfg WebSocketConfig) *WebSocketServer {
 	return &WebSocketServer{broker: b, cfg: cfg, clients: make(map[string]*wsClient)}
 }
 
+// SetToken sets the authentication token for WebSocket connections.
+func (ws *WebSocketServer) SetToken(token string) {
+	ws.token = token
+}
+
 // Handler returns an HTTP handler for WebSocket connections.
 func (ws *WebSocketServer) Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -62,6 +68,20 @@ func (ws *WebSocketServer) Handler() http.Handler {
 }
 
 func (ws *WebSocketServer) handleUpgrade(w http.ResponseWriter, r *http.Request) {
+	// Check authentication if token is configured
+	if ws.token != "" {
+		token := r.URL.Query().Get("token")
+		if token == "" {
+			auth := r.Header.Get("Authorization")
+			if len(auth) > 7 && auth[:7] == "Bearer " {
+				token = auth[7:]
+			}
+		}
+		if token != ws.token {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+	}
 	ws.mu.RLock()
 	count := len(ws.clients)
 	ws.mu.RUnlock()
@@ -98,7 +118,6 @@ func (ws *WebSocketServer) handleUpgrade(w http.ResponseWriter, r *http.Request)
 	flusher.Flush()
 
 	// Register with broker for consuming
-ConsumerLoop:
 	for {
 		select {
 		case <-ctx.Done():
@@ -109,15 +128,6 @@ ConsumerLoop:
 			}
 			_, _ = w.Write(msg)
 			flusher.Flush()
-		default:
-			// Check for incoming messages via query parameter or body
-			if r.URL.Query().Get("action") != "" {
-				ws.handleHTTPRequest(w, r, clientID)
-				flusher.Flush()
-				break ConsumerLoop
-			}
-			// Brief sleep to prevent busy loop
-			time.Sleep(10 * time.Millisecond)
 		}
 	}
 }

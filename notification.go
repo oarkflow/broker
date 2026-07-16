@@ -50,13 +50,16 @@ type NotificationBus struct {
 	history []Notification
 	cap     int
 	closed  bool
+	workers chan struct{}
 }
+
+const notificationWorkerPoolSize = 64
 
 func NewNotificationBus(capacity int) *NotificationBus {
 	if capacity <= 0 {
 		capacity = 1024
 	}
-	return &NotificationBus{subs: map[string]Callback{}, cap: capacity}
+	return &NotificationBus{subs: map[string]Callback{}, cap: capacity, workers: make(chan struct{}, notificationWorkerPoolSize)}
 }
 func (b *NotificationBus) Subscribe(id string, cb Callback) {
 	if id == "" || cb == nil {
@@ -91,7 +94,17 @@ func (b *NotificationBus) Publish(n Notification) {
 	b.mu.Unlock()
 	for _, cb := range subs {
 		cb := cb
-		go func() { _ = cb.HandleNotification(context.Background(), n) }()
+		// Use bounded worker pool to prevent goroutine explosion
+		select {
+		case b.workers <- struct{}{}:
+			go func() {
+				defer func() { <-b.workers }()
+				_ = cb.HandleNotification(context.Background(), n)
+			}()
+		default:
+			// Pool full, execute synchronously as fallback
+			_ = cb.HandleNotification(context.Background(), n)
+		}
 	}
 }
 func (b *NotificationBus) History(limit int) []Notification {

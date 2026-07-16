@@ -2,6 +2,7 @@ package broker
 
 import (
 	"context"
+	"hash/fnv"
 	"math"
 	"sort"
 	"sync"
@@ -205,14 +206,12 @@ func (r *GroupRebalancer) ShouldLeaseForConsumer(consumerID, group string, messa
 		return true
 	}
 	r.mu.RLock()
+	defer r.mu.RUnlock()
 	g, ok := r.groups[group]
-	r.mu.RUnlock()
 	if !ok || len(g.Members) <= 1 {
 		return true
 	}
 	slot := hashKey(messageKey) % 256
-	r.mu.RLock()
-	defer r.mu.RUnlock()
 	for _, a := range g.Assignments {
 		if a.ConsumerID == consumerID {
 			return slot >= a.HashSlot && slot < a.HashSlot+uint32(a.TotalSlots)
@@ -225,11 +224,9 @@ func hashKey(key string) uint32 {
 	if key == "" {
 		return 0
 	}
-	var h uint32
-	for i := 0; i < len(key); i++ {
-		h = h*31 + uint32(key[i])
-	}
-	return h
+	h := fnv.New32a()
+	h.Write([]byte(key))
+	return h.Sum32()
 }
 
 func (b *Broker) GroupRebalancer() *GroupRebalancer {

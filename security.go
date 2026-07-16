@@ -102,14 +102,7 @@ func (a *ACL) Authorize(p AdminPrincipal, permission string) bool {
 
 func constantTimeEqual(a, b string) bool {
 	if len(a) != len(b) {
-		// Still compare a same-sized dummy buffer so mismatched lengths do not
-		// become a cheap oracle for prefix guessing.
-		if len(a) > len(b) {
-			b = strings.Repeat("\x00", len(a))
-		} else {
-			a = strings.Repeat("\x00", len(b))
-		}
-		return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1 && false
+		return false
 	}
 	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
 }

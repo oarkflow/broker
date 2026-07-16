@@ -93,6 +93,24 @@ func NewSagaEngine(b *Broker) *SagaEngine {
 	return &SagaEngine{b: b, sagas: map[string]*SagaInstance{}}
 }
 
+// CleanupSagas removes completed/failed/compensated sagas older than maxAge.
+func (e *SagaEngine) CleanupSagas(maxAge time.Duration) int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	cutoff := time.Now().Add(-maxAge)
+	removed := 0
+	for id, s := range e.sagas {
+		switch s.Status {
+		case SagaCompleted, SagaCompensated, SagaFailed:
+			if !s.FinishedAt.IsZero() && s.FinishedAt.Before(cutoff) {
+				delete(e.sagas, id)
+				removed++
+			}
+		}
+	}
+	return removed
+}
+
 func (e *SagaEngine) CreateSaga(ctx context.Context, def SagaDefinition) *SagaInstance {
 	id := def.ID
 	if id == "" {
@@ -212,7 +230,18 @@ func (e *SagaEngine) executeSteps(s *SagaInstance) {
 			e.failSaga(s, i, step.Name, err.Error())
 			return
 		}
-		res, err := h.Wait(ctx)
+		// Create a context with timeout for the wait to prevent goroutine leaks
+		waitCtx := context.Background()
+		if step.Action.Timeout > 0 {
+			var cancel context.CancelFunc
+			waitCtx, cancel = context.WithTimeout(waitCtx, step.Action.Timeout)
+			defer cancel()
+		} else if s.Timeout > 0 {
+			var cancel context.CancelFunc
+			waitCtx, cancel = context.WithTimeout(waitCtx, s.Timeout)
+			defer cancel()
+		}
+		res, err := h.Wait(waitCtx)
 		sr := SagaStepResult{
 			StepName:  step.Name,
 			TaskID:    taskID,
