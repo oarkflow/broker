@@ -31,6 +31,7 @@ var (
 	ErrCallbackFailed    = errors.New("broker: callback failed")
 	ErrCancelled         = errors.New("broker: cancelled")
 	ErrConsumerBanned    = errors.New("broker: consumer banned")
+	ErrRateLimited       = errors.New("broker: rate limited")
 )
 
 type BrokerError struct {

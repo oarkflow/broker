@@ -27,6 +27,7 @@ const (
 	StrategyRuleBased           StrategyType = "rule_based"
 	StrategyPowerOfTwoChoices   StrategyType = "power_of_two_choices"
 	StrategySharded             StrategyType = "sharded"
+	StrategyHealthBased         StrategyType = "health_based"
 )
 
 // ConsumerCandidate represents a consumer that can receive a routed message.
@@ -119,6 +120,8 @@ func NewStrategy(cfg StrategyConfig) ConsumerStrategy {
 		return NewPowerOfTwoChoicesStrategy()
 	case StrategySharded:
 		return NewShardedStrategy(cfg.HashKey)
+	case StrategyHealthBased:
+		return NewHealthBasedStrategy()
 	default:
 		return NewRoundRobinStrategy()
 	}
@@ -709,6 +712,43 @@ func (r *StrategyRegistry) List() []StrategyType {
 }
 
 // ---------------------------------------------------------------------------
+// Health Based
+// ---------------------------------------------------------------------------
+
+type healthBasedStrategy struct{}
+
+func NewHealthBasedStrategy() ConsumerStrategy {
+	return &healthBasedStrategy{}
+}
+
+func (s *healthBasedStrategy) Name() StrategyType { return StrategyHealthBased }
+
+func (s *healthBasedStrategy) Select(_ context.Context, _ Message, candidates []ConsumerCandidate) ([]ConsumerCandidate, error) {
+	if len(candidates) == 0 {
+		return nil, nil
+	}
+	healthy := make([]ConsumerCandidate, 0, len(candidates))
+	for _, c := range candidates {
+		if c.Healthy && c.LoadScore() > 0 {
+			healthy = append(healthy, c)
+		}
+	}
+	if len(healthy) == 0 {
+		return nil, ErrNoSubscribers
+	}
+	best := healthy[0]
+	bestScore := best.LoadScore()
+	for i := 1; i < len(healthy); i++ {
+		score := healthy[i].LoadScore()
+		if score > bestScore {
+			best = healthy[i]
+			bestScore = score
+		}
+	}
+	return []ConsumerCandidate{best}, nil
+}
+
+// ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
 
@@ -740,6 +780,8 @@ func parseStrategyType(s string) StrategyType {
 		return StrategyPowerOfTwoChoices
 	case "sharded", "sh":
 		return StrategySharded
+	case "health_based", "healthbased", "hb":
+		return StrategyHealthBased
 	default:
 		return StrategyRoundRobin
 	}

@@ -27,6 +27,7 @@ const (
 	RouteSticky          RouteMode = "sticky_session"
 	RouteP2C             RouteMode = "power_of_two_choices"
 	RouteSharded         RouteMode = "sharded"
+	RouteDLX             RouteMode = "dead_letter_exchange"
 )
 
 type Route struct {

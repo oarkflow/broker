@@ -6,6 +6,7 @@ import (
 	"math/rand"
 	"runtime/debug"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -196,6 +197,63 @@ type Subscription struct {
 	paused       atomic.Bool
 	inFlight     atomic.Int64
 	strategy     ConsumerStrategy
+	dedup        *ConsumerDedup
+}
+
+// ConsumerDedup provides idempotent consumer processing by deduplicating messages
+// based on idempotency key or deduplication ID.
+type ConsumerDedup struct {
+	mu     sync.Mutex
+	seen   map[string]time.Time
+	window time.Duration
+}
+
+// NewConsumerDedup creates a new consumer deduplication tracker.
+func NewConsumerDedup(window time.Duration) *ConsumerDedup {
+	if window <= 0 {
+		window = 5 * time.Minute
+	}
+	return &ConsumerDedup{
+		seen:   make(map[string]time.Time),
+		window: window,
+	}
+}
+
+// IsDuplicate returns true if the message has already been processed within the dedup window.
+func (d *ConsumerDedup) IsDuplicate(msg Message) bool {
+	key := d.dedupKey(msg)
+	if key == "" {
+		return false
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if t, ok := d.seen[key]; ok && time.Since(t) < d.window {
+		return true
+	}
+	d.seen[key] = time.Now()
+	return false
+}
+
+// Cleanup removes expired entries from the dedup tracker.
+func (d *ConsumerDedup) Cleanup() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	cutoff := time.Now().Add(-d.window)
+	for k, t := range d.seen {
+		if t.Before(cutoff) {
+			delete(d.seen, k)
+		}
+	}
+}
+
+func (d *ConsumerDedup) dedupKey(msg Message) string {
+	if msg.IdempotencyKey != "" {
+		return "idemp:" + msg.IdempotencyKey
+	}
+	if msg.DeduplicationID != "" {
+		return "dedup:" + msg.DeduplicationID
+	}
+	return ""
 }
 
 func (s *Subscription) ID() string { return s.id }
@@ -282,6 +340,9 @@ func (b *Broker) subscribe(ctx context.Context, cfg ConsumerConfig, handler Hand
 		}
 	}
 	s := &Subscription{id: b.nextID("sub"), b: b, cfg: cfg, handler: handler, batchHandler: batchHandler, ctx: cctx, cancel: cancel, stopped: make(chan struct{}), strategy: strategy}
+	if cfg.DeduplicationWindow > 0 || cfg.Idempotent {
+		s.dedup = NewConsumerDedup(cfg.DeduplicationWindow)
+	}
 	b.subsMu.Lock()
 	b.subs[s.id] = s
 	b.subsMu.Unlock()
@@ -438,6 +499,10 @@ func (s *Subscription) handleBatch(ctx context.Context, msgs []Message) (err err
 }
 
 func (s *Subscription) handle(ctx context.Context, m Message) (err error) {
+	if s.dedup != nil && s.dedup.IsDuplicate(m) {
+		_ = s.b.store.Ack(ctx, AckRequest{MessageID: m.ID, Queue: s.cfg.Queue, LeaseToken: m.LeaseToken, ConsumerID: s.cfg.Name})
+		return nil
+	}
 	m.Status = MessageProcessing
 	_ = s.b.store.Update(ctx, m)
 	h := &ackHandle{b: s.b, msg: m, queue: s.cfg.Queue, consumer: s.cfg.Name}
@@ -487,11 +552,24 @@ func (s *Subscription) fail(ctx context.Context, h *ackHandle, m Message, err er
 	if s.b.cfg.Hooks.OnHandlerError != nil {
 		s.b.cfg.Hooks.OnHandlerError(ctx, MessageEvent{Message: m, Consumer: s.cfg.Name, Queue: s.cfg.Queue, Error: err, Time: time.Now()})
 	}
-	if IsPermanent(err) || m.Attempts+1 >= firstPositive(m.MaxAttempts, s.cfg.RetryPolicy.MaxAttempts, s.b.cfg.DefaultRetry.MaxAttempts) {
+	maxAttempts := firstPositive(m.MaxAttempts, s.cfg.RetryPolicy.MaxAttempts, s.b.cfg.DefaultRetry.MaxAttempts)
+	if IsPermanent(err) || m.Attempts+1 >= maxAttempts {
 		_ = h.Nack(ctx, NackToDLQ(s.cfg.DLQ), NackError(err.Error()), NackReason("retries_exhausted"))
 		if s.b.cfg.Hooks.OnDeadLettered != nil {
 			s.b.cfg.Hooks.OnDeadLettered(ctx, DLQEvent{Message: m, Queue: s.cfg.DLQ, Reason: "retries_exhausted", Error: err, Time: time.Now()})
 		}
+		if s.b.cfg.Hooks.OnMaxRedeliveryExceeded != nil {
+			s.b.cfg.Hooks.OnMaxRedeliveryExceeded(ctx, DLQEvent{Message: m, Queue: s.cfg.DLQ, Reason: "max_redelivery_exceeded", Error: err, Time: time.Now()})
+		}
+		s.b.notify.Publish(Notification{
+			Type:      "message.max_redelivery_exceeded",
+			Source:    s.cfg.Name,
+			Severity:  SeverityWarn,
+			MessageID: m.ID,
+			Queue:     m.Queue,
+			Timestamp: time.Now(),
+			Data:      map[string]any{"attempts": m.Attempts, "max_attempts": maxAttempts, "error": err.Error()},
+		})
 		if m.TaskID != "" {
 			s.b.failTask(ctx, m.TaskID, err)
 		}
@@ -553,7 +631,7 @@ func (s *Subscription) buildCandidate() ConsumerCandidate {
 	return ConsumerCandidate{
 		ConsumerID:  s.cfg.Name,
 		Group:       s.cfg.Group,
-		Weight:      1,
+		Weight:      s.cfg.Priority,
 		MaxInFlight: s.cfg.MaxInFlight,
 		InFlight:    int(s.inFlight.Load()),
 		Healthy:     true,

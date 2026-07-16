@@ -1038,6 +1038,49 @@ func (s *MemoryStore) Cleanup(maxHistoryPerMessage int) {
 	}
 }
 
+// StreamLag returns the consumer lag (messages behind) for a given stream and consumer group.
+func (s *MemoryStore) StreamLag(stream, consumerGroup string) (uint64, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	st, ok := s.streams[stream]
+	if !ok {
+		return 0, ErrStreamNotFound
+	}
+	committed := uint64(0)
+	if groups := s.offsets[stream]; groups != nil {
+		committed = groups[consumerGroup]
+	}
+	return st.offset - committed, nil
+}
+
+// StreamLagAll returns the consumer lag for all consumer groups on a stream.
+func (s *MemoryStore) StreamLagAll(stream string) (map[string]uint64, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	st, ok := s.streams[stream]
+	if !ok {
+		return nil, ErrStreamNotFound
+	}
+	result := make(map[string]uint64)
+	if groups := s.offsets[stream]; groups != nil {
+		for group, committed := range groups {
+			result[group] = st.offset - committed
+		}
+	}
+	return result, nil
+}
+
+// StreamHeadOffset returns the latest offset for a stream.
+func (s *MemoryStore) StreamHeadOffset(stream string) (uint64, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	st, ok := s.streams[stream]
+	if !ok {
+		return 0, ErrStreamNotFound
+	}
+	return st.offset, nil
+}
+
 func (s *MemoryStore) listIDsLocked(ids []string, limit int, dlqOnly bool) []Message {
 	if limit <= 0 || limit > len(ids) {
 		limit = len(ids)

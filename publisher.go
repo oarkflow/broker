@@ -98,6 +98,9 @@ func (p *Publisher) publish(ctx context.Context, topic string, payload any, opts
 	if err != nil {
 		return PublishResult{}, err
 	}
+	if err := p.checkBackpressure(ctx, prep); err != nil {
+		return PublishResult{}, err
+	}
 	stored, err := p.b.store.Append(ctx, prep.msg, prep.dests)
 	if err != nil {
 		if p.b.cfg.Hooks.OnPublishFailed != nil {
@@ -236,6 +239,31 @@ func (b *Broker) recordPublisher(ctx context.Context, rec PublisherRecord) {
 	if b != nil && b.stateStore != nil {
 		_ = b.stateStore.PutPublisherRecord(ctx, rec)
 	}
+}
+
+// checkBackpressure checks if the target queues are full and applies broker-level backpressure.
+// This only applies when the broker's default backpressure policy is set to reject or block.
+// Queue-specific backpressure policies (drop_oldest, drop_newest, dlq) are handled by the store.
+func (p *Publisher) checkBackpressure(ctx context.Context, prep preparedPublish) error {
+	if p.b.cfg.Backpressure != BackpressureReject && p.b.cfg.Backpressure != BackpressureBlock {
+		return nil
+	}
+	for _, d := range prep.dests {
+		if d.Kind == DestinationQueue || d.Kind == DestinationDLQ {
+			stats, err := p.b.store.Stats(ctx)
+			if err != nil {
+				continue
+			}
+			if depth, ok := stats.Queues[d.Name]; ok {
+				if ms, ok := p.b.store.(*MemoryStore); ok {
+					if q := ms.queues[d.Name]; q != nil && q.cfg.MaxDepth > 0 && depth >= q.cfg.MaxDepth {
+						return errf(ErrBackpressure, "queue %s depth %d >= max %d", d.Name, depth, q.cfg.MaxDepth)
+					}
+				}
+			}
+		}
+	}
+	return nil
 }
 
 func (p *Publisher) Request(ctx context.Context, subject string, request any, response any, opts ...RequestOption) error {

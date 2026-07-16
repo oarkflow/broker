@@ -144,4 +144,9 @@ type Hooks struct {
 	OnDLQReplay      func(context.Context, DLQEvent)
 	OnDLQPurge       func(context.Context, DLQEvent)
 	OnDLQArchive     func(context.Context, DLQEvent)
+
+	OnMaxRedeliveryExceeded func(context.Context, DLQEvent)
+	OnRateLimited           func(context.Context, MessageEvent)
+	OnCircuitOpen           func(context.Context, BrokerEvent)
+	OnCircuitClosed         func(context.Context, BrokerEvent)
 }

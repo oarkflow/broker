@@ -65,6 +65,7 @@ const (
 	ClassExchange   = 40
 	ClassQueue      = 50
 	ClassBasic      = 60
+	ClassTx         = 90
 	ClassConfirm    = 85
 )
 
@@ -146,6 +147,16 @@ const (
 const (
 	MethodConfirmSelect    = 10
 	MethodConfirmSelectOk  = 11
+)
+
+// Transaction method IDs.
+const (
+	MethodTxSelect    = 10
+	MethodTxSelectOk  = 11
+	MethodTxCommit    = 20
+	MethodTxCommitOk  = 21
+	MethodTxRollback    = 30
+	MethodTxRollbackOk  = 31
 )
 
 // Reply codes.

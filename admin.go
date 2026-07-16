@@ -47,6 +47,9 @@ func (a AdminServer) Handler() http.Handler {
 	mux.HandleFunc("/healthz", a.wrap(a.health))
 	mux.HandleFunc("/readyz", a.wrap(a.ready))
 	mux.HandleFunc("/stats", a.wrap(a.stats))
+	mux.HandleFunc("/metrics", a.wrap(a.metrics))
+	mux.HandleFunc("/lag", a.wrap(a.lag))
+	mux.HandleFunc("/audit", a.wrap(a.audit))
 	mux.HandleFunc("/publish", a.wrap(a.publish))
 	mux.HandleFunc("/topics", a.wrap(a.topics))
 	mux.HandleFunc("/queues", a.wrap(a.queues))
@@ -73,6 +76,18 @@ func (a AdminServer) ListenAndServe(addr string) *http.Server {
 	}()
 	return srv
 }
+
+// GracefulShutdown performs a graceful shutdown of the HTTP server, waiting for
+// in-flight requests to complete within the given timeout.
+func (a AdminServer) GracefulShutdown(ctx context.Context, srv *http.Server, drainTimeout time.Duration) error {
+	if drainTimeout <= 0 {
+		drainTimeout = 15 * time.Second
+	}
+	drainCtx, cancel := context.WithTimeout(ctx, drainTimeout)
+	defer cancel()
+	return srv.Shutdown(drainCtx)
+}
+
 func (a AdminServer) HTTPServer(addr string) *http.Server {
 	readHeader := a.ReadHeaderTimeout
 	if readHeader <= 0 {
@@ -196,6 +211,36 @@ func (a AdminServer) ready(w http.ResponseWriter, r *http.Request) {
 func (a AdminServer) stats(w http.ResponseWriter, r *http.Request) {
 	st, err := a.Broker.store.Stats(r.Context())
 	writeBrokerJSON(w, map[string]any{"broker_state": a.Broker.State(), "store": st, "error": errString(err)})
+}
+func (a AdminServer) metrics(w http.ResponseWriter, r *http.Request) {
+	if a.Broker.promMetrics == nil {
+		http.Error(w, "prometheus metrics not enabled", 503)
+		return
+	}
+	a.Broker.promMetrics.UpdateGauges()
+	st, _ := a.Broker.store.Stats(r.Context())
+	a.Broker.promMetrics.UpdateStoreStats(st)
+	a.Broker.promMetrics.PromHandler().ServeHTTP(w, r)
+}
+func (a AdminServer) lag(w http.ResponseWriter, r *http.Request) {
+	stream := r.URL.Query().Get("stream")
+	if stream == "" {
+		http.Error(w, "stream parameter required", 400)
+		return
+	}
+	report, err := a.Broker.StreamLagReport(r.Context(), stream)
+	if err != nil {
+		http.Error(w, err.Error(), 404)
+		return
+	}
+	writeBrokerJSON(w, report)
+}
+func (a AdminServer) audit(w http.ResponseWriter, r *http.Request) {
+	if a.Broker.auditLogger == nil {
+		writeBrokerJSON(w, []AuditEvent{})
+		return
+	}
+	writeBrokerJSON(w, a.Broker.auditLogger.History(queryLimit(r, 100)))
 }
 func (a AdminServer) topics(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodPost {

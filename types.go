@@ -288,6 +288,9 @@ type ConsumerConfig struct {
 	HeartbeatInterval time.Duration `json:"heartbeat_interval"`
 	Strategy          StrategyType  `json:"strategy,omitempty"`
 	StrategyConfig    *StrategyConfig `json:"-"`
+	Priority                int           `json:"priority,omitempty"`
+	Idempotent              bool          `json:"idempotent,omitempty"`
+	DeduplicationWindow     time.Duration `json:"deduplication_window,omitempty"`
 }
 
 type Config struct {
@@ -315,6 +318,15 @@ type Config struct {
 	LeaseSweepInterval    time.Duration       `json:"lease_sweep_interval"`
 	RemoteConsumerTimeout time.Duration       `json:"remote_consumer_timeout"`
 	Hooks                 Hooks               `json:"-"`
+	EnablePrometheus      bool                `json:"enable_prometheus,omitempty"`
+	EnableTracing         bool                `json:"enable_tracing,omitempty"`
+	TracerConfig          *TracerConfig       `json:"-"`
+	AuditEnabled          bool                `json:"audit_enabled,omitempty"`
+	RateLimit             *RateLimitConfig    `json:"rate_limit,omitempty"`
+	Tenancy               *TenancyConfig      `json:"tenancy,omitempty"`
+	Partition             *PartitionConfig    `json:"partition,omitempty"`
+	WebSocket             *WebSocketConfig    `json:"websocket,omitempty"`
+	ExactlyOnce           *ExactlyOnceConfig  `json:"exactly_once,omitempty"`
 }
 
 type Handler func(context.Context, Delivery) error

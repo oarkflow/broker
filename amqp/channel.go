@@ -33,8 +33,12 @@ type pendingDelivery struct {
 }
 
 type txOperation struct {
-	typ  string
-	data any
+	kind      string
+	messageID string
+	queue     string
+	topic     string
+	body      []byte
+	opts      []broker.PublishOption
 }
 
 // amqpConsumer represents an active consumer.
@@ -71,6 +75,8 @@ func (ch *Channel) handleMethod(method *MethodFrame) error {
 		return ch.handleBasicMethod(method)
 	case ClassConfirm:
 		return ch.handleConfirmMethod(method)
+	case ClassTx:
+		return ch.handleTxMethod(method)
 	default:
 		return ch.sendChannelError(ReplySyntaxError, fmt.Sprintf("unknown class %d", method.ClassID))
 	}
@@ -662,9 +668,19 @@ func (ch *Channel) handleBasicPublish(args []byte) error {
 		opts = append(opts, broker.WithHeaders(headers))
 	}
 
-	_, err = ch.conn.server.cfg.Broker.Publisher().Publish(ch.conn.server.ctx, exchange, body, opts...)
-	if err != nil {
-		log.Printf("[amqp] publish error: %v", err)
+	// If in transaction mode, buffer the operation.
+	if ch.txActive {
+		ch.txBuffer = append(ch.txBuffer, &txOperation{
+			kind:  "publish",
+			topic: exchange,
+			body:  body,
+			opts:  opts,
+		})
+	} else {
+		_, err = ch.conn.server.cfg.Broker.Publisher().Publish(ch.conn.server.ctx, exchange, body, opts...)
+		if err != nil {
+			log.Printf("[amqp] publish error: %v", err)
+		}
 	}
 
 	// If in confirm mode, send ack
@@ -772,20 +788,28 @@ func (ch *Channel) handleBasicAck(args []byte) error {
 		// Ack all up to and including this tag
 		for tag, pending := range ch.unacked {
 			if tag <= deliveryTag {
-				_ = b.Store().Ack(ch.conn.server.ctx, broker.AckRequest{
-					MessageID:  pending.messageID,
-					Queue:      pending.queue,
-					ConsumerID: "",
-				})
+				if ch.txActive {
+					ch.txBuffer = append(ch.txBuffer, &txOperation{kind: "ack", messageID: pending.messageID, queue: pending.queue})
+				} else {
+					_ = b.Store().Ack(ch.conn.server.ctx, broker.AckRequest{
+						MessageID:  pending.messageID,
+						Queue:      pending.queue,
+						ConsumerID: "",
+					})
+				}
 				delete(ch.unacked, tag)
 			}
 		}
 	} else if pending, ok := ch.unacked[deliveryTag]; ok {
-		_ = b.Store().Ack(ch.conn.server.ctx, broker.AckRequest{
-			MessageID:  pending.messageID,
-			Queue:      pending.queue,
-			ConsumerID: "",
-		})
+		if ch.txActive {
+			ch.txBuffer = append(ch.txBuffer, &txOperation{kind: "ack", messageID: pending.messageID, queue: pending.queue})
+		} else {
+			_ = b.Store().Ack(ch.conn.server.ctx, broker.AckRequest{
+				MessageID:  pending.messageID,
+				Queue:      pending.queue,
+				ConsumerID: "",
+			})
+		}
 		delete(ch.unacked, deliveryTag)
 	}
 	ch.unackedMu.Unlock()
@@ -821,12 +845,16 @@ func (ch *Channel) handleNackOrReject(deliveryTag uint64, multiple, requeue bool
 				if !requeue {
 					nackAction = broker.NackReject
 				}
-				_ = b.Store().Nack(ch.conn.server.ctx, broker.NackRequest{
-					MessageID:  pending.messageID,
-					Queue:      pending.queue,
-					ConsumerID: "",
-					Action:     nackAction,
-				})
+				if ch.txActive {
+					ch.txBuffer = append(ch.txBuffer, &txOperation{kind: "nack", messageID: pending.messageID, queue: pending.queue})
+				} else {
+					_ = b.Store().Nack(ch.conn.server.ctx, broker.NackRequest{
+						MessageID:  pending.messageID,
+						Queue:      pending.queue,
+						ConsumerID: "",
+						Action:     nackAction,
+					})
+				}
 				delete(ch.unacked, tag)
 			}
 		}
@@ -835,12 +863,16 @@ func (ch *Channel) handleNackOrReject(deliveryTag uint64, multiple, requeue bool
 		if !requeue {
 			nackAction = broker.NackReject
 		}
-		_ = b.Store().Nack(ch.conn.server.ctx, broker.NackRequest{
-			MessageID:  pending.messageID,
-			Queue:      pending.queue,
-			ConsumerID: "",
-			Action:     nackAction,
-		})
+		if ch.txActive {
+			ch.txBuffer = append(ch.txBuffer, &txOperation{kind: "nack", messageID: pending.messageID, queue: pending.queue})
+		} else {
+			_ = b.Store().Nack(ch.conn.server.ctx, broker.NackRequest{
+				MessageID:  pending.messageID,
+				Queue:      pending.queue,
+				ConsumerID: "",
+				Action:     nackAction,
+			})
+		}
 		delete(ch.unacked, deliveryTag)
 	}
 	ch.unackedMu.Unlock()
@@ -924,6 +956,55 @@ func (ch *Channel) handleConfirmMethod(method *MethodFrame) error {
 	default:
 		return ch.sendChannelError(ReplySyntaxError, fmt.Sprintf("unknown confirm method %d", method.MethodID))
 	}
+}
+
+// handleTxMethod handles transaction methods.
+func (ch *Channel) handleTxMethod(method *MethodFrame) error {
+	switch method.MethodID {
+	case MethodTxSelect:
+		ch.txActive = true
+		ch.txBuffer = nil
+		return ch.codec().WriteMethodFrame(ch.id, ClassTx, MethodTxSelectOk, nil)
+	case MethodTxCommit:
+		// Execute all buffered operations.
+		for _, op := range ch.txBuffer {
+			if err := ch.executeTxOp(op); err != nil {
+				ch.txActive = false
+				ch.txBuffer = nil
+				return ch.sendChannelError(ReplyInternalError, err.Error())
+			}
+		}
+		ch.txActive = false
+		ch.txBuffer = nil
+		return ch.codec().WriteMethodFrame(ch.id, ClassTx, MethodTxCommitOk, nil)
+	case MethodTxRollback:
+		ch.txActive = false
+		ch.txBuffer = nil
+		return ch.codec().WriteMethodFrame(ch.id, ClassTx, MethodTxRollbackOk, nil)
+	default:
+		return ch.sendChannelError(ReplySyntaxError, fmt.Sprintf("unknown tx method %d", method.MethodID))
+	}
+}
+
+func (ch *Channel) executeTxOp(op *txOperation) error {
+	ctx := ch.conn.server.ctx
+	switch op.kind {
+	case "publish":
+		_, err := ch.conn.server.cfg.Broker.Publisher().Publish(ctx, op.topic, op.body, op.opts...)
+		return err
+	case "ack":
+		return ch.conn.server.cfg.Broker.Store().Ack(ctx, broker.AckRequest{
+			MessageID: op.messageID,
+			Queue:     op.queue,
+		})
+	case "nack":
+		return ch.conn.server.cfg.Broker.Store().Nack(ctx, broker.NackRequest{
+			MessageID: op.messageID,
+			Queue:     op.queue,
+			Action:    broker.NackRequeue,
+		})
+	}
+	return nil
 }
 
 // handleContentFrame handles content frames (header/body) for this channel.

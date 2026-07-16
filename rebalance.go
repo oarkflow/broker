@@ -14,11 +14,13 @@ type GroupAssignment struct {
 	Partitions []int  `json:"partitions,omitempty"`
 	HashSlot   uint32 `json:"hash_slot,omitempty"`
 	TotalSlots int    `json:"total_slots,omitempty"`
+	Weight     int    `json:"weight,omitempty"`
 }
 
 type GroupState struct {
 	Name        string            `json:"name"`
 	Members     []string          `json:"members"`
+	Weights     map[string]int    `json:"weights,omitempty"`
 	Assignments []GroupAssignment `json:"assignments"`
 	Version     int               `json:"version"`
 	UpdatedAt   time.Time         `json:"updated_at"`
@@ -28,30 +30,58 @@ type GroupRebalancer struct {
 	mu       sync.RWMutex
 	groups   map[string]*GroupState
 	capacity int
+	hooks    *RebalanceHooks
+}
+
+type RebalanceHooks struct {
+	OnBeforeRebalance func(group string, oldMembers, newMembers []string)
+	OnAfterRebalance  func(group string, state *GroupState)
+	OnDrainStarted    func(group, consumerID string)
+	OnDrainCompleted  func(group, consumerID string)
 }
 
 func NewGroupRebalancer() *GroupRebalancer {
 	return &GroupRebalancer{groups: map[string]*GroupState{}}
 }
 
+func NewGroupRebalancerWithHooks(hooks *RebalanceHooks) *GroupRebalancer {
+	return &GroupRebalancer{groups: map[string]*GroupState{}, hooks: hooks}
+}
+
 func (r *GroupRebalancer) JoinGroup(consumerID, group string) *GroupState {
+	return r.JoinGroupWithWeight(consumerID, group, 1)
+}
+
+func (r *GroupRebalancer) JoinGroupWithWeight(consumerID, group string, weight int) *GroupState {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	g, ok := r.groups[group]
 	if !ok {
-		g = &GroupState{Name: group, UpdatedAt: time.Now()}
+		g = &GroupState{Name: group, Weights: map[string]int{}, UpdatedAt: time.Now()}
 		r.groups[group] = g
 	}
+	if g.Weights == nil {
+		g.Weights = map[string]int{}
+	}
+	oldMembers := append([]string(nil), g.Members...)
 	for _, m := range g.Members {
 		if m == consumerID {
+			g.Weights[consumerID] = weight
 			g.UpdatedAt = time.Now()
 			return cloneGroupState(g)
 		}
 	}
 	g.Members = append(g.Members, consumerID)
+	g.Weights[consumerID] = weight
 	g.Version++
 	g.UpdatedAt = time.Now()
+	if r.hooks != nil && r.hooks.OnBeforeRebalance != nil {
+		r.hooks.OnBeforeRebalance(group, oldMembers, g.Members)
+	}
 	r.rebalanceLocked(g)
+	if r.hooks != nil && r.hooks.OnAfterRebalance != nil {
+		r.hooks.OnAfterRebalance(group, cloneGroupState(g))
+	}
 	return cloneGroupState(g)
 }
 
@@ -62,6 +92,7 @@ func (r *GroupRebalancer) LeaveGroup(consumerID, group string) *GroupState {
 	if !ok {
 		return nil
 	}
+	oldMembers := append([]string(nil), g.Members...)
 	filtered := make([]string, 0, len(g.Members))
 	for _, m := range g.Members {
 		if m != consumerID {
@@ -69,13 +100,20 @@ func (r *GroupRebalancer) LeaveGroup(consumerID, group string) *GroupState {
 		}
 	}
 	g.Members = filtered
+	delete(g.Weights, consumerID)
 	g.Version++
 	g.UpdatedAt = time.Now()
 	if len(g.Members) == 0 {
 		delete(r.groups, group)
 		return nil
 	}
+	if r.hooks != nil && r.hooks.OnBeforeRebalance != nil {
+		r.hooks.OnBeforeRebalance(group, oldMembers, g.Members)
+	}
 	r.rebalanceLocked(g)
+	if r.hooks != nil && r.hooks.OnAfterRebalance != nil {
+		r.hooks.OnAfterRebalance(group, cloneGroupState(g))
+	}
 	return cloneGroupState(g)
 }
 
@@ -121,25 +159,44 @@ func (r *GroupRebalancer) rebalanceLocked(g *GroupState) {
 		g.Assignments = nil
 		return
 	}
-	sort.Strings(g.Members)
 	totalSlots := 256
-	slotsPerMember := totalSlots / len(g.Members)
-	remainder := totalSlots % len(g.Members)
+	if g.Weights == nil {
+		g.Weights = map[string]int{}
+	}
+	totalWeight := 0
+	for _, m := range g.Members {
+		w := g.Weights[m]
+		if w <= 0 {
+			w = 1
+		}
+		totalWeight += w
+	}
 	g.Assignments = make([]GroupAssignment, 0, len(g.Members))
 	start := 0
-	for i, member := range g.Members {
-		slots := slotsPerMember
-		if i < remainder {
-			slots++
+	for _, member := range g.Members {
+		w := g.Weights[member]
+		if w <= 0 {
+			w = 1
+		}
+		slots := (totalSlots * w) / totalWeight
+		if slots <= 0 {
+			slots = 1
 		}
 		assigned := GroupAssignment{
 			ConsumerID: member,
 			Group:      g.Name,
+			Weight:     w,
 			HashSlot:   uint32(start),
 			TotalSlots: slots,
 		}
 		start += slots
 		g.Assignments = append(g.Assignments, assigned)
+	}
+	// Fill remaining slots to reach totalSlots.
+	remaining := totalSlots - start
+	if remaining > 0 && len(g.Assignments) > 0 {
+		last := &g.Assignments[len(g.Assignments)-1]
+		last.TotalSlots += remaining
 	}
 }
 
@@ -257,11 +314,19 @@ func (b *Broker) reconcileGroups(now time.Time) {
 			}
 			continue
 		}
+		// Graceful drain: remove inactive members.
 		for _, member := range g.Members {
 			if !active[member] {
+				if b.GroupRebalancer().hooks != nil && b.GroupRebalancer().hooks.OnDrainStarted != nil {
+					b.GroupRebalancer().hooks.OnDrainStarted(group, member)
+				}
 				b.GroupRebalancer().LeaveGroup(member, group)
+				if b.GroupRebalancer().hooks != nil && b.GroupRebalancer().hooks.OnDrainCompleted != nil {
+					b.GroupRebalancer().hooks.OnDrainCompleted(group, member)
+				}
 			}
 		}
+		// Join new members.
 		for cid := range active {
 			found := false
 			for _, m := range g.Members {

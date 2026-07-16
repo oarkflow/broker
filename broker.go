@@ -39,6 +39,23 @@ type Broker struct {
 	sagaEngine      *SagaEngine
 	wg              sync.WaitGroup
 	startedAt       time.Time
+	promMetrics     *PrometheusMetrics
+	tracer          *Tracer
+	auditLogger     *AuditLogger
+	rateLimiter     *QueueRateLimiter
+	wsServer        *WebSocketServer
+	federationMgr   *FederationManager
+	shovelMgr       *ShovelManager
+	tenantMgr       *TenantManager
+	outbox          *TransactionalOutbox
+	offsetMgr       *ConsumerOffsetManager
+	messageReplay   *MessageReplay
+	logCompaction   *StreamLogCompaction
+	partitionRouter *PartitionRouter
+	partitionOrdering *PartitionOrdering
+	partitionReassignment *PartitionReassignment
+	mqttServer      *MQTTServer
+	grpcServer      *GRPCServer
 }
 
 func New(cfg Config) (*Broker, error) {
@@ -98,7 +115,54 @@ func New(cfg Config) (*Broker, error) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	b := &Broker{cfg: cfg, store: cfg.Store, stateStore: cfg.StateStore, router: NewRouter(), codec: cfg.Codec, frameCodec: cfg.FrameCodec, pool: pool, ownPool: own, ctx: ctx, cancel: cancel, subs: map[string]*Subscription{}, waiters: map[string]chan Response{}, tasks: map[string]*TaskInfo{}, taskWait: map[string][]chan TaskResult{}, notify: NewNotificationBus(1024), consumers: NewConsumerRegistry(512), cluster: NewCluster(firstNonEmpty(cfg.NodeID, "node-1"))}
+	if cfg.EnablePrometheus {
+		b.promMetrics = GlobalPrometheusMetrics()
+		if cfg.Hooks.OnStarted == nil {
+			cfg.Hooks = mergeHooks(cfg.Hooks, b.promMetrics.HookMetrics())
+		}
+	}
+	if cfg.EnableTracing || cfg.TracerConfig != nil {
+		tcfg := TracerConfig{Enabled: true, ServiceName: cfg.Name}
+		if cfg.TracerConfig != nil {
+			tcfg = *cfg.TracerConfig
+			tcfg.Enabled = true
+		}
+		b.tracer = NewTracer(tcfg)
+		b.tracer.Start()
+		if cfg.Hooks.OnStarted == nil {
+			cfg.Hooks = mergeHooks(cfg.Hooks, b.tracer.TracingHooks())
+		}
+	}
+	if cfg.AuditEnabled {
+		b.auditLogger = NewAuditLogger(10000)
+		b.auditLogger.AddSink(ConsoleAuditSink{})
+		if b.notify != nil {
+			b.auditLogger.AddSink(NotificationAuditSink{Bus: b.notify})
+		}
+	}
+	if cfg.RateLimit != nil {
+		b.rateLimiter = NewQueueRateLimiter(*cfg.RateLimit)
+	}
+	if cfg.Tenancy != nil {
+		b.tenantMgr = NewTenantManager(b, *cfg.Tenancy)
+	}
+	if cfg.Partition != nil {
+		b.partitionRouter = NewPartitionRouter(*cfg.Partition)
+	}
+	if cfg.WebSocket != nil {
+		b.wsServer = NewWebSocketServer(b, *cfg.WebSocket)
+	}
 	b.sagaEngine = NewSagaEngine(b)
+	b.wsServer = NewWebSocketServer(b, WebSocketConfig{})
+	b.federationMgr = NewFederationManager(b)
+	b.shovelMgr = NewShovelManager(b)
+	b.outbox = NewTransactionalOutbox(b)
+	b.offsetMgr = NewConsumerOffsetManager(b)
+	b.messageReplay = NewMessageReplay(b)
+	b.logCompaction = NewStreamLogCompaction(b)
+	b.partitionRouter = NewPartitionRouter(PartitionConfig{})
+	b.partitionOrdering = NewPartitionOrdering(b)
+	b.partitionReassignment = NewPartitionReassignment(b)
 	b.state.Store(BrokerConfigured)
 	_ = b.store.DeclareQueue(context.Background(), QueueConfig{Name: cfg.DefaultQueue, VisibilityTimeout: cfg.DefaultVisibility, RetryPolicy: cfg.DefaultRetry, DLQ: cfg.DefaultDLQ})
 	_ = b.store.DeclareQueue(context.Background(), QueueConfig{Name: cfg.DefaultDLQ, VisibilityTimeout: cfg.DefaultVisibility, RetryPolicy: cfg.DefaultRetry})
@@ -165,6 +229,22 @@ func (b *Broker) Stop(ctx context.Context) error {
 		// Drain timeout exceeded; force shutdown.
 	case <-ctx.Done():
 		return ctx.Err()
+	}
+	// Clean up new components.
+	if b.tracer != nil {
+		b.tracer.Stop()
+	}
+	if b.rateLimiter != nil {
+		b.rateLimiter.Stop()
+	}
+	if b.federationMgr != nil {
+		b.federationMgr.Stop()
+	}
+	if b.shovelMgr != nil {
+		b.shovelMgr.Stop()
+	}
+	if b.wsServer != nil {
+		b.wsServer.Stop()
 	}
 	// Always close all resources regardless of individual errors.
 	var firstErr error
@@ -372,6 +452,60 @@ func (b *Broker) ConsumerOffset(ctx context.Context, commit OffsetCommit) (uint6
 	return b.store.ConsumerOffset(ctx, commit)
 }
 
+// StreamLag returns the consumer lag (messages behind) for a given stream and consumer group.
+func (b *Broker) StreamLag(ctx context.Context, stream, consumerGroup string) (uint64, error) {
+	if ms, ok := b.store.(*FileWALStore); ok {
+		return ms.MemoryStore.StreamLag(stream, consumerGroup)
+	} else if ms, ok := b.store.(*MemoryStore); ok {
+		return ms.StreamLag(stream, consumerGroup)
+	}
+	return 0, ErrStreamNotFound
+}
+
+// StreamLagAll returns consumer lag for all consumer groups on a stream.
+func (b *Broker) StreamLagAll(ctx context.Context, stream string) (map[string]uint64, error) {
+	if ms, ok := b.store.(*FileWALStore); ok {
+		return ms.MemoryStore.StreamLagAll(stream)
+	} else if ms, ok := b.store.(*MemoryStore); ok {
+		return ms.StreamLagAll(stream)
+	}
+	return nil, ErrStreamNotFound
+}
+
+// StreamHeadOffset returns the latest offset for a stream.
+func (b *Broker) StreamHeadOffset(ctx context.Context, stream string) (uint64, error) {
+	if ms, ok := b.store.(*FileWALStore); ok {
+		return ms.MemoryStore.StreamHeadOffset(stream)
+	} else if ms, ok := b.store.(*MemoryStore); ok {
+		return ms.StreamHeadOffset(stream)
+	}
+	return 0, ErrStreamNotFound
+}
+
+// StreamConsumerLag is a result type for stream lag queries.
+type StreamConsumerLag struct {
+	Stream        string            `json:"stream"`
+	HeadOffset    uint64            `json:"head_offset"`
+	ConsumerLag   map[string]uint64 `json:"consumer_lag"`
+}
+
+// StreamLagReport returns a full lag report for a stream.
+func (b *Broker) StreamLagReport(ctx context.Context, stream string) (StreamConsumerLag, error) {
+	head, err := b.StreamHeadOffset(ctx, stream)
+	if err != nil {
+		return StreamConsumerLag{}, err
+	}
+	lags, err := b.StreamLagAll(ctx, stream)
+	if err != nil {
+		return StreamConsumerLag{}, err
+	}
+	return StreamConsumerLag{
+		Stream:      stream,
+		HeadOffset:  head,
+		ConsumerLag: lags,
+	}, nil
+}
+
 func (b *Broker) SagaEngine() *SagaEngine        { return b.sagaEngine }
 func (b *Broker) TaskRouter() *TaskRouter          { return b.router.TaskRouter() }
 func (b *Broker) ConfigLoader() *RoutingConfigLoader { return b.router.ConfigLoader() }
@@ -410,4 +544,190 @@ func randomHex(n int) string {
 		return fmt.Sprintf("%d", time.Now().UnixNano())
 	}
 	return hex.EncodeToString(buf)
+}
+
+// mergeHooks merges two Hooks structs, with the override taking precedence.
+func mergeHooks(base, override Hooks) Hooks {
+	merged := base
+	if override.BeforePublish != nil {
+		merged.BeforePublish = override.BeforePublish
+	}
+	if override.AfterPublish != nil {
+		merged.AfterPublish = override.AfterPublish
+	}
+	if override.OnPublishRejected != nil {
+		merged.OnPublishRejected = override.OnPublishRejected
+	}
+	if override.OnPublishConfirmed != nil {
+		merged.OnPublishConfirmed = override.OnPublishConfirmed
+	}
+	if override.OnPublishFailed != nil {
+		merged.OnPublishFailed = override.OnPublishFailed
+	}
+	if override.BeforeRoute != nil {
+		merged.BeforeRoute = override.BeforeRoute
+	}
+	if override.AfterRoute != nil {
+		merged.AfterRoute = override.AfterRoute
+	}
+	if override.OnRouteMiss != nil {
+		merged.OnRouteMiss = override.OnRouteMiss
+	}
+	if override.OnRouteConflict != nil {
+		merged.OnRouteConflict = override.OnRouteConflict
+	}
+	if override.OnMessageMoved != nil {
+		merged.OnMessageMoved = override.OnMessageMoved
+	}
+	if override.OnMessageCopied != nil {
+		merged.OnMessageCopied = override.OnMessageCopied
+	}
+	if override.OnMessageRerouted != nil {
+		merged.OnMessageRerouted = override.OnMessageRerouted
+	}
+	if override.OnConsumerRegistered != nil {
+		merged.OnConsumerRegistered = override.OnConsumerRegistered
+	}
+	if override.OnConsumerAssigned != nil {
+		merged.OnConsumerAssigned = override.OnConsumerAssigned
+	}
+	if override.OnConsumerRevoked != nil {
+		merged.OnConsumerRevoked = override.OnConsumerRevoked
+	}
+	if override.BeforeHandle != nil {
+		merged.BeforeHandle = override.BeforeHandle
+	}
+	if override.AfterHandle != nil {
+		merged.AfterHandle = override.AfterHandle
+	}
+	if override.OnHandlerError != nil {
+		merged.OnHandlerError = override.OnHandlerError
+	}
+	if override.OnPanic != nil {
+		merged.OnPanic = override.OnPanic
+	}
+	if override.OnAck != nil {
+		merged.OnAck = override.OnAck
+	}
+	if override.OnNack != nil {
+		merged.OnNack = override.OnNack
+	}
+	if override.OnLeaseExtended != nil {
+		merged.OnLeaseExtended = override.OnLeaseExtended
+	}
+	if override.OnConsumerPaused != nil {
+		merged.OnConsumerPaused = override.OnConsumerPaused
+	}
+	if override.OnConsumerResumed != nil {
+		merged.OnConsumerResumed = override.OnConsumerResumed
+	}
+	if override.OnConsumerDraining != nil {
+		merged.OnConsumerDraining = override.OnConsumerDraining
+	}
+	if override.OnConsumerBanned != nil {
+		merged.OnConsumerBanned = override.OnConsumerBanned
+	}
+	if override.OnConsumerUnbanned != nil {
+		merged.OnConsumerUnbanned = override.OnConsumerUnbanned
+	}
+	if override.OnConsumerStopped != nil {
+		merged.OnConsumerStopped = override.OnConsumerStopped
+	}
+	if override.OnTaskCreated != nil {
+		merged.OnTaskCreated = override.OnTaskCreated
+	}
+	if override.OnTaskScheduled != nil {
+		merged.OnTaskScheduled = override.OnTaskScheduled
+	}
+	if override.OnTaskQueued != nil {
+		merged.OnTaskQueued = override.OnTaskQueued
+	}
+	if override.OnTaskStarted != nil {
+		merged.OnTaskStarted = override.OnTaskStarted
+	}
+	if override.OnTaskProgress != nil {
+		merged.OnTaskProgress = override.OnTaskProgress
+	}
+	if override.OnTaskSucceeded != nil {
+		merged.OnTaskSucceeded = override.OnTaskSucceeded
+	}
+	if override.OnTaskFailed != nil {
+		merged.OnTaskFailed = override.OnTaskFailed
+	}
+	if override.OnTaskRetrying != nil {
+		merged.OnTaskRetrying = override.OnTaskRetrying
+	}
+	if override.OnTaskCancelled != nil {
+		merged.OnTaskCancelled = override.OnTaskCancelled
+	}
+	if override.OnTaskTimedOut != nil {
+		merged.OnTaskTimedOut = override.OnTaskTimedOut
+	}
+	if override.OnTaskCompensating != nil {
+		merged.OnTaskCompensating = override.OnTaskCompensating
+	}
+	if override.OnTaskCompensated != nil {
+		merged.OnTaskCompensated = override.OnTaskCompensated
+	}
+	if override.OnTaskArchived != nil {
+		merged.OnTaskArchived = override.OnTaskArchived
+	}
+	if override.BeforeAppend != nil {
+		merged.BeforeAppend = override.BeforeAppend
+	}
+	if override.AfterAppend != nil {
+		merged.AfterAppend = override.AfterAppend
+	}
+	if override.OnCommit != nil {
+		merged.OnCommit = override.OnCommit
+	}
+	if override.OnRollback != nil {
+		merged.OnRollback = override.OnRollback
+	}
+	if override.OnFsyncSlow != nil {
+		merged.OnFsyncSlow = override.OnFsyncSlow
+	}
+	if override.OnCorruption != nil {
+		merged.OnCorruption = override.OnCorruption
+	}
+	if override.OnRecoveryStart != nil {
+		merged.OnRecoveryStart = override.OnRecoveryStart
+	}
+	if override.OnRecoveryDone != nil {
+		merged.OnRecoveryDone = override.OnRecoveryDone
+	}
+	if override.OnRetryDecision != nil {
+		merged.OnRetryDecision = override.OnRetryDecision
+	}
+	if override.OnRetryScheduled != nil {
+		merged.OnRetryScheduled = override.OnRetryScheduled
+	}
+	if override.OnRetryExhausted != nil {
+		merged.OnRetryExhausted = override.OnRetryExhausted
+	}
+	if override.OnDeadLettered != nil {
+		merged.OnDeadLettered = override.OnDeadLettered
+	}
+	if override.OnDLQReplay != nil {
+		merged.OnDLQReplay = override.OnDLQReplay
+	}
+	if override.OnDLQPurge != nil {
+		merged.OnDLQPurge = override.OnDLQPurge
+	}
+	if override.OnDLQArchive != nil {
+		merged.OnDLQArchive = override.OnDLQArchive
+	}
+	if override.OnMaxRedeliveryExceeded != nil {
+		merged.OnMaxRedeliveryExceeded = override.OnMaxRedeliveryExceeded
+	}
+	if override.OnRateLimited != nil {
+		merged.OnRateLimited = override.OnRateLimited
+	}
+	if override.OnCircuitOpen != nil {
+		merged.OnCircuitOpen = override.OnCircuitOpen
+	}
+	if override.OnCircuitClosed != nil {
+		merged.OnCircuitClosed = override.OnCircuitClosed
+	}
+	return merged
 }
