@@ -200,10 +200,13 @@ func (r *ConsumerRegistry) AddStats(id string, leased, acked, nacked, failed int
 	c.Acked += acked
 	c.Nacked += nacked
 	c.Failed += failed
-	c.InFlight += int(leased - acked - nacked - failed)
-	if c.InFlight < 0 {
-		c.InFlight = 0
+	// Calculate in-flight safely using int64 to avoid overflow on 32-bit systems
+	delta := leased - acked - nacked - failed
+	newInFlight := int64(c.InFlight) + delta
+	if newInFlight < 0 {
+		newInFlight = 0
 	}
+	c.InFlight = int(newInFlight)
 	if lastErr != "" {
 		c.LastError = lastErr
 	}

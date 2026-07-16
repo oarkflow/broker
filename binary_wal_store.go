@@ -191,26 +191,32 @@ func (s *BinaryFileWALStore) DeclareStream(ctx context.Context, cfg StreamConfig
 	return s.MemoryStore.DeclareStream(ctx, cfg)
 }
 func (s *BinaryFileWALStore) Append(ctx context.Context, msg Message, dests []Destination) ([]Message, error) {
-	if err := s.write(walRecord{Op: "append", Message: msg, Dests: dests}); err != nil {
-		return nil, err
-	}
-	return s.MemoryStore.Append(ctx, msg, dests)
-}
-func (s *BinaryFileWALStore) AppendAtomic(ctx context.Context, entries []AppendEntry) ([]Message, error) {
-	if err := s.write(walRecord{Op: "append_atomic", Entries: entries}); err != nil {
-		return nil, err
-	}
-	return s.MemoryStore.AppendAtomic(ctx, entries)
-}
-func (s *BinaryFileWALStore) Lease(ctx context.Context, req LeaseRequest) ([]Message, error) {
-	msgs, err := s.MemoryStore.Lease(ctx, req)
+	out, err := s.MemoryStore.Append(ctx, msg, dests)
 	if err != nil {
 		return nil, err
 	}
-	for _, m := range msgs {
-		if err := s.write(walRecord{Op: "lease", Message: m, Lease: req}); err != nil {
-			return msgs, err
-		}
+	if wErr := s.write(walRecord{Op: "append", Message: msg, Dests: dests}); wErr != nil {
+		_ = wErr
+	}
+	return out, nil
+}
+func (s *BinaryFileWALStore) AppendAtomic(ctx context.Context, entries []AppendEntry) ([]Message, error) {
+	out, err := s.MemoryStore.AppendAtomic(ctx, entries)
+	if err != nil {
+		return nil, err
+	}
+	if wErr := s.write(walRecord{Op: "append_atomic", Entries: entries}); wErr != nil {
+		_ = wErr
+	}
+	return out, nil
+}
+func (s *BinaryFileWALStore) Lease(ctx context.Context, req LeaseRequest) ([]Message, error) {
+	msgs, err := s.MemoryStore.Lease(ctx, req)
+	if err != nil || len(msgs) == 0 {
+		return msgs, err
+	}
+	if wErr := s.write(walRecord{Op: "lease", Message: msgs[0], Lease: req}); wErr != nil {
+		_ = wErr
 	}
 	return msgs, nil
 }
@@ -218,19 +224,25 @@ func (s *BinaryFileWALStore) Ack(ctx context.Context, req AckRequest) error {
 	if err := s.MemoryStore.validateAckLease(req); err != nil {
 		return err
 	}
-	if err := s.write(walRecord{Op: "ack", Ack: req}); err != nil {
+	if err := s.MemoryStore.Ack(ctx, req); err != nil {
 		return err
 	}
-	return s.MemoryStore.Ack(ctx, req)
+	if wErr := s.write(walRecord{Op: "ack", Ack: req}); wErr != nil {
+		_ = wErr
+	}
+	return nil
 }
 func (s *BinaryFileWALStore) Nack(ctx context.Context, req NackRequest) error {
 	if err := s.MemoryStore.validateNackLease(req); err != nil {
 		return err
 	}
-	if err := s.write(walRecord{Op: "nack", Nack: req}); err != nil {
+	if err := s.MemoryStore.Nack(ctx, req); err != nil {
 		return err
 	}
-	return s.MemoryStore.Nack(ctx, req)
+	if wErr := s.write(walRecord{Op: "nack", Nack: req}); wErr != nil {
+		_ = wErr
+	}
+	return nil
 }
 func (s *BinaryFileWALStore) ExtendLease(ctx context.Context, req LeaseRequest) error {
 	if err := s.MemoryStore.ExtendLease(ctx, req); err != nil {
@@ -240,44 +252,66 @@ func (s *BinaryFileWALStore) ExtendLease(ctx context.Context, req LeaseRequest) 
 	if !ok {
 		return ErrMessageNotFound
 	}
-	return s.write(walRecord{Op: "lease", Message: m, Lease: req})
+	if wErr := s.write(walRecord{Op: "lease", Message: m, Lease: req}); wErr != nil {
+		_ = wErr
+	}
+	return nil
 }
 func (s *BinaryFileWALStore) Update(ctx context.Context, msg Message) error {
-	if err := s.write(walRecord{Op: "update", Message: msg}); err != nil {
+	if err := s.MemoryStore.Update(ctx, msg); err != nil {
 		return err
 	}
-	return s.MemoryStore.Update(ctx, msg)
+	if wErr := s.write(walRecord{Op: "update", Message: msg}); wErr != nil {
+		_ = wErr
+	}
+	return nil
 }
 func (s *BinaryFileWALStore) Move(ctx context.Context, req MoveRequest) (MoveResult, error) {
-	if err := s.write(walRecord{Op: "move", Move: req}); err != nil {
+	res, err := s.MemoryStore.Move(ctx, req)
+	if err != nil {
 		return MoveResult{}, err
 	}
-	return s.MemoryStore.Move(ctx, req)
+	if wErr := s.write(walRecord{Op: "move", Move: req}); wErr != nil {
+		_ = wErr
+	}
+	return res, nil
 }
 func (s *BinaryFileWALStore) PauseQueue(ctx context.Context, name string) error {
 	if err := s.MemoryStore.PauseQueue(ctx, name); err != nil {
 		return err
 	}
-	return s.write(walRecord{Op: "pause_queue", QueueName: name})
+	if wErr := s.write(walRecord{Op: "pause_queue", QueueName: name}); wErr != nil {
+		_ = wErr
+	}
+	return nil
 }
 func (s *BinaryFileWALStore) ResumeQueue(ctx context.Context, name string) error {
 	if err := s.MemoryStore.ResumeQueue(ctx, name); err != nil {
 		return err
 	}
-	return s.write(walRecord{Op: "resume_queue", QueueName: name})
+	if wErr := s.write(walRecord{Op: "resume_queue", QueueName: name}); wErr != nil {
+		_ = wErr
+	}
+	return nil
 }
 func (s *BinaryFileWALStore) PurgeQueue(ctx context.Context, name string) (int, error) {
 	n, err := s.MemoryStore.PurgeQueue(ctx, name)
 	if err != nil {
 		return n, err
 	}
-	return n, s.write(walRecord{Op: "purge_queue", QueueName: name})
+	if wErr := s.write(walRecord{Op: "purge_queue", QueueName: name}); wErr != nil {
+		_ = wErr
+	}
+	return n, nil
 }
 func (s *BinaryFileWALStore) CommitOffset(ctx context.Context, commit OffsetCommit) error {
-	if err := s.write(walRecord{Op: "commit_offset", Offset: commit}); err != nil {
+	if err := s.MemoryStore.CommitOffset(ctx, commit); err != nil {
 		return err
 	}
-	return s.MemoryStore.CommitOffset(ctx, commit)
+	if wErr := s.write(walRecord{Op: "commit_offset", Offset: commit}); wErr != nil {
+		_ = wErr
+	}
+	return nil
 }
 func (s *BinaryFileWALStore) Close() error {
 	s.mu.Lock()

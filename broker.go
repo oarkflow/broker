@@ -166,8 +166,12 @@ func New(cfg Config) (*Broker, error) {
 	b.partitionOrdering = NewPartitionOrdering(b)
 	b.partitionReassignment = NewPartitionReassignment(b)
 	b.state.Store(BrokerConfigured)
-	_ = b.store.DeclareQueue(context.Background(), QueueConfig{Name: cfg.DefaultQueue, VisibilityTimeout: cfg.DefaultVisibility, RetryPolicy: cfg.DefaultRetry, DLQ: cfg.DefaultDLQ})
-	_ = b.store.DeclareQueue(context.Background(), QueueConfig{Name: cfg.DefaultDLQ, VisibilityTimeout: cfg.DefaultVisibility, RetryPolicy: cfg.DefaultRetry})
+	if err := b.store.DeclareQueue(context.Background(), QueueConfig{Name: cfg.DefaultQueue, VisibilityTimeout: cfg.DefaultVisibility, RetryPolicy: cfg.DefaultRetry, DLQ: cfg.DefaultDLQ}); err != nil {
+		return nil, fmt.Errorf("declare default queue: %w", err)
+	}
+	if err := b.store.DeclareQueue(context.Background(), QueueConfig{Name: cfg.DefaultDLQ, VisibilityTimeout: cfg.DefaultVisibility, RetryPolicy: cfg.DefaultRetry}); err != nil {
+		return nil, fmt.Errorf("declare default DLQ: %w", err)
+	}
 	return b, nil
 }
 

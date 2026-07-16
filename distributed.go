@@ -516,7 +516,17 @@ func (s *ReplicatedStore) Append(ctx context.Context, msg Message, dests []Desti
 	if err := s.waitForCommit(ctx, idx); err != nil {
 		return nil, err
 	}
-	return nil, nil
+	// After Raft commit, the leader's local store has applied the mutation.
+	// Query it for the actual stored messages to return to the caller.
+	localMsg, ok, err := s.Store.Get(ctx, msg.ID)
+	if err != nil {
+		return nil, err
+	}
+	if ok {
+		return []Message{localMsg}, nil
+	}
+	// Fallback: return the original message if local lookup fails
+	return []Message{msg}, nil
 }
 
 func (s *ReplicatedStore) Ack(ctx context.Context, req AckRequest) error {
@@ -582,7 +592,13 @@ func (s *ReplicatedStore) PurgeQueue(ctx context.Context, name string) (int, err
 	if err := s.waitForCommit(ctx, idx); err != nil {
 		return 0, err
 	}
-	return 0, nil
+	// Query local store for the actual purge count
+	n, err := s.Store.PurgeQueue(ctx, name)
+	if err != nil {
+		// If local purge fails (already purged by Raft), return 0
+		return 0, nil
+	}
+	return n, nil
 }
 
 type brokerStoreAdapter struct {

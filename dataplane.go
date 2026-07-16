@@ -502,7 +502,16 @@ func (a AdminServer) v1Message(w http.ResponseWriter, r *http.Request, tail stri
 		var req AckRequest
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		req.MessageID = id
+		// Validate lease token if message is leased
 		m, hadMessage, _ := a.Broker.store.Get(r.Context(), id)
+		if hadMessage && m.LeaseToken != "" && req.LeaseToken == "" {
+			http.Error(w, "lease token required for leased message", 403)
+			return
+		}
+		if hadMessage && m.LeaseToken != "" && req.LeaseToken != m.LeaseToken {
+			http.Error(w, "invalid lease token", 403)
+			return
+		}
 		if err := a.Broker.store.Ack(r.Context(), req); err != nil {
 			http.Error(w, err.Error(), 409)
 			return
@@ -519,6 +528,16 @@ func (a AdminServer) v1Message(w http.ResponseWriter, r *http.Request, tail stri
 		var req NackRequest
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		req.MessageID = id
+		// Validate lease token if message is leased
+		m, hadMessage, _ := a.Broker.store.Get(r.Context(), id)
+		if hadMessage && m.LeaseToken != "" && req.LeaseToken == "" {
+			http.Error(w, "lease token required for leased message", 403)
+			return
+		}
+		if hadMessage && m.LeaseToken != "" && req.LeaseToken != m.LeaseToken {
+			http.Error(w, "invalid lease token", 403)
+			return
+		}
 		if req.Action == "" {
 			req.Action = NackRequeue
 		}
@@ -526,7 +545,7 @@ func (a AdminServer) v1Message(w http.ResponseWriter, r *http.Request, tail stri
 			req.Action = NackReject
 		}
 		req.IncrementAttempt = true
-		m, hadMessage, _ := a.Broker.store.Get(r.Context(), id)
+		m, hadMessage, _ = a.Broker.store.Get(r.Context(), id)
 		if err := a.Broker.store.Nack(r.Context(), req); err != nil {
 			http.Error(w, err.Error(), 409)
 			return

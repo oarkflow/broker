@@ -292,6 +292,12 @@ func (a AdminServer) queue(w http.ResponseWriter, r *http.Request) {
 	}
 	parts := strings.Split(strings.Trim(path, "/"), "/")
 	name := parts[0]
+	if validated, err := sanitizeIdentifier(name); err != nil {
+		http.Error(w, "invalid queue name: "+err.Error(), 400)
+		return
+	} else {
+		name = validated
+	}
 	if len(parts) == 2 {
 		switch parts[1] {
 		case "messages":
@@ -384,6 +390,12 @@ func (a AdminServer) stream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	name := parts[0]
+	if validated, err := sanitizeIdentifier(name); err != nil {
+		http.Error(w, "invalid stream name: "+err.Error(), 400)
+		return
+	} else {
+		name = validated
+	}
 	if len(parts) == 1 || (len(parts) == 2 && parts[1] == "messages") {
 		afterRaw := firstNonEmpty(r.URL.Query().Get("after"), r.URL.Query().Get("after_offset"))
 		after, _ := strconv.ParseUint(afterRaw, 10, 64)
@@ -470,6 +482,12 @@ func (a AdminServer) message(w http.ResponseWriter, r *http.Request) {
 	}
 	parts := strings.Split(path, "/")
 	id := parts[0]
+	if validated, err := sanitizeIdentifier(id); err != nil {
+		http.Error(w, "invalid message id: "+err.Error(), 400)
+		return
+	} else {
+		id = validated
+	}
 	if len(parts) == 2 {
 		switch parts[1] {
 		case "history":
@@ -645,6 +663,26 @@ func errString(err error) string {
 		return ""
 	}
 	return err.Error()
+}
+
+// sanitizeIdentifier validates that an identifier contains only safe characters.
+// Returns the identifier if valid, or an error if invalid.
+func sanitizeIdentifier(s string) (string, error) {
+	if s == "" {
+		return "", fmt.Errorf("empty identifier")
+	}
+	if len(s) > 256 {
+		return "", fmt.Errorf("identifier too long: %d > 256", len(s))
+	}
+	for _, c := range s {
+		if c < 32 || c > 126 {
+			return "", fmt.Errorf("identifier contains invalid character: %d", c)
+		}
+		if c == '/' || c == '\\' || c == '\x00' {
+			return "", fmt.Errorf("identifier contains forbidden character: %c", c)
+		}
+	}
+	return s, nil
 }
 
 func adminAction(r *http.Request) string {

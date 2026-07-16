@@ -32,9 +32,10 @@ type WebSocketServer struct {
 }
 
 type wsClient struct {
-	id     string
-	send   chan []byte
-	closed chan struct{}
+	id        string
+	send      chan []byte
+	closed    chan struct{}
+	closeOnce sync.Once
 }
 
 // NewWebSocketServer creates a new WebSocket server.
@@ -110,7 +111,7 @@ func (ws *WebSocketServer) handleUpgrade(w http.ResponseWriter, r *http.Request)
 		ws.mu.Lock()
 		delete(ws.clients, clientID)
 		ws.mu.Unlock()
-		close(client.closed)
+		client.closeOnce.Do(func() { close(client.closed) })
 	}()
 
 	// Send client ID
@@ -233,6 +234,7 @@ func (ws *WebSocketServer) Stop() {
 	ws.mu.Lock()
 	for id, c := range ws.clients {
 		close(c.send)
+		c.closeOnce.Do(func() { close(c.closed) })
 		delete(ws.clients, id)
 	}
 	ws.mu.Unlock()
