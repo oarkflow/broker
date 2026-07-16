@@ -408,7 +408,7 @@ func (a AdminServer) v1PollFrame(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func writeFrameBatch(w http.ResponseWriter, codec *BinaryMessageCodec, msgs []Message) {
+func writeFrameBatch(w http.ResponseWriter, codec FrameCodec, msgs []Message) {
 	w.Header().Set("Content-Type", "application/vnd.pool.broker.frames")
 	for _, msg := range msgs {
 		frame, err := codec.EncodeMessage(nil, msg)

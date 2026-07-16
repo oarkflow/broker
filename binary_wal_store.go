@@ -19,18 +19,27 @@ import (
 // AES-GCM payload protection.
 type BinaryFileWALStore struct {
 	*MemoryStore
-	mu    sync.Mutex
-	path  string
-	file  *os.File
-	codec *BinaryMessageCodec
+	mu      sync.Mutex
+	path    string
+	file    *os.File
+	codec   FrameCodec
+	keyName string
 }
 
 func NewBinaryFileWALStore(dir string, opts ...BinaryMessageCodecOption) (*BinaryFileWALStore, error) {
+	return NewBinaryFileWALStoreWithCodec(dir, NewBinaryMessageCodec(opts...))
+}
+
+// NewBinaryFileWALStoreWithCodec creates a BinaryFileWALStore with a specific codec (FWB1 or FWB2).
+func NewBinaryFileWALStoreWithCodec(dir string, codec FrameCodec) (*BinaryFileWALStore, error) {
+	if codec == nil {
+		codec = NewBinaryMessageCodec()
+	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
 	path := filepath.Join(dir, "broker.wal.fwb")
-	st := &BinaryFileWALStore{MemoryStore: NewMemoryStore(), path: path, codec: NewBinaryMessageCodec(opts...)}
+	st := &BinaryFileWALStore{MemoryStore: NewMemoryStore(), path: path, codec: codec}
 	if err := st.recover(); err != nil {
 		return nil, err
 	}
@@ -68,7 +77,8 @@ func (s *BinaryFileWALStore) recover() error {
 			return err
 		}
 		pos += int64(uvarintLen(l))
-		if l == 0 || l > uint64(s.codec.MaxFrameSize) && s.codec.MaxFrameSize > 0 {
+		maxFrame := uint64(1 << 20) // 1MB default
+		if l == 0 || l > maxFrame {
 			_ = os.Truncate(s.path, pos-int64(uvarintLen(l)))
 			s.normalizeRecoveredInflight()
 			return nil

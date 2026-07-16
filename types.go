@@ -302,7 +302,8 @@ type Config struct {
 	Pool                  *pool.Pool    `json:"-"`
 	OwnPool               bool                `json:"own_pool"`
 	Codec                 Codec               `json:"-"`
-	FrameCodec            *BinaryMessageCodec `json:"-"`
+	FrameCodec            FrameCodec          `json:"-"`
+	FrameCodecType        CodecType           `json:"-"`
 	SchemaRegistry        SchemaRegistry      `json:"-"`
 	DefaultQueue          string              `json:"default_queue"`
 	DefaultVisibility     time.Duration       `json:"default_visibility"`
@@ -327,6 +328,10 @@ type Config struct {
 	Partition             *PartitionConfig    `json:"partition,omitempty"`
 	WebSocket             *WebSocketConfig    `json:"websocket,omitempty"`
 	ExactlyOnce           *ExactlyOnceConfig  `json:"exactly_once,omitempty"`
+	// SigningKey is the HMAC signing key for frame authentication.
+	SigningKey []byte `json:"-"`
+	// EncryptionKey is the AES encryption key for frame encryption at rest.
+	EncryptionKey []byte `json:"-"`
 }
 
 type Handler func(context.Context, Delivery) error

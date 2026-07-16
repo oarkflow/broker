@@ -18,7 +18,7 @@ type Broker struct {
 	stateStore StateStore
 	router     *Router
 	codec      Codec
-	frameCodec *BinaryMessageCodec
+	frameCodec FrameCodec
 	pool       *fw.Pool
 	ownPool    bool
 	ctx        context.Context
@@ -99,7 +99,12 @@ func New(cfg Config) (*Broker, error) {
 		cfg.Codec = JSONCodec{}
 	}
 	if cfg.FrameCodec == nil {
-		cfg.FrameCodec = NewBinaryMessageCodec(WithFrameMaxSize(cfg.MaxMessageSize + (1 << 20)))
+		cfg.FrameCodec = NewFrameCodec(FrameCodecConfig{
+			Type:          cfg.FrameCodecType,
+			MaxFrameSize:  cfg.MaxMessageSize + (1 << 20),
+			SigningKey:    cfg.SigningKey,
+			EncryptionKey: cfg.EncryptionKey,
+		})
 	}
 	if cfg.Store == nil {
 		cfg.Store = NewMemoryStore()
@@ -175,7 +180,7 @@ func New(cfg Config) (*Broker, error) {
 	return b, nil
 }
 
-func (b *Broker) FrameCodec() *BinaryMessageCodec {
+func (b *Broker) FrameCodec() FrameCodec {
 	if b == nil || b.frameCodec == nil {
 		return NewBinaryMessageCodec()
 	}

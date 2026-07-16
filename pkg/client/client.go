@@ -32,7 +32,7 @@ type Config struct {
 	HTTPClient                                         *http.Client
 	Pool                                               *fw.Pool
 	Hooks                                              Hooks
-	FrameCodec                                         *broker.BinaryMessageCodec
+	FrameCodec                                         broker.FrameCodec
 	// TLSCertFile is the path to the client TLS certificate for mTLS.
 	TLSCertFile string
 	// TLSKeyFile is the path to the client TLS private key for mTLS.
@@ -146,9 +146,6 @@ func New(cfg Config) *Client {
 	}
 	if cfg.LeaseExtensionInterval <= 0 {
 		cfg.LeaseExtensionInterval = cfg.VisibilityTimeout / 2
-		if cfg.FrameCodec == nil {
-			cfg.FrameCodec = broker.NewBinaryMessageCodec()
-		}
 		if cfg.LeaseExtensionInterval <= 0 {
 			cfg.LeaseExtensionInterval = 10 * time.Second
 		}
@@ -326,7 +323,7 @@ func mustMarshal(v any) []byte {
 	return b
 }
 
-func decodeFrameBatch(data []byte, codec *broker.BinaryMessageCodec) ([]broker.Message, error) {
+func decodeFrameBatch(data []byte, codec broker.FrameCodec) ([]broker.Message, error) {
 	r := bufio.NewReader(bytes.NewReader(data))
 	var out []broker.Message
 	for {

@@ -28,6 +28,7 @@ func main() {
 	frameSigningKey := flag.String("frame-signing-key", env("BROKER_FRAME_SIGNING_KEY", ""), "optional FWB1 frame HMAC signing key")
 	frameEncryptionKey := flag.String("frame-encryption-key", env("BROKER_FRAME_ENCRYPTION_KEY", ""), "optional FWB1 frame AES-GCM payload encryption key")
 	frameCompress := flag.Int("frame-compress-threshold", int(envInt64("BROKER_FRAME_COMPRESS_THRESHOLD", 0)), "gzip payloads in FWB1 frames at or above this size; 0 disables")
+	codecType := flag.String("codec", env("BROKER_CODEC", "fwb1"), "frame codec: fwb1 (string keys) or fwb2 (compact numeric tags)")
 	token := flag.String("token", env("BROKER_TOKEN", ""), "required bearer token for admin/API unless --insecure-dev is set")
 	readToken := flag.String("read-token", env("BROKER_READ_TOKEN", ""), "optional read-only bearer token")
 	workerToken := flag.String("worker-token", env("BROKER_WORKER_TOKEN", ""), "optional remote worker bearer token with consumer/message/task permissions")
@@ -50,7 +51,13 @@ func main() {
 		logger.Log.Fatal("both -tls-cert and -tls-key must be provided together")
 	}
 
-	frameCodec := broker.NewBinaryMessageCodec(frameCodecOptions(*frameSigningKey, *frameEncryptionKey, *frameCompress, int(*maxBody)+1<<20)...)
+	frameCodec := broker.NewFrameCodec(broker.FrameCodecConfig{
+		Type:              broker.CodecType(*codecType),
+		CompressThreshold: *frameCompress,
+		MaxFrameSize:      int(*maxBody) + (1 << 20),
+		SigningKey:        []byte(*frameSigningKey),
+		EncryptionKey:     []byte(*frameEncryptionKey),
+	})
 	var store broker.Store
 	kind := strings.ToLower(strings.TrimSpace(*storeKind))
 	if kind == "" && *wal != "" {
@@ -86,7 +93,7 @@ func main() {
 			}
 			store = st
 		} else {
-			st, err := broker.NewBinaryFileWALStore(*wal, frameCodecOptions(*frameSigningKey, *frameEncryptionKey, *frameCompress, int(*maxBody)+1<<20)...)
+			st, err := broker.NewBinaryFileWALStoreWithCodec(*wal, frameCodec)
 			if err != nil {
 				logger.Log.Fatal("open binary WAL store", zlog.Err(err))
 			}
