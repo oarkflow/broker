@@ -58,6 +58,24 @@ type AtomicStore interface {
 	AppendAtomic(context.Context, []AppendEntry) ([]Message, error)
 }
 
+// BatchAppendResult is the per-entry outcome of a BatchAppendStore.AppendBatch
+// call. Unlike AppendAtomic, a failure in one entry does not affect the
+// others — each publisher gets its own success/error independent of what
+// else was coalesced into the same batch.
+type BatchAppendResult struct {
+	Messages []Message
+	Err      error
+}
+
+// BatchAppendStore is an optional Store capability that appends many
+// unrelated entries (e.g. concurrent publishes from different callers)
+// under a single lock/fsync instead of one per entry, while preserving
+// per-entry error isolation. Stores that don't implement it fall back to
+// looping over Append.
+type BatchAppendStore interface {
+	AppendBatch(context.Context, []AppendEntry) []BatchAppendResult
+}
+
 type LeaseRequest struct {
 	Queue             string
 	ConsumerID        string
@@ -457,6 +475,34 @@ func (s *MemoryStore) AppendAtomic(ctx context.Context, entries []AppendEntry) (
 	return out, nil
 }
 
+// AppendBatch appends many independent entries under a single lock
+// acquisition. Unlike AppendAtomic, one entry's error does not abort the
+// rest — each gets its own result, matching the semantics of calling
+// Append once per entry but without paying for a lock per call.
+func (s *MemoryStore) AppendBatch(ctx context.Context, entries []AppendEntry) []BatchAppendResult {
+	results := make([]BatchAppendResult, len(entries))
+	select {
+	case <-ctx.Done():
+		for i := range results {
+			results[i].Err = ctx.Err()
+		}
+		return results
+	default:
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		for i := range results {
+			results[i].Err = ErrClosed
+		}
+		return results
+	}
+	for i, e := range entries {
+		results[i].Messages, results[i].Err = s.appendLocked(e.Message, e.Destinations)
+	}
+	return results
+}
+
 func (s *MemoryStore) Lease(ctx context.Context, req LeaseRequest) ([]Message, error) {
 	select {
 	case <-ctx.Done():
@@ -486,7 +532,7 @@ func (s *MemoryStore) Lease(ctx context.Context, req LeaseRequest) ([]Message, e
 		scanLimit = len(q.ids)
 	}
 	type candidate struct {
-		idx    int
+		idx      int
 		priority int
 	}
 	// minBuf is a small fixed-capacity buffer of the best candidates seen so far.
@@ -1228,11 +1274,15 @@ func strconvFormatInt(i int64) string { return strconv.FormatInt(i, 36) }
 // in the config to enable AES-GCM encryption of all WAL records at rest.
 type FileWALStore struct {
 	*MemoryStore
-	path    string
-	file    *os.File
+	dir     string
 	gcm     cipher.AEAD
 	keyName string
-	gc      *groupCommitWriter
+	shards  []*fileWALShard
+}
+
+type fileWALShard struct {
+	file *os.File
+	gc   *groupCommitWriter
 }
 
 // FileWALStoreConfig configures the FileWALStore.
@@ -1267,12 +1317,14 @@ func NewFileWALStore(dir string) (*FileWALStore, error) {
 // NewFileWALStoreWithConfig creates a FileWALStore with optional encryption.
 // If EncryptionKey is nil or empty, WAL records are stored in plaintext.
 // If EncryptionKey is provided (16, 24, or 32 bytes), all records are AES-GCM encrypted.
+// Like BinaryFileWALStore, the WAL is partitioned across DefaultWALShards
+// shard files (queue-hashed, pinned to the directory on first creation) so
+// concurrent writers to different queues fsync in parallel.
 func NewFileWALStoreWithConfig(cfg FileWALStoreConfig) (*FileWALStore, error) {
 	if err := os.MkdirAll(cfg.Dir, 0o700); err != nil {
 		return nil, err
 	}
-	path := filepath.Join(cfg.Dir, "broker.wal.jsonl")
-	st := &FileWALStore{MemoryStore: NewMemoryStore(), path: path, keyName: cfg.KeyName}
+	st := &FileWALStore{MemoryStore: NewMemoryStore(), dir: cfg.Dir, keyName: cfg.KeyName}
 	// Set up optional encryption
 	if len(cfg.EncryptionKey) > 0 {
 		block, err := aes.NewCipher(cfg.EncryptionKey)
@@ -1285,20 +1337,65 @@ func NewFileWALStoreWithConfig(cfg FileWALStoreConfig) (*FileWALStore, error) {
 		}
 		st.gcm = gcm
 	}
-	if err := st.recover(); err != nil {
-		return nil, err
-	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	n, err := st.resolveShardCount(DefaultWALShards)
 	if err != nil {
 		return nil, err
 	}
-	st.file = f
-	st.gc = newGroupCommitWriter(f)
+	if err := st.recoverAll(n); err != nil {
+		return nil, err
+	}
+	st.shards = make([]*fileWALShard, n)
+	for i := 0; i < n; i++ {
+		f, err := os.OpenFile(st.shardPath(i, n), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+		if err != nil {
+			return nil, err
+		}
+		st.shards[i] = &fileWALShard{file: f, gc: newGroupCommitWriter(f)}
+	}
 	return st, nil
 }
 
-func (s *FileWALStore) recover() error {
-	f, err := os.Open(s.path)
+func (s *FileWALStore) resolveShardCount(requested int) (int, error) {
+	marker := filepath.Join(s.dir, "broker.wal.shards")
+	if data, err := os.ReadFile(marker); err == nil {
+		if n, perr := strconv.Atoi(strings.TrimSpace(string(data))); perr == nil && n > 0 {
+			return n, nil
+		}
+	}
+	if requested <= 0 {
+		requested = 1
+	}
+	if err := os.WriteFile(marker, []byte(strconv.Itoa(requested)), 0o600); err != nil {
+		return 0, err
+	}
+	return requested, nil
+}
+
+func (s *FileWALStore) shardPath(i, n int) string {
+	return filepath.Join(s.dir, fmt.Sprintf("broker.wal.%d-of-%d.jsonl", i, n))
+}
+
+// recoverAll replays the legacy pre-sharding single WAL file (upgrade path)
+// followed by every current shard file.
+func (s *FileWALStore) recoverAll(n int) error {
+	if err := s.recoverFile(filepath.Join(s.dir, "broker.wal.jsonl")); err != nil {
+		return err
+	}
+	var errs []error
+	for i := 0; i < n; i++ {
+		if err := s.recoverFile(s.shardPath(i, n)); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	s.normalizeRecoveredInflight()
+	if len(errs) > 0 {
+		return errors.Join(errs...)
+	}
+	return nil
+}
+
+func (s *FileWALStore) recoverFile(path string) error {
+	f, err := os.Open(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil
@@ -1312,7 +1409,6 @@ func (s *FileWALStore) recover() error {
 	for {
 		line, readErr := r.ReadBytes('\n')
 		if len(line) == 0 && errors.Is(readErr, io.EOF) {
-			s.normalizeRecoveredInflight()
 			if len(recoveryErrors) > 0 {
 				return fmt.Errorf("WAL recovery completed with %d errors: %w", len(recoveryErrors), errors.Join(recoveryErrors...))
 			}
@@ -1353,8 +1449,7 @@ func (s *FileWALStore) recover() error {
 			var rec walRecord
 			if err := json.Unmarshal(data, &rec); err != nil {
 				if errors.Is(readErr, io.EOF) {
-					_ = os.Truncate(s.path, offset)
-					s.normalizeRecoveredInflight()
+					_ = os.Truncate(path, offset)
 					return nil
 				}
 				// Skip corrupted record but continue recovery.
@@ -1364,8 +1459,7 @@ func (s *FileWALStore) recover() error {
 			}
 			if err := verifyWALRecord(rec); err != nil {
 				if errors.Is(readErr, io.EOF) {
-					_ = os.Truncate(s.path, offset)
-					s.normalizeRecoveredInflight()
+					_ = os.Truncate(path, offset)
 					return nil
 				}
 				// Skip invalid record but continue recovery.
@@ -1380,7 +1474,6 @@ func (s *FileWALStore) recover() error {
 		}
 		offset += int64(len(line))
 		if errors.Is(readErr, io.EOF) {
-			s.normalizeRecoveredInflight()
 			if len(recoveryErrors) > 0 {
 				return fmt.Errorf("WAL recovery completed with %d errors: %w", len(recoveryErrors), errors.Join(recoveryErrors...))
 			}
@@ -1446,27 +1539,24 @@ func (s *FileWALStore) applyRecovered(r walRecord) error {
 	return nil
 }
 
-func (s *FileWALStore) write(r walRecord) error {
-	if s.file == nil {
-		return ErrClosed
-	}
+func (s *FileWALStore) encodeRecord(r walRecord) ([]byte, error) {
 	r.At = time.Now()
 	r.Checksum = ""
 	payload, err := json.Marshal(r)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	sum := sha256.Sum256(payload)
 	r.Checksum = hex.EncodeToString(sum[:])
 	line, err := json.Marshal(r)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	// Optional AES-GCM encryption at rest
 	if s.gcm != nil {
 		nonce := make([]byte, s.gcm.NonceSize())
 		if _, err := io.ReadFull(cryptorand.Reader, nonce); err != nil {
-			return fmt.Errorf("wal: generate nonce: %w", err)
+			return nil, fmt.Errorf("wal: generate nonce: %w", err)
 		}
 		encrypted := s.gcm.Seal(nonce, nonce, line, nil)
 		// Base64-encode to avoid newlines in binary data breaking line-based reading
@@ -1475,7 +1565,55 @@ func (s *FileWALStore) write(r walRecord) error {
 		line = append([]byte("ENC:"), encoded...)
 	}
 	line = append(line, '\n')
-	return s.gc.write(line)
+	return line, nil
+}
+
+func (s *FileWALStore) shardIndex(r walRecord) int {
+	return walShardIndex(r, len(s.shards))
+}
+
+func (s *FileWALStore) write(r walRecord) error {
+	if len(s.shards) == 0 {
+		return ErrClosed
+	}
+	line, err := s.encodeRecord(r)
+	if err != nil {
+		return err
+	}
+	return s.shards[s.shardIndex(r)].gc.write(line)
+}
+
+// writeBatch groups records by shard and fsyncs each shard's group once, in
+// parallel across shards, instead of one fsync per record.
+func (s *FileWALStore) writeBatch(records []walRecord) error {
+	if len(s.shards) == 0 {
+		return ErrClosed
+	}
+	if len(records) == 0 {
+		return nil
+	}
+	byShard := make(map[int][]byte, len(s.shards))
+	for _, r := range records {
+		line, err := s.encodeRecord(r)
+		if err != nil {
+			return err
+		}
+		idx := s.shardIndex(r)
+		byShard[idx] = append(byShard[idx], line...)
+	}
+	errCh := make(chan error, len(byShard))
+	for idx, buf := range byShard {
+		sh := s.shards[idx]
+		buf := buf
+		go func() { errCh <- sh.gc.write(buf) }()
+	}
+	var firstErr error
+	for range byShard {
+		if err := <-errCh; err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
 }
 
 func verifyWALRecord(r walRecord) error {
@@ -1529,6 +1667,25 @@ func (s *FileWALStore) Append(ctx context.Context, msg Message, dests []Destinat
 		_ = wErr
 	}
 	return out, nil
+}
+
+// AppendBatch appends many independent entries via a single in-memory lock
+// and a single WAL fsync, while preserving per-entry error isolation.
+func (s *FileWALStore) AppendBatch(ctx context.Context, entries []AppendEntry) []BatchAppendResult {
+	results := s.MemoryStore.AppendBatch(ctx, entries)
+	records := make([]walRecord, 0, len(entries))
+	for i, e := range entries {
+		if results[i].Err != nil {
+			continue
+		}
+		records = append(records, walRecord{Op: "append", Message: e.Message, Dests: e.Destinations})
+	}
+	if len(records) > 0 {
+		if wErr := s.writeBatch(records); wErr != nil {
+			_ = wErr
+		}
+	}
+	return results
 }
 func (s *FileWALStore) AppendAtomic(ctx context.Context, entries []AppendEntry) ([]Message, error) {
 	out, err := s.MemoryStore.AppendAtomic(ctx, entries)
@@ -1651,12 +1808,19 @@ func (s *FileWALStore) CommitOffset(ctx context.Context, commit OffsetCommit) er
 }
 
 func (s *FileWALStore) Close() error {
-	if s.gc != nil {
-		_ = s.gc.close()
+	for _, sh := range s.shards {
+		if sh.gc != nil {
+			_ = sh.gc.close()
+		}
 	}
 	_ = s.MemoryStore.Close()
-	if s.file != nil {
-		return s.file.Close()
+	var firstErr error
+	for _, sh := range s.shards {
+		if sh.file != nil {
+			if err := sh.file.Close(); err != nil && firstErr == nil {
+				firstErr = err
+			}
+		}
 	}
-	return nil
+	return firstErr
 }

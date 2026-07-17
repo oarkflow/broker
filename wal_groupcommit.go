@@ -1,9 +1,59 @@
 package broker
 
 import (
+	"hash/fnv"
 	"os"
 	"sync"
 )
+
+// walShardKey derives the routing key (queue/topic/stream name) a WAL
+// record belongs to, so that all durability records for one queue always
+// land in the same WAL shard file and keep their relative order, while
+// records for different queues can be sharded onto independent writers.
+// Records with no natural key (or a rare/admin op not worth partitioning)
+// return "" and are routed to shard 0.
+func walShardKey(r walRecord) string {
+	switch r.Op {
+	case "declare_queue":
+		return r.Queue.Name
+	case "declare_topic":
+		return r.Topic.Name
+	case "declare_stream":
+		return r.Stream.Name
+	case "append", "lease", "update":
+		return firstNonEmpty(r.Message.Queue, firstNonEmpty(r.Message.Topic, r.Message.Stream))
+	case "append_atomic":
+		if len(r.Entries) > 0 {
+			return firstNonEmpty(r.Entries[0].Message.Queue, firstNonEmpty(r.Entries[0].Message.Topic, r.Entries[0].Message.Stream))
+		}
+	case "ack":
+		return r.Ack.Queue
+	case "nack":
+		return r.Nack.Queue
+	case "move":
+		return r.Move.Source
+	case "pause_queue", "resume_queue", "purge_queue":
+		return r.QueueName
+	case "commit_offset":
+		return r.Offset.Stream
+	}
+	return ""
+}
+
+// walShardIndex maps a WAL record to one of n shards by hashing its
+// routing key. n<=1 or an empty key always resolves to shard 0.
+func walShardIndex(r walRecord, n int) int {
+	if n <= 1 {
+		return 0
+	}
+	key := walShardKey(r)
+	if key == "" {
+		return 0
+	}
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(key))
+	return int(h.Sum32() % uint32(n))
+}
 
 // groupCommitWriter batches concurrent WAL append calls into a single fsync
 // per batch instead of one fsync per call. Durability is unchanged: every

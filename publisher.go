@@ -101,7 +101,7 @@ func (p *Publisher) publish(ctx context.Context, topic string, payload any, opts
 	if err := p.checkBackpressure(ctx, prep); err != nil {
 		return PublishResult{}, err
 	}
-	stored, err := p.b.store.Append(ctx, prep.msg, prep.dests)
+	stored, err := p.b.pubCoalescer.submit(ctx, prep.msg, prep.dests)
 	if err != nil {
 		if p.b.cfg.Hooks.OnPublishFailed != nil {
 			prep.event.Error = err
@@ -224,7 +224,8 @@ func (p *Publisher) afterPublish(ctx context.Context, prep preparedPublish, res 
 	if p.b.cfg.Hooks.OnPublishConfirmed != nil {
 		p.b.cfg.Hooks.OnPublishConfirmed(ctx, prep.event)
 	}
-	p.b.notify.Publish(Notification{Type: "message.published", Source: "publisher", Severity: SeverityInfo, MessageID: prep.msg.ID, Topic: prep.msg.Topic, Queue: prep.msg.Queue, TenantID: prep.msg.TenantID, TraceID: prep.msg.TraceID, Timestamp: time.Now()})
+	// "message.published" is emitted by the publish coalescer (batched via
+	// NotificationBus.PublishMany), not here — avoids publishing it twice.
 	p.b.recordPublisher(ctx, PublisherRecord{ID: prep.msg.ID, Operation: "publish", Topic: prep.msg.Topic, Queue: prep.msg.Queue, Stream: prep.msg.Stream, MessageID: prep.msg.ID, Status: "succeeded", CreatedAt: prep.msg.CreatedAt, UpdatedAt: time.Now()})
 }
 

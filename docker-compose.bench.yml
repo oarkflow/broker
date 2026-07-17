@@ -5,8 +5,10 @@ services:
       target: brokerd
     ports:
       - "8090:8090"
+      - "50051:50051"
     command:
       - "-addr=:8090"
+      - "-grpc-addr=:50051"
       - "-store=${BROKER_STORE:-wal}"
       - "-wal=/data"
       - "-token=bench-token"
@@ -22,6 +24,8 @@ services:
       - broker
     command:
       - "-addr=http://broker:8090"
+      - "-tcp-addr=broker:50051"
+      - "-transport=${TRANSPORT:-http}"
       - "-token=bench-token"
       - "-queue=bench.q"
       - "-mode=publish"
@@ -38,6 +42,8 @@ services:
       - broker
     command:
       - "-addr=http://broker:8090"
+      - "-tcp-addr=broker:50051"
+      - "-transport=${TRANSPORT:-http}"
       - "-token=bench-token"
       - "-queue=bench.q"
       - "-mode=pull"

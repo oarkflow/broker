@@ -42,6 +42,8 @@ func main() {
 	maxBody := flag.Int64("max-body", envInt64("BROKER_MAX_BODY", 1<<20), "maximum HTTP request body size in bytes")
 	quiet := flag.Bool("quiet", envBool("BROKER_QUIET"), "disable live broker event logs")
 	debugEvents := flag.Bool("debug-events", envBool("BROKER_DEBUG_EVENTS"), "include debug heartbeat/lease-extension events in live logs")
+	noNotificationHistory := flag.Bool("no-notification-history", envBool("BROKER_NO_NOTIFICATION_HISTORY"), "disable the /notifications and /events history buffer to skip its lock on every publish/ack (pure throughput deployments that don't use those APIs)")
+	grpcAddr := flag.String("grpc-addr", env("BROKER_GRPC_ADDR", ""), "optional length-prefixed-JSON/TCP transport address (e.g. :50051); avoids per-request HTTP framing overhead. Empty disables it.")
 	flag.Parse()
 
 	if !*insecureDev && *token == "" {
@@ -103,7 +105,11 @@ func main() {
 		logger.Log.Fatal("unsupported store", zlog.String("store", *storeKind))
 	}
 
-	b, err := broker.New(broker.Config{Mode: broker.ModeStandalone, Store: store, DefaultQueue: *queue, FrameCodec: frameCodec})
+	notificationHistorySize := 0
+	if *noNotificationHistory {
+		notificationHistorySize = -1
+	}
+	b, err := broker.New(broker.Config{Mode: broker.ModeStandalone, Store: store, DefaultQueue: *queue, FrameCodec: frameCodec, NotificationHistorySize: notificationHistorySize})
 	if err != nil {
 		logger.Log.Fatal("create broker", zlog.Err(err))
 	}
@@ -127,6 +133,16 @@ func main() {
 	if *publisherToken != "" {
 		tokens = append(tokens, broker.AdminToken{Name: "publisher", Token: *publisherToken, Permissions: []string{broker.PermissionPublish, broker.PermissionTaskWrite, broker.PermissionTaskRead, broker.PermissionBrokerRead}})
 	}
+	if *grpcAddr != "" {
+		gs := broker.NewGRPCServer(b, broker.GRPCConfig{ListenAddr: *grpcAddr, BrokerToken: *token})
+		go func() {
+			if err := gs.ListenAndServe(); err != nil {
+				logger.Log.Fatal("grpc-like transport listen failed", zlog.String("addr", *grpcAddr), zlog.Err(err))
+			}
+		}()
+		fmt.Printf("length-prefixed-JSON/TCP transport listening on %s\n", *grpcAddr)
+	}
+
 	admin := broker.AdminServer{Broker: b, ACL: broker.NewACL(tokens...), InsecureDev: *insecureDev, MaxBodyBytes: *maxBody, TLSCertFile: *tlsCert, TLSKeyFile: *tlsKey, ClientCAFile: *clientCA, RequireClientCert: *requireClientCert}
 	srv := admin.HTTPServer(*addr)
 	serverErr := make(chan error, 1)

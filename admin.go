@@ -14,6 +14,11 @@ import (
 	"time"
 )
 
+// defaultAdaptivePullLimit is used when a pull/poll request doesn't specify
+// a limit. Lease() only ever returns what's actually queued, so this just
+// caps how big an automatic batch can get — it doesn't force over-fetching.
+const defaultAdaptivePullLimit = 100
+
 type AdminServer struct {
 	Broker *Broker
 
@@ -331,6 +336,7 @@ func (a AdminServer) queue(w http.ResponseWriter, r *http.Request) {
 				ConsumerGroup     string `json:"consumer_group"`
 				Limit             int    `json:"limit"`
 				VisibilityTimeout int64  `json:"visibility_timeout_ns"`
+				WaitNS            int64  `json:"wait_ns"`
 			}
 			if r.Method == http.MethodPost && r.Body != nil {
 				_ = json.NewDecoder(r.Body).Decode(&req)
@@ -342,13 +348,39 @@ func (a AdminServer) queue(w http.ResponseWriter, r *http.Request) {
 				req.ConsumerGroup = firstNonEmpty(r.URL.Query().Get("group"), req.ConsumerID)
 			}
 			if req.Limit <= 0 {
-				req.Limit = queryLimit(r, 1)
+				// No client-specified limit: drain up to a generous batch
+				// automatically. Lease only ever returns what's actually
+				// queued, so a naive client that never tunes this still
+				// gets efficient batched delivery when there's a backlog,
+				// and just what's available when the queue is nearly
+				// empty — no manual tuning required.
+				req.Limit = queryLimit(r, defaultAdaptivePullLimit)
 			}
 			vis := time.Duration(req.VisibilityTimeout)
-			msgs, err := a.Broker.store.Lease(r.Context(), LeaseRequest{Queue: name, ConsumerID: req.ConsumerID, ConsumerGroup: req.ConsumerGroup, Limit: req.Limit, VisibilityTimeout: vis})
-			if err != nil {
-				http.Error(w, err.Error(), 409)
-				return
+			wait := time.Duration(req.WaitNS)
+			if wait <= 0 {
+				wait = queryDuration(r, "wait", 0)
+			}
+			deadline := time.Now().Add(wait)
+			var msgs []Message
+			for {
+				var err error
+				msgs, err = a.Broker.store.Lease(r.Context(), LeaseRequest{Queue: name, ConsumerID: req.ConsumerID, ConsumerGroup: req.ConsumerGroup, Limit: req.Limit, VisibilityTimeout: vis})
+				if err != nil {
+					http.Error(w, err.Error(), 409)
+					return
+				}
+				if len(msgs) > 0 || wait <= 0 || time.Now().After(deadline) {
+					break
+				}
+				// Long-poll instead of returning empty immediately: avoids
+				// busy-poll request storms from idle consumers, the same
+				// way /v1/poll already behaves.
+				select {
+				case <-time.After(25 * time.Millisecond):
+				case <-r.Context().Done():
+					return
+				}
 			}
 			writeBrokerJSON(w, msgs)
 			return
@@ -382,6 +414,7 @@ func (a AdminServer) queue(w http.ResponseWriter, r *http.Request) {
 	}
 	http.NotFound(w, r)
 }
+
 // ackBatch acks many messages (possibly across queues/consumers) in one HTTP
 // call, amortizing per-request network and JSON overhead for consumers.
 func (a AdminServer) ackBatch(w http.ResponseWriter, r *http.Request) {

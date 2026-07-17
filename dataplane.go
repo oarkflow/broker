@@ -366,7 +366,7 @@ func (a AdminServer) v1PollFrame(w http.ResponseWriter, r *http.Request) {
 		req.ConsumerGroup = firstNonEmpty(r.URL.Query().Get("consumer_group"), r.URL.Query().Get("group"))
 	}
 	if req.Limit <= 0 {
-		req.Limit = queryLimit(r, 1)
+		req.Limit = queryLimit(r, defaultAdaptivePullLimit)
 	}
 	if req.ConsumerID == "" || req.Queue == "" {
 		http.Error(w, "consumer_id and queue required", 400)
@@ -441,7 +441,7 @@ func (a AdminServer) v1Poll(w http.ResponseWriter, r *http.Request) {
 		req.ConsumerGroup = firstNonEmpty(r.URL.Query().Get("consumer_group"), r.URL.Query().Get("group"))
 	}
 	if req.Limit <= 0 {
-		req.Limit = queryLimit(r, 1)
+		req.Limit = queryLimit(r, defaultAdaptivePullLimit)
 	}
 	if req.ConsumerID == "" || req.Queue == "" {
 		http.Error(w, "consumer_id and queue required", 400)

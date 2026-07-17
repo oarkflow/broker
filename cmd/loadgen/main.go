@@ -6,12 +6,14 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"math/rand"
+	"net"
 	"net/http"
 	"os"
 	"slices"
@@ -41,6 +43,8 @@ func main() {
 	batch := flag.Int("batch", 1, "messages per publish HTTP call (uses /publish/batch when >1)")
 	consumerID := flag.String("consumer-id", "", "consumer id; defaults to hostname (unique per container)")
 	group := flag.String("group", "loadgen-group", "consumer group for pull/roundtrip mode")
+	transport := flag.String("transport", "http", "http (JSON+HTTP, -addr) | tcp (length-prefixed JSON over a persistent TCP connection, -tcp-addr)")
+	tcpAddr := flag.String("tcp-addr", "localhost:50051", "broker TCP transport address, used when -transport=tcp")
 	flag.Parse()
 
 	if *consumerID == "" {
@@ -60,8 +64,8 @@ func main() {
 	// Ensure queue exists.
 	declareQueue(client, *addr, *token, *queue)
 
-	fmt.Printf("mode=%s addr=%s queue=%s concurrency=%d duration=%s payload=%dB batch=%d pull-limit=%d consumer-id=%s group=%s\n",
-		*mode, *addr, *queue, *concurrency, *duration, *payloadSize, *batch, *pullLimit, *consumerID, *group)
+	fmt.Printf("mode=%s transport=%s addr=%s queue=%s concurrency=%d duration=%s payload=%dB batch=%d pull-limit=%d consumer-id=%s group=%s\n",
+		*mode, *transport, *addr, *queue, *concurrency, *duration, *payloadSize, *batch, *pullLimit, *consumerID, *group)
 
 	var (
 		results   []result
@@ -76,6 +80,16 @@ func main() {
 
 	worker := func(workerID string) {
 		defer wg.Done()
+		var gc *grpcClient
+		if *transport == "tcp" {
+			var err error
+			gc, err = dialGRPC(*tcpAddr, *token)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "dial tcp transport:", err)
+				return
+			}
+			defer gc.close()
+		}
 		for {
 			select {
 			case <-stop:
@@ -88,15 +102,39 @@ func main() {
 			var msgs int
 			switch *mode {
 			case "publish":
-				dur, code, ok, msgs = doPublish(client, *addr, *token, *queue, payload, *batch)
+				if gc != nil {
+					dur, code, ok, msgs = doPublishTCP(gc, *queue, payload, *batch)
+				} else {
+					dur, code, ok, msgs = doPublish(client, *addr, *token, *queue, payload, *batch)
+				}
 			case "pull":
-				dur, code, ok, msgs = doPull(client, *addr, *token, *queue, *pullLimit, workerID, *group)
+				if gc != nil {
+					dur, code, ok, msgs = doPullTCP(gc, *queue, *pullLimit, workerID)
+				} else {
+					dur, code, ok, msgs = doPull(client, *addr, *token, *queue, *pullLimit, workerID, *group)
+				}
 			case "roundtrip":
-				pdur, pcode, pok, pmsgs := doPublish(client, *addr, *token, *queue, payload, *batch)
+				var pdur time.Duration
+				var pcode int
+				var pok bool
+				var pmsgs int
+				if gc != nil {
+					pdur, pcode, pok, pmsgs = doPublishTCP(gc, *queue, payload, *batch)
+				} else {
+					pdur, pcode, pok, pmsgs = doPublish(client, *addr, *token, *queue, payload, *batch)
+				}
 				if !pok {
 					dur, code, ok, msgs = pdur, pcode, pok, pmsgs
 				} else {
-					qdur, qcode, qok, qmsgs := doPull(client, *addr, *token, *queue, *pullLimit, workerID, *group)
+					var qdur time.Duration
+					var qcode int
+					var qok bool
+					var qmsgs int
+					if gc != nil {
+						qdur, qcode, qok, qmsgs = doPullTCP(gc, *queue, *pullLimit, workerID)
+					} else {
+						qdur, qcode, qok, qmsgs = doPull(client, *addr, *token, *queue, *pullLimit, workerID, *group)
+					}
 					dur, code, ok, msgs = pdur+qdur, qcode, qok, pmsgs+qmsgs
 				}
 			}
@@ -275,6 +313,122 @@ func doPull(client *http.Client, addr, token, queue string, limit int, consumerI
 	}
 	_ = json.Unmarshal(ackData, &ackOut)
 	return dur, ackResp.StatusCode, ackOut.Acked == len(msgs), ackOut.Acked
+}
+
+// grpcClient speaks the broker's length-prefixed-JSON/TCP transport
+// (broker.GRPCServer): a persistent connection carrying one request/response
+// pair at a time, avoiding per-request HTTP framing and connection-setup
+// overhead. Not safe for concurrent use — each loadgen worker gets its own.
+type grpcClient struct {
+	conn  net.Conn
+	token string
+	enc   *json.Encoder
+	dec   *json.Decoder
+	seq   int64
+}
+
+type grpcWireRequest struct {
+	ID      string            `json:"id"`
+	Method  string            `json:"method"`
+	Body    json.RawMessage   `json:"body"`
+	Headers map[string]string `json:"headers,omitempty"`
+}
+
+type grpcWireResponse struct {
+	ID     string          `json:"id"`
+	Error  string          `json:"error,omitempty"`
+	Status int             `json:"status"`
+	Body   json.RawMessage `json:"body,omitempty"`
+}
+
+func dialGRPC(addr, token string) (*grpcClient, error) {
+	conn, err := net.DialTimeout("tcp", addr, 10*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	// Buffer reads explicitly: json.Decoder reading straight off a net.Conn
+	// issues one syscall per read-ahead chunk with no coalescing, unlike
+	// Go's http.Transport which buffers internally.
+	r := bufio.NewReaderSize(conn, 64<<10)
+	return &grpcClient{conn: conn, token: token, enc: json.NewEncoder(conn), dec: json.NewDecoder(r)}, nil
+}
+
+func (c *grpcClient) call(method string, body any) (grpcWireResponse, error) {
+	c.seq++
+	payload, _ := json.Marshal(body)
+	req := grpcWireRequest{ID: strconv.FormatInt(c.seq, 10), Method: method, Body: payload}
+	if c.token != "" {
+		req.Headers = map[string]string{"Authorization": "Bearer " + c.token}
+	}
+	if err := c.enc.Encode(req); err != nil {
+		return grpcWireResponse{}, err
+	}
+	var resp grpcWireResponse
+	if err := c.dec.Decode(&resp); err != nil {
+		return grpcWireResponse{}, err
+	}
+	return resp, nil
+}
+
+func (c *grpcClient) close() { c.conn.Close() }
+
+func doPublishTCP(gc *grpcClient, queue string, payload []byte, batch int) (time.Duration, int, bool, int) {
+	// The TCP transport has no batch-publish method; -batch is ignored here
+	// (kept naive/single-message, matching the "smart without manual
+	// tuning" default) and each call publishes one message.
+	_ = batch
+	start := time.Now()
+	resp, err := gc.call("broker.Publish", map[string]any{
+		"topic":   "bench",
+		"queue":   queue,
+		"payload": json.RawMessage(payload),
+	})
+	dur := time.Since(start)
+	if err != nil {
+		return dur, 0, false, 0
+	}
+	ok := resp.Status >= 200 && resp.Status < 300
+	msgs := 0
+	if ok {
+		msgs = 1
+	}
+	return dur, resp.Status, ok, msgs
+}
+
+func doPullTCP(gc *grpcClient, queue string, limit int, consumerID string) (time.Duration, int, bool, int) {
+	start := time.Now()
+	resp, err := gc.call("broker.Poll", map[string]any{
+		"queue":    queue,
+		"limit":    limit,
+		"consumer": consumerID,
+	})
+	if err != nil {
+		return time.Since(start), 0, false, 0
+	}
+	if resp.Status < 200 || resp.Status >= 300 {
+		return time.Since(start), resp.Status, false, 0
+	}
+	var msgs []struct {
+		ID         string `json:"id"`
+		LeaseToken string `json:"lease_token"`
+	}
+	if err := json.Unmarshal(resp.Body, &msgs); err != nil || len(msgs) == 0 {
+		return time.Since(start), resp.Status, true, 0 // empty queue is not an error
+	}
+	acked := 0
+	for _, m := range msgs {
+		ackResp, err := gc.call("broker.Ack", map[string]any{
+			"message_id":  m.ID,
+			"queue":       queue,
+			"lease_token": m.LeaseToken,
+			"consumer_id": consumerID,
+		})
+		if err == nil && ackResp.Status >= 200 && ackResp.Status < 300 {
+			acked++
+		}
+	}
+	dur := time.Since(start)
+	return dur, resp.Status, acked == len(msgs), acked
 }
 
 func randPayload(n int) []byte {

@@ -15,6 +15,24 @@ import (
 	"github.com/oarkflow/broker"
 )
 
+// findNonEmptyWALFile locates the shard file a test's single queue actually
+// wrote to (the WAL is partitioned across DefaultWALShards files by queue
+// hash, so most shard files exist but stay empty in single-queue tests).
+func findNonEmptyWALFile(t *testing.T, dir, pattern string) string {
+	t.Helper()
+	matches, err := filepath.Glob(filepath.Join(dir, pattern))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range matches {
+		if info, err := os.Stat(m); err == nil && info.Size() > 0 {
+			return m
+		}
+	}
+	t.Fatalf("no non-empty WAL file matching %s in %s", pattern, dir)
+	return ""
+}
+
 // TestUnencryptedBrokerConsumerPublisher tests the full stack without encryption.
 func TestUnencryptedBrokerConsumerPublisher(t *testing.T) {
 	ctx := context.Background()
@@ -66,7 +84,7 @@ func TestUnencryptedBrokerConsumerPublisher(t *testing.T) {
 	}
 
 	// Verify WAL file is plaintext
-	walPath := filepath.Join(dir, "broker.wal.jsonl")
+	walPath := findNonEmptyWALFile(t, dir, "broker.wal.*-of-*.jsonl")
 	data, err := os.ReadFile(walPath)
 	if err != nil {
 		t.Fatalf("ReadFile: %v", err)
@@ -142,7 +160,7 @@ func TestEncryptedWALBrokerConsumerPublisher(t *testing.T) {
 	}
 
 	// Verify WAL file is encrypted (starts with "ENC:")
-	walPath := filepath.Join(dir, "broker.wal.jsonl")
+	walPath := findNonEmptyWALFile(t, dir, "broker.wal.*-of-*.jsonl")
 	data, err := os.ReadFile(walPath)
 	if err != nil {
 		t.Fatalf("ReadFile: %v", err)
@@ -298,7 +316,7 @@ func TestEncryptedBinaryWAL(t *testing.T) {
 	}
 
 	// Verify binary WAL file exists and is not plaintext
-	walPath := filepath.Join(dir, "broker.wal.fwb")
+	walPath := findNonEmptyWALFile(t, dir, "broker.wal.*-of-*.fwb")
 	data, err := os.ReadFile(walPath)
 	if err != nil {
 		t.Fatalf("ReadFile: %v", err)

@@ -13,49 +13,50 @@ import (
 )
 
 type Broker struct {
-	cfg        Config
-	store      Store
-	stateStore StateStore
-	router     *Router
-	codec      Codec
-	frameCodec FrameCodec
-	pool       *fw.Pool
-	ownPool    bool
-	ctx        context.Context
-	cancel     context.CancelFunc
-	state      atomic.Value
-	seq        atomic.Uint64
-	subsMu     sync.RWMutex
-	subs       map[string]*Subscription
-	waitMu     sync.Mutex
-	waiters    map[string]chan Response
-	taskMu     sync.RWMutex
-	tasks      map[string]*TaskInfo
-	taskWait   map[string][]chan TaskResult
-	notify          *NotificationBus
-	cluster         *Cluster
-	consumers       *ConsumerRegistry
-	groupRebalancer *GroupRebalancer
-	sagaEngine      *SagaEngine
-	wg              sync.WaitGroup
-	startedAt       time.Time
-	promMetrics     *PrometheusMetrics
-	tracer          *Tracer
-	auditLogger     *AuditLogger
-	rateLimiter     *QueueRateLimiter
-	wsServer        *WebSocketServer
-	federationMgr   *FederationManager
-	shovelMgr       *ShovelManager
-	tenantMgr       *TenantManager
-	outbox          *TransactionalOutbox
-	offsetMgr       *ConsumerOffsetManager
-	messageReplay   *MessageReplay
-	logCompaction   *StreamLogCompaction
-	partitionRouter *PartitionRouter
-	partitionOrdering *PartitionOrdering
+	cfg                   Config
+	store                 Store
+	stateStore            StateStore
+	router                *Router
+	codec                 Codec
+	frameCodec            FrameCodec
+	pool                  *fw.Pool
+	ownPool               bool
+	ctx                   context.Context
+	cancel                context.CancelFunc
+	state                 atomic.Value
+	seq                   atomic.Uint64
+	subsMu                sync.RWMutex
+	subs                  map[string]*Subscription
+	waitMu                sync.Mutex
+	waiters               map[string]chan Response
+	taskMu                sync.RWMutex
+	tasks                 map[string]*TaskInfo
+	taskWait              map[string][]chan TaskResult
+	notify                *NotificationBus
+	cluster               *Cluster
+	consumers             *ConsumerRegistry
+	groupRebalancer       *GroupRebalancer
+	sagaEngine            *SagaEngine
+	wg                    sync.WaitGroup
+	startedAt             time.Time
+	promMetrics           *PrometheusMetrics
+	tracer                *Tracer
+	auditLogger           *AuditLogger
+	rateLimiter           *QueueRateLimiter
+	wsServer              *WebSocketServer
+	federationMgr         *FederationManager
+	shovelMgr             *ShovelManager
+	tenantMgr             *TenantManager
+	outbox                *TransactionalOutbox
+	offsetMgr             *ConsumerOffsetManager
+	messageReplay         *MessageReplay
+	logCompaction         *StreamLogCompaction
+	partitionRouter       *PartitionRouter
+	partitionOrdering     *PartitionOrdering
 	partitionReassignment *PartitionReassignment
-	mqttServer      *MQTTServer
-	grpcServer      *GRPCServer
+	mqttServer            *MQTTServer
+	grpcServer            *GRPCServer
+	pubCoalescer          *publishCoalescer
 }
 
 func New(cfg Config) (*Broker, error) {
@@ -119,7 +120,8 @@ func New(cfg Config) (*Broker, error) {
 		own = true
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	b := &Broker{cfg: cfg, store: cfg.Store, stateStore: cfg.StateStore, router: NewRouter(), codec: cfg.Codec, frameCodec: cfg.FrameCodec, pool: pool, ownPool: own, ctx: ctx, cancel: cancel, subs: map[string]*Subscription{}, waiters: map[string]chan Response{}, tasks: map[string]*TaskInfo{}, taskWait: map[string][]chan TaskResult{}, notify: NewNotificationBus(1024), consumers: NewConsumerRegistry(512), cluster: NewCluster(firstNonEmpty(cfg.NodeID, "node-1"))}
+	b := &Broker{cfg: cfg, store: cfg.Store, stateStore: cfg.StateStore, router: NewRouter(), codec: cfg.Codec, frameCodec: cfg.FrameCodec, pool: pool, ownPool: own, ctx: ctx, cancel: cancel, subs: map[string]*Subscription{}, waiters: map[string]chan Response{}, tasks: map[string]*TaskInfo{}, taskWait: map[string][]chan TaskResult{}, notify: NewNotificationBus(cfg.NotificationHistorySize), consumers: NewConsumerRegistry(512), cluster: NewCluster(firstNonEmpty(cfg.NodeID, "node-1"))}
+	b.pubCoalescer = newPublishCoalescer(b.store, b.notify)
 	if cfg.EnablePrometheus {
 		b.promMetrics = GlobalPrometheusMetrics()
 		if cfg.Hooks.OnStarted == nil {
@@ -259,6 +261,9 @@ func (b *Broker) Stop(ctx context.Context) error {
 	}
 	// Always close all resources regardless of individual errors.
 	var firstErr error
+	if b.pubCoalescer != nil {
+		_ = b.pubCoalescer.close()
+	}
 	if b.ownPool {
 		if err := b.pool.Shutdown(ctx); err != nil && firstErr == nil {
 			firstErr = err
@@ -291,15 +296,15 @@ func (b *Broker) State() BrokerState {
 	}
 	return BrokerConfigured
 }
-func (b *Broker) Store() Store                    { return b.store }
-func (b *Broker) StateStore() StateStore          { return b.stateStore }
-func (b *Broker) Router() *Router                 { return b.router }
-func (b *Broker) Notifications() *NotificationBus { return b.notify }
-func (b *Broker) Cluster() *Cluster               { return b.cluster }
-func (b *Broker) Publisher() *Publisher           { return &Publisher{b: b} }
-func (b *Broker) AuditLogger() *AuditLogger       { return b.auditLogger }
+func (b *Broker) Store() Store                          { return b.store }
+func (b *Broker) StateStore() StateStore                { return b.stateStore }
+func (b *Broker) Router() *Router                       { return b.router }
+func (b *Broker) Notifications() *NotificationBus       { return b.notify }
+func (b *Broker) Cluster() *Cluster                     { return b.cluster }
+func (b *Broker) Publisher() *Publisher                 { return &Publisher{b: b} }
+func (b *Broker) AuditLogger() *AuditLogger             { return b.auditLogger }
 func (b *Broker) PrometheusMetrics() *PrometheusMetrics { return b.promMetrics }
-func (b *Broker) Tracer() *Tracer                 { return b.tracer }
+func (b *Broker) Tracer() *Tracer                       { return b.tracer }
 
 func (b *Broker) setState(ctx context.Context, st BrokerState, err error) {
 	b.state.Store(st)
@@ -502,9 +507,9 @@ func (b *Broker) StreamHeadOffset(ctx context.Context, stream string) (uint64, e
 
 // StreamConsumerLag is a result type for stream lag queries.
 type StreamConsumerLag struct {
-	Stream        string            `json:"stream"`
-	HeadOffset    uint64            `json:"head_offset"`
-	ConsumerLag   map[string]uint64 `json:"consumer_lag"`
+	Stream      string            `json:"stream"`
+	HeadOffset  uint64            `json:"head_offset"`
+	ConsumerLag map[string]uint64 `json:"consumer_lag"`
 }
 
 // StreamLagReport returns a full lag report for a stream.
@@ -524,12 +529,12 @@ func (b *Broker) StreamLagReport(ctx context.Context, stream string) (StreamCons
 	}, nil
 }
 
-func (b *Broker) SagaEngine() *SagaEngine        { return b.sagaEngine }
-func (b *Broker) TaskRouter() *TaskRouter          { return b.router.TaskRouter() }
-func (b *Broker) ConfigLoader() *RoutingConfigLoader { return b.router.ConfigLoader() }
-func (b *Broker) AddRoute(route Route)             { b.router.Add(route) }
-func (b *Broker) AddRoutingPlan(plan RoutingPlan)  { b.router.AddPlan(plan) }
-func (b *Broker) RemoveRoutingPlan(name string)     { b.router.RemovePlan(name) }
+func (b *Broker) SagaEngine() *SagaEngine             { return b.sagaEngine }
+func (b *Broker) TaskRouter() *TaskRouter             { return b.router.TaskRouter() }
+func (b *Broker) ConfigLoader() *RoutingConfigLoader  { return b.router.ConfigLoader() }
+func (b *Broker) AddRoute(route Route)                { b.router.Add(route) }
+func (b *Broker) AddRoutingPlan(plan RoutingPlan)     { b.router.AddPlan(plan) }
+func (b *Broker) RemoveRoutingPlan(name string)       { b.router.RemovePlan(name) }
 func (b *Broker) LoadRoutingConfig(data []byte) error { return b.router.LoadRoutingConfig(data) }
 
 // SelectConsumers selects consumers for a message using the configured routing strategy.

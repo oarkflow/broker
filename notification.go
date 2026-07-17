@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -45,32 +46,60 @@ type CallbackFunc func(context.Context, Notification) error
 func (f CallbackFunc) HandleNotification(ctx context.Context, n Notification) error { return f(ctx, n) }
 
 type NotificationBus struct {
-	mu      sync.RWMutex
-	subs    map[string]Callback
-	history []Notification
-	cap     int
-	closed  bool
-	workers chan struct{}
+	mu            sync.RWMutex
+	subs          map[string]Callback
+	history       []Notification
+	cap           int
+	recordHistory bool
+	subCount      atomic.Int32
+	closed        bool
+	workers       chan struct{}
 }
 
 const notificationWorkerPoolSize = 64
 
+// NewNotificationBus creates a bus with a bounded history ring buffer.
+// capacity == 0 uses the default size (1024); capacity < 0 disables
+// history recording entirely (Publish/PublishMany then take the lock only
+// when there's an actual subscriber to dispatch to — the common case for a
+// pure producer/consumer workload with nobody watching /notifications).
 func NewNotificationBus(capacity int) *NotificationBus {
-	if capacity <= 0 {
+	record := true
+	if capacity < 0 {
+		record = false
+		capacity = 0
+	} else if capacity == 0 {
 		capacity = 1024
 	}
-	return &NotificationBus{subs: map[string]Callback{}, cap: capacity, workers: make(chan struct{}, notificationWorkerPoolSize)}
+	return &NotificationBus{subs: map[string]Callback{}, cap: capacity, recordHistory: record, workers: make(chan struct{}, notificationWorkerPoolSize)}
 }
 func (b *NotificationBus) Subscribe(id string, cb Callback) {
 	if id == "" || cb == nil {
 		return
 	}
 	b.mu.Lock()
+	if _, exists := b.subs[id]; !exists {
+		b.subCount.Add(1)
+	}
 	b.subs[id] = cb
 	b.mu.Unlock()
 }
-func (b *NotificationBus) Unsubscribe(id string) { b.mu.Lock(); delete(b.subs, id); b.mu.Unlock() }
+func (b *NotificationBus) Unsubscribe(id string) {
+	b.mu.Lock()
+	if _, exists := b.subs[id]; exists {
+		delete(b.subs, id)
+		b.subCount.Add(-1)
+	}
+	b.mu.Unlock()
+}
 func (b *NotificationBus) Publish(n Notification) {
+	// Fast path: nobody is subscribed and history recording is off, so this
+	// notification has no observer at all — skip the lock entirely instead
+	// of paying for it on every single publish/ack in a plain producer or
+	// consumer workload with no /notifications or /events listener.
+	if !b.recordHistory && b.subCount.Load() == 0 {
+		return
+	}
 	if n.Timestamp.IsZero() {
 		n.Timestamp = time.Now()
 	}
@@ -82,16 +111,68 @@ func (b *NotificationBus) Publish(n Notification) {
 		b.mu.Unlock()
 		return
 	}
-	b.history = append(b.history, n)
-	if len(b.history) > b.cap {
-		copy(b.history, b.history[len(b.history)-b.cap:])
-		b.history = b.history[:b.cap]
+	if b.recordHistory {
+		b.history = append(b.history, n)
+		if len(b.history) > b.cap {
+			copy(b.history, b.history[len(b.history)-b.cap:])
+			b.history = b.history[:b.cap]
+		}
 	}
 	subs := make([]Callback, 0, len(b.subs))
 	for _, cb := range b.subs {
 		subs = append(subs, cb)
 	}
 	b.mu.Unlock()
+	b.dispatch(subs, n)
+}
+
+// PublishMany appends many notifications and gathers the subscriber list
+// under a single lock acquisition instead of one per notification, then
+// dispatches each to every subscriber the same way Publish does. Used by
+// the publish coalescer so a batch of unrelated concurrent publishes pays
+// for the notification-bus lock once instead of once per message.
+func (b *NotificationBus) PublishMany(ns []Notification) {
+	if len(ns) == 0 {
+		return
+	}
+	if !b.recordHistory && b.subCount.Load() == 0 {
+		return
+	}
+	now := time.Now()
+	for i := range ns {
+		if ns[i].Timestamp.IsZero() {
+			ns[i].Timestamp = now
+		}
+		if ns[i].ID == "" {
+			ns[i].ID = ns[i].Type + "-" + newIDFromTime()
+		}
+	}
+	b.mu.Lock()
+	if b.closed {
+		b.mu.Unlock()
+		return
+	}
+	if b.recordHistory {
+		b.history = append(b.history, ns...)
+		if len(b.history) > b.cap {
+			copy(b.history, b.history[len(b.history)-b.cap:])
+			b.history = b.history[:b.cap]
+		}
+	}
+	subs := make([]Callback, 0, len(b.subs))
+	for _, cb := range b.subs {
+		subs = append(subs, cb)
+	}
+	b.mu.Unlock()
+	if len(subs) == 0 {
+		return
+	}
+	for _, n := range ns {
+		b.dispatch(subs, n)
+	}
+}
+
+func (b *NotificationBus) dispatch(subs []Callback, n Notification) {
 	for _, cb := range subs {
 		cb := cb
 		// Use bounded worker pool to prevent goroutine explosion
