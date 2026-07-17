@@ -104,7 +104,7 @@ func TestFileWALPermissionsChecksumAndTailRecovery(t *testing.T) {
 	if err := st.Close(); err != nil {
 		t.Fatal(err)
 	}
-	walPath := findNonEmptyWALFile(t, dir, "broker.wal.*-of-*.jsonl")
+	walPath := dir + "/broker.wal.jsonl"
 	info, err := os.Stat(walPath)
 	if err != nil {
 		t.Fatal(err)

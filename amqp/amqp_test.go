@@ -2,6 +2,7 @@ package amqp
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"io"
 	"net"
@@ -106,7 +107,7 @@ func TestServerStartStop(t *testing.T) {
 		t.Fatalf("Failed to create broker: %v", err)
 	}
 
-	ctx := t.Context()
+	ctx := context.Background()
 	if err := b.Start(ctx); err != nil {
 		t.Fatalf("Failed to start broker: %v", err)
 	}
@@ -130,7 +131,7 @@ func TestServerStartStop(t *testing.T) {
 	conn.Close()
 
 	// Stop server
-	stopCtx := t.Context()
+	stopCtx := context.Background()
 	if err := server.Stop(stopCtx); err != nil {
 		t.Errorf("Failed to stop server: %v", err)
 	}
@@ -147,7 +148,7 @@ func TestConnectionHandshake(t *testing.T) {
 		t.Fatalf("Failed to create broker: %v", err)
 	}
 
-	ctx := t.Context()
+	ctx := context.Background()
 	if err := b.Start(ctx); err != nil {
 		t.Fatalf("Failed to start broker: %v", err)
 	}
@@ -163,7 +164,7 @@ func TestConnectionHandshake(t *testing.T) {
 	}
 
 	go server.Serve()
-	defer server.Stop(t.Context())
+	defer server.Stop(context.Background())
 
 	// Connect as AMQP client
 	addr := server.Addr().String()
@@ -215,7 +216,7 @@ func TestParseMethodFrame(t *testing.T) {
 
 func TestParseHeaderFrame(t *testing.T) {
 	payload := make([]byte, 12)
-	binary.BigEndian.PutUint16(payload[0:2], 60)  // class ID
+	binary.BigEndian.PutUint16(payload[0:2], 60)   // class ID
 	binary.BigEndian.PutUint64(payload[2:10], 100) // body size
 	binary.BigEndian.PutUint16(payload[10:12], 0)  // property flags
 

@@ -10,44 +10,22 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"strconv"
-	"strings"
 	"time"
 )
 
-// BinaryFileWALStore is a durable single-node WAL store backed by the native
-// FWB1 binary frame codec. It provides the same Store behavior as FileWALStore
-// while using compact length-prefixed frames with CRC32C and optional HMAC /
-// AES-GCM payload protection.
-//
-// The WAL is split across a fixed number of shard files (like Kafka
-// partitions on disk), each with its own independent group-commit writer
-// goroutine. A record is routed to a shard by hashing the queue/topic/stream
-// it belongs to, so all operations on one queue always land in the same
-// shard file (preserving per-queue order) while operations on different
-// queues fsync in parallel instead of funneling through one writer. The
-// shard count is pinned to the WAL directory the first time it's created
-// (recorded in broker.wal.shards) so it can never silently change across
-// restarts in a way that would split one queue's history across files out
-// of order.
+// BinaryFileWALStore is a durable single-node store backed by the native BWL1
+// operation codec. BWL1 writes packed mutation records directly—without JSON
+// or a generic Message wrapper—and protects them with CRC32C plus optional
+// HMAC-SHA256 and AES-GCM.
 type BinaryFileWALStore struct {
 	*MemoryStore
-	dir     string
-	codec   FrameCodec
-	keyName string
-	shards  []*binaryWALShard
+	path     string
+	file     *os.File
+	codec    FrameCodec // retained for legacy FWB1/FWB2 WAL recovery
+	walCodec *WALRecordCodec
+	keyName  string
+	gc       *groupCommitWriter
 }
-
-type binaryWALShard struct {
-	file *os.File
-	gc   *groupCommitWriter
-}
-
-// DefaultWALShards is the shard count used when a caller doesn't specify
-// one (0 or negative). It's a conservative default that still gets most of
-// the cross-queue parallelism benefit without opening excessive file
-// descriptors on small deployments.
-const DefaultWALShards = 4
 
 func NewBinaryFileWALStore(dir string, opts ...BinaryMessageCodecOption) (*BinaryFileWALStore, error) {
 	return NewBinaryFileWALStoreWithCodec(dir, NewBinaryMessageCodec(opts...))
@@ -55,79 +33,49 @@ func NewBinaryFileWALStore(dir string, opts ...BinaryMessageCodecOption) (*Binar
 
 // NewBinaryFileWALStoreWithCodec creates a BinaryFileWALStore with a specific codec (FWB1 or FWB2).
 func NewBinaryFileWALStoreWithCodec(dir string, codec FrameCodec) (*BinaryFileWALStore, error) {
-	return NewBinaryFileWALStoreSharded(dir, DefaultWALShards, codec)
-}
-
-// NewBinaryFileWALStoreSharded creates a BinaryFileWALStore whose WAL is
-// partitioned across n shard files. n is only honored the first time the
-// directory is initialized; subsequent opens reuse whatever shard count was
-// pinned on creation, regardless of what's requested here.
-func NewBinaryFileWALStoreSharded(dir string, n int, codec FrameCodec) (*BinaryFileWALStore, error) {
 	if codec == nil {
 		codec = NewBinaryMessageCodec()
+	}
+	walCodec, err := newWALRecordCodecFromFrameCodec(codec)
+	if err != nil {
+		return nil, err
+	}
+	return NewBinaryFileWALStoreWithWALCodec(dir, codec, walCodec)
+}
+
+// NewBinaryFileWALStoreWithWALCodec allows applications using a custom network
+// FrameCodec to configure the native BWL1 durability codec explicitly. The
+// frame codec is retained only to recover pre-BWL1 FWB1/FWB2 JSON records.
+func NewBinaryFileWALStoreWithWALCodec(dir string, legacyCodec FrameCodec, walCodec *WALRecordCodec) (*BinaryFileWALStore, error) {
+	if legacyCodec == nil {
+		legacyCodec = NewBinaryMessageCodec()
+	}
+	if walCodec == nil {
+		var err error
+		walCodec, err = newWALRecordCodecFromFrameCodec(legacyCodec)
+		if err != nil {
+			return nil, err
+		}
 	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
-	st := &BinaryFileWALStore{MemoryStore: NewMemoryStore(), dir: dir, codec: codec}
-	resolved, err := st.resolveShardCount(n)
+	path := filepath.Join(dir, "broker.wal.fwb")
+	st := &BinaryFileWALStore{MemoryStore: NewMemoryStore(), path: path, codec: legacyCodec, walCodec: walCodec}
+	if err := st.recover(); err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
 		return nil, err
 	}
-	if err := st.recoverAll(resolved); err != nil {
-		return nil, err
-	}
-	st.shards = make([]*binaryWALShard, resolved)
-	for i := 0; i < resolved; i++ {
-		f, err := os.OpenFile(st.shardPath(i, resolved), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
-		if err != nil {
-			return nil, err
-		}
-		st.shards[i] = &binaryWALShard{file: f, gc: newGroupCommitWriter(f)}
-	}
+	st.file = f
+	st.gc = newGroupCommitWriter(f)
 	return st, nil
 }
 
-// resolveShardCount pins the shard count for a WAL directory on first use
-// and returns the pinned value forever after, ignoring the requested count
-// on later opens so per-queue ordering across restarts is never at risk.
-func (s *BinaryFileWALStore) resolveShardCount(requested int) (int, error) {
-	marker := filepath.Join(s.dir, "broker.wal.shards")
-	if data, err := os.ReadFile(marker); err == nil {
-		if n, perr := strconv.Atoi(strings.TrimSpace(string(data))); perr == nil && n > 0 {
-			return n, nil
-		}
-	}
-	if requested <= 0 {
-		requested = 1
-	}
-	if err := os.WriteFile(marker, []byte(strconv.Itoa(requested)), 0o600); err != nil {
-		return 0, err
-	}
-	return requested, nil
-}
-
-func (s *BinaryFileWALStore) shardPath(i, n int) string {
-	return filepath.Join(s.dir, fmt.Sprintf("broker.wal.%d-of-%d.fwb", i, n))
-}
-
-// recoverAll replays the legacy pre-sharding single WAL file (upgrade path)
-// followed by every current shard file.
-func (s *BinaryFileWALStore) recoverAll(n int) error {
-	if err := s.recoverFile(filepath.Join(s.dir, "broker.wal.fwb")); err != nil {
-		return err
-	}
-	for i := 0; i < n; i++ {
-		if err := s.recoverFile(s.shardPath(i, n)); err != nil {
-			return err
-		}
-	}
-	s.normalizeRecoveredInflight()
-	return nil
-}
-
-func (s *BinaryFileWALStore) recoverFile(path string) error {
-	f, err := os.Open(path)
+func (s *BinaryFileWALStore) recover() error {
+	f, err := os.Open(s.path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil
@@ -141,33 +89,48 @@ func (s *BinaryFileWALStore) recoverFile(path string) error {
 		l, err := binary.ReadUvarint(r)
 		if err != nil {
 			if errors.Is(err, io.EOF) {
+				s.normalizeRecoveredInflight()
 				return nil
 			}
 			if errors.Is(err, io.ErrUnexpectedEOF) {
-				_ = os.Truncate(path, pos)
+				_ = os.Truncate(s.path, pos)
+				s.normalizeRecoveredInflight()
 				return nil
 			}
 			return err
 		}
 		pos += int64(uvarintLen(l))
-		maxFrame := uint64(1 << 20) // 1MB default
+		maxFrame := uint64(s.walCodec.maxRecordSize)
+		if maxFrame < 1<<20 {
+			maxFrame = 1 << 20 // retain compatibility with legacy default frames
+		}
 		if l == 0 || l > maxFrame {
-			_ = os.Truncate(path, pos-int64(uvarintLen(l)))
+			_ = os.Truncate(s.path, pos-int64(uvarintLen(l)))
+			s.normalizeRecoveredInflight()
 			return nil
 		}
 		buf := make([]byte, int(l))
 		if _, err := io.ReadFull(r, buf); err != nil {
-			_ = os.Truncate(path, pos-int64(uvarintLen(l)))
+			_ = os.Truncate(s.path, pos-int64(uvarintLen(l)))
+			s.normalizeRecoveredInflight()
 			return nil
 		}
 		pos += int64(l)
-		var msg Message
-		if err := s.codec.DecodeMessage(buf, &msg); err != nil {
-			return err
-		}
 		var rec walRecord
-		if err := json.Unmarshal(msg.Payload, &rec); err != nil {
-			return err
+		if isNativeBinaryWALRecord(buf) {
+			if err := s.walCodec.decode(buf, &rec); err != nil {
+				return fmt.Errorf("decode BWL record at offset %d: %w", pos-int64(l), err)
+			}
+		} else {
+			// Backward-compatible recovery for WAL files produced before BWL1.
+			// New writes never use this JSON path.
+			var msg Message
+			if err := s.codec.DecodeMessage(buf, &msg); err != nil {
+				return fmt.Errorf("decode legacy WAL frame at offset %d: %w", pos-int64(l), err)
+			}
+			if err := json.Unmarshal(msg.Payload, &rec); err != nil {
+				return fmt.Errorf("decode legacy JSON WAL record at offset %d: %w", pos-int64(l), err)
+			}
 		}
 		s.applyRecovered(rec)
 	}
@@ -203,8 +166,12 @@ func (s *BinaryFileWALStore) applyRecovered(r walRecord) {
 		_, _ = s.MemoryStore.AppendAtomic(ctx, r.Entries)
 	case "lease":
 		_ = s.MemoryStore.Update(ctx, r.Message)
+	case "lease_batch", "update_batch":
+		_ = errors.Join(s.MemoryStore.UpdateBatch(ctx, r.Messages)...)
 	case "ack":
 		_ = s.MemoryStore.Ack(ctx, r.Ack)
+	case "ack_batch":
+		_ = errors.Join(s.MemoryStore.AckBatch(ctx, r.Acks)...)
 	case "nack":
 		_ = s.MemoryStore.Nack(ctx, r.Nack)
 	case "move":
@@ -221,72 +188,17 @@ func (s *BinaryFileWALStore) applyRecovered(r walRecord) {
 		_ = s.MemoryStore.CommitOffset(ctx, r.Offset)
 	}
 }
-
-func (s *BinaryFileWALStore) encodeRecord(r walRecord) ([]byte, error) {
-	r.At = time.Now()
-	r.Checksum = "" // frame CRC/HMAC protect binary WAL records.
-	payload, err := json.Marshal(r)
-	if err != nil {
-		return nil, err
-	}
-	frame, err := s.codec.EncodeMessage(nil, Message{ID: newIDFromTime(), Type: "wal." + r.Op, ContentType: "application/json", Payload: payload, CreatedAt: r.At, Status: MessagePersisted})
-	if err != nil {
-		return nil, err
-	}
-	var lenBuf [binary.MaxVarintLen64]byte
-	n := binary.PutUvarint(lenBuf[:], uint64(len(frame)))
-	buf := make([]byte, 0, n+len(frame))
-	buf = append(buf, lenBuf[:n]...)
-	buf = append(buf, frame...)
-	return buf, nil
-}
-
-func (s *BinaryFileWALStore) shardIndex(r walRecord) int {
-	return walShardIndex(r, len(s.shards))
-}
-
 func (s *BinaryFileWALStore) write(r walRecord) error {
-	if len(s.shards) == 0 {
+	if s.file == nil || s.gc == nil {
 		return ErrClosed
 	}
-	buf, err := s.encodeRecord(r)
+	r.At = time.Now()
+	r.Checksum = "" // BWL1 CRC32C/HMAC protect the complete native record.
+	record, err := s.walCodec.encode(nil, r)
 	if err != nil {
 		return err
 	}
-	return s.shards[s.shardIndex(r)].gc.write(buf)
-}
-
-// writeBatch groups records by shard and fsyncs each shard's group once, in
-// parallel across shards, instead of one fsync per record.
-func (s *BinaryFileWALStore) writeBatch(records []walRecord) error {
-	if len(s.shards) == 0 {
-		return ErrClosed
-	}
-	if len(records) == 0 {
-		return nil
-	}
-	byShard := make(map[int][]byte, len(s.shards))
-	for _, r := range records {
-		buf, err := s.encodeRecord(r)
-		if err != nil {
-			return err
-		}
-		idx := s.shardIndex(r)
-		byShard[idx] = append(byShard[idx], buf...)
-	}
-	errCh := make(chan error, len(byShard))
-	for idx, buf := range byShard {
-		sh := s.shards[idx]
-		buf := buf
-		go func() { errCh <- sh.gc.write(buf) }()
-	}
-	var firstErr error
-	for range byShard {
-		if err := <-errCh; err != nil && firstErr == nil {
-			firstErr = err
-		}
-	}
-	return firstErr
+	return s.gc.writeUvarintPrefixed(record)
 }
 
 func uvarintLen(v uint64) int {
@@ -317,48 +229,40 @@ func (s *BinaryFileWALStore) Append(ctx context.Context, msg Message, dests []De
 	if err != nil {
 		return nil, err
 	}
-	if wErr := s.write(walRecord{Op: "append", Message: msg, Dests: dests}); wErr != nil {
-		_ = wErr
+	if err := s.write(walRecord{Op: "append", Message: msg, Dests: dests}); err != nil {
+		return out, err
 	}
 	return out, nil
-}
-
-// AppendBatch appends many independent entries via a single in-memory lock
-// and, per destination shard, a single WAL fsync — while preserving
-// per-entry error isolation (one bad entry doesn't fail the others).
-func (s *BinaryFileWALStore) AppendBatch(ctx context.Context, entries []AppendEntry) []BatchAppendResult {
-	results := s.MemoryStore.AppendBatch(ctx, entries)
-	records := make([]walRecord, 0, len(entries))
-	for i, e := range entries {
-		if results[i].Err != nil {
-			continue
-		}
-		records = append(records, walRecord{Op: "append", Message: e.Message, Dests: e.Destinations})
-	}
-	if len(records) > 0 {
-		if wErr := s.writeBatch(records); wErr != nil {
-			_ = wErr
-		}
-	}
-	return results
 }
 func (s *BinaryFileWALStore) AppendAtomic(ctx context.Context, entries []AppendEntry) ([]Message, error) {
 	out, err := s.MemoryStore.AppendAtomic(ctx, entries)
 	if err != nil {
 		return nil, err
 	}
-	if wErr := s.write(walRecord{Op: "append_atomic", Entries: entries}); wErr != nil {
-		_ = wErr
+	if err := s.write(walRecord{Op: "append_atomic", Entries: entries}); err != nil {
+		return out, err
 	}
 	return out, nil
+}
+func (s *BinaryFileWALStore) AppendAtomicMinimal(ctx context.Context, entries []AppendEntry) error {
+	if err := s.MemoryStore.AppendAtomicMinimal(ctx, entries); err != nil {
+		return err
+	}
+	return s.write(walRecord{Op: "append_atomic", Entries: entries})
+}
+func (s *BinaryFileWALStore) AppendAtomicOwned(ctx context.Context, entries []AppendEntry) error {
+	if err := s.MemoryStore.AppendAtomicOwned(ctx, entries); err != nil {
+		return err
+	}
+	return s.write(walRecord{Op: "append_atomic", Entries: entries})
 }
 func (s *BinaryFileWALStore) Lease(ctx context.Context, req LeaseRequest) ([]Message, error) {
 	msgs, err := s.MemoryStore.Lease(ctx, req)
 	if err != nil || len(msgs) == 0 {
 		return msgs, err
 	}
-	if wErr := s.write(walRecord{Op: "lease", Message: msgs[0], Lease: req}); wErr != nil {
-		_ = wErr
+	if err := s.write(walRecord{Op: "lease_batch", Messages: msgs, Lease: req}); err != nil {
+		return msgs, err
 	}
 	return msgs, nil
 }
@@ -369,10 +273,27 @@ func (s *BinaryFileWALStore) Ack(ctx context.Context, req AckRequest) error {
 	if err := s.MemoryStore.Ack(ctx, req); err != nil {
 		return err
 	}
-	if wErr := s.write(walRecord{Op: "ack", Ack: req}); wErr != nil {
-		_ = wErr
+	return s.write(walRecord{Op: "ack", Ack: req})
+}
+func (s *BinaryFileWALStore) AckBatch(ctx context.Context, reqs []AckRequest) []error {
+	errs := s.MemoryStore.AckBatch(ctx, reqs)
+	successful := make([]AckRequest, 0, len(reqs))
+	indices := make([]int, 0, len(reqs))
+	for i, err := range errs {
+		if err == nil {
+			successful = append(successful, reqs[i])
+			indices = append(indices, i)
+		}
 	}
-	return nil
+	if len(successful) == 0 {
+		return errs
+	}
+	if err := s.write(walRecord{Op: "ack_batch", Acks: successful}); err != nil {
+		for _, i := range indices {
+			errs[i] = err
+		}
+	}
+	return errs
 }
 func (s *BinaryFileWALStore) Nack(ctx context.Context, req NackRequest) error {
 	if err := s.MemoryStore.validateNackLease(req); err != nil {
@@ -381,40 +302,54 @@ func (s *BinaryFileWALStore) Nack(ctx context.Context, req NackRequest) error {
 	if err := s.MemoryStore.Nack(ctx, req); err != nil {
 		return err
 	}
-	if wErr := s.write(walRecord{Op: "nack", Nack: req}); wErr != nil {
-		_ = wErr
-	}
-	return nil
+	return s.write(walRecord{Op: "nack", Nack: req})
 }
 func (s *BinaryFileWALStore) ExtendLease(ctx context.Context, req LeaseRequest) error {
 	if err := s.MemoryStore.ExtendLease(ctx, req); err != nil {
 		return err
 	}
-	m, ok, _ := s.MemoryStore.Get(ctx, req.MessageID)
+	m, ok, err := s.MemoryStore.Get(ctx, req.MessageID)
+	if err != nil {
+		return err
+	}
 	if !ok {
 		return ErrMessageNotFound
 	}
-	if wErr := s.write(walRecord{Op: "lease", Message: m, Lease: req}); wErr != nil {
-		_ = wErr
-	}
-	return nil
+	return s.write(walRecord{Op: "lease", Message: m, Lease: req})
 }
 func (s *BinaryFileWALStore) Update(ctx context.Context, msg Message) error {
 	if err := s.MemoryStore.Update(ctx, msg); err != nil {
 		return err
 	}
-	if wErr := s.write(walRecord{Op: "update", Message: msg}); wErr != nil {
-		_ = wErr
+	return s.write(walRecord{Op: "update", Message: msg})
+}
+func (s *BinaryFileWALStore) UpdateBatch(ctx context.Context, messages []Message) []error {
+	errs := s.MemoryStore.UpdateBatch(ctx, messages)
+	successful := make([]Message, 0, len(messages))
+	indices := make([]int, 0, len(messages))
+	for i, err := range errs {
+		if err == nil {
+			successful = append(successful, messages[i])
+			indices = append(indices, i)
+		}
 	}
-	return nil
+	if len(successful) == 0 {
+		return errs
+	}
+	if err := s.write(walRecord{Op: "update_batch", Messages: successful}); err != nil {
+		for _, i := range indices {
+			errs[i] = err
+		}
+	}
+	return errs
 }
 func (s *BinaryFileWALStore) Move(ctx context.Context, req MoveRequest) (MoveResult, error) {
 	res, err := s.MemoryStore.Move(ctx, req)
 	if err != nil {
 		return MoveResult{}, err
 	}
-	if wErr := s.write(walRecord{Op: "move", Move: req}); wErr != nil {
-		_ = wErr
+	if err := s.write(walRecord{Op: "move", Move: req}); err != nil {
+		return res, err
 	}
 	return res, nil
 }
@@ -422,27 +357,21 @@ func (s *BinaryFileWALStore) PauseQueue(ctx context.Context, name string) error 
 	if err := s.MemoryStore.PauseQueue(ctx, name); err != nil {
 		return err
 	}
-	if wErr := s.write(walRecord{Op: "pause_queue", QueueName: name}); wErr != nil {
-		_ = wErr
-	}
-	return nil
+	return s.write(walRecord{Op: "pause_queue", QueueName: name})
 }
 func (s *BinaryFileWALStore) ResumeQueue(ctx context.Context, name string) error {
 	if err := s.MemoryStore.ResumeQueue(ctx, name); err != nil {
 		return err
 	}
-	if wErr := s.write(walRecord{Op: "resume_queue", QueueName: name}); wErr != nil {
-		_ = wErr
-	}
-	return nil
+	return s.write(walRecord{Op: "resume_queue", QueueName: name})
 }
 func (s *BinaryFileWALStore) PurgeQueue(ctx context.Context, name string) (int, error) {
 	n, err := s.MemoryStore.PurgeQueue(ctx, name)
 	if err != nil {
 		return n, err
 	}
-	if wErr := s.write(walRecord{Op: "purge_queue", QueueName: name}); wErr != nil {
-		_ = wErr
+	if err := s.write(walRecord{Op: "purge_queue", QueueName: name}); err != nil {
+		return n, err
 	}
 	return n, nil
 }
@@ -450,25 +379,17 @@ func (s *BinaryFileWALStore) CommitOffset(ctx context.Context, commit OffsetComm
 	if err := s.MemoryStore.CommitOffset(ctx, commit); err != nil {
 		return err
 	}
-	if wErr := s.write(walRecord{Op: "commit_offset", Offset: commit}); wErr != nil {
-		_ = wErr
-	}
-	return nil
+	return s.write(walRecord{Op: "commit_offset", Offset: commit})
 }
+
 func (s *BinaryFileWALStore) Close() error {
-	for _, sh := range s.shards {
-		if sh.gc != nil {
-			_ = sh.gc.close()
-		}
+	var joined error
+	if s.gc != nil {
+		joined = errors.Join(joined, s.gc.close())
 	}
-	_ = s.MemoryStore.Close()
-	var firstErr error
-	for _, sh := range s.shards {
-		if sh.file != nil {
-			if err := sh.file.Close(); err != nil && firstErr == nil {
-				firstErr = err
-			}
-		}
+	joined = errors.Join(joined, s.MemoryStore.Close())
+	if s.file != nil {
+		joined = errors.Join(joined, s.file.Close())
 	}
-	return firstErr
+	return joined
 }

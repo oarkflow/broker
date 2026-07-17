@@ -294,47 +294,43 @@ type ConsumerConfig struct {
 }
 
 type Config struct {
-	Name                string             `json:"name"`
-	Mode                Mode               `json:"mode"`
-	NodeID              string             `json:"node_id"`
-	Store               Store              `json:"-"`
-	StateStore          StateStore         `json:"-"`
-	Pool                *pool.Pool         `json:"-"`
-	OwnPool             bool               `json:"own_pool"`
-	Codec               Codec              `json:"-"`
-	FrameCodec          FrameCodec         `json:"-"`
-	FrameCodecType      CodecType          `json:"-"`
-	SchemaRegistry      SchemaRegistry     `json:"-"`
-	DefaultQueue        string             `json:"default_queue"`
-	DefaultVisibility   time.Duration      `json:"default_visibility"`
-	DefaultRetry        RetryPolicy        `json:"default_retry"`
-	DefaultDLQ          string             `json:"default_dlq"`
-	MaxMessageSize      int                `json:"max_message_size"`
-	Backpressure        BackpressurePolicy `json:"backpressure"`
-	EnableNotifications bool               `json:"enable_notifications"`
-	// NotificationHistorySize controls the notification bus's history ring
-	// buffer (used by the /notifications and /events APIs). 0 uses the
-	// default size; a negative value disables history recording, letting
-	// Publish skip the notification-bus lock entirely when nobody is
-	// subscribed — worth setting for pure throughput workloads that don't
-	// use those APIs.
-	NotificationHistorySize int                `json:"notification_history_size,omitempty"`
-	EnableRequestResponse   bool               `json:"enable_request_response"`
-	EnableTaskTracking      bool               `json:"enable_task_tracking"`
-	DrainTimeout            time.Duration      `json:"drain_timeout"`
-	PollInterval            time.Duration      `json:"poll_interval"`
-	LeaseSweepInterval      time.Duration      `json:"lease_sweep_interval"`
-	RemoteConsumerTimeout   time.Duration      `json:"remote_consumer_timeout"`
-	Hooks                   Hooks              `json:"-"`
-	EnablePrometheus        bool               `json:"enable_prometheus,omitempty"`
-	EnableTracing           bool               `json:"enable_tracing,omitempty"`
-	TracerConfig            *TracerConfig      `json:"-"`
-	AuditEnabled            bool               `json:"audit_enabled,omitempty"`
-	RateLimit               *RateLimitConfig   `json:"rate_limit,omitempty"`
-	Tenancy                 *TenancyConfig     `json:"tenancy,omitempty"`
-	Partition               *PartitionConfig   `json:"partition,omitempty"`
-	WebSocket               *WebSocketConfig   `json:"websocket,omitempty"`
-	ExactlyOnce             *ExactlyOnceConfig `json:"exactly_once,omitempty"`
+	Name                        string             `json:"name"`
+	Mode                        Mode               `json:"mode"`
+	NodeID                      string             `json:"node_id"`
+	Store                       Store              `json:"-"`
+	StateStore                  StateStore         `json:"-"`
+	Pool                        *pool.Pool         `json:"-"`
+	OwnPool                     bool               `json:"own_pool"`
+	Codec                       Codec              `json:"-"`
+	FrameCodec                  FrameCodec         `json:"-"`
+	FrameCodecType              CodecType          `json:"-"`
+	SchemaRegistry              SchemaRegistry     `json:"-"`
+	DefaultQueue                string             `json:"default_queue"`
+	DefaultVisibility           time.Duration      `json:"default_visibility"`
+	DefaultRetry                RetryPolicy        `json:"default_retry"`
+	DefaultDLQ                  string             `json:"default_dlq"`
+	MaxMessageSize              int                `json:"max_message_size"`
+	Backpressure                BackpressurePolicy `json:"backpressure"`
+	EnableNotifications         bool               `json:"enable_notifications"`
+	NotificationHistoryCapacity int                `json:"notification_history_capacity,omitempty"`
+	EnablePublisherTracking     bool               `json:"enable_publisher_tracking,omitempty"`
+	EnableConsumerEventTracking bool               `json:"enable_consumer_event_tracking,omitempty"`
+	EnableRequestResponse       bool               `json:"enable_request_response"`
+	EnableTaskTracking          bool               `json:"enable_task_tracking"`
+	DrainTimeout                time.Duration      `json:"drain_timeout"`
+	PollInterval                time.Duration      `json:"poll_interval"`
+	LeaseSweepInterval          time.Duration      `json:"lease_sweep_interval"`
+	RemoteConsumerTimeout       time.Duration      `json:"remote_consumer_timeout"`
+	Hooks                       Hooks              `json:"-"`
+	EnablePrometheus            bool               `json:"enable_prometheus,omitempty"`
+	EnableTracing               bool               `json:"enable_tracing,omitempty"`
+	TracerConfig                *TracerConfig      `json:"-"`
+	AuditEnabled                bool               `json:"audit_enabled,omitempty"`
+	RateLimit                   *RateLimitConfig   `json:"rate_limit,omitempty"`
+	Tenancy                     *TenancyConfig     `json:"tenancy,omitempty"`
+	Partition                   *PartitionConfig   `json:"partition,omitempty"`
+	WebSocket                   *WebSocketConfig   `json:"websocket,omitempty"`
+	ExactlyOnce                 *ExactlyOnceConfig `json:"exactly_once,omitempty"`
 	// SigningKey is the HMAC signing key for frame authentication.
 	SigningKey []byte `json:"-"`
 	// EncryptionKey is the AES encryption key for frame encryption at rest.

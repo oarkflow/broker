@@ -56,7 +56,6 @@ type Broker struct {
 	partitionReassignment *PartitionReassignment
 	mqttServer            *MQTTServer
 	grpcServer            *GRPCServer
-	pubCoalescer          *publishCoalescer
 }
 
 func New(cfg Config) (*Broker, error) {
@@ -120,8 +119,7 @@ func New(cfg Config) (*Broker, error) {
 		own = true
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	b := &Broker{cfg: cfg, store: cfg.Store, stateStore: cfg.StateStore, router: NewRouter(), codec: cfg.Codec, frameCodec: cfg.FrameCodec, pool: pool, ownPool: own, ctx: ctx, cancel: cancel, subs: map[string]*Subscription{}, waiters: map[string]chan Response{}, tasks: map[string]*TaskInfo{}, taskWait: map[string][]chan TaskResult{}, notify: NewNotificationBus(cfg.NotificationHistorySize), consumers: NewConsumerRegistry(512), cluster: NewCluster(firstNonEmpty(cfg.NodeID, "node-1"))}
-	b.pubCoalescer = newPublishCoalescer(b.store, b.notify)
+	b := &Broker{cfg: cfg, store: cfg.Store, stateStore: cfg.StateStore, router: NewRouter(), codec: cfg.Codec, frameCodec: cfg.FrameCodec, pool: pool, ownPool: own, ctx: ctx, cancel: cancel, subs: map[string]*Subscription{}, waiters: map[string]chan Response{}, tasks: map[string]*TaskInfo{}, taskWait: map[string][]chan TaskResult{}, notify: NewNotificationBus(cfg.NotificationHistoryCapacity), consumers: NewConsumerRegistry(512), cluster: NewCluster(firstNonEmpty(cfg.NodeID, "node-1"))}
 	if cfg.EnablePrometheus {
 		b.promMetrics = GlobalPrometheusMetrics()
 		if cfg.Hooks.OnStarted == nil {
@@ -261,9 +259,6 @@ func (b *Broker) Stop(ctx context.Context) error {
 	}
 	// Always close all resources regardless of individual errors.
 	var firstErr error
-	if b.pubCoalescer != nil {
-		_ = b.pubCoalescer.close()
-	}
 	if b.ownPool {
 		if err := b.pool.Shutdown(ctx); err != nil && firstErr == nil {
 			firstErr = err

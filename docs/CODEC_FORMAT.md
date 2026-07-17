@@ -1,6 +1,6 @@
 # FastWorker Broker Codec Format: FWB1
 
-FWB1 is the native binary broker frame used by the broker for high-performance message exchange, binary WAL records, frame publish/poll endpoints, and future replication transport. The broker still keeps payloads opaque so application teams can use JSON, raw bytes, Protobuf, MessagePack, or any custom payload codec.
+FWB1 is the native binary network message frame used for high-performance publish/poll endpoints and replication transport. Durable WAL mutations now use the dedicated packed **BWL1** format rather than JSON inside an FWB frame; see `BWL1_WAL_FORMAT.md`. Legacy FWB-wrapped JSON WAL records remain recoverable. Message payloads stay opaque so applications can use JSON, raw bytes, Protobuf, MessagePack, or another payload codec.
 
 ## Design goals
 

@@ -1,4 +1,4 @@
-module github.com/oarkflow/broker/contrib/sqlitestore
+module github.com/oarkflow/broker/contrib
 
 go 1.23.2
 

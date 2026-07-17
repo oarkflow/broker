@@ -1,0 +1,60 @@
+services:
+  broker:
+    build:
+      context: .
+      target: brokerd
+    command:
+      - -addr=:8090
+      - -native-addr=:8091
+      - -native-dir=/data/native-stream
+      - -native-partitions=${PARTITIONS:-8}
+      - -native-segment-bytes=${SEGMENT_BYTES:-1073741824}
+      - -native-commit-delay=${COMMIT_DELAY:-750us}
+      - -native-commit-bytes=${COMMIT_BYTES:-4194304}
+      - -native-sync=true
+      - -wal=/data/queue-wal
+      - -token=bench-token
+      - -quiet
+    ports:
+      - 8090:8090
+      - 8091:8091
+    volumes:
+      - native-broker-data:/data
+    deploy:
+      resources:
+        limits:
+          cpus: '${BROKER_CPUS:-4}'
+          memory: ${BROKER_MEMORY:-4g}
+
+  native-publisher:
+    build:
+      context: .
+      target: native-bench
+    profiles: [tools]
+    command:
+      - -addr=broker:8091
+      - -mode=publish
+      - -stream=${STREAM:-bench}
+      - -partitions=${PARTITIONS:-8}
+      - -c=${PRODUCER_CONCURRENCY:-16}
+      - -batch=${PUBLISH_BATCH:-1000}
+      - -payload=${PAYLOAD_SIZE:-256}
+      - -messages=${NUM_RECORDS:-1000000}
+
+  native-consumer:
+    build:
+      context: .
+      target: native-bench
+    profiles: [tools]
+    command:
+      - -addr=broker:8091
+      - -mode=consume
+      - -stream=${STREAM:-bench}
+      - -group=${GROUP:-bench-group}
+      - -partitions=${PARTITIONS:-8}
+      - -c=${CONSUMER_CONCURRENCY:-8}
+      - -fetch=${FETCH_BATCH:-4000}
+      - -messages=${NUM_RECORDS:-1000000}
+
+volumes:
+  native-broker-data:

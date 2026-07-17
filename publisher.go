@@ -8,6 +8,14 @@ import (
 
 type Publisher struct{ b *Broker }
 
+// PublishBatchItem allows a batch to target different topics, queues, streams,
+// and option sets while still being committed with one capable store call.
+type PublishBatchItem struct {
+	Topic   string
+	Payload any
+	Options []PublishOption
+}
+
 func (p *Publisher) Publish(ctx context.Context, topic string, payload any, opts ...PublishOption) (PublishResult, error) {
 	return p.publish(ctx, topic, payload, opts...)
 }
@@ -31,21 +39,302 @@ func (p *Publisher) PublishAsync(ctx context.Context, topic string, payload any,
 	return f
 }
 func (p *Publisher) PublishBatch(ctx context.Context, topic string, payloads []any, opts ...PublishOption) (BatchPublishResult, error) {
-	res := BatchPublishResult{Results: make([]PublishResult, 0, len(payloads))}
-	var first error
-	for _, payload := range payloads {
-		r, err := p.publish(ctx, topic, payload, opts...)
-		if err != nil {
-			if first == nil {
-				first = err
-			}
-			res.Errors = append(res.Errors, err.Error())
-		} else {
-			res.Results = append(res.Results, r)
+	items := make([]PublishBatchItem, len(payloads))
+	for i := range payloads {
+		items[i] = PublishBatchItem{Topic: topic, Payload: payloads[i], Options: opts}
+	}
+	aligned, errs, first := p.publishItemsAligned(ctx, items)
+	res := BatchPublishResult{Results: make([]PublishResult, 0, len(items))}
+	for i := range aligned {
+		if errs[i] != nil {
+			res.Errors = append(res.Errors, errs[i].Error())
+			continue
 		}
+		res.Results = append(res.Results, aligned[i])
 	}
 	return res, first
 }
+
+// PublishItems publishes a heterogeneous batch. Successful entries are
+// returned in input order; failures are listed in Errors.
+func (p *Publisher) PublishItems(ctx context.Context, items []PublishBatchItem) (BatchPublishResult, error) {
+	aligned, errs, first := p.publishItemsAligned(ctx, items)
+	res := BatchPublishResult{Results: make([]PublishResult, 0, len(items))}
+	for i := range aligned {
+		if errs[i] != nil {
+			res.Errors = append(res.Errors, errs[i].Error())
+			continue
+		}
+		res.Results = append(res.Results, aligned[i])
+	}
+	return res, first
+}
+
+func (p *Publisher) publishItemsAligned(ctx context.Context, items []PublishBatchItem) ([]PublishResult, []error, error) {
+	results := make([]PublishResult, len(items))
+	errs := make([]error, len(items))
+	preps := make([]preparedPublish, 0, len(items))
+	indices := make([]int, 0, len(items))
+	entries := make([]AppendEntry, 0, len(items))
+	var first error
+	for i := range items {
+		prep, err := p.preparePublish(ctx, items[i].Topic, items[i].Payload, items[i].Options...)
+		if err == nil {
+			err = p.checkBackpressure(ctx, prep)
+		}
+		if err != nil {
+			errs[i] = err
+			if first == nil {
+				first = err
+			}
+			continue
+		}
+		preps = append(preps, prep)
+		indices = append(indices, i)
+		entries = append(entries, AppendEntry{Message: prep.msg, Destinations: prep.dests})
+	}
+	if len(entries) == 0 {
+		return results, errs, first
+	}
+
+	if atomicStore, ok := p.b.store.(AtomicStore); ok {
+		stored, err := atomicStore.AppendAtomic(ctx, entries)
+		if err == nil {
+			pos := 0
+			for j, prep := range preps {
+				count := nonEmptyDestinationCount(prep.msg, prep.dests)
+				end := pos + count
+				if end > len(stored) {
+					end = len(stored)
+				}
+				res := PublishResult{MessageID: prep.msg.ID, Messages: stored[pos:end], Destinations: prep.dests, Confirmed: firstConfirm(prep.opts.ConfirmLevel, ConfirmPersisted)}
+				results[indices[j]] = res
+				if p.hasPublishSideEffects() {
+					p.afterPublish(ctx, prep, res)
+				}
+				pos = end
+			}
+			return results, errs, first
+		}
+		// Never retry an ambiguous atomic failure item-by-item; the store may
+		// have synced the transaction before surfacing an I/O error.
+		for _, idx := range indices {
+			errs[idx] = err
+		}
+		if first == nil {
+			first = err
+		}
+		return results, errs, first
+	}
+
+	for j, prep := range preps {
+		stored, err := p.b.store.Append(ctx, prep.msg, prep.dests)
+		idx := indices[j]
+		if err != nil {
+			errs[idx] = err
+			if first == nil {
+				first = err
+			}
+			continue
+		}
+		res := PublishResult{MessageID: prep.msg.ID, Messages: stored, Destinations: prep.dests, Confirmed: firstConfirm(prep.opts.ConfirmLevel, ConfirmPersisted)}
+		results[idx] = res
+		if p.hasPublishSideEffects() {
+			p.afterPublish(ctx, prep, res)
+		}
+	}
+	return results, errs, first
+}
+
+func nonEmptyDestinationCount(msg Message, dests []Destination) int {
+	if len(dests) == 0 {
+		if msg.Topic == "" {
+			return 0
+		}
+		return 1
+	}
+	count := 0
+	for _, dest := range dests {
+		if dest.Name != "" {
+			count++
+		}
+	}
+	return count
+}
+
+func (p *Publisher) publishItemsMinimal(ctx context.Context, items []PublishBatchItem) ([]error, error) {
+	if p.hasPublishSideEffects() {
+		_, errs, first := p.publishItemsAligned(ctx, items)
+		return errs, first
+	}
+	errs := make([]error, len(items))
+	entries := make([]AppendEntry, 0, len(items))
+	indices := make([]int, 0, len(items))
+	var first error
+	for i := range items {
+		prep, err := p.preparePublish(ctx, items[i].Topic, items[i].Payload, items[i].Options...)
+		if err == nil {
+			err = p.checkBackpressure(ctx, prep)
+		}
+		if err != nil {
+			errs[i] = err
+			if first == nil {
+				first = err
+			}
+			continue
+		}
+		entries = append(entries, AppendEntry{Message: prep.msg, Destinations: prep.dests})
+		indices = append(indices, i)
+	}
+	if len(entries) == 0 {
+		return errs, first
+	}
+	var err error
+	switch store := p.b.store.(type) {
+	case OwnedAtomicStore:
+		err = store.AppendAtomicOwned(ctx, entries)
+	case MinimalAtomicStore:
+		err = store.AppendAtomicMinimal(ctx, entries)
+	case AtomicStore:
+		_, err = store.AppendAtomic(ctx, entries)
+	default:
+		for _, entry := range entries {
+			if _, appendErr := p.b.store.Append(ctx, entry.Message, entry.Destinations); appendErr != nil {
+				err = appendErr
+				break
+			}
+		}
+	}
+	if err == nil {
+		return errs, first
+	}
+	for _, idx := range indices {
+		errs[idx] = err
+	}
+	if first == nil {
+		first = err
+	}
+	return errs, first
+}
+
+// publishMessagesMinimal is the ownership-transfer fast path used by native
+// transports. The decoded message buffers become store-owned, avoiding option
+// closures, JSON re-marshalling, result cloning, and per-message callbacks when
+// those features are disabled.
+func (p *Publisher) publishMessagesMinimal(ctx context.Context, messages []Message) ([]error, error) {
+	if p.hasPublishSideEffects() {
+		items := make([]PublishBatchItem, len(messages))
+		for i := range messages {
+			items[i] = PublishBatchItem{Topic: messages[i].Topic, Payload: messages[i].Payload, Options: publishOptionsFromFrame(messages[i])}
+		}
+		return p.publishItemsMinimal(ctx, items)
+	}
+	errs := make([]error, len(messages))
+	entries := make([]AppendEntry, 0, len(messages))
+	indices := make([]int, 0, len(messages))
+	var first error
+	now := time.Now()
+	for i := range messages {
+		entry, err := p.prepareOwnedMessage(ctx, messages[i], now)
+		if err != nil {
+			errs[i] = err
+			if first == nil {
+				first = err
+			}
+			continue
+		}
+		entries = append(entries, entry)
+		indices = append(indices, i)
+	}
+	if len(entries) == 0 {
+		return errs, first
+	}
+	var err error
+	switch store := p.b.store.(type) {
+	case OwnedAtomicStore:
+		err = store.AppendAtomicOwned(ctx, entries)
+	case MinimalAtomicStore:
+		err = store.AppendAtomicMinimal(ctx, entries)
+	case AtomicStore:
+		_, err = store.AppendAtomic(ctx, entries)
+	default:
+		for i := range entries {
+			if _, appendErr := p.b.store.Append(ctx, entries[i].Message, entries[i].Destinations); appendErr != nil {
+				err = appendErr
+				break
+			}
+		}
+	}
+	if err != nil {
+		for _, index := range indices {
+			errs[index] = err
+		}
+		if first == nil {
+			first = err
+		}
+	}
+	return errs, first
+}
+
+func (p *Publisher) prepareOwnedMessage(ctx context.Context, msg Message, now time.Time) (AppendEntry, error) {
+	if p == nil || p.b == nil {
+		return AppendEntry{}, ErrClosed
+	}
+	if p.b.State() == BrokerPaused {
+		return AppendEntry{}, ErrPaused
+	}
+	if len(msg.Payload) > p.b.cfg.MaxMessageSize {
+		return AppendEntry{}, ErrMessageTooLarge
+	}
+	if msg.ID == "" {
+		msg.ID = p.b.nextID("msg")
+	}
+	if msg.CreatedAt.IsZero() {
+		msg.CreatedAt = now
+	}
+	if msg.AvailableAt.IsZero() {
+		msg.AvailableAt = msg.CreatedAt
+	}
+	if msg.Status == "" {
+		msg.Status = MessageAccepted
+	}
+	if msg.AvailableAt.After(now) {
+		msg.Status = MessageScheduled
+	}
+	if msg.ContentType == "" {
+		msg.ContentType = p.b.codec.ContentType()
+	}
+	if msg.MaxAttempts <= 0 {
+		msg.MaxAttempts = p.b.cfg.DefaultRetry.MaxAttempts
+	}
+	if msg.Headers != nil {
+		msg.TaskID = firstNonEmpty(msg.TaskID, msg.Headers["x-task-id"])
+		msg.TaskName = firstNonEmpty(msg.TaskName, msg.Headers["x-task-name"])
+	}
+	if p.b.cfg.SchemaRegistry != nil {
+		if err := p.b.cfg.SchemaRegistry.Validate(ctx, msg); err != nil {
+			return AppendEntry{}, err
+		}
+	}
+	dests := make([]Destination, 0, 4)
+	if msg.Queue != "" {
+		dests = append(dests, Destination{Kind: DestinationQueue, Name: msg.Queue})
+	}
+	if msg.Stream != "" {
+		dests = append(dests, Destination{Kind: DestinationStream, Name: msg.Stream})
+	}
+	routed, _ := p.b.router.Route(ctx, msg)
+	dests = append(dests, routed...)
+	if len(dests) == 0 && msg.Topic != "" {
+		dests = append(dests, Destination{Kind: DestinationTopic, Name: msg.Topic})
+	}
+	prep := preparedPublish{msg: msg, dests: dests}
+	if err := p.checkBackpressure(ctx, prep); err != nil {
+		return AppendEntry{}, err
+	}
+	return AppendEntry{Message: msg, Destinations: dests}, nil
+}
+
 func (p *Publisher) PublishBatchAsync(ctx context.Context, topic string, payloads []any, opts ...PublishOption) BatchPublishFuture {
 	f := newFutureResult[BatchPublishResult](p.b.nextID("batchf"))
 	cctx, cancel := context.WithCancel(ctx)
@@ -101,7 +390,7 @@ func (p *Publisher) publish(ctx context.Context, topic string, payload any, opts
 	if err := p.checkBackpressure(ctx, prep); err != nil {
 		return PublishResult{}, err
 	}
-	stored, err := p.b.pubCoalescer.submit(ctx, prep.msg, prep.dests)
+	stored, err := p.b.store.Append(ctx, prep.msg, prep.dests)
 	if err != nil {
 		if p.b.cfg.Hooks.OnPublishFailed != nil {
 			prep.event.Error = err
@@ -215,6 +504,16 @@ func (p *Publisher) preparePublish(ctx context.Context, topic string, payload an
 	return preparedPublish{msg: msg, dests: dests, event: ev, opts: o}, nil
 }
 
+func (p *Publisher) hasPublishSideEffects() bool {
+	if p == nil || p.b == nil {
+		return false
+	}
+	h := p.b.cfg.Hooks
+	return h.BeforePublish != nil || h.AfterPublish != nil || h.OnPublishConfirmed != nil ||
+		h.OnPublishFailed != nil || h.OnPublishRejected != nil ||
+		p.b.cfg.EnablePublisherTracking || (p.b.notify != nil && p.b.notify.Enabled())
+}
+
 func (p *Publisher) afterPublish(ctx context.Context, prep preparedPublish, res PublishResult) {
 	prep.event.Result = res
 	prep.event.Destinations = prep.dests
@@ -224,8 +523,7 @@ func (p *Publisher) afterPublish(ctx context.Context, prep preparedPublish, res 
 	if p.b.cfg.Hooks.OnPublishConfirmed != nil {
 		p.b.cfg.Hooks.OnPublishConfirmed(ctx, prep.event)
 	}
-	// "message.published" is emitted by the publish coalescer (batched via
-	// NotificationBus.PublishMany), not here — avoids publishing it twice.
+	p.b.notify.Publish(Notification{Type: "message.published", Source: "publisher", Severity: SeverityInfo, MessageID: prep.msg.ID, Topic: prep.msg.Topic, Queue: prep.msg.Queue, TenantID: prep.msg.TenantID, TraceID: prep.msg.TraceID, Timestamp: time.Now()})
 	p.b.recordPublisher(ctx, PublisherRecord{ID: prep.msg.ID, Operation: "publish", Topic: prep.msg.Topic, Queue: prep.msg.Queue, Stream: prep.msg.Stream, MessageID: prep.msg.ID, Status: "succeeded", CreatedAt: prep.msg.CreatedAt, UpdatedAt: time.Now()})
 }
 
@@ -237,7 +535,7 @@ func firstConfirm(v, d ConfirmLevel) ConfirmLevel {
 }
 
 func (b *Broker) recordPublisher(ctx context.Context, rec PublisherRecord) {
-	if b != nil && b.stateStore != nil {
+	if b != nil && b.cfg.EnablePublisherTracking && b.stateStore != nil {
 		_ = b.stateStore.PutPublisherRecord(ctx, rec)
 	}
 }

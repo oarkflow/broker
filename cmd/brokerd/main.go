@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -20,14 +21,22 @@ import (
 
 func main() {
 	addr := flag.String("addr", env("BROKER_ADDR", ":8090"), "HTTP listen address")
+	nativeAddr := flag.String("native-addr", env("BROKER_NATIVE_ADDR", ":8091"), "native BST1 stream listen address; empty disables")
+	nativeDir := flag.String("native-dir", env("BROKER_NATIVE_DIR", ""), "native segmented stream directory; defaults to <wal>/native-stream")
+	nativePartitions := flag.Int("native-partitions", int(envInt64("BROKER_NATIVE_PARTITIONS", 8)), "native stream partitions")
+	nativeSegmentBytes := flag.Int64("native-segment-bytes", envInt64("BROKER_NATIVE_SEGMENT_BYTES", 1<<30), "native stream segment size")
+	nativeCommitDelay := flag.Duration("native-commit-delay", 750*time.Microsecond, "native stream group commit delay")
+	nativeCommitBytes := flag.Int("native-commit-bytes", int(envInt64("BROKER_NATIVE_COMMIT_BYTES", 4<<20)), "native stream group commit byte target")
+	nativeSync := flag.Bool("native-sync", !envBool("BROKER_NATIVE_NO_SYNC"), "fdatasync grouped native stream appends before acknowledgement")
 	storeKind := flag.String("store", env("BROKER_STORE", ""), "message store: memory, wal, sqlite; empty auto-selects wal when -wal is set")
 	sqliteDriver := flag.String("sqlite-driver", env("BROKER_SQLITE_DRIVER", "sqlite"), "database/sql driver for sqlite message store")
 	sqliteDSN := flag.String("sqlite-dsn", env("BROKER_SQLITE_DSN", "./.broker-data/broker-messages.sqlite"), "SQLite DSN for message store")
 	wal := flag.String("wal", env("BROKER_WAL", ""), "WAL directory; empty uses in-memory store")
 	walFormat := flag.String("wal-format", env("BROKER_WAL_FORMAT", "binary"), "WAL format: binary or json")
-	frameSigningKey := flag.String("frame-signing-key", env("BROKER_FRAME_SIGNING_KEY", ""), "optional FWB1 frame HMAC signing key")
-	frameEncryptionKey := flag.String("frame-encryption-key", env("BROKER_FRAME_ENCRYPTION_KEY", ""), "optional FWB1 frame AES-GCM payload encryption key")
-	frameCompress := flag.Int("frame-compress-threshold", int(envInt64("BROKER_FRAME_COMPRESS_THRESHOLD", 0)), "gzip payloads in FWB1 frames at or above this size; 0 disables")
+	walShards := flag.Int("wal-shards", int(envInt64("BROKER_WAL_SHARDS", 1)), "independent binary WAL shards; use separate volumes for best scaling")
+	frameSigningKey := flag.String("frame-signing-key", env("BROKER_FRAME_SIGNING_KEY", ""), "optional FWB frame and BWL1 WAL HMAC signing key")
+	frameEncryptionKey := flag.String("frame-encryption-key", env("BROKER_FRAME_ENCRYPTION_KEY", ""), "optional FWB frame and BWL1 WAL AES-GCM encryption key")
+	frameCompress := flag.Int("frame-compress-threshold", int(envInt64("BROKER_FRAME_COMPRESS_THRESHOLD", 0)), "gzip FWB payloads and BWL1 records at or above this size; 0 disables")
 	codecType := flag.String("codec", env("BROKER_CODEC", "fwb1"), "frame codec: fwb1 (string keys) or fwb2 (compact numeric tags)")
 	token := flag.String("token", env("BROKER_TOKEN", ""), "required bearer token for admin/API unless --insecure-dev is set")
 	readToken := flag.String("read-token", env("BROKER_READ_TOKEN", ""), "optional read-only bearer token")
@@ -42,8 +51,11 @@ func main() {
 	maxBody := flag.Int64("max-body", envInt64("BROKER_MAX_BODY", 1<<20), "maximum HTTP request body size in bytes")
 	quiet := flag.Bool("quiet", envBool("BROKER_QUIET"), "disable live broker event logs")
 	debugEvents := flag.Bool("debug-events", envBool("BROKER_DEBUG_EVENTS"), "include debug heartbeat/lease-extension events in live logs")
-	noNotificationHistory := flag.Bool("no-notification-history", envBool("BROKER_NO_NOTIFICATION_HISTORY"), "disable the /notifications and /events history buffer to skip its lock on every publish/ack (pure throughput deployments that don't use those APIs)")
-	grpcAddr := flag.String("grpc-addr", env("BROKER_GRPC_ADDR", ""), "optional length-prefixed-JSON/TCP transport address (e.g. :50051); avoids per-request HTTP framing overhead. Empty disables it.")
+	messageHistory := flag.Int("message-history", int(envInt64("BROKER_MESSAGE_HISTORY", 0)), "message history entries retained per message; 0 disables hot-path history")
+	notificationHistory := flag.Int("notification-history", int(envInt64("BROKER_NOTIFICATION_HISTORY", 0)), "notification events retained in memory; 0 disables retention")
+	retainCompleted := flag.Bool("retain-completed", envBool("BROKER_RETAIN_COMPLETED"), "retain completed message bodies in memory after durable acknowledgement")
+	publisherTracking := flag.Bool("publisher-tracking", envBool("BROKER_PUBLISHER_TRACKING"), "retain per-publisher counters/history")
+	consumerEventTracking := flag.Bool("consumer-event-tracking", envBool("BROKER_CONSUMER_EVENT_TRACKING"), "emit per-message consumer events")
 	flag.Parse()
 
 	if !*insecureDev && *token == "" {
@@ -67,7 +79,7 @@ func main() {
 	}
 	switch kind {
 	case "", "memory":
-		// broker.New will install the default in-memory message store.
+		store = broker.NewMemoryStore()
 	case "sqlite":
 		st, err := sqlitestore.OpenMessageStore(*sqliteDriver, *sqliteDSN)
 		if err != nil {
@@ -95,21 +107,43 @@ func main() {
 			}
 			store = st
 		} else {
-			st, err := broker.NewBinaryFileWALStoreWithCodec(*wal, frameCodec)
-			if err != nil {
-				logger.Log.Fatal("open binary WAL store", zlog.Err(err))
+			if *walShards <= 0 {
+				logger.Log.Fatal("-wal-shards must be positive")
 			}
-			store = st
+			if *walShards == 1 {
+				st, err := broker.NewBinaryFileWALStoreWithCodec(*wal, frameCodec)
+				if err != nil {
+					logger.Log.Fatal("open binary WAL store", zlog.Err(err))
+				}
+				store = st
+			} else {
+				st, err := broker.NewPartitionedBinaryWALStore(*wal, *walShards, frameCodec)
+				if err != nil {
+					logger.Log.Fatal("open partitioned binary WAL store", zlog.Err(err))
+				}
+				store = st
+			}
 		}
 	default:
 		logger.Log.Fatal("unsupported store", zlog.String("store", *storeKind))
 	}
 
-	notificationHistorySize := 0
-	if *noNotificationHistory {
-		notificationHistorySize = -1
+	if configurable, ok := store.(interface{ SetHistoryLimit(int) }); ok {
+		configurable.SetHistoryLimit(*messageHistory)
 	}
-	b, err := broker.New(broker.Config{Mode: broker.ModeStandalone, Store: store, DefaultQueue: *queue, FrameCodec: frameCodec, NotificationHistorySize: notificationHistorySize})
+	if configurable, ok := store.(interface{ SetRetainCompleted(bool) }); ok {
+		configurable.SetRetainCompleted(*retainCompleted)
+	}
+
+	b, err := broker.New(broker.Config{
+		Mode:                        broker.ModeStandalone,
+		Store:                       store,
+		DefaultQueue:                *queue,
+		FrameCodec:                  frameCodec,
+		NotificationHistoryCapacity: *notificationHistory,
+		EnablePublisherTracking:     *publisherTracking,
+		EnableConsumerEventTracking: *consumerEventTracking,
+	})
 	if err != nil {
 		logger.Log.Fatal("create broker", zlog.Err(err))
 	}
@@ -133,16 +167,6 @@ func main() {
 	if *publisherToken != "" {
 		tokens = append(tokens, broker.AdminToken{Name: "publisher", Token: *publisherToken, Permissions: []string{broker.PermissionPublish, broker.PermissionTaskWrite, broker.PermissionTaskRead, broker.PermissionBrokerRead}})
 	}
-	if *grpcAddr != "" {
-		gs := broker.NewGRPCServer(b, broker.GRPCConfig{ListenAddr: *grpcAddr, BrokerToken: *token})
-		go func() {
-			if err := gs.ListenAndServe(); err != nil {
-				logger.Log.Fatal("grpc-like transport listen failed", zlog.String("addr", *grpcAddr), zlog.Err(err))
-			}
-		}()
-		fmt.Printf("length-prefixed-JSON/TCP transport listening on %s\n", *grpcAddr)
-	}
-
 	admin := broker.AdminServer{Broker: b, ACL: broker.NewACL(tokens...), InsecureDev: *insecureDev, MaxBodyBytes: *maxBody, TLSCertFile: *tlsCert, TLSKeyFile: *tlsKey, ClientCAFile: *clientCA, RequireClientCert: *requireClientCert}
 	srv := admin.HTTPServer(*addr)
 	serverErr := make(chan error, 1)
@@ -160,7 +184,28 @@ func main() {
 		}
 	case <-time.After(200 * time.Millisecond):
 	}
+	var native *broker.NativeStreamServer
+	var nativeErr chan error
+	if *nativeAddr != "" {
+		dir := *nativeDir
+		if dir == "" {
+			if *wal != "" {
+				dir = filepath.Join(*wal, "native-stream")
+			} else {
+				dir = filepath.Join(".broker-data", "native-stream")
+			}
+		}
+		native, err = broker.NewNativeStreamServer(broker.NativeStreamConfig{Dir: dir, Partitions: *nativePartitions, SegmentBytes: *nativeSegmentBytes, GroupCommitDelay: *nativeCommitDelay, GroupCommitBytes: *nativeCommitBytes, MaxFrameBytes: 128 << 20, Sync: *nativeSync})
+		if err != nil {
+			logger.Log.Fatal("open native stream", zlog.Err(err))
+		}
+		nativeErr = make(chan error, 1)
+		go func() { nativeErr <- native.ListenAndServe(*nativeAddr) }()
+	}
 	fmt.Printf("fastworker broker listening on %s\n", *addr)
+	if native != nil {
+		fmt.Printf("native BST1 stream listening on %s partitions=%d sync=%t\n", *nativeAddr, *nativePartitions, *nativeSync)
+	}
 	if *insecureDev {
 		fmt.Println("WARNING: authentication disabled by --insecure-dev")
 	}
@@ -174,7 +219,7 @@ func main() {
 		fmt.Printf("durable sqlite message store: driver=%s dsn=%s\n", *sqliteDriver, *sqliteDSN)
 	}
 	if kind == "wal" || kind == "filewal" || kind == "file-wal" {
-		fmt.Printf("durable WAL: %s format=%s\n", *wal, *walFormat)
+		fmt.Printf("durable WAL: %s format=%s shards=%d history=%d retain_completed=%t\n", *wal, *walFormat, *walShards, *messageHistory, *retainCompleted)
 	}
 
 	sig := make(chan os.Signal, 1)
@@ -184,6 +229,9 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	_ = srv.Shutdown(ctx)
+	if native != nil {
+		_ = native.Close()
+	}
 	_ = b.Stop(ctx)
 	if srvErr := srv.Close(); srvErr != nil && srvErr != http.ErrServerClosed {
 		logger.Log.Warn("server close", zlog.Err(srvErr))

@@ -6,15 +6,14 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"math/rand"
-	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"slices"
 	"strconv"
@@ -22,13 +21,17 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/oarkflow/broker"
 )
 
 type result struct {
-	ok   bool
-	dur  time.Duration
-	code int
-	msgs int
+	ok        bool
+	dur       time.Duration
+	code      int
+	msgs      int
+	published int
+	consumed  int
 }
 
 func main() {
@@ -36,6 +39,7 @@ func main() {
 	token := flag.String("token", "bench-token", "bearer token")
 	queue := flag.String("queue", "bench.q", "queue name")
 	mode := flag.String("mode", "publish", "publish | pull | roundtrip")
+	protocol := flag.String("protocol", "json", "wire protocol: json or frame")
 	concurrency := flag.Int("c", 50, "concurrent workers")
 	duration := flag.Duration("duration", 15*time.Second, "test duration")
 	payloadSize := flag.Int("payload", 256, "payload size in bytes")
@@ -43,8 +47,6 @@ func main() {
 	batch := flag.Int("batch", 1, "messages per publish HTTP call (uses /publish/batch when >1)")
 	consumerID := flag.String("consumer-id", "", "consumer id; defaults to hostname (unique per container)")
 	group := flag.String("group", "loadgen-group", "consumer group for pull/roundtrip mode")
-	transport := flag.String("transport", "http", "http (JSON+HTTP, -addr) | tcp (length-prefixed JSON over a persistent TCP connection, -tcp-addr)")
-	tcpAddr := flag.String("tcp-addr", "localhost:50051", "broker TCP transport address, used when -transport=tcp")
 	flag.Parse()
 
 	if *consumerID == "" {
@@ -58,21 +60,29 @@ func main() {
 	client := &http.Client{Timeout: 10 * time.Second}
 	client.Transport = &http.Transport{MaxIdleConnsPerHost: 256}
 	payload := randPayload(*payloadSize)
+	frameCodec := broker.NewFrameCodec(broker.FrameCodecConfig{Type: broker.CodecFWB1, MaxFrameSize: 128 << 20})
+	*protocol = strings.ToLower(strings.TrimSpace(*protocol))
+	if *protocol != "json" && *protocol != "frame" {
+		fmt.Fprintln(os.Stderr, "-protocol must be json or frame")
+		os.Exit(2)
+	}
 
 	waitForReady(client, *addr, 30*time.Second)
 
 	// Ensure queue exists.
 	declareQueue(client, *addr, *token, *queue)
 
-	fmt.Printf("mode=%s transport=%s addr=%s queue=%s concurrency=%d duration=%s payload=%dB batch=%d pull-limit=%d consumer-id=%s group=%s\n",
-		*mode, *transport, *addr, *queue, *concurrency, *duration, *payloadSize, *batch, *pullLimit, *consumerID, *group)
+	fmt.Printf("mode=%s protocol=%s addr=%s queue=%s concurrency=%d duration=%s payload=%dB batch=%d pull-limit=%d consumer-id=%s group=%s\n",
+		*mode, *protocol, *addr, *queue, *concurrency, *duration, *payloadSize, *batch, *pullLimit, *consumerID, *group)
 
 	var (
-		results   []result
-		resultsMu sync.Mutex
-		total     int64
-		errs      int64
-		totalMsgs int64
+		results        []result
+		resultsMu      sync.Mutex
+		total          int64
+		errs           int64
+		totalMsgs      int64
+		totalPublished int64
+		totalConsumed  int64
 	)
 
 	stop := make(chan struct{})
@@ -80,16 +90,6 @@ func main() {
 
 	worker := func(workerID string) {
 		defer wg.Done()
-		var gc *grpcClient
-		if *transport == "tcp" {
-			var err error
-			gc, err = dialGRPC(*tcpAddr, *token)
-			if err != nil {
-				fmt.Fprintln(os.Stderr, "dial tcp transport:", err)
-				return
-			}
-			defer gc.close()
-		}
 		for {
 			select {
 			case <-stop:
@@ -100,51 +100,35 @@ func main() {
 			var code int
 			var ok bool
 			var msgs int
+			var published int
+			var consumed int
 			switch *mode {
 			case "publish":
-				if gc != nil {
-					dur, code, ok, msgs = doPublishTCP(gc, *queue, payload, *batch)
-				} else {
-					dur, code, ok, msgs = doPublish(client, *addr, *token, *queue, payload, *batch)
-				}
+				dur, code, ok, msgs = doPublish(client, frameCodec, *protocol, *addr, *token, *queue, payload, *batch)
+				published = msgs
 			case "pull":
-				if gc != nil {
-					dur, code, ok, msgs = doPullTCP(gc, *queue, *pullLimit, workerID)
-				} else {
-					dur, code, ok, msgs = doPull(client, *addr, *token, *queue, *pullLimit, workerID, *group)
-				}
+				dur, code, ok, msgs = doPull(client, frameCodec, *protocol, *addr, *token, *queue, *pullLimit, workerID, *group)
+				consumed = msgs
 			case "roundtrip":
-				var pdur time.Duration
-				var pcode int
-				var pok bool
-				var pmsgs int
-				if gc != nil {
-					pdur, pcode, pok, pmsgs = doPublishTCP(gc, *queue, payload, *batch)
-				} else {
-					pdur, pcode, pok, pmsgs = doPublish(client, *addr, *token, *queue, payload, *batch)
-				}
+				pdur, pcode, pok, pmsgs := doPublish(client, frameCodec, *protocol, *addr, *token, *queue, payload, *batch)
+				published = pmsgs
 				if !pok {
 					dur, code, ok, msgs = pdur, pcode, pok, pmsgs
 				} else {
-					var qdur time.Duration
-					var qcode int
-					var qok bool
-					var qmsgs int
-					if gc != nil {
-						qdur, qcode, qok, qmsgs = doPullTCP(gc, *queue, *pullLimit, workerID)
-					} else {
-						qdur, qcode, qok, qmsgs = doPull(client, *addr, *token, *queue, *pullLimit, workerID, *group)
-					}
+					qdur, qcode, qok, qmsgs := doPull(client, frameCodec, *protocol, *addr, *token, *queue, *pullLimit, workerID, *group)
 					dur, code, ok, msgs = pdur+qdur, qcode, qok, pmsgs+qmsgs
+					consumed = qmsgs
 				}
 			}
 			atomic.AddInt64(&total, 1)
 			atomic.AddInt64(&totalMsgs, int64(msgs))
+			atomic.AddInt64(&totalPublished, int64(published))
+			atomic.AddInt64(&totalConsumed, int64(consumed))
 			if !ok {
 				atomic.AddInt64(&errs, 1)
 			}
 			resultsMu.Lock()
-			results = append(results, result{ok: ok, dur: dur, code: code, msgs: msgs})
+			results = append(results, result{ok: ok, dur: dur, code: code, msgs: msgs, published: published, consumed: consumed})
 			resultsMu.Unlock()
 		}
 	}
@@ -158,7 +142,7 @@ func main() {
 	wg.Wait()
 	elapsed := time.Since(start)
 
-	report(results, total, errs, totalMsgs, elapsed)
+	report(results, total, errs, totalMsgs, totalPublished, totalConsumed, elapsed)
 }
 
 func waitForReady(client *http.Client, addr string, timeout time.Duration) {
@@ -193,7 +177,14 @@ func declareQueue(client *http.Client, addr, token, queue string) {
 
 // doPublish sends either a single message via /publish or, when batch > 1, a
 // slice of messages via /publish/batch — one HTTP round trip either way.
-func doPublish(client *http.Client, addr, token, queue string, payload []byte, batch int) (time.Duration, int, bool, int) {
+func doPublish(client *http.Client, codec broker.FrameCodec, protocol, addr, token, queue string, payload []byte, batch int) (time.Duration, int, bool, int) {
+	if protocol == "frame" {
+		return doPublishFrame(client, codec, addr, token, queue, payload, batch)
+	}
+	return doPublishJSON(client, addr, token, queue, payload, batch)
+}
+
+func doPublishJSON(client *http.Client, addr, token, queue string, payload []byte, batch int) (time.Duration, int, bool, int) {
 	if batch <= 1 {
 		body, _ := json.Marshal(map[string]any{
 			"topic":   "bench",
@@ -203,6 +194,7 @@ func doPublish(client *http.Client, addr, token, queue string, payload []byte, b
 		req, _ := http.NewRequest(http.MethodPost, addr+"/publish", bytes.NewReader(body))
 		req.Header.Set("Authorization", "Bearer "+token)
 		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Prefer", "return=minimal")
 		start := time.Now()
 		resp, err := client.Do(req)
 		dur := time.Since(start)
@@ -231,6 +223,7 @@ func doPublish(client *http.Client, addr, token, queue string, payload []byte, b
 	req, _ := http.NewRequest(http.MethodPost, addr+"/publish/batch", bytes.NewReader(body))
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Prefer", "return=minimal")
 	start := time.Now()
 	resp, err := client.Do(req)
 	dur := time.Since(start)
@@ -241,6 +234,9 @@ func doPublish(client *http.Client, addr, token, queue string, payload []byte, b
 	resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return dur, resp.StatusCode, false, 0
+	}
+	if resp.StatusCode == http.StatusNoContent {
+		return dur, resp.StatusCode, true, batch
 	}
 	var out struct {
 		Results []json.RawMessage `json:"results"`
@@ -261,7 +257,14 @@ func doPublish(client *http.Client, addr, token, queue string, payload []byte, b
 // in a single /ack/batch call. Ack failures are counted against msgs so a
 // worker that leases but can't durably complete messages shows up as errors
 // rather than silently inflating throughput.
-func doPull(client *http.Client, addr, token, queue string, limit int, consumerID, group string) (time.Duration, int, bool, int) {
+func doPull(client *http.Client, codec broker.FrameCodec, protocol, addr, token, queue string, limit int, consumerID, group string) (time.Duration, int, bool, int) {
+	if protocol == "frame" {
+		return doPullFrame(client, codec, addr, token, queue, limit, consumerID, group)
+	}
+	return doPullJSON(client, addr, token, queue, limit, consumerID, group)
+}
+
+func doPullJSON(client *http.Client, addr, token, queue string, limit int, consumerID, group string) (time.Duration, int, bool, int) {
 	body, _ := json.Marshal(map[string]any{
 		"consumer_id":    consumerID,
 		"consumer_group": group,
@@ -301,6 +304,7 @@ func doPull(client *http.Client, addr, token, queue string, limit int, consumerI
 	ackReq, _ := http.NewRequest(http.MethodPost, addr+"/ack/batch", bytes.NewReader(ackBody))
 	ackReq.Header.Set("Authorization", "Bearer "+token)
 	ackReq.Header.Set("Content-Type", "application/json")
+	ackReq.Header.Set("Prefer", "return=minimal")
 	ackResp, err := client.Do(ackReq)
 	dur := time.Since(start)
 	if err != nil {
@@ -308,6 +312,9 @@ func doPull(client *http.Client, addr, token, queue string, limit int, consumerI
 	}
 	ackData, _ := io.ReadAll(ackResp.Body)
 	ackResp.Body.Close()
+	if ackResp.StatusCode == http.StatusNoContent {
+		return dur, ackResp.StatusCode, true, len(msgs)
+	}
 	var ackOut struct {
 		Acked int `json:"acked"`
 	}
@@ -315,120 +322,83 @@ func doPull(client *http.Client, addr, token, queue string, limit int, consumerI
 	return dur, ackResp.StatusCode, ackOut.Acked == len(msgs), ackOut.Acked
 }
 
-// grpcClient speaks the broker's length-prefixed-JSON/TCP transport
-// (broker.GRPCServer): a persistent connection carrying one request/response
-// pair at a time, avoiding per-request HTTP framing and connection-setup
-// overhead. Not safe for concurrent use — each loadgen worker gets its own.
-type grpcClient struct {
-	conn  net.Conn
-	token string
-	enc   *json.Encoder
-	dec   *json.Decoder
-	seq   int64
-}
-
-type grpcWireRequest struct {
-	ID      string            `json:"id"`
-	Method  string            `json:"method"`
-	Body    json.RawMessage   `json:"body"`
-	Headers map[string]string `json:"headers,omitempty"`
-}
-
-type grpcWireResponse struct {
-	ID     string          `json:"id"`
-	Error  string          `json:"error,omitempty"`
-	Status int             `json:"status"`
-	Body   json.RawMessage `json:"body,omitempty"`
-}
-
-func dialGRPC(addr, token string) (*grpcClient, error) {
-	conn, err := net.DialTimeout("tcp", addr, 10*time.Second)
+func doPublishFrame(client *http.Client, codec broker.FrameCodec, addr, token, queue string, payload []byte, batch int) (time.Duration, int, bool, int) {
+	if batch <= 0 {
+		batch = 1
+	}
+	messages := make([]broker.Message, batch)
+	for i := range messages {
+		messages[i] = broker.Message{Topic: "bench", Queue: queue, Payload: payload, ContentType: "application/octet-stream"}
+	}
+	body, err := broker.EncodeMessageFrameBatch(nil, codec, messages)
 	if err != nil {
-		return nil, err
+		return 0, 0, false, 0
 	}
-	// Buffer reads explicitly: json.Decoder reading straight off a net.Conn
-	// issues one syscall per read-ahead chunk with no coalescing, unlike
-	// Go's http.Transport which buffers internally.
-	r := bufio.NewReaderSize(conn, 64<<10)
-	return &grpcClient{conn: conn, token: token, enc: json.NewEncoder(conn), dec: json.NewDecoder(r)}, nil
-}
-
-func (c *grpcClient) call(method string, body any) (grpcWireResponse, error) {
-	c.seq++
-	payload, _ := json.Marshal(body)
-	req := grpcWireRequest{ID: strconv.FormatInt(c.seq, 10), Method: method, Body: payload}
-	if c.token != "" {
-		req.Headers = map[string]string{"Authorization": "Bearer " + c.token}
-	}
-	if err := c.enc.Encode(req); err != nil {
-		return grpcWireResponse{}, err
-	}
-	var resp grpcWireResponse
-	if err := c.dec.Decode(&resp); err != nil {
-		return grpcWireResponse{}, err
-	}
-	return resp, nil
-}
-
-func (c *grpcClient) close() { c.conn.Close() }
-
-func doPublishTCP(gc *grpcClient, queue string, payload []byte, batch int) (time.Duration, int, bool, int) {
-	// The TCP transport has no batch-publish method; -batch is ignored here
-	// (kept naive/single-message, matching the "smart without manual
-	// tuning" default) and each call publishes one message.
-	_ = batch
+	req, _ := http.NewRequest(http.MethodPost, addr+"/v1/publish/frame/batch", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/vnd.pool.broker.frames")
+	req.Header.Set("Prefer", "return=minimal")
 	start := time.Now()
-	resp, err := gc.call("broker.Publish", map[string]any{
-		"topic":   "bench",
-		"queue":   queue,
-		"payload": json.RawMessage(payload),
-	})
+	resp, err := client.Do(req)
 	dur := time.Since(start)
 	if err != nil {
 		return dur, 0, false, 0
 	}
-	ok := resp.Status >= 200 && resp.Status < 300
-	msgs := 0
-	if ok {
-		msgs = 1
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	ok := resp.StatusCode >= 200 && resp.StatusCode < 300
+	if !ok {
+		return dur, resp.StatusCode, false, 0
 	}
-	return dur, resp.Status, ok, msgs
+	return dur, resp.StatusCode, true, batch
 }
 
-func doPullTCP(gc *grpcClient, queue string, limit int, consumerID string) (time.Duration, int, bool, int) {
+func doPullFrame(client *http.Client, codec broker.FrameCodec, addr, token, queue string, limit int, consumerID, group string) (time.Duration, int, bool, int) {
+	query := url.Values{}
+	query.Set("queue", queue)
+	query.Set("consumer_id", consumerID)
+	query.Set("consumer_group", group)
+	query.Set("limit", strconv.Itoa(limit))
+	req, _ := http.NewRequest(http.MethodGet, addr+"/v1/poll/frame?"+query.Encode(), nil)
+	req.Header.Set("Authorization", "Bearer "+token)
 	start := time.Now()
-	resp, err := gc.call("broker.Poll", map[string]any{
-		"queue":    queue,
-		"limit":    limit,
-		"consumer": consumerID,
-	})
+	resp, err := client.Do(req)
 	if err != nil {
 		return time.Since(start), 0, false, 0
 	}
-	if resp.Status < 200 || resp.Status >= 300 {
-		return time.Since(start), resp.Status, false, 0
+	data, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return time.Since(start), resp.StatusCode, false, 0
 	}
-	var msgs []struct {
-		ID         string `json:"id"`
-		LeaseToken string `json:"lease_token"`
+	messages, err := broker.DecodeMessageFrameBatch(data, codec, limit)
+	if err != nil {
+		return time.Since(start), resp.StatusCode, false, 0
 	}
-	if err := json.Unmarshal(resp.Body, &msgs); err != nil || len(msgs) == 0 {
-		return time.Since(start), resp.Status, true, 0 // empty queue is not an error
+	if len(messages) == 0 {
+		return time.Since(start), resp.StatusCode, true, 0
 	}
-	acked := 0
-	for _, m := range msgs {
-		ackResp, err := gc.call("broker.Ack", map[string]any{
-			"message_id":  m.ID,
-			"queue":       queue,
-			"lease_token": m.LeaseToken,
-			"consumer_id": consumerID,
-		})
-		if err == nil && ackResp.Status >= 200 && ackResp.Status < 300 {
-			acked++
-		}
+	acks := make([]broker.AckRequest, len(messages))
+	for i := range messages {
+		acks[i] = broker.AckRequest{MessageID: messages[i].ID, Queue: queue, LeaseToken: messages[i].LeaseToken, ConsumerID: consumerID}
 	}
+	ackBody := broker.EncodeAckFrameBatch(nil, acks)
+	ackReq, _ := http.NewRequest(http.MethodPost, addr+"/v1/ack/frame", bytes.NewReader(ackBody))
+	ackReq.Header.Set("Authorization", "Bearer "+token)
+	ackReq.Header.Set("Content-Type", "application/vnd.pool.broker.acks")
+	ackReq.Header.Set("Prefer", "return=minimal")
+	ackResp, err := client.Do(ackReq)
 	dur := time.Since(start)
-	return dur, resp.Status, acked == len(msgs), acked
+	if err != nil {
+		return dur, 0, false, 0
+	}
+	io.Copy(io.Discard, ackResp.Body)
+	ackResp.Body.Close()
+	ok := ackResp.StatusCode >= 200 && ackResp.StatusCode < 300
+	if !ok {
+		return dur, ackResp.StatusCode, false, 0
+	}
+	return dur, ackResp.StatusCode, true, len(messages)
 }
 
 func randPayload(n int) []byte {
@@ -441,7 +411,7 @@ func randPayload(n int) []byte {
 	return []byte(`"` + string(buf) + `"`)
 }
 
-func report(results []result, total, errs, totalMsgs int64, elapsed time.Duration) {
+func report(results []result, total, errs, totalMsgs, totalPublished, totalConsumed int64, elapsed time.Duration) {
 	durs := make([]time.Duration, 0, len(results))
 	codeCounts := map[int]int{}
 	for _, r := range results {
@@ -470,7 +440,9 @@ func report(results []result, total, errs, totalMsgs int64, elapsed time.Duratio
 	fmt.Printf("errors         : %d (%.2f%%)\n", errs, 100*float64(errs)/float64(max64(total, 1)))
 	fmt.Printf("elapsed        : %s\n", elapsed)
 	fmt.Printf("req/s          : %.1f\n", rps)
-	fmt.Printf("msg/s          : %.1f\n", mps)
+	fmt.Printf("msg/s combined : %.1f\n", mps)
+	fmt.Printf("publish msg/s  : %.1f\n", float64(totalPublished)/elapsed.Seconds())
+	fmt.Printf("consume msg/s  : %.1f\n", float64(totalConsumed)/elapsed.Seconds())
 	if len(durs) > 0 {
 		fmt.Printf("latency p50    : %s\n", pct(0.50))
 		fmt.Printf("latency p95    : %s\n", pct(0.95))

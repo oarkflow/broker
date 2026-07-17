@@ -1,6 +1,6 @@
 module github.com/oarkflow/broker/cmd
 
-go 1.26.2
+go 1.23.2
 
 require (
 	github.com/oarkflow/broker v0.0.0

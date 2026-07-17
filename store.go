@@ -58,22 +58,23 @@ type AtomicStore interface {
 	AppendAtomic(context.Context, []AppendEntry) ([]Message, error)
 }
 
-// BatchAppendResult is the per-entry outcome of a BatchAppendStore.AppendBatch
-// call. Unlike AppendAtomic, a failure in one entry does not affect the
-// others — each publisher gets its own success/error independent of what
-// else was coalesced into the same batch.
-type BatchAppendResult struct {
-	Messages []Message
-	Err      error
+type MinimalAtomicStore interface {
+	AppendAtomicMinimal(context.Context, []AppendEntry) error
 }
 
-// BatchAppendStore is an optional Store capability that appends many
-// unrelated entries (e.g. concurrent publishes from different callers)
-// under a single lock/fsync instead of one per entry, while preserving
-// per-entry error isolation. Stores that don't implement it fall back to
-// looping over Append.
-type BatchAppendStore interface {
-	AppendBatch(context.Context, []AppendEntry) []BatchAppendResult
+// OwnedAtomicStore is the zero-copy batch append path. Ownership of message
+// payload/header/metadata slices and maps transfers to the store; callers must
+// not mutate entries after the method returns.
+type OwnedAtomicStore interface {
+	AppendAtomicOwned(context.Context, []AppendEntry) error
+}
+
+type BatchAckStore interface {
+	AckBatch(context.Context, []AckRequest) []error
+}
+
+type BatchUpdateStore interface {
+	UpdateBatch(context.Context, []Message) []error
 }
 
 type LeaseRequest struct {
@@ -187,9 +188,12 @@ type StoreStats struct {
 }
 
 type memoryQueue struct {
-	cfg   QueueConfig
-	ids   []string
-	state QueueState
+	cfg         QueueConfig
+	ids         []string
+	head        int
+	depth       int
+	hasPriority bool
+	state       QueueState
 }
 
 type memoryTopic struct {
@@ -205,21 +209,87 @@ type memoryStream struct {
 }
 
 type MemoryStore struct {
-	mu       sync.RWMutex
-	queues   map[string]*memoryQueue
-	topics   map[string]*memoryTopic
-	streams  map[string]*memoryStream
-	messages map[string]*Message
-	history  map[string][]MessageHistory
-	offsets  map[string]map[string]uint64
-	dedup    map[string]time.Time
-	idemp    map[string]string
-	rand     *mathrand.Rand
-	closed   bool
+	mu              sync.RWMutex
+	queues          map[string]*memoryQueue
+	topics          map[string]*memoryTopic
+	streams         map[string]*memoryStream
+	messages        map[string]*Message
+	history         map[string][]MessageHistory
+	offsets         map[string]map[string]uint64
+	dedup           map[string]time.Time
+	idemp           map[string]string
+	rand            *mathrand.Rand
+	historyLimit    int
+	retainCompleted bool
+	completed       map[string]struct{}
+	completedOrder  []string
+	completedNext   int
+	completedLimit  int
+	closed          bool
 }
 
 func NewMemoryStore() *MemoryStore {
-	return &MemoryStore{queues: map[string]*memoryQueue{}, topics: map[string]*memoryTopic{}, streams: map[string]*memoryStream{}, messages: map[string]*Message{}, history: map[string][]MessageHistory{}, offsets: map[string]map[string]uint64{}, dedup: map[string]time.Time{}, idemp: map[string]string{}, rand: mathrand.New(mathrand.NewSource(time.Now().UnixNano()))}
+	return &MemoryStore{queues: map[string]*memoryQueue{}, topics: map[string]*memoryTopic{}, streams: map[string]*memoryStream{}, messages: map[string]*Message{}, history: map[string][]MessageHistory{}, offsets: map[string]map[string]uint64{}, dedup: map[string]time.Time{}, idemp: map[string]string{}, rand: mathrand.New(mathrand.NewSource(time.Now().UnixNano())), historyLimit: 32, retainCompleted: true, completed: map[string]struct{}{}, completedLimit: 65536}
+}
+
+func (s *MemoryStore) addCompletedTombstoneLocked(id string) {
+	if id == "" || s.completedLimit <= 0 {
+		return
+	}
+	if _, exists := s.completed[id]; exists {
+		return
+	}
+	if len(s.completedOrder) < s.completedLimit {
+		s.completedOrder = append(s.completedOrder, id)
+	} else {
+		old := s.completedOrder[s.completedNext]
+		delete(s.completed, old)
+		s.completedOrder[s.completedNext] = id
+		s.completedNext++
+		if s.completedNext == len(s.completedOrder) {
+			s.completedNext = 0
+		}
+	}
+	s.completed[id] = struct{}{}
+}
+
+func (s *MemoryStore) wasCompleted(id string) bool {
+	s.mu.RLock()
+	_, ok := s.completed[id]
+	s.mu.RUnlock()
+	return ok
+}
+
+func (s *MemoryStore) SetRetainCompleted(retain bool) {
+	s.mu.Lock()
+	s.retainCompleted = retain
+	if !retain {
+		for id, m := range s.messages {
+			if m != nil && (m.Status == MessageCompleted || m.Status == MessagePurged) {
+				if m.Status == MessageCompleted {
+					s.addCompletedTombstoneLocked(id)
+				}
+				delete(s.messages, id)
+				delete(s.history, id)
+			}
+		}
+		for _, q := range s.queues {
+			s.advanceQueueHeadLocked(q)
+		}
+	}
+	s.mu.Unlock()
+}
+
+func (s *MemoryStore) SetHistoryLimit(limit int) {
+	if limit < 0 {
+		limit = 0
+	}
+	s.mu.Lock()
+	s.historyLimit = limit
+	if limit == 0 {
+		s.history = map[string][]MessageHistory{}
+	}
+	s.mu.Unlock()
 }
 
 func (s *MemoryStore) DeclareQueue(ctx context.Context, cfg QueueConfig) error {
@@ -315,10 +385,14 @@ func (s *MemoryStore) Append(ctx context.Context, msg Message, dests []Destinati
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.appendLocked(msg, dests)
+	return s.appendLockedCollect(msg, dests, true, false)
 }
 
 func (s *MemoryStore) appendLocked(msg Message, dests []Destination) ([]Message, error) {
+	return s.appendLockedCollect(msg, dests, true, false)
+}
+
+func (s *MemoryStore) appendLockedCollect(msg Message, dests []Destination, collect, owned bool) ([]Message, error) {
 	if s.closed {
 		return nil, ErrClosed
 	}
@@ -347,13 +421,22 @@ func (s *MemoryStore) appendLocked(msg Message, dests []Destination) ([]Message,
 	if len(dests) == 0 {
 		dests = []Destination{{Kind: DestinationTopic, Name: msg.Topic}}
 	}
-	out := make([]Message, 0, len(dests))
+	var out []Message
+	if collect {
+		out = make([]Message, 0, len(dests))
+	}
 	copyNo := 0
+	now := time.Now()
 	for _, d := range dests {
 		if d.Name == "" {
 			continue
 		}
-		m := cloneMessage(msg)
+		var m Message
+		if owned && copyNo == 0 {
+			m = msg
+		} else {
+			m = cloneMessage(msg)
+		}
 		if copyNo > 0 {
 			m.ParentID = msg.ID
 			m.ID = msg.ID + ":copy:" + itoa(copyNo)
@@ -374,19 +457,21 @@ func (s *MemoryStore) appendLocked(msg Message, dests []Destination) ([]Message,
 				s.queues[d.Name] = &memoryQueue{cfg: QueueConfig{Name: d.Name, VisibilityTimeout: 30 * time.Second, RetryPolicy: DefaultRetryPolicy()}, state: QueueActive}
 			}
 			q := s.queues[d.Name]
-			if q.cfg.MaxDepth > 0 && len(q.ids) >= q.cfg.MaxDepth {
+			if q.cfg.MaxDepth > 0 && q.depth >= q.cfg.MaxDepth {
 				if handled, err := s.applyBackpressureLocked(q, d.Name, &m); handled || err != nil {
 					if err != nil {
 						return out, err
 					}
-					out = append(out, cloneMessage(m))
+					if collect {
+						out = append(out, cloneMessage(m))
+					}
 					continue
 				}
 			}
 			m.Queue = d.Name
 			if d.Kind == DestinationDLQ {
 				m.Status = MessageDeadLettered
-			} else if m.AvailableAt.After(time.Now()) {
+			} else if m.AvailableAt.After(now) {
 				m.Status = MessageScheduled
 			} else {
 				m.Status = MessageQueued
@@ -395,6 +480,10 @@ func (s *MemoryStore) appendLocked(msg Message, dests []Destination) ([]Message,
 			m.LeaseUntil = time.Time{}
 			s.messages[m.ID] = &m
 			q.ids = append(q.ids, m.ID)
+			q.depth++
+			if m.Priority != 0 {
+				q.hasPriority = true
+			}
 			s.addHistoryLocked(m.ID, m.Status, "queue_append", "", d.Name, "", "", "")
 		case DestinationStream, DestinationArchive:
 			if _, ok := s.streams[d.Name]; !ok {
@@ -409,7 +498,9 @@ func (s *MemoryStore) appendLocked(msg Message, dests []Destination) ([]Message,
 			st.ids = append(st.ids, m.ID)
 			s.addHistoryLocked(m.ID, MessagePersisted, "stream_append", "", d.Name, "", "", "")
 		}
-		out = append(out, cloneMessage(m))
+		if collect {
+			out = append(out, cloneMessage(m))
+		}
 	}
 	if msg.DeduplicationID != "" {
 		s.dedup[msg.DeduplicationID] = time.Now().Add(dedupWindow(msg))
@@ -421,6 +512,20 @@ func (s *MemoryStore) appendLocked(msg Message, dests []Destination) ([]Message,
 }
 
 func (s *MemoryStore) AppendAtomic(ctx context.Context, entries []AppendEntry) ([]Message, error) {
+	return s.appendAtomic(ctx, entries, true, false)
+}
+
+func (s *MemoryStore) AppendAtomicMinimal(ctx context.Context, entries []AppendEntry) error {
+	_, err := s.appendAtomic(ctx, entries, false, false)
+	return err
+}
+
+func (s *MemoryStore) AppendAtomicOwned(ctx context.Context, entries []AppendEntry) error {
+	_, err := s.appendAtomic(ctx, entries, false, true)
+	return err
+}
+
+func (s *MemoryStore) appendAtomic(ctx context.Context, entries []AppendEntry, collect, owned bool) ([]Message, error) {
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
@@ -428,79 +533,78 @@ func (s *MemoryStore) AppendAtomic(ctx context.Context, entries []AppendEntry) (
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.closed {
-		return nil, ErrClosed
+	if err := s.validateAtomicLocked(entries); err != nil {
+		return nil, err
 	}
-	seenDedup := map[string]struct{}{}
-	seenIdemp := map[string]struct{}{}
-	for _, e := range entries {
-		if e.Message.ID == "" {
-			return nil, errf(ErrInvalidMessage, "message id required")
-		}
-		if e.Message.DeduplicationID != "" {
-			if _, dup := seenDedup[e.Message.DeduplicationID]; dup {
-				return nil, ErrDuplicateMessage
-			}
-			seenDedup[e.Message.DeduplicationID] = struct{}{}
-			if until, ok := s.dedup[e.Message.DeduplicationID]; ok && until.After(time.Now()) {
-				return nil, ErrDuplicateMessage
-			}
-		}
-		if e.Message.IdempotencyKey != "" {
-			if _, dup := seenIdemp[e.Message.IdempotencyKey]; dup {
-				return nil, ErrDuplicateMessage
-			}
-			seenIdemp[e.Message.IdempotencyKey] = struct{}{}
-			if existing, ok := s.idemp[e.Message.IdempotencyKey]; ok && existing != "" {
-				return nil, ErrDuplicateMessage
-			}
-		}
-		for _, d := range e.Destinations {
-			if d.Kind == DestinationQueue || d.Kind == DestinationDLQ {
-				q := s.queues[d.Name]
-				if q != nil && q.cfg.MaxDepth > 0 && len(q.ids) >= q.cfg.MaxDepth && q.cfg.Backpressure != BackpressureDropOldest && q.cfg.Backpressure != BackpressureDLQ && q.cfg.Backpressure != BackpressureDropNewest {
-					return nil, ErrBackpressure
-				}
-			}
-		}
+	var out []Message
+	if collect {
+		out = make([]Message, 0, len(entries))
 	}
-	out := make([]Message, 0, len(entries))
-	for _, e := range entries {
-		stored, err := s.appendLocked(e.Message, e.Destinations)
+	for _, entry := range entries {
+		stored, err := s.appendLockedCollect(entry.Message, entry.Destinations, collect, owned)
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, stored...)
+		if collect {
+			out = append(out, stored...)
+		}
 	}
 	return out, nil
 }
 
-// AppendBatch appends many independent entries under a single lock
-// acquisition. Unlike AppendAtomic, one entry's error does not abort the
-// rest — each gets its own result, matching the semantics of calling
-// Append once per entry but without paying for a lock per call.
-func (s *MemoryStore) AppendBatch(ctx context.Context, entries []AppendEntry) []BatchAppendResult {
-	results := make([]BatchAppendResult, len(entries))
-	select {
-	case <-ctx.Done():
-		for i := range results {
-			results[i].Err = ctx.Err()
-		}
-		return results
-	default:
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
+func (s *MemoryStore) validateAtomicLocked(entries []AppendEntry) error {
 	if s.closed {
-		for i := range results {
-			results[i].Err = ErrClosed
+		return ErrClosed
+	}
+	var seenDedup, seenIdemp map[string]struct{}
+	var pendingDepth map[string]int
+	now := time.Now()
+	for _, entry := range entries {
+		if entry.Message.ID == "" {
+			return errf(ErrInvalidMessage, "message id required")
 		}
-		return results
+		if id := entry.Message.DeduplicationID; id != "" {
+			if seenDedup == nil {
+				seenDedup = make(map[string]struct{})
+			}
+			if _, ok := seenDedup[id]; ok {
+				return ErrDuplicateMessage
+			}
+			seenDedup[id] = struct{}{}
+			if until, ok := s.dedup[id]; ok && until.After(now) {
+				return ErrDuplicateMessage
+			}
+		}
+		if key := entry.Message.IdempotencyKey; key != "" {
+			if seenIdemp == nil {
+				seenIdemp = make(map[string]struct{})
+			}
+			if _, ok := seenIdemp[key]; ok {
+				return ErrDuplicateMessage
+			}
+			seenIdemp[key] = struct{}{}
+			if existing := s.idemp[key]; existing != "" {
+				return ErrDuplicateMessage
+			}
+		}
+		for _, d := range entry.Destinations {
+			if d.Kind != DestinationQueue && d.Kind != DestinationDLQ {
+				continue
+			}
+			q := s.queues[d.Name]
+			if q == nil || q.cfg.MaxDepth <= 0 {
+				continue
+			}
+			if pendingDepth == nil {
+				pendingDepth = make(map[string]int)
+			}
+			pendingDepth[d.Name]++
+			if q.depth+pendingDepth[d.Name] > q.cfg.MaxDepth && q.cfg.Backpressure != BackpressureDropOldest && q.cfg.Backpressure != BackpressureDLQ && q.cfg.Backpressure != BackpressureDropNewest {
+				return ErrBackpressure
+			}
+		}
 	}
-	for i, e := range entries {
-		results[i].Messages, results[i].Err = s.appendLocked(e.Message, e.Destinations)
-	}
-	return results
+	return nil
 }
 
 func (s *MemoryStore) Lease(ctx context.Context, req LeaseRequest) ([]Message, error) {
@@ -525,87 +629,159 @@ func (s *MemoryStore) Lease(ctx context.Context, req LeaseRequest) ([]Message, e
 	if q.state == QueuePaused {
 		return nil, ErrPaused
 	}
-	out := make([]Message, 0, req.Limit)
-	// Bounded priority scan: keep only top-priority candidates up to scanLimit.
-	scanLimit := req.Limit
-	if scanLimit > len(q.ids) {
-		scanLimit = len(q.ids)
-	}
-	type candidate struct {
-		idx      int
-		priority int
-	}
-	// minBuf is a small fixed-capacity buffer of the best candidates seen so far.
-	// It's kept sorted descending by priority. We replace the lowest when we find a better one.
-	minBuf := make([]candidate, 0, scanLimit)
-	for i, id := range q.ids {
-		m := s.messages[id]
-		if m == nil {
-			continue
-		}
-		if m.Status == MessageQueued || m.Status == MessageScheduled || m.Status == MessageAvailable || m.Status == MessageRetryScheduled {
+	out := make([]Message, 0, minInt(req.Limit, q.depth))
+
+	if !q.hasPriority {
+		for i := q.head; i < len(q.ids) && len(out) < req.Limit; i++ {
+			m := s.messages[q.ids[i]]
+			if m == nil || m.Queue != req.Queue || isTerminalQueueStatus(m.Status) {
+				continue
+			}
 			if !m.ExpiresAt.IsZero() && now.After(m.ExpiresAt) {
 				m.Status = MessageExpired
+				m.LeaseToken = ""
+				m.LeaseUntil = time.Time{}
+				if q.depth > 0 {
+					q.depth--
+				}
 				s.addHistoryLocked(m.ID, MessageExpired, "expired", req.Queue, "", "ttl expired", req.ConsumerID, "")
 				continue
 			}
-			if m.AvailableAt.IsZero() || !m.AvailableAt.After(now) {
-				if len(minBuf) < scanLimit {
-					minBuf = append(minBuf, candidate{idx: i, priority: m.Priority})
-					// Keep minBuf sorted descending so the last element is the minimum.
-					for k := len(minBuf) - 1; k > 0 && minBuf[k].priority > minBuf[k-1].priority; k-- {
-						minBuf[k], minBuf[k-1] = minBuf[k-1], minBuf[k]
-					}
-				} else if m.Priority > minBuf[len(minBuf)-1].priority {
-					minBuf[len(minBuf)-1] = candidate{idx: i, priority: m.Priority}
-					// Bubble up the new element to maintain descending order.
-					for k := len(minBuf) - 1; k > 0 && minBuf[k].priority > minBuf[k-1].priority; k-- {
-						minBuf[k], minBuf[k-1] = minBuf[k-1], minBuf[k]
-					}
-				}
+			if !isLeaseableQueueStatus(m.Status) || (!m.AvailableAt.IsZero() && m.AvailableAt.After(now)) {
+				continue
+			}
+			s.leaseMessageLocked(m, req, now)
+			out = append(out, cloneMessage(*m))
+		}
+		s.advanceQueueHeadLocked(q)
+		return out, nil
+	}
+
+	type candidate struct{ idx, priority int }
+	candidates := make([]candidate, 0, minInt(req.Limit, q.depth))
+	for i := q.head; i < len(q.ids); i++ {
+		m := s.messages[q.ids[i]]
+		if m == nil || m.Queue != req.Queue || isTerminalQueueStatus(m.Status) {
+			continue
+		}
+		if !m.ExpiresAt.IsZero() && now.After(m.ExpiresAt) {
+			m.Status = MessageExpired
+			m.LeaseToken = ""
+			m.LeaseUntil = time.Time{}
+			if q.depth > 0 {
+				q.depth--
+			}
+			s.addHistoryLocked(m.ID, MessageExpired, "expired", req.Queue, "", "ttl expired", req.ConsumerID, "")
+			continue
+		}
+		if !isLeaseableQueueStatus(m.Status) || (!m.AvailableAt.IsZero() && m.AvailableAt.After(now)) {
+			continue
+		}
+		if len(candidates) < req.Limit {
+			candidates = append(candidates, candidate{i, m.Priority})
+			for k := len(candidates) - 1; k > 0 && candidates[k].priority > candidates[k-1].priority; k-- {
+				candidates[k], candidates[k-1] = candidates[k-1], candidates[k]
+			}
+		} else if m.Priority > candidates[len(candidates)-1].priority {
+			candidates[len(candidates)-1] = candidate{i, m.Priority}
+			for k := len(candidates) - 1; k > 0 && candidates[k].priority > candidates[k-1].priority; k-- {
+				candidates[k], candidates[k-1] = candidates[k-1], candidates[k]
 			}
 		}
 	}
-	// minBuf is already sorted descending by priority; FIFO order is preserved for
-	// equal priorities because we scan q.ids in order and only append (never reorder
-	// equal elements).
-	for _, c := range minBuf {
-		if len(out) >= req.Limit {
-			break
-		}
+	for _, c := range candidates {
 		m := s.messages[q.ids[c.idx]]
 		if m == nil {
 			continue
 		}
-		m.Status = MessageLeased
-		m.ConsumerID = req.ConsumerID
-		m.ConsumerGroup = req.ConsumerGroup
-		m.LeaseToken = newIDLocked(s, "lease")
-		m.LeaseUntil = now.Add(req.VisibilityTimeout)
-		s.addHistoryLocked(m.ID, MessageLeased, "leased", req.Queue, req.ConsumerID, "", req.ConsumerID, "")
+		s.leaseMessageLocked(m, req, now)
 		out = append(out, cloneMessage(*m))
 	}
+	s.advanceQueueHeadLocked(q)
 	return out, nil
 }
 
+func isLeaseableQueueStatus(status MessageStatus) bool {
+	switch status {
+	case MessageQueued, MessageScheduled, MessageAvailable, MessageRetryScheduled, MessageDeadLettered:
+		return true
+	default:
+		return false
+	}
+}
+
+func isTerminalQueueStatus(status MessageStatus) bool {
+	switch status {
+	case MessageCompleted, MessagePurged, MessageExpired, MessageMoved, MessageCancelled:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *MemoryStore) leaseMessageLocked(m *Message, req LeaseRequest, now time.Time) {
+	m.Status = MessageLeased
+	m.ConsumerID = req.ConsumerID
+	m.ConsumerGroup = req.ConsumerGroup
+	m.LeaseToken = newIDLocked(s, "lease")
+	m.LeaseUntil = now.Add(req.VisibilityTimeout)
+	s.addHistoryLocked(m.ID, MessageLeased, "leased", req.Queue, req.ConsumerID, "", req.ConsumerID, "")
+}
+
 func (s *MemoryStore) Ack(ctx context.Context, req AckRequest) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.ackLocked(req)
+}
+
+func (s *MemoryStore) ackLocked(req AckRequest) error {
 	m, ok := s.messages[req.MessageID]
 	if !ok {
+		if _, completed := s.completed[req.MessageID]; completed {
+			return nil
+		}
 		return ErrMessageNotFound
 	}
-	if m.LeaseToken != "" {
-		if req.LeaseToken == "" || m.LeaseToken != req.LeaseToken {
-			return ErrLeaseLost
-		}
+	if m.Status == MessageCompleted {
+		return nil
+	}
+	if m.LeaseToken != "" && (req.LeaseToken == "" || m.LeaseToken != req.LeaseToken) {
+		return ErrLeaseLost
 	}
 	m.Status = MessageCompleted
 	m.LeaseToken = ""
 	m.LeaseUntil = time.Time{}
 	s.removeFromQueueLocked(m.Queue, m.ID)
 	s.addHistoryLocked(m.ID, MessageCompleted, "acked", req.Queue, "", "", req.ConsumerID, "")
+	if !s.retainCompleted {
+		s.addCompletedTombstoneLocked(m.ID)
+		delete(s.messages, m.ID)
+		delete(s.history, m.ID)
+	}
 	return nil
+}
+
+func (s *MemoryStore) AckBatch(ctx context.Context, reqs []AckRequest) []error {
+	errs := make([]error, len(reqs))
+	select {
+	case <-ctx.Done():
+		for i := range errs {
+			errs[i] = ctx.Err()
+		}
+		return errs
+	default:
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range reqs {
+		errs[i] = s.ackLocked(reqs[i])
+	}
+	return errs
 }
 
 func (s *MemoryStore) validateAckLease(req AckRequest) error {
@@ -613,6 +789,9 @@ func (s *MemoryStore) validateAckLease(req AckRequest) error {
 	defer s.mu.RUnlock()
 	m, ok := s.messages[req.MessageID]
 	if !ok {
+		if _, completed := s.completed[req.MessageID]; completed {
+			return nil
+		}
 		return ErrMessageNotFound
 	}
 	if m.LeaseToken != "" {
@@ -662,15 +841,21 @@ func (s *MemoryStore) Nack(ctx context.Context, req NackRequest) error {
 		if dlq == "" {
 			dlq = m.Queue + ".dlq"
 		}
-		s.removeFromQueueLocked(m.Queue, m.ID)
-		m.OriginalQueue = firstNonEmpty(m.OriginalQueue, m.Queue)
+		sourceQueue := m.Queue
+		s.removeFromQueueLocked(sourceQueue, m.ID)
+		m.OriginalQueue = firstNonEmpty(m.OriginalQueue, sourceQueue)
 		m.Queue = dlq
 		m.Status = MessageDeadLettered
 		m.DeadLetterReason = req.Reason
 		if _, ok := s.queues[dlq]; !ok {
 			s.queues[dlq] = &memoryQueue{cfg: QueueConfig{Name: dlq}, state: QueueActive}
 		}
-		s.queues[dlq].ids = append(s.queues[dlq].ids, m.ID)
+		dlqQueue := s.queues[dlq]
+		dlqQueue.ids = append(dlqQueue.ids, m.ID)
+		dlqQueue.depth++
+		if source := s.queues[sourceQueue]; source != nil {
+			s.advanceQueueHeadLocked(source)
+		}
 		s.addHistoryLocked(m.ID, MessageDeadLettered, "dead_lettered", req.Queue, dlq, req.Reason, req.ConsumerID, req.Error)
 	case NackRetry:
 		m.Status = MessageRetryScheduled
@@ -714,6 +899,31 @@ func (s *MemoryStore) Update(ctx context.Context, msg Message) error {
 	return nil
 }
 
+func (s *MemoryStore) UpdateBatch(ctx context.Context, messages []Message) []error {
+	errs := make([]error, len(messages))
+	select {
+	case <-ctx.Done():
+		for i := range errs {
+			errs[i] = ctx.Err()
+		}
+		return errs
+	default:
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range messages {
+		msg := messages[i]
+		if _, ok := s.messages[msg.ID]; !ok {
+			errs[i] = ErrMessageNotFound
+			continue
+		}
+		m := cloneMessage(msg)
+		s.messages[msg.ID] = &m
+		s.addHistoryLocked(m.ID, m.Status, "updated", m.Queue, "", "", m.ConsumerID, m.LastError)
+	}
+	return errs
+}
+
 func (s *MemoryStore) Get(ctx context.Context, id string) (Message, bool, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -739,7 +949,7 @@ func (s *MemoryStore) ListQueue(ctx context.Context, name string, limit int) ([]
 	if !ok {
 		return nil, ErrQueueNotFound
 	}
-	return s.listIDsLocked(q.ids, limit, false), nil
+	return s.listQueueIDsLocked(q, name, limit), nil
 }
 
 func (s *MemoryStore) ListDLQ(ctx context.Context, name string, limit int) ([]Message, error) {
@@ -804,17 +1014,23 @@ func (s *MemoryStore) applyBackpressureLocked(q *memoryQueue, queue string, inco
 	}
 	switch policy {
 	case BackpressureDropOldest:
-		for len(q.ids) > 0 {
-			id := q.ids[0]
-			q.ids = q.ids[1:]
+		for i := q.head; i < len(q.ids); i++ {
+			id := q.ids[i]
 			old := s.messages[id]
-			if old == nil || old.Status == MessageLeased || old.Status == MessageProcessing || old.Status == MessageProgressing {
+			if old == nil || isTerminalQueueStatus(old.Status) {
+				continue
+			}
+			if old.Status == MessageLeased || old.Status == MessageProcessing || old.Status == MessageProgressing {
 				continue
 			}
 			old.Status = MessagePurged
 			old.LeaseToken = ""
 			old.LeaseUntil = time.Time{}
+			if q.depth > 0 {
+				q.depth--
+			}
 			s.addHistoryLocked(id, MessagePurged, "backpressure_drop_oldest", queue, "", "queue full", "", "")
+			s.advanceQueueHeadLocked(q)
 			return false, nil
 		}
 		return false, ErrBackpressure
@@ -837,7 +1053,9 @@ func (s *MemoryStore) applyBackpressureLocked(q *memoryQueue, queue string, inco
 		incoming.Status = MessageDeadLettered
 		incoming.DeadLetterReason = "backpressure"
 		s.messages[incoming.ID] = incoming
-		s.queues[dlq].ids = append(s.queues[dlq].ids, incoming.ID)
+		dlqQueue := s.queues[dlq]
+		dlqQueue.ids = append(dlqQueue.ids, incoming.ID)
+		dlqQueue.depth++
 		s.addHistoryLocked(incoming.ID, MessageDeadLettered, "backpressure_dlq", queue, dlq, "queue full", "", "")
 		return true, nil
 	case BackpressureBlock, BackpressureSpillDisk, BackpressureReject:
@@ -859,7 +1077,12 @@ func (s *MemoryStore) appendCloneLocked(m Message, d Destination, req MoveReques
 			m.Status = MessageDeadLettered
 		}
 		s.messages[m.ID] = &m
-		s.queues[d.Name].ids = append(s.queues[d.Name].ids, m.ID)
+		q := s.queues[d.Name]
+		q.ids = append(q.ids, m.ID)
+		q.depth++
+		if m.Priority != 0 {
+			q.hasPriority = true
+		}
 	case DestinationTopic:
 		if _, ok := s.topics[d.Name]; !ok {
 			s.topics[d.Name] = &memoryTopic{cfg: TopicConfig{Name: d.Name}, state: QueueActive}
@@ -917,17 +1140,22 @@ func (s *MemoryStore) PurgeQueue(ctx context.Context, name string) (int, error) 
 	if !ok {
 		return 0, ErrQueueNotFound
 	}
-	n := 0
-	for _, id := range q.ids {
-		if m := s.messages[id]; m != nil {
+	n := q.depth
+	for _, id := range q.ids[q.head:] {
+		if m := s.messages[id]; m != nil && m.Queue == name && !isTerminalQueueStatus(m.Status) {
 			m.Status = MessagePurged
 			m.LeaseToken = ""
 			m.LeaseUntil = time.Time{}
 			s.addHistoryLocked(id, MessagePurged, "purged", name, "", "queue purge", "", "")
+			if !s.retainCompleted {
+				delete(s.messages, id)
+				delete(s.history, id)
+			}
 		}
-		n++
 	}
-	q.ids = nil
+	q.head = len(q.ids)
+	q.depth = 0
+	q.hasPriority = false
 	q.state = QueuePurged
 	return n, nil
 }
@@ -1010,11 +1238,11 @@ func (s *MemoryStore) Stats(ctx context.Context) (StoreStats, error) {
 	defer s.mu.RUnlock()
 	st := StoreStats{Queues: map[string]int{}, Topics: map[string]int{}, Streams: map[string]int{}, Offsets: map[string]map[string]uint64{}, DLQ: map[string]int{}, Messages: len(s.messages)}
 	for name, q := range s.queues {
-		st.Queues[name] = len(q.ids)
+		st.Queues[name] = q.depth
 		if strings.Contains(name, ".dlq") || strings.HasSuffix(name, "dlq") {
-			st.DLQ[name] = len(q.ids)
+			st.DLQ[name] = q.depth
 		}
-		for _, id := range q.ids {
+		for _, id := range q.ids[q.head:] {
 			if m := s.messages[id]; m != nil {
 				if m.Status == MessageLeased {
 					st.Leased++
@@ -1141,6 +1369,9 @@ func (s *MemoryStore) listIDsLocked(ids []string, limit int, dlqOnly bool) []Mes
 			break
 		}
 		if m := s.messages[id]; m != nil {
+			if isTerminalQueueStatus(m.Status) {
+				continue
+			}
 			if dlqOnly && m.Status != MessageDeadLettered {
 				continue
 			}
@@ -1157,7 +1388,7 @@ func (s *MemoryStore) resolveMoveIDsLocked(req MoveRequest) []string {
 	switch req.SourceType {
 	case DestinationQueue, DestinationDLQ:
 		if q := s.queues[req.Source]; q != nil {
-			return append([]string(nil), q.ids...)
+			return append([]string(nil), q.ids[q.head:]...)
 		}
 	case DestinationTopic:
 		if t := s.topics[req.Source]; t != nil {
@@ -1188,8 +1419,44 @@ func (s *MemoryStore) removeFromSourceLocked(kind DestinationKind, source, id st
 
 func (s *MemoryStore) removeFromQueueLocked(queue, id string) {
 	if q := s.queues[queue]; q != nil {
-		q.ids = removeID(q.ids, id)
+		if q.depth > 0 {
+			q.depth--
+		}
+		s.advanceQueueHeadLocked(q)
 	}
+}
+
+func (s *MemoryStore) advanceQueueHeadLocked(q *memoryQueue) {
+	for q.head < len(q.ids) {
+		m := s.messages[q.ids[q.head]]
+		if m != nil && m.Queue == q.cfg.Name && !isTerminalQueueStatus(m.Status) {
+			break
+		}
+		q.head++
+	}
+	if q.head > 4096 && q.head*2 >= len(q.ids) {
+		copy(q.ids, q.ids[q.head:])
+		q.ids = q.ids[:len(q.ids)-q.head]
+		q.head = 0
+	}
+}
+
+func (s *MemoryStore) listQueueIDsLocked(q *memoryQueue, queue string, limit int) []Message {
+	if limit <= 0 || limit > q.depth {
+		limit = q.depth
+	}
+	out := make([]Message, 0, limit)
+	for _, id := range q.ids[q.head:] {
+		if len(out) >= limit {
+			break
+		}
+		m := s.messages[id]
+		if m == nil || m.Queue != queue || isTerminalQueueStatus(m.Status) {
+			continue
+		}
+		out = append(out, cloneMessage(*m))
+	}
+	return out
 }
 
 func removeID(ids []string, id string) []string {
@@ -1203,7 +1470,15 @@ func removeID(ids []string, id string) []string {
 }
 
 func (s *MemoryStore) addHistoryLocked(id string, status MessageStatus, event, source, target, reason, actor, errText string) {
-	s.history[id] = append(s.history[id], MessageHistory{MessageID: id, Status: status, Event: event, Source: source, Target: target, Reason: reason, Actor: actor, Error: errText, Time: time.Now()})
+	if s.historyLimit <= 0 {
+		return
+	}
+	history := append(s.history[id], MessageHistory{MessageID: id, Status: status, Event: event, Source: source, Target: target, Reason: reason, Actor: actor, Error: errText, Time: time.Now()})
+	if len(history) > s.historyLimit {
+		copy(history, history[len(history)-s.historyLimit:])
+		history = history[:s.historyLimit]
+	}
+	s.history[id] = history
 }
 
 func cloneMessage(in Message) Message {
@@ -1274,15 +1549,11 @@ func strconvFormatInt(i int64) string { return strconv.FormatInt(i, 36) }
 // in the config to enable AES-GCM encryption of all WAL records at rest.
 type FileWALStore struct {
 	*MemoryStore
-	dir     string
+	path    string
+	file    *os.File
 	gcm     cipher.AEAD
 	keyName string
-	shards  []*fileWALShard
-}
-
-type fileWALShard struct {
-	file *os.File
-	gc   *groupCommitWriter
+	gc      *groupCommitWriter
 }
 
 // FileWALStoreConfig configures the FileWALStore.
@@ -1301,7 +1572,9 @@ type walRecord struct {
 	Topic     TopicConfig   `json:"topic,omitempty"`
 	Stream    StreamConfig  `json:"stream,omitempty"`
 	Lease     LeaseRequest  `json:"lease,omitempty"`
+	Messages  []Message     `json:"messages,omitempty"`
 	Ack       AckRequest    `json:"ack,omitempty"`
+	Acks      []AckRequest  `json:"acks,omitempty"`
 	Nack      NackRequest   `json:"nack,omitempty"`
 	Move      MoveRequest   `json:"move,omitempty"`
 	QueueName string        `json:"queue_name,omitempty"`
@@ -1317,14 +1590,12 @@ func NewFileWALStore(dir string) (*FileWALStore, error) {
 // NewFileWALStoreWithConfig creates a FileWALStore with optional encryption.
 // If EncryptionKey is nil or empty, WAL records are stored in plaintext.
 // If EncryptionKey is provided (16, 24, or 32 bytes), all records are AES-GCM encrypted.
-// Like BinaryFileWALStore, the WAL is partitioned across DefaultWALShards
-// shard files (queue-hashed, pinned to the directory on first creation) so
-// concurrent writers to different queues fsync in parallel.
 func NewFileWALStoreWithConfig(cfg FileWALStoreConfig) (*FileWALStore, error) {
 	if err := os.MkdirAll(cfg.Dir, 0o700); err != nil {
 		return nil, err
 	}
-	st := &FileWALStore{MemoryStore: NewMemoryStore(), dir: cfg.Dir, keyName: cfg.KeyName}
+	path := filepath.Join(cfg.Dir, "broker.wal.jsonl")
+	st := &FileWALStore{MemoryStore: NewMemoryStore(), path: path, keyName: cfg.KeyName}
 	// Set up optional encryption
 	if len(cfg.EncryptionKey) > 0 {
 		block, err := aes.NewCipher(cfg.EncryptionKey)
@@ -1337,65 +1608,20 @@ func NewFileWALStoreWithConfig(cfg FileWALStoreConfig) (*FileWALStore, error) {
 		}
 		st.gcm = gcm
 	}
-	n, err := st.resolveShardCount(DefaultWALShards)
+	if err := st.recover(); err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
 		return nil, err
 	}
-	if err := st.recoverAll(n); err != nil {
-		return nil, err
-	}
-	st.shards = make([]*fileWALShard, n)
-	for i := 0; i < n; i++ {
-		f, err := os.OpenFile(st.shardPath(i, n), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
-		if err != nil {
-			return nil, err
-		}
-		st.shards[i] = &fileWALShard{file: f, gc: newGroupCommitWriter(f)}
-	}
+	st.file = f
+	st.gc = newGroupCommitWriter(f)
 	return st, nil
 }
 
-func (s *FileWALStore) resolveShardCount(requested int) (int, error) {
-	marker := filepath.Join(s.dir, "broker.wal.shards")
-	if data, err := os.ReadFile(marker); err == nil {
-		if n, perr := strconv.Atoi(strings.TrimSpace(string(data))); perr == nil && n > 0 {
-			return n, nil
-		}
-	}
-	if requested <= 0 {
-		requested = 1
-	}
-	if err := os.WriteFile(marker, []byte(strconv.Itoa(requested)), 0o600); err != nil {
-		return 0, err
-	}
-	return requested, nil
-}
-
-func (s *FileWALStore) shardPath(i, n int) string {
-	return filepath.Join(s.dir, fmt.Sprintf("broker.wal.%d-of-%d.jsonl", i, n))
-}
-
-// recoverAll replays the legacy pre-sharding single WAL file (upgrade path)
-// followed by every current shard file.
-func (s *FileWALStore) recoverAll(n int) error {
-	if err := s.recoverFile(filepath.Join(s.dir, "broker.wal.jsonl")); err != nil {
-		return err
-	}
-	var errs []error
-	for i := 0; i < n; i++ {
-		if err := s.recoverFile(s.shardPath(i, n)); err != nil {
-			errs = append(errs, err)
-		}
-	}
-	s.normalizeRecoveredInflight()
-	if len(errs) > 0 {
-		return errors.Join(errs...)
-	}
-	return nil
-}
-
-func (s *FileWALStore) recoverFile(path string) error {
-	f, err := os.Open(path)
+func (s *FileWALStore) recover() error {
+	f, err := os.Open(s.path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil
@@ -1409,6 +1635,7 @@ func (s *FileWALStore) recoverFile(path string) error {
 	for {
 		line, readErr := r.ReadBytes('\n')
 		if len(line) == 0 && errors.Is(readErr, io.EOF) {
+			s.normalizeRecoveredInflight()
 			if len(recoveryErrors) > 0 {
 				return fmt.Errorf("WAL recovery completed with %d errors: %w", len(recoveryErrors), errors.Join(recoveryErrors...))
 			}
@@ -1449,7 +1676,8 @@ func (s *FileWALStore) recoverFile(path string) error {
 			var rec walRecord
 			if err := json.Unmarshal(data, &rec); err != nil {
 				if errors.Is(readErr, io.EOF) {
-					_ = os.Truncate(path, offset)
+					_ = os.Truncate(s.path, offset)
+					s.normalizeRecoveredInflight()
 					return nil
 				}
 				// Skip corrupted record but continue recovery.
@@ -1459,7 +1687,8 @@ func (s *FileWALStore) recoverFile(path string) error {
 			}
 			if err := verifyWALRecord(rec); err != nil {
 				if errors.Is(readErr, io.EOF) {
-					_ = os.Truncate(path, offset)
+					_ = os.Truncate(s.path, offset)
+					s.normalizeRecoveredInflight()
 					return nil
 				}
 				// Skip invalid record but continue recovery.
@@ -1474,6 +1703,7 @@ func (s *FileWALStore) recoverFile(path string) error {
 		}
 		offset += int64(len(line))
 		if errors.Is(readErr, io.EOF) {
+			s.normalizeRecoveredInflight()
 			if len(recoveryErrors) > 0 {
 				return fmt.Errorf("WAL recovery completed with %d errors: %w", len(recoveryErrors), errors.Join(recoveryErrors...))
 			}
@@ -1517,8 +1747,12 @@ func (s *FileWALStore) applyRecovered(r walRecord) error {
 		return err
 	case "lease":
 		return s.MemoryStore.Update(ctx, r.Message)
+	case "lease_batch", "update_batch":
+		return errors.Join(s.MemoryStore.UpdateBatch(ctx, r.Messages)...)
 	case "ack":
 		return s.MemoryStore.Ack(ctx, r.Ack)
+	case "ack_batch":
+		return errors.Join(s.MemoryStore.AckBatch(ctx, r.Acks)...)
 	case "nack":
 		return s.MemoryStore.Nack(ctx, r.Nack)
 	case "move":
@@ -1539,24 +1773,27 @@ func (s *FileWALStore) applyRecovered(r walRecord) error {
 	return nil
 }
 
-func (s *FileWALStore) encodeRecord(r walRecord) ([]byte, error) {
+func (s *FileWALStore) write(r walRecord) error {
+	if s.file == nil {
+		return ErrClosed
+	}
 	r.At = time.Now()
 	r.Checksum = ""
 	payload, err := json.Marshal(r)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	sum := sha256.Sum256(payload)
 	r.Checksum = hex.EncodeToString(sum[:])
 	line, err := json.Marshal(r)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	// Optional AES-GCM encryption at rest
 	if s.gcm != nil {
 		nonce := make([]byte, s.gcm.NonceSize())
 		if _, err := io.ReadFull(cryptorand.Reader, nonce); err != nil {
-			return nil, fmt.Errorf("wal: generate nonce: %w", err)
+			return fmt.Errorf("wal: generate nonce: %w", err)
 		}
 		encrypted := s.gcm.Seal(nonce, nonce, line, nil)
 		// Base64-encode to avoid newlines in binary data breaking line-based reading
@@ -1565,55 +1802,7 @@ func (s *FileWALStore) encodeRecord(r walRecord) ([]byte, error) {
 		line = append([]byte("ENC:"), encoded...)
 	}
 	line = append(line, '\n')
-	return line, nil
-}
-
-func (s *FileWALStore) shardIndex(r walRecord) int {
-	return walShardIndex(r, len(s.shards))
-}
-
-func (s *FileWALStore) write(r walRecord) error {
-	if len(s.shards) == 0 {
-		return ErrClosed
-	}
-	line, err := s.encodeRecord(r)
-	if err != nil {
-		return err
-	}
-	return s.shards[s.shardIndex(r)].gc.write(line)
-}
-
-// writeBatch groups records by shard and fsyncs each shard's group once, in
-// parallel across shards, instead of one fsync per record.
-func (s *FileWALStore) writeBatch(records []walRecord) error {
-	if len(s.shards) == 0 {
-		return ErrClosed
-	}
-	if len(records) == 0 {
-		return nil
-	}
-	byShard := make(map[int][]byte, len(s.shards))
-	for _, r := range records {
-		line, err := s.encodeRecord(r)
-		if err != nil {
-			return err
-		}
-		idx := s.shardIndex(r)
-		byShard[idx] = append(byShard[idx], line...)
-	}
-	errCh := make(chan error, len(byShard))
-	for idx, buf := range byShard {
-		sh := s.shards[idx]
-		buf := buf
-		go func() { errCh <- sh.gc.write(buf) }()
-	}
-	var firstErr error
-	for range byShard {
-		if err := <-errCh; err != nil && firstErr == nil {
-			firstErr = err
-		}
-	}
-	return firstErr
+	return s.gc.write(line)
 }
 
 func verifyWALRecord(r walRecord) error {
@@ -1655,60 +1844,47 @@ func (s *FileWALStore) DeclareStream(ctx context.Context, cfg StreamConfig) erro
 	return s.MemoryStore.DeclareStream(ctx, cfg)
 }
 func (s *FileWALStore) Append(ctx context.Context, msg Message, dests []Destination) ([]Message, error) {
-	// Apply in-memory first, then write WAL. If WAL write fails, the in-memory
-	// state is still correct. On restart, recovery replays WAL into memory, so
-	// any missed WAL writes are harmless (duplicate append is idempotent).
 	out, err := s.MemoryStore.Append(ctx, msg, dests)
 	if err != nil {
 		return nil, err
 	}
-	if wErr := s.write(walRecord{Op: "append", Message: msg, Dests: dests}); wErr != nil {
-		// WAL write failed but in-memory is correct. Log but don't fail the operation.
-		_ = wErr
+	if err := s.write(walRecord{Op: "append", Message: msg, Dests: dests}); err != nil {
+		return out, err
 	}
 	return out, nil
-}
-
-// AppendBatch appends many independent entries via a single in-memory lock
-// and a single WAL fsync, while preserving per-entry error isolation.
-func (s *FileWALStore) AppendBatch(ctx context.Context, entries []AppendEntry) []BatchAppendResult {
-	results := s.MemoryStore.AppendBatch(ctx, entries)
-	records := make([]walRecord, 0, len(entries))
-	for i, e := range entries {
-		if results[i].Err != nil {
-			continue
-		}
-		records = append(records, walRecord{Op: "append", Message: e.Message, Dests: e.Destinations})
-	}
-	if len(records) > 0 {
-		if wErr := s.writeBatch(records); wErr != nil {
-			_ = wErr
-		}
-	}
-	return results
 }
 func (s *FileWALStore) AppendAtomic(ctx context.Context, entries []AppendEntry) ([]Message, error) {
 	out, err := s.MemoryStore.AppendAtomic(ctx, entries)
 	if err != nil {
 		return nil, err
 	}
-	if wErr := s.write(walRecord{Op: "append_atomic", Entries: entries}); wErr != nil {
-		_ = wErr
+	if err := s.write(walRecord{Op: "append_atomic", Entries: entries}); err != nil {
+		return out, err
 	}
 	return out, nil
 }
-
+func (s *FileWALStore) AppendAtomicMinimal(ctx context.Context, entries []AppendEntry) error {
+	if err := s.MemoryStore.AppendAtomicMinimal(ctx, entries); err != nil {
+		return err
+	}
+	return s.write(walRecord{Op: "append_atomic", Entries: entries})
+}
+func (s *FileWALStore) AppendAtomicOwned(ctx context.Context, entries []AppendEntry) error {
+	if err := s.MemoryStore.AppendAtomicOwned(ctx, entries); err != nil {
+		return err
+	}
+	return s.write(walRecord{Op: "append_atomic", Entries: entries})
+}
 func (s *FileWALStore) Lease(ctx context.Context, req LeaseRequest) ([]Message, error) {
 	msgs, err := s.MemoryStore.Lease(ctx, req)
 	if err != nil || len(msgs) == 0 {
 		return msgs, err
 	}
-	if wErr := s.write(walRecord{Op: "lease", Message: msgs[0], Lease: req}); wErr != nil {
-		_ = wErr
+	if err := s.write(walRecord{Op: "lease_batch", Messages: msgs, Lease: req}); err != nil {
+		return msgs, err
 	}
 	return msgs, nil
 }
-
 func (s *FileWALStore) Ack(ctx context.Context, req AckRequest) error {
 	if err := s.MemoryStore.validateAckLease(req); err != nil {
 		return err
@@ -1716,10 +1892,27 @@ func (s *FileWALStore) Ack(ctx context.Context, req AckRequest) error {
 	if err := s.MemoryStore.Ack(ctx, req); err != nil {
 		return err
 	}
-	if wErr := s.write(walRecord{Op: "ack", Ack: req}); wErr != nil {
-		_ = wErr
+	return s.write(walRecord{Op: "ack", Ack: req})
+}
+func (s *FileWALStore) AckBatch(ctx context.Context, reqs []AckRequest) []error {
+	errs := s.MemoryStore.AckBatch(ctx, reqs)
+	successful := make([]AckRequest, 0, len(reqs))
+	indices := make([]int, 0, len(reqs))
+	for i, err := range errs {
+		if err == nil {
+			successful = append(successful, reqs[i])
+			indices = append(indices, i)
+		}
 	}
-	return nil
+	if len(successful) == 0 {
+		return errs
+	}
+	if err := s.write(walRecord{Op: "ack_batch", Acks: successful}); err != nil {
+		for _, i := range indices {
+			errs[i] = err
+		}
+	}
+	return errs
 }
 func (s *FileWALStore) Nack(ctx context.Context, req NackRequest) error {
 	if err := s.MemoryStore.validateNackLease(req); err != nil {
@@ -1728,41 +1921,54 @@ func (s *FileWALStore) Nack(ctx context.Context, req NackRequest) error {
 	if err := s.MemoryStore.Nack(ctx, req); err != nil {
 		return err
 	}
-	if wErr := s.write(walRecord{Op: "nack", Nack: req}); wErr != nil {
-		_ = wErr
-	}
-	return nil
+	return s.write(walRecord{Op: "nack", Nack: req})
 }
 func (s *FileWALStore) ExtendLease(ctx context.Context, req LeaseRequest) error {
-	m, ok, _ := s.MemoryStore.Get(ctx, req.MessageID)
-	if !ok {
-		return ErrMessageNotFound
-	}
 	if err := s.MemoryStore.ExtendLease(ctx, req); err != nil {
 		return err
 	}
-	if wErr := s.write(walRecord{Op: "lease", Message: m, Lease: req}); wErr != nil {
-		_ = wErr
+	m, ok, err := s.MemoryStore.Get(ctx, req.MessageID)
+	if err != nil {
+		return err
 	}
-	return nil
+	if !ok {
+		return ErrMessageNotFound
+	}
+	return s.write(walRecord{Op: "lease", Message: m, Lease: req})
 }
-
 func (s *FileWALStore) Update(ctx context.Context, msg Message) error {
 	if err := s.MemoryStore.Update(ctx, msg); err != nil {
 		return err
 	}
-	if wErr := s.write(walRecord{Op: "update", Message: msg}); wErr != nil {
-		_ = wErr
+	return s.write(walRecord{Op: "update", Message: msg})
+}
+func (s *FileWALStore) UpdateBatch(ctx context.Context, messages []Message) []error {
+	errs := s.MemoryStore.UpdateBatch(ctx, messages)
+	successful := make([]Message, 0, len(messages))
+	indices := make([]int, 0, len(messages))
+	for i, err := range errs {
+		if err == nil {
+			successful = append(successful, messages[i])
+			indices = append(indices, i)
+		}
 	}
-	return nil
+	if len(successful) == 0 {
+		return errs
+	}
+	if err := s.write(walRecord{Op: "update_batch", Messages: successful}); err != nil {
+		for _, i := range indices {
+			errs[i] = err
+		}
+	}
+	return errs
 }
 func (s *FileWALStore) Move(ctx context.Context, req MoveRequest) (MoveResult, error) {
 	res, err := s.MemoryStore.Move(ctx, req)
 	if err != nil {
 		return MoveResult{}, err
 	}
-	if wErr := s.write(walRecord{Op: "move", Move: req}); wErr != nil {
-		_ = wErr
+	if err := s.write(walRecord{Op: "move", Move: req}); err != nil {
+		return res, err
 	}
 	return res, nil
 }
@@ -1770,57 +1976,39 @@ func (s *FileWALStore) PauseQueue(ctx context.Context, name string) error {
 	if err := s.MemoryStore.PauseQueue(ctx, name); err != nil {
 		return err
 	}
-	if wErr := s.write(walRecord{Op: "pause_queue", QueueName: name}); wErr != nil {
-		_ = wErr
-	}
-	return nil
+	return s.write(walRecord{Op: "pause_queue", QueueName: name})
 }
-
 func (s *FileWALStore) ResumeQueue(ctx context.Context, name string) error {
 	if err := s.MemoryStore.ResumeQueue(ctx, name); err != nil {
 		return err
 	}
-	if wErr := s.write(walRecord{Op: "resume_queue", QueueName: name}); wErr != nil {
-		_ = wErr
-	}
-	return nil
+	return s.write(walRecord{Op: "resume_queue", QueueName: name})
 }
-
 func (s *FileWALStore) PurgeQueue(ctx context.Context, name string) (int, error) {
 	n, err := s.MemoryStore.PurgeQueue(ctx, name)
 	if err != nil {
 		return 0, err
 	}
-	if wErr := s.write(walRecord{Op: "purge_queue", QueueName: name}); wErr != nil {
-		_ = wErr
+	if err := s.write(walRecord{Op: "purge_queue", QueueName: name}); err != nil {
+		return n, err
 	}
 	return n, nil
 }
-
 func (s *FileWALStore) CommitOffset(ctx context.Context, commit OffsetCommit) error {
 	if err := s.MemoryStore.CommitOffset(ctx, commit); err != nil {
 		return err
 	}
-	if wErr := s.write(walRecord{Op: "commit_offset", Offset: commit}); wErr != nil {
-		_ = wErr
-	}
-	return nil
+	return s.write(walRecord{Op: "commit_offset", Offset: commit})
 }
 
 func (s *FileWALStore) Close() error {
-	for _, sh := range s.shards {
-		if sh.gc != nil {
-			_ = sh.gc.close()
-		}
+	var joined error
+	if s.gc != nil {
+		joined = errors.Join(joined, s.gc.close())
 	}
-	_ = s.MemoryStore.Close()
-	var firstErr error
-	for _, sh := range s.shards {
-		if sh.file != nil {
-			if err := sh.file.Close(); err != nil && firstErr == nil {
-				firstErr = err
-			}
-		}
+	joined = errors.Join(joined, s.MemoryStore.Close())
+	if s.file != nil {
+		joined = errors.Join(joined, s.file.Close())
 	}
-	return firstErr
+	return joined
 }

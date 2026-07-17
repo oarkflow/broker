@@ -1,8 +1,11 @@
 package broker
 
 import (
+	"bufio"
+	"bytes"
 	"encoding/binary"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -37,6 +40,8 @@ func (a AdminServer) dataPlane(w http.ResponseWriter, r *http.Request) {
 		a.v1Publish(w, r)
 	case path == "/publish/frame":
 		a.v1PublishFrame(w, r)
+	case path == "/publish/frame/batch":
+		a.v1PublishFrameBatch(w, r)
 	case path == "/publish/batch":
 		a.v1PublishBatch(w, r)
 	case path == "/request":
@@ -51,6 +56,8 @@ func (a AdminServer) dataPlane(w http.ResponseWriter, r *http.Request) {
 		a.v1Poll(w, r)
 	case path == "/poll/frame":
 		a.v1PollFrame(w, r)
+	case path == "/ack/frame":
+		a.v1AckFrameBatch(w, r)
 	case strings.HasPrefix(path, "/messages/"):
 		a.v1Message(w, r, strings.TrimPrefix(path, "/messages/"))
 	case path == "/tasks/submit":
@@ -130,6 +137,254 @@ func (a AdminServer) v1PublishFrame(w http.ResponseWriter, r *http.Request) {
 	}
 	writeBrokerJSON(w, res)
 }
+
+func publishOptionsFromFrame(msg Message) []PublishOption {
+	opts := []PublishOption{WithMessageID(msg.ID), WithHeaders(msg.Headers), WithMetadata(msg.Metadata), WithType(msg.Type), WithContentType(msg.ContentType), WithKey(msg.Key), WithRoutingKey(msg.RoutingKey), WithPriority(msg.Priority), WithTenantID(msg.TenantID), WithProducerID(msg.ProducerID), WithCorrelationID(msg.CorrelationID), WithCausationID(msg.CausationID), WithIdempotencyKey(msg.IdempotencyKey)}
+	if msg.Queue != "" {
+		opts = append(opts, WithQueue(msg.Queue))
+	}
+	if msg.Stream != "" {
+		opts = append(opts, WithStream(msg.Stream))
+	}
+	if !msg.AvailableAt.IsZero() && msg.AvailableAt.After(time.Now()) {
+		opts = append(opts, WithRunAt(msg.AvailableAt))
+	}
+	if !msg.ExpiresAt.IsZero() && msg.ExpiresAt.After(time.Now()) {
+		opts = append(opts, WithTTL(time.Until(msg.ExpiresAt)))
+	}
+	return opts
+}
+
+func (a AdminServer) v1PublishFrameBatch(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodBroker(w)
+		return
+	}
+	messages, err := readFrameBatch(r.Body, a.Broker.FrameCodec(), 1<<20)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if len(messages) == 0 {
+		http.Error(w, "empty frame batch", http.StatusBadRequest)
+		return
+	}
+	items := make([]PublishBatchItem, len(messages))
+	for i := range messages {
+		items[i] = PublishBatchItem{Topic: messages[i].Topic, Payload: messages[i].Payload, Options: publishOptionsFromFrame(messages[i])}
+	}
+	if preferMinimal(r) {
+		errs, first := a.Broker.Publisher().publishMessagesMinimal(r.Context(), messages)
+		writeMinimalPublishResponse(w, errs, first)
+		return
+	}
+	results, errs, first := a.Broker.Publisher().publishItemsAligned(r.Context(), items)
+	errorsOut := make([]string, len(errs))
+	failed := 0
+	for i, err := range errs {
+		if err != nil {
+			errorsOut[i] = err.Error()
+			failed++
+		}
+	}
+	if failed > 0 {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusMultiStatus)
+	}
+	writeBrokerJSON(w, map[string]any{"results": results, "errors": errorsOut, "failed": failed, "error": errorString(first)})
+}
+
+func readFrameBatch(reader io.Reader, codec FrameCodec, maxMessages int) ([]Message, error) {
+	if maxMessages <= 0 {
+		maxMessages = 1 << 20
+	}
+	buffered := bufio.NewReaderSize(reader, 64<<10)
+	messages := make([]Message, 0, 128)
+	for {
+		length, err := binary.ReadUvarint(buffered)
+		if err != nil {
+			if err == io.EOF {
+				return messages, nil
+			}
+			return nil, fmt.Errorf("read frame length: %w", err)
+		}
+		if length == 0 || length > 128<<20 {
+			return nil, errf(ErrInvalidMessage, "invalid frame length %d", length)
+		}
+		if len(messages) >= maxMessages {
+			return nil, errf(ErrBackpressure, "frame batch exceeds %d messages", maxMessages)
+		}
+		frame := make([]byte, int(length))
+		if _, err := io.ReadFull(buffered, frame); err != nil {
+			return nil, fmt.Errorf("read frame payload: %w", err)
+		}
+		var message Message
+		if err := codec.DecodeMessage(frame, &message); err != nil {
+			return nil, err
+		}
+		messages = append(messages, message)
+	}
+}
+
+func EncodeMessageFrameBatch(dst []byte, codec FrameCodec, messages []Message) ([]byte, error) {
+	for i := range messages {
+		frame, err := codec.EncodeMessage(nil, messages[i])
+		if err != nil {
+			return nil, err
+		}
+		dst = binary.AppendUvarint(dst, uint64(len(frame)))
+		dst = append(dst, frame...)
+	}
+	return dst, nil
+}
+
+func DecodeMessageFrameBatch(data []byte, codec FrameCodec, maxMessages int) ([]Message, error) {
+	return readFrameBatch(bytes.NewReader(data), codec, maxMessages)
+}
+
+func EncodeAckFrameBatch(dst []byte, requests []AckRequest) []byte {
+	dst = binary.AppendUvarint(dst, uint64(len(requests)))
+	for _, request := range requests {
+		dst = appendFrameString(dst, request.MessageID)
+		dst = appendFrameString(dst, request.Queue)
+		dst = appendFrameString(dst, request.LeaseToken)
+		dst = appendFrameString(dst, request.ConsumerID)
+	}
+	return dst
+}
+
+func appendFrameString(dst []byte, value string) []byte {
+	dst = binary.AppendUvarint(dst, uint64(len(value)))
+	return append(dst, value...)
+}
+
+func decodeAckFrameBatch(reader io.Reader, maxBytes int64) ([]AckRequest, error) {
+	if maxBytes <= 0 {
+		maxBytes = 1 << 20
+	}
+	data, err := io.ReadAll(io.LimitReader(reader, maxBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > maxBytes {
+		return nil, ErrMessageTooLarge
+	}
+	count, n := binary.Uvarint(data)
+	if n <= 0 || count > 1<<20 {
+		return nil, errf(ErrInvalidMessage, "invalid ack batch")
+	}
+	data = data[n:]
+	requests := make([]AckRequest, int(count))
+	for i := range requests {
+		values := []*string{&requests[i].MessageID, &requests[i].Queue, &requests[i].LeaseToken, &requests[i].ConsumerID}
+		for _, target := range values {
+			length, read := binary.Uvarint(data)
+			if read <= 0 {
+				return nil, errf(ErrInvalidMessage, "invalid ack string length")
+			}
+			data = data[read:]
+			if length > uint64(len(data)) {
+				return nil, io.ErrUnexpectedEOF
+			}
+			*target = string(data[:length])
+			data = data[length:]
+		}
+	}
+	if len(data) != 0 {
+		return nil, errf(ErrInvalidMessage, "trailing ack data")
+	}
+	return requests, nil
+}
+
+func preferMinimal(r *http.Request) bool {
+	return strings.Contains(strings.ToLower(r.Header.Get("Prefer")), "return=minimal")
+}
+
+func errorString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
+}
+
+func writeMinimalPublishResponse(w http.ResponseWriter, errs []error, first error) {
+	failed := 0
+	errorsOut := make([]string, len(errs))
+	for i, err := range errs {
+		if err != nil {
+			failed++
+			errorsOut[i] = err.Error()
+		}
+	}
+	if failed == 0 {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusMultiStatus)
+	_ = json.NewEncoder(w).Encode(map[string]any{"errors": errorsOut, "failed": failed, "error": errorString(first)})
+}
+
+func (a AdminServer) v1AckFrameBatch(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodBroker(w)
+		return
+	}
+	requests, err := decodeAckFrameBatch(r.Body, 1<<20)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if len(requests) == 0 {
+		http.Error(w, "empty ack batch", http.StatusBadRequest)
+		return
+	}
+	errs := make([]error, len(requests))
+	if batchStore, ok := a.Broker.store.(BatchAckStore); ok {
+		errs = batchStore.AckBatch(r.Context(), requests)
+	} else {
+		for i := range requests {
+			errs[i] = a.Broker.store.Ack(r.Context(), requests[i])
+		}
+	}
+	acked := 0
+	errorsOut := make([]string, len(errs))
+	for i, err := range errs {
+		if err == nil {
+			acked++
+			a.Broker.Consumers().AddStats(requests[i].ConsumerID, 0, 1, 0, 0, "")
+		} else {
+			errorsOut[i] = err.Error()
+		}
+	}
+	if acked == len(requests) && preferMinimal(r) {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if acked != len(requests) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusMultiStatus)
+	}
+	writeBrokerJSON(w, map[string]any{"acked": acked, "errors": errorsOut})
+}
+func messageFromHTTPPayload(m PublishHTTPPayload) Message {
+	return Message{
+		Topic:          m.Topic,
+		Queue:          m.Queue,
+		Stream:         m.Stream,
+		Type:           m.Type,
+		Payload:        []byte(m.Payload),
+		Headers:        m.Headers,
+		Metadata:       m.Metadata,
+		Key:            m.Key,
+		RoutingKey:     m.RoutingKey,
+		Priority:       m.Priority,
+		TenantID:       m.TenantID,
+		CorrelationID:  m.CorrelationID,
+		IdempotencyKey: m.IdempotencyKey,
+	}
+}
+
 func (a AdminServer) v1Publish(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		methodBroker(w)
@@ -166,9 +421,17 @@ func (a AdminServer) v1PublishBatch(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid json", 400)
 		return
 	}
-	results := []PublishResult{}
-	errs := []string{}
-	for _, m := range req.Messages {
+	if preferMinimal(r) {
+		messages := make([]Message, len(req.Messages))
+		for i := range req.Messages {
+			messages[i] = messageFromHTTPPayload(req.Messages[i])
+		}
+		errs, first := a.Broker.Publisher().publishMessagesMinimal(r.Context(), messages)
+		writeMinimalPublishResponse(w, errs, first)
+		return
+	}
+	items := make([]PublishBatchItem, len(req.Messages))
+	for i, m := range req.Messages {
 		opts := []PublishOption{WithHeaders(m.Headers), WithMetadata(m.Metadata), WithType(m.Type), WithKey(m.Key), WithRoutingKey(m.RoutingKey), WithPriority(m.Priority), WithTenantID(m.TenantID), WithCorrelationID(m.CorrelationID), WithIdempotencyKey(m.IdempotencyKey)}
 		if m.Queue != "" {
 			opts = append(opts, WithQueue(m.Queue))
@@ -176,14 +439,10 @@ func (a AdminServer) v1PublishBatch(w http.ResponseWriter, r *http.Request) {
 		if m.Stream != "" {
 			opts = append(opts, WithStream(m.Stream))
 		}
-		res, err := a.Broker.Publisher().Publish(r.Context(), m.Topic, []byte(m.Payload), opts...)
-		if err != nil {
-			errs = append(errs, err.Error())
-			continue
-		}
-		results = append(results, res)
+		items[i] = PublishBatchItem{Topic: m.Topic, Payload: []byte(m.Payload), Options: opts}
 	}
-	writeBrokerJSON(w, BatchPublishResult{Results: results, Errors: errs})
+	res, _ := a.Broker.Publisher().PublishItems(r.Context(), items)
+	writeBrokerJSON(w, res)
 }
 func (a AdminServer) v1Request(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -366,7 +625,7 @@ func (a AdminServer) v1PollFrame(w http.ResponseWriter, r *http.Request) {
 		req.ConsumerGroup = firstNonEmpty(r.URL.Query().Get("consumer_group"), r.URL.Query().Get("group"))
 	}
 	if req.Limit <= 0 {
-		req.Limit = queryLimit(r, defaultAdaptivePullLimit)
+		req.Limit = queryLimit(r, 1)
 	}
 	if req.ConsumerID == "" || req.Queue == "" {
 		http.Error(w, "consumer_id and queue required", 400)
@@ -394,7 +653,6 @@ func (a AdminServer) v1PollFrame(w http.ResponseWriter, r *http.Request) {
 					msgs[i].ConsumerID = req.ConsumerID
 					msgs[i].ConsumerGroup = firstNonEmpty(req.ConsumerGroup, req.ConsumerID)
 					msgs[i].Status = MessageProcessing
-					_ = a.Broker.store.Update(r.Context(), msgs[i])
 				}
 			}
 			writeFrameBatch(w, a.Broker.FrameCodec(), msgs)
@@ -409,18 +667,13 @@ func (a AdminServer) v1PollFrame(w http.ResponseWriter, r *http.Request) {
 }
 
 func writeFrameBatch(w http.ResponseWriter, codec FrameCodec, msgs []Message) {
-	w.Header().Set("Content-Type", "application/vnd.pool.broker.frames")
-	for _, msg := range msgs {
-		frame, err := codec.EncodeMessage(nil, msg)
-		if err != nil {
-			http.Error(w, err.Error(), 500)
-			return
-		}
-		var buf [binary.MaxVarintLen64]byte
-		n := binary.PutUvarint(buf[:], uint64(len(frame)))
-		_, _ = w.Write(buf[:n])
-		_, _ = w.Write(frame)
+	body, err := EncodeMessageFrameBatch(nil, codec, msgs)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
 	}
+	w.Header().Set("Content-Type", "application/vnd.pool.broker.frames")
+	_, _ = w.Write(body)
 }
 func (a AdminServer) v1Poll(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost && r.Method != http.MethodGet {
@@ -441,7 +694,7 @@ func (a AdminServer) v1Poll(w http.ResponseWriter, r *http.Request) {
 		req.ConsumerGroup = firstNonEmpty(r.URL.Query().Get("consumer_group"), r.URL.Query().Get("group"))
 	}
 	if req.Limit <= 0 {
-		req.Limit = queryLimit(r, defaultAdaptivePullLimit)
+		req.Limit = queryLimit(r, 1)
 	}
 	if req.ConsumerID == "" || req.Queue == "" {
 		http.Error(w, "consumer_id and queue required", 400)
@@ -473,11 +726,12 @@ func (a AdminServer) v1Poll(w http.ResponseWriter, r *http.Request) {
 					msgs[i].ConsumerID = req.ConsumerID
 					msgs[i].ConsumerGroup = firstNonEmpty(req.ConsumerGroup, req.ConsumerID)
 					msgs[i].Status = MessageProcessing
-					_ = a.Broker.store.Update(r.Context(), msgs[i])
 					if tid := firstNonEmpty(msgs[i].TaskID, msgs[i].Headers["x-task-id"]); tid != "" {
 						a.Broker.startTask(r.Context(), tid)
 					}
-					a.Broker.emitConsumerNotification(req.ConsumerID, Notification{Type: "message.leased", Source: a.Broker.cfg.Name, Severity: SeverityInfo, MessageID: msgs[i].ID, TaskID: firstNonEmpty(msgs[i].TaskID, msgs[i].Headers["x-task-id"]), Topic: msgs[i].Topic, Queue: req.Queue, Consumer: req.ConsumerID, ConsumerGroup: req.ConsumerGroup, Timestamp: time.Now(), Data: map[string]any{"lease_until": msgs[i].LeaseUntil, "attempts": msgs[i].Attempts}})
+					if a.Broker.cfg.EnableNotifications || a.Broker.cfg.EnableConsumerEventTracking {
+						a.Broker.emitConsumerNotification(req.ConsumerID, Notification{Type: "message.leased", Source: a.Broker.cfg.Name, Severity: SeverityInfo, MessageID: msgs[i].ID, TaskID: firstNonEmpty(msgs[i].TaskID, msgs[i].Headers["x-task-id"]), Topic: msgs[i].Topic, Queue: req.Queue, Consumer: req.ConsumerID, ConsumerGroup: req.ConsumerGroup, Timestamp: time.Now(), Data: map[string]any{"lease_until": msgs[i].LeaseUntil, "attempts": msgs[i].Attempts}})
+					}
 				}
 			}
 			writeBrokerJSON(w, msgs)
@@ -774,7 +1028,8 @@ func (a AdminServer) v1SagaCreate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 409)
 		return
 	}
-	writeBrokerJSON(w, inst.clone())
+	snapshot := inst.clone()
+	writeBrokerJSON(w, &snapshot)
 }
 
 func (a AdminServer) v1Saga(w http.ResponseWriter, r *http.Request, tail string) {
@@ -788,7 +1043,7 @@ func (a AdminServer) v1Saga(w http.ResponseWriter, r *http.Request, tail string)
 		http.NotFound(w, r)
 		return
 	}
-	writeBrokerJSON(w, s)
+	writeBrokerJSON(w, &s)
 }
 
 func queryDuration(r *http.Request, key string, d time.Duration) time.Duration {

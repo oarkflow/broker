@@ -57,9 +57,9 @@ type grpcConn struct {
 }
 
 type grpcRequest struct {
-	ID      string            `json:"id"`
-	Method  string            `json:"method"`
-	Body    json.RawMessage   `json:"body"`
+	ID      string          `json:"id"`
+	Method  string          `json:"method"`
+	Body    json.RawMessage `json:"body"`
 	Headers map[string]string `json:"headers,omitempty"`
 }
 
@@ -71,23 +71,23 @@ type grpcResponse struct {
 }
 
 const (
-	GRPCMethodPublish       = "broker.Publish"
-	GRPCMethodSubscribe     = "broker.Subscribe"
-	GRPCMethodAck           = "broker.Ack"
-	GRPCMethodNack          = "broker.Nack"
-	GRPCMethodPoll          = "broker.Poll"
-	GRPCMethodRequest       = "broker.Request"
-	GRPCMethodStats         = "broker.Stats"
-	GRPCMethodHealth        = "broker.Health"
-	GRPCMethodDeclareQueue  = "broker.DeclareQueue"
-	GRPCMethodDeclareTopic  = "broker.DeclareTopic"
+	GRPCMethodPublish      = "broker.Publish"
+	GRPCMethodSubscribe    = "broker.Subscribe"
+	GRPCMethodAck          = "broker.Ack"
+	GRPCMethodNack         = "broker.Nack"
+	GRPCMethodPoll         = "broker.Poll"
+	GRPCMethodRequest      = "broker.Request"
+	GRPCMethodStats        = "broker.Stats"
+	GRPCMethodHealth       = "broker.Health"
+	GRPCMethodDeclareQueue = "broker.DeclareQueue"
+	GRPCMethodDeclareTopic = "broker.DeclareTopic"
 	GRPCMethodDeclareStream = "broker.DeclareStream"
-	GRPCMethodReadStream    = "broker.ReadStream"
-	GRPCMethodCommitOffset  = "broker.CommitOffset"
-	GRPCMethodMove          = "broker.Move"
-	GRPCMethodPauseQueue    = "broker.PauseQueue"
-	GRPCMethodResumeQueue   = "broker.ResumeQueue"
-	GRPCMethodPurgeQueue    = "broker.PurgeQueue"
+	GRPCMethodReadStream   = "broker.ReadStream"
+	GRPCMethodCommitOffset = "broker.CommitOffset"
+	GRPCMethodMove         = "broker.Move"
+	GRPCMethodPauseQueue   = "broker.PauseQueue"
+	GRPCMethodResumeQueue  = "broker.ResumeQueue"
+	GRPCMethodPurgeQueue   = "broker.PurgeQueue"
 )
 
 // NewGRPCServer creates a new gRPC-like server.
@@ -317,15 +317,13 @@ func (gs *GRPCServer) handlePublish(ctx context.Context, req grpcRequest) grpcRe
 
 func (gs *GRPCServer) handleAck(ctx context.Context, req grpcRequest) grpcResponse {
 	var a struct {
-		MessageID  string `json:"message_id"`
-		Queue      string `json:"queue"`
-		LeaseToken string `json:"lease_token"`
-		ConsumerID string `json:"consumer_id"`
+		MessageID string `json:"message_id"`
+		Queue     string `json:"queue"`
 	}
 	if err := json.Unmarshal(req.Body, &a); err != nil {
 		return grpcResponse{ID: req.ID, Error: err.Error(), Status: 400}
 	}
-	err := gs.broker.Store().Ack(ctx, AckRequest{MessageID: a.MessageID, Queue: a.Queue, LeaseToken: a.LeaseToken, ConsumerID: a.ConsumerID})
+	err := gs.broker.Store().Ack(ctx, AckRequest{MessageID: a.MessageID, Queue: a.Queue})
 	if err != nil {
 		return grpcResponse{ID: req.ID, Error: err.Error(), Status: 409}
 	}
@@ -334,11 +332,9 @@ func (gs *GRPCServer) handleAck(ctx context.Context, req grpcRequest) grpcRespon
 
 func (gs *GRPCServer) handleNack(ctx context.Context, req grpcRequest) grpcResponse {
 	var n struct {
-		MessageID  string `json:"message_id"`
-		Queue      string `json:"queue"`
-		LeaseToken string `json:"lease_token"`
-		ConsumerID string `json:"consumer_id"`
-		Action     string `json:"action"`
+		MessageID string `json:"message_id"`
+		Queue     string `json:"queue"`
+		Action    string `json:"action"`
 	}
 	if err := json.Unmarshal(req.Body, &n); err != nil {
 		return grpcResponse{ID: req.ID, Error: err.Error(), Status: 400}
@@ -352,7 +348,7 @@ func (gs *GRPCServer) handleNack(ctx context.Context, req grpcRequest) grpcRespo
 	case "reject":
 		action = NackReject
 	}
-	err := gs.broker.Store().Nack(ctx, NackRequest{MessageID: n.MessageID, Queue: n.Queue, LeaseToken: n.LeaseToken, ConsumerID: n.ConsumerID, Action: action})
+	err := gs.broker.Store().Nack(ctx, NackRequest{MessageID: n.MessageID, Queue: n.Queue, Action: action})
 	if err != nil {
 		return grpcResponse{ID: req.ID, Error: err.Error(), Status: 409}
 	}
@@ -369,7 +365,7 @@ func (gs *GRPCServer) handlePoll(ctx context.Context, req grpcRequest) grpcRespo
 		return grpcResponse{ID: req.ID, Error: err.Error(), Status: 400}
 	}
 	if p.Limit <= 0 {
-		p.Limit = defaultAdaptivePullLimit
+		p.Limit = 1
 	}
 	msgs, err := gs.broker.Store().Lease(ctx, LeaseRequest{Queue: p.Queue, ConsumerID: p.Consumer, Limit: p.Limit})
 	if err != nil {

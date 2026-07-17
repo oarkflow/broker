@@ -14,11 +14,6 @@ import (
 	"time"
 )
 
-// defaultAdaptivePullLimit is used when a pull/poll request doesn't specify
-// a limit. Lease() only ever returns what's actually queued, so this just
-// caps how big an automatic batch can get — it doesn't force over-fetching.
-const defaultAdaptivePullLimit = 100
-
 type AdminServer struct {
 	Broker *Broker
 
@@ -336,7 +331,6 @@ func (a AdminServer) queue(w http.ResponseWriter, r *http.Request) {
 				ConsumerGroup     string `json:"consumer_group"`
 				Limit             int    `json:"limit"`
 				VisibilityTimeout int64  `json:"visibility_timeout_ns"`
-				WaitNS            int64  `json:"wait_ns"`
 			}
 			if r.Method == http.MethodPost && r.Body != nil {
 				_ = json.NewDecoder(r.Body).Decode(&req)
@@ -348,39 +342,13 @@ func (a AdminServer) queue(w http.ResponseWriter, r *http.Request) {
 				req.ConsumerGroup = firstNonEmpty(r.URL.Query().Get("group"), req.ConsumerID)
 			}
 			if req.Limit <= 0 {
-				// No client-specified limit: drain up to a generous batch
-				// automatically. Lease only ever returns what's actually
-				// queued, so a naive client that never tunes this still
-				// gets efficient batched delivery when there's a backlog,
-				// and just what's available when the queue is nearly
-				// empty — no manual tuning required.
-				req.Limit = queryLimit(r, defaultAdaptivePullLimit)
+				req.Limit = queryLimit(r, 1)
 			}
 			vis := time.Duration(req.VisibilityTimeout)
-			wait := time.Duration(req.WaitNS)
-			if wait <= 0 {
-				wait = queryDuration(r, "wait", 0)
-			}
-			deadline := time.Now().Add(wait)
-			var msgs []Message
-			for {
-				var err error
-				msgs, err = a.Broker.store.Lease(r.Context(), LeaseRequest{Queue: name, ConsumerID: req.ConsumerID, ConsumerGroup: req.ConsumerGroup, Limit: req.Limit, VisibilityTimeout: vis})
-				if err != nil {
-					http.Error(w, err.Error(), 409)
-					return
-				}
-				if len(msgs) > 0 || wait <= 0 || time.Now().After(deadline) {
-					break
-				}
-				// Long-poll instead of returning empty immediately: avoids
-				// busy-poll request storms from idle consumers, the same
-				// way /v1/poll already behaves.
-				select {
-				case <-time.After(25 * time.Millisecond):
-				case <-r.Context().Done():
-					return
-				}
+			msgs, err := a.Broker.store.Lease(r.Context(), LeaseRequest{Queue: name, ConsumerID: req.ConsumerID, ConsumerGroup: req.ConsumerGroup, Limit: req.Limit, VisibilityTimeout: vis})
+			if err != nil {
+				http.Error(w, err.Error(), 409)
+				return
 			}
 			writeBrokerJSON(w, msgs)
 			return
@@ -427,17 +395,34 @@ func (a AdminServer) ackBatch(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid json", 400)
 		return
 	}
+	var batchErrs []error
+	if store, ok := a.Broker.store.(BatchAckStore); ok {
+		batchErrs = store.AckBatch(r.Context(), reqs)
+	} else {
+		batchErrs = make([]error, len(reqs))
+		for i := range reqs {
+			batchErrs[i] = a.Broker.store.Ack(r.Context(), reqs[i])
+		}
+	}
 	errs := make([]string, len(reqs))
-	ok := 0
-	for i, req := range reqs {
-		if err := a.Broker.store.Ack(r.Context(), req); err != nil {
+	acked := 0
+	for i, err := range batchErrs {
+		if err != nil {
 			errs[i] = err.Error()
 			continue
 		}
-		ok++
-		a.Broker.Consumers().AddStats(req.ConsumerID, 0, 1, 0, 0, "")
+		acked++
+		a.Broker.Consumers().AddStats(reqs[i].ConsumerID, 0, 1, 0, 0, "")
 	}
-	writeBrokerJSON(w, map[string]any{"acked": ok, "errors": errs})
+	if acked == len(reqs) && preferMinimal(r) {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if acked != len(reqs) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusMultiStatus)
+	}
+	writeBrokerJSON(w, map[string]any{"acked": acked, "errors": errs})
 }
 func (a AdminServer) streams(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodPost {
@@ -656,9 +641,17 @@ func (a AdminServer) publishBatch(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid json", 400)
 		return
 	}
-	results := make([]PublishResult, len(items))
-	errs := make([]string, len(items))
 	pub := a.Broker.Publisher()
+	if preferMinimal(r) {
+		messages := make([]Message, len(items))
+		for i, req := range items {
+			messages[i] = Message{Topic: req.Topic, Queue: req.Queue, Stream: req.Stream, Type: req.Type, Payload: []byte(req.Payload), Headers: req.Headers}
+		}
+		errs, first := pub.publishMessagesMinimal(r.Context(), messages)
+		writeMinimalPublishResponse(w, errs, first)
+		return
+	}
+	batchItems := make([]PublishBatchItem, len(items))
 	for i, req := range items {
 		opts := []PublishOption{WithHeaders(req.Headers), WithType(req.Type)}
 		if req.Queue != "" {
@@ -667,12 +660,14 @@ func (a AdminServer) publishBatch(w http.ResponseWriter, r *http.Request) {
 		if req.Stream != "" {
 			opts = append(opts, WithStream(req.Stream))
 		}
-		res, err := pub.Publish(r.Context(), req.Topic, []byte(req.Payload), opts...)
+		batchItems[i] = PublishBatchItem{Topic: req.Topic, Payload: []byte(req.Payload), Options: opts}
+	}
+	results, publishErrs, _ := pub.publishItemsAligned(r.Context(), batchItems)
+	errs := make([]string, len(publishErrs))
+	for i, err := range publishErrs {
 		if err != nil {
 			errs[i] = err.Error()
-			continue
 		}
-		results[i] = res
 	}
 	writeBrokerJSON(w, map[string]any{"results": results, "errors": errs})
 }
@@ -821,7 +816,7 @@ func adminAction(r *http.Request) string {
 		return PermissionMessageMove
 	case path == "/notifications" || path == "/events" || strings.HasPrefix(path, "/v1/events"):
 		return PermissionNotification
-	case path == "/ack/batch":
+	case path == "/ack/batch" || path == "/v1/ack/frame":
 		return PermissionMessageAck
 	case strings.HasPrefix(path, "/v1/consumers/register"):
 		return PermissionConsumerRegister

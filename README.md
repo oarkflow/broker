@@ -23,6 +23,7 @@ A production-oriented, feature-complete message broker for Go — supporting emb
 - [Broker Modes](#broker-modes)
 - [Features](#features)
 - [Protocols](#protocols)
+- [Performance](PERFORMANCE.md)
 - [Encryption](#encryption)
 - [Security](#security)
 - [Configuration](#configuration)
@@ -157,7 +158,7 @@ go build -o broker-worker ./cmd/broker-worker/
 
 | Feature | Description |
 |---------|-------------|
-| WAL durability | JSONL or binary (FWB1) with checksums |
+| WAL durability | JSONL or native packed BWL1 records with CRC32C |
 | Crash recovery | Replay WAL, in-flight requeue |
 | Retry policy | Exponential backoff with jitter |
 | DLQ | Dead-letter queue with replay |
@@ -210,8 +211,8 @@ All protocols support TLS/mTLS when configured.
 | Component | Encryption | How to Enable |
 |-----------|-----------|---------------|
 | JSONL WAL | AES-256-GCM | `-frame-encryption-key <hex-key>` |
-| Binary WAL | AES-256-GCM | `-frame-encryption-key <hex-key>` |
-| FWB1 Codec | AES-GCM + HMAC-SHA256 | `WithFrameEncryptionKey()`, `WithFrameSigningKey()` |
+| Binary WAL (BWL1) | AES-256-GCM + optional HMAC-SHA256 | `-frame-encryption-key`, `-frame-signing-key` |
+| FWB1/FWB2 network codecs | AES-GCM + HMAC-SHA256 | `WithFrameEncryptionKey()`, `WithFrameSigningKey()` |
 | SQLite | AES-256-GCM | `NewEncryptedMessageStore(db, key)` |
 
 ### In Transit
@@ -748,8 +749,10 @@ broker/
   ratelimit.go           Rate limiting
   circuit_breaker.go     Circuit breaker
   audit.go               Audit logging
-  frame_codec.go         FWB1 binary codec
-  binary_wal_store.go    Binary WAL store
+  frame_codec.go         FWB1 network message codec
+  compact_codec.go       FWB2 compact network codec
+  wal_record_codec.go    BWL1 packed mutation codec
+  binary_wal_store.go    Native BWL1 WAL store
 
   amqp/                  AMQP 0-9-1 protocol server
   cluster/               Raft consensus (extension points)
@@ -767,3 +770,15 @@ broker/
 ## License
 
 See [LICENSE](LICENSE) for details.
+
+## High-throughput BST1 stream mode
+
+For Kafka-equivalent append/fetch workloads use the native stream listener rather than queue leasing:
+
+```bash
+brokerd -wal .broker-data/queue -native-addr :8091 \
+  -native-dir .broker-data/native-stream -native-partitions 8 \
+  -native-sync=true -insecure-dev
+```
+
+The `native-bench` command uses persistent TCP clients, compact record batches, partition offsets and restart-safe segmented logs. See `NATIVE_STREAM_PERFORMANCE.md` and `scripts/benchmark_native_vs_kafka.sh`.

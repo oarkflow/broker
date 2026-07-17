@@ -46,58 +46,44 @@ type CallbackFunc func(context.Context, Notification) error
 func (f CallbackFunc) HandleNotification(ctx context.Context, n Notification) error { return f(ctx, n) }
 
 type NotificationBus struct {
-	mu            sync.RWMutex
-	subs          map[string]Callback
-	history       []Notification
-	cap           int
-	recordHistory bool
-	subCount      atomic.Int32
-	closed        bool
-	workers       chan struct{}
+	subMu     sync.RWMutex
+	historyMu sync.RWMutex
+	subs      map[string]Callback
+	history   []Notification
+	cap       int
+	workers   chan struct{}
+	enabled   atomic.Bool
+	closed    atomic.Bool
 }
 
 const notificationWorkerPoolSize = 64
 
-// NewNotificationBus creates a bus with a bounded history ring buffer.
-// capacity == 0 uses the default size (1024); capacity < 0 disables
-// history recording entirely (Publish/PublishMany then take the lock only
-// when there's an actual subscriber to dispatch to — the common case for a
-// pure producer/consumer workload with nobody watching /notifications).
 func NewNotificationBus(capacity int) *NotificationBus {
-	record := true
 	if capacity < 0 {
-		record = false
 		capacity = 0
-	} else if capacity == 0 {
-		capacity = 1024
 	}
-	return &NotificationBus{subs: map[string]Callback{}, cap: capacity, recordHistory: record, workers: make(chan struct{}, notificationWorkerPoolSize)}
+	return &NotificationBus{subs: map[string]Callback{}, cap: capacity, workers: make(chan struct{}, notificationWorkerPoolSize)}
 }
 func (b *NotificationBus) Subscribe(id string, cb Callback) {
-	if id == "" || cb == nil {
+	if b == nil || id == "" || cb == nil || b.closed.Load() {
 		return
 	}
-	b.mu.Lock()
-	if _, exists := b.subs[id]; !exists {
-		b.subCount.Add(1)
-	}
+	b.subMu.Lock()
 	b.subs[id] = cb
-	b.mu.Unlock()
+	b.enabled.Store(true)
+	b.subMu.Unlock()
 }
 func (b *NotificationBus) Unsubscribe(id string) {
-	b.mu.Lock()
-	if _, exists := b.subs[id]; exists {
-		delete(b.subs, id)
-		b.subCount.Add(-1)
+	if b == nil {
+		return
 	}
-	b.mu.Unlock()
+	b.subMu.Lock()
+	delete(b.subs, id)
+	b.enabled.Store(len(b.subs) > 0 || b.cap > 0)
+	b.subMu.Unlock()
 }
 func (b *NotificationBus) Publish(n Notification) {
-	// Fast path: nobody is subscribed and history recording is off, so this
-	// notification has no observer at all — skip the lock entirely instead
-	// of paying for it on every single publish/ack in a plain producer or
-	// consumer workload with no /notifications or /events listener.
-	if !b.recordHistory && b.subCount.Load() == 0 {
+	if b == nil || b.closed.Load() || !b.enabled.Load() {
 		return
 	}
 	if n.Timestamp.IsZero() {
@@ -106,76 +92,23 @@ func (b *NotificationBus) Publish(n Notification) {
 	if n.ID == "" {
 		n.ID = n.Type + "-" + newIDFromTime()
 	}
-	b.mu.Lock()
-	if b.closed {
-		b.mu.Unlock()
-		return
-	}
-	if b.recordHistory {
+	if b.cap > 0 {
+		b.historyMu.Lock()
 		b.history = append(b.history, n)
 		if len(b.history) > b.cap {
 			copy(b.history, b.history[len(b.history)-b.cap:])
 			b.history = b.history[:b.cap]
 		}
+		b.historyMu.Unlock()
 	}
+	b.subMu.RLock()
 	subs := make([]Callback, 0, len(b.subs))
 	for _, cb := range b.subs {
 		subs = append(subs, cb)
 	}
-	b.mu.Unlock()
-	b.dispatch(subs, n)
-}
-
-// PublishMany appends many notifications and gathers the subscriber list
-// under a single lock acquisition instead of one per notification, then
-// dispatches each to every subscriber the same way Publish does. Used by
-// the publish coalescer so a batch of unrelated concurrent publishes pays
-// for the notification-bus lock once instead of once per message.
-func (b *NotificationBus) PublishMany(ns []Notification) {
-	if len(ns) == 0 {
-		return
-	}
-	if !b.recordHistory && b.subCount.Load() == 0 {
-		return
-	}
-	now := time.Now()
-	for i := range ns {
-		if ns[i].Timestamp.IsZero() {
-			ns[i].Timestamp = now
-		}
-		if ns[i].ID == "" {
-			ns[i].ID = ns[i].Type + "-" + newIDFromTime()
-		}
-	}
-	b.mu.Lock()
-	if b.closed {
-		b.mu.Unlock()
-		return
-	}
-	if b.recordHistory {
-		b.history = append(b.history, ns...)
-		if len(b.history) > b.cap {
-			copy(b.history, b.history[len(b.history)-b.cap:])
-			b.history = b.history[:b.cap]
-		}
-	}
-	subs := make([]Callback, 0, len(b.subs))
-	for _, cb := range b.subs {
-		subs = append(subs, cb)
-	}
-	b.mu.Unlock()
-	if len(subs) == 0 {
-		return
-	}
-	for _, n := range ns {
-		b.dispatch(subs, n)
-	}
-}
-
-func (b *NotificationBus) dispatch(subs []Callback, n Notification) {
+	b.subMu.RUnlock()
 	for _, cb := range subs {
 		cb := cb
-		// Use bounded worker pool to prevent goroutine explosion
 		select {
 		case b.workers <- struct{}{}:
 			go func() {
@@ -183,14 +116,16 @@ func (b *NotificationBus) dispatch(subs []Callback, n Notification) {
 				_ = cb.HandleNotification(context.Background(), n)
 			}()
 		default:
-			// Pool full, execute synchronously as fallback
 			_ = cb.HandleNotification(context.Background(), n)
 		}
 	}
 }
 func (b *NotificationBus) History(limit int) []Notification {
-	b.mu.RLock()
-	defer b.mu.RUnlock()
+	if b == nil || b.cap <= 0 {
+		return nil
+	}
+	b.historyMu.RLock()
+	defer b.historyMu.RUnlock()
 	if limit <= 0 || limit > len(b.history) {
 		limit = len(b.history)
 	}
@@ -198,7 +133,16 @@ func (b *NotificationBus) History(limit int) []Notification {
 	copy(out, b.history[len(b.history)-limit:])
 	return out
 }
-func (b *NotificationBus) Close() { b.mu.Lock(); b.closed = true; b.subs = nil; b.mu.Unlock() }
+func (b *NotificationBus) Enabled() bool { return b != nil && b.enabled.Load() && !b.closed.Load() }
+func (b *NotificationBus) Close() {
+	if b == nil || !b.closed.CompareAndSwap(false, true) {
+		return
+	}
+	b.subMu.Lock()
+	b.subs = nil
+	b.enabled.Store(false)
+	b.subMu.Unlock()
+}
 
 type WebhookCallback struct {
 	URL         string

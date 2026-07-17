@@ -47,3 +47,31 @@ func NewFrameCodec(cfg FrameCodecConfig) FrameCodec {
 		)
 	}
 }
+
+// WALCodecConfig exposes equivalent durability protection settings to the
+// dedicated BWL1 write-ahead-log codec.
+func (c *BinaryMessageCodec) WALCodecConfig() WALCodecConfig {
+	if c == nil {
+		return WALCodecConfig{MaxRecordSize: binaryWALDefaultMax}
+	}
+	return WALCodecConfig{
+		CompressThreshold: c.CompressThreshold,
+		MaxRecordSize:     c.MaxFrameSize,
+		EncryptionKey:     append([]byte(nil), c.EncryptionKey...),
+		SigningKey:        append([]byte(nil), c.SigningKey...),
+	}
+}
+
+// WALCodecConfig exposes equivalent durability protection settings to the
+// dedicated BWL1 write-ahead-log codec.
+func (c *CompactMessageCodec) WALCodecConfig() WALCodecConfig {
+	if c == nil {
+		return WALCodecConfig{MaxRecordSize: binaryWALDefaultMax}
+	}
+	return WALCodecConfig{
+		CompressThreshold: c.CompressThreshold,
+		MaxRecordSize:     c.MaxFrameSize,
+		EncryptionKey:     append([]byte(nil), c.EncryptionKey...),
+		SigningKey:        append([]byte(nil), c.SigningKey...),
+	}
+}

@@ -1,84 +1,41 @@
 package broker
 
 import (
-	"hash/fnv"
+	"bufio"
+	"encoding/binary"
 	"os"
 	"sync"
 )
 
-// walShardKey derives the routing key (queue/topic/stream name) a WAL
-// record belongs to, so that all durability records for one queue always
-// land in the same WAL shard file and keep their relative order, while
-// records for different queues can be sharded onto independent writers.
-// Records with no natural key (or a rare/admin op not worth partitioning)
-// return "" and are routed to shard 0.
-func walShardKey(r walRecord) string {
-	switch r.Op {
-	case "declare_queue":
-		return r.Queue.Name
-	case "declare_topic":
-		return r.Topic.Name
-	case "declare_stream":
-		return r.Stream.Name
-	case "append", "lease", "update":
-		return firstNonEmpty(r.Message.Queue, firstNonEmpty(r.Message.Topic, r.Message.Stream))
-	case "append_atomic":
-		if len(r.Entries) > 0 {
-			return firstNonEmpty(r.Entries[0].Message.Queue, firstNonEmpty(r.Entries[0].Message.Topic, r.Entries[0].Message.Stream))
-		}
-	case "ack":
-		return r.Ack.Queue
-	case "nack":
-		return r.Nack.Queue
-	case "move":
-		return r.Move.Source
-	case "pause_queue", "resume_queue", "purge_queue":
-		return r.QueueName
-	case "commit_offset":
-		return r.Offset.Stream
-	}
-	return ""
-}
-
-// walShardIndex maps a WAL record to one of n shards by hashing its
-// routing key. n<=1 or an empty key always resolves to shard 0.
-func walShardIndex(r walRecord, n int) int {
-	if n <= 1 {
-		return 0
-	}
-	key := walShardKey(r)
-	if key == "" {
-		return 0
-	}
-	h := fnv.New32a()
-	_, _ = h.Write([]byte(key))
-	return int(h.Sum32() % uint32(n))
-}
-
-// groupCommitWriter batches concurrent WAL append calls into a single fsync
-// per batch instead of one fsync per call. Durability is unchanged: every
-// write() call still blocks until its bytes are durably fsynced — it just
-// shares that fsync with whatever else was queued at the same instant, which
-// is how most WAL-based stores (Postgres, etc.) get high write throughput
-// under concurrency without relaxing durability.
+// groupCommitWriter batches concurrent WAL append calls into one buffered
+// write/flush/fsync cycle. A caller returns only after its batch is synced.
 type groupCommitWriter struct {
 	file *os.File
+	buf  *bufio.Writer
 
-	closeMu sync.RWMutex
-	closed  bool
-	writeCh chan *groupCommitReq
-	doneCh  chan struct{}
+	closeMu  sync.RWMutex
+	closed   bool
+	writeCh  chan *groupCommitReq
+	doneCh   chan struct{}
+	closeErr error
 }
 
 type groupCommitReq struct {
-	data []byte
-	done chan error
+	data    []byte
+	prefix  [binary.MaxVarintLen64]byte
+	prefixN uint8
+	done    chan error
 }
+
+var groupCommitReqPool = sync.Pool{New: func() any {
+	return &groupCommitReq{done: make(chan error, 1)}
+}}
 
 func newGroupCommitWriter(f *os.File) *groupCommitWriter {
 	w := &groupCommitWriter{
 		file:    f,
-		writeCh: make(chan *groupCommitReq, 4096),
+		buf:     bufio.NewWriterSize(f, 4<<20),
+		writeCh: make(chan *groupCommitReq, 16384),
 		doneCh:  make(chan struct{}),
 	}
 	go w.run()
@@ -87,49 +44,88 @@ func newGroupCommitWriter(f *os.File) *groupCommitWriter {
 
 func (w *groupCommitWriter) run() {
 	defer close(w.doneCh)
+	batch := make([]*groupCommitReq, 0, 4096)
 	for req := range w.writeCh {
-		batch := make([]*groupCommitReq, 0, 64)
-		batch = append(batch, req)
+		batch = append(batch[:0], req)
 	drain:
-		for len(batch) < 4096 {
+		for len(batch) < cap(batch) {
 			select {
-			case r2, ok := <-w.writeCh:
+			case next, ok := <-w.writeCh:
 				if !ok {
 					break drain
 				}
-				batch = append(batch, r2)
+				batch = append(batch, next)
 			default:
 				break drain
 			}
 		}
 		var writeErr error
-		for _, b := range batch {
-			if _, err := w.file.Write(b.data); err != nil {
+		for _, item := range batch {
+			if item.prefixN > 0 {
+				if _, err := w.buf.Write(item.prefix[:item.prefixN]); err != nil {
+					writeErr = err
+					break
+				}
+			}
+			if _, err := w.buf.Write(item.data); err != nil {
 				writeErr = err
 				break
 			}
 		}
 		if writeErr == nil {
+			writeErr = w.buf.Flush()
+		}
+		if writeErr == nil {
 			writeErr = w.file.Sync()
 		}
-		for _, b := range batch {
-			b.done <- writeErr
+		for _, item := range batch {
+			item.done <- writeErr
 		}
+	}
+	if err := w.buf.Flush(); err != nil {
+		w.closeErr = err
+	}
+	if w.closeErr == nil {
+		w.closeErr = w.file.Sync()
 	}
 }
 
-// write appends data and blocks until it (and possibly a batch of
-// concurrent writers) has been durably fsynced. Safe for concurrent use.
 func (w *groupCommitWriter) write(data []byte) error {
 	w.closeMu.RLock()
 	if w.closed {
 		w.closeMu.RUnlock()
 		return ErrClosed
 	}
-	req := &groupCommitReq{data: data, done: make(chan error, 1)}
+	req := groupCommitReqPool.Get().(*groupCommitReq)
+	req.data = data
 	w.writeCh <- req
 	w.closeMu.RUnlock()
-	return <-req.done
+	err := <-req.done
+	req.data = nil
+	req.prefixN = 0
+	groupCommitReqPool.Put(req)
+	return err
+}
+
+// writeUvarintPrefixed writes a uvarint record length and the record as two
+// buffered segments. It avoids allocating and copying a combined prefix+record
+// slice on every durable mutation.
+func (w *groupCommitWriter) writeUvarintPrefixed(data []byte) error {
+	w.closeMu.RLock()
+	if w.closed {
+		w.closeMu.RUnlock()
+		return ErrClosed
+	}
+	req := groupCommitReqPool.Get().(*groupCommitReq)
+	req.data = data
+	req.prefixN = uint8(binary.PutUvarint(req.prefix[:], uint64(len(data))))
+	w.writeCh <- req
+	w.closeMu.RUnlock()
+	err := <-req.done
+	req.data = nil
+	req.prefixN = 0
+	groupCommitReqPool.Put(req)
+	return err
 }
 
 func (w *groupCommitWriter) close() error {
@@ -140,5 +136,5 @@ func (w *groupCommitWriter) close() error {
 	}
 	w.closeMu.Unlock()
 	<-w.doneCh
-	return nil
+	return w.closeErr
 }

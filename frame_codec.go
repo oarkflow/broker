@@ -137,7 +137,7 @@ func (c *BinaryMessageCodec) EncodeFrame(dst []byte, typ FrameType, msg Message)
 	if max <= 0 {
 		max = defaultMaxFrame
 	}
-	payload := append([]byte(nil), msg.Payload...)
+	payload := msg.Payload
 	flags := FrameFlags(0)
 	if len(msg.Headers) > 0 {
 		flags |= FrameFlagHasHeaders
@@ -154,7 +154,7 @@ func (c *BinaryMessageCodec) EncodeFrame(dst []byte, typ FrameType, msg Message)
 	if msg.CorrelationID != "" && msg.ReplyTo == "" && msg.RequestID == "" {
 		flags |= FrameFlagResponse
 	}
-	meta := cloneMap(msg.Metadata)
+	meta := msg.Metadata
 	if c.CompressThreshold > 0 && len(payload) >= c.CompressThreshold {
 		compressed, err := gzipBytes(payload)
 		if err != nil {
@@ -166,6 +166,7 @@ func (c *BinaryMessageCodec) EncodeFrame(dst []byte, typ FrameType, msg Message)
 		}
 	}
 	if len(c.EncryptionKey) > 0 {
+		meta = cloneMap(meta)
 		sealed, nonce, err := sealPayload(c.EncryptionKey, payload, msg.ID)
 		if err != nil {
 			return nil, err

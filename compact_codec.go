@@ -37,57 +37,57 @@ import (
 //   0x0a: attempts      0x14: available_at   0x1e: last_error
 
 const (
-	FWB2Magic = "FWB2"
+	FWB2Magic        = "FWB2"
 	FWB2Version byte = 2
 
 	// Compact TLV tags (1 byte each)
-	tagID              byte = 0x01
-	tagParentID        byte = 0x02
-	tagTopic           byte = 0x03
-	tagQueue           byte = 0x04
-	tagStream          byte = 0x05
-	tagPartition       byte = 0x06
-	tagOffset          byte = 0x07
-	tagRoutingKey      byte = 0x08
-	tagStatus          byte = 0x09
-	tagAttempts        byte = 0x0A
-	tagType            byte = 0x0B
-	tagContentType     byte = 0x0C
-	tagSchema          byte = 0x0D
-	tagSchemaVersion   byte = 0x0E
-	tagTraceID         byte = 0x0F
-	tagSpanID          byte = 0x10
-	tagKey             byte = 0x11
-	tagPriority        byte = 0x12
-	tagCreatedAt       byte = 0x13
-	tagAvailableAt     byte = 0x14
-	tagCorrelationID   byte = 0x15
-	tagCausationID     byte = 0x16
-	tagRequestID       byte = 0x17
-	tagReplyTo         byte = 0x18
-	tagReplyGroup      byte = 0x19
-	tagIdempotencyKey  byte = 0x1A
-	tagDeduplicationID byte = 0x1B
-	tagTenantID        byte = 0x1C
-	tagLeaseToken      byte = 0x1D
-	tagLastError       byte = 0x1E
-	tagMaxAttempts     byte = 0x1F
-	tagRedeliveries    byte = 0x20
-	tagExpiresAt       byte = 0x21
-	tagLeaseUntil      byte = 0x22
-	tagProducerID      byte = 0x23
-	tagConsumerID      byte = 0x24
-	tagConsumerGroup   byte = 0x25
-	tagTaskID          byte = 0x26
-	tagTaskName        byte = 0x27
+	tagID               byte = 0x01
+	tagParentID         byte = 0x02
+	tagTopic            byte = 0x03
+	tagQueue            byte = 0x04
+	tagStream           byte = 0x05
+	tagPartition        byte = 0x06
+	tagOffset           byte = 0x07
+	tagRoutingKey       byte = 0x08
+	tagStatus           byte = 0x09
+	tagAttempts         byte = 0x0A
+	tagType             byte = 0x0B
+	tagContentType      byte = 0x0C
+	tagSchema           byte = 0x0D
+	tagSchemaVersion    byte = 0x0E
+	tagTraceID          byte = 0x0F
+	tagSpanID           byte = 0x10
+	tagKey              byte = 0x11
+	tagPriority         byte = 0x12
+	tagCreatedAt        byte = 0x13
+	tagAvailableAt      byte = 0x14
+	tagCorrelationID    byte = 0x15
+	tagCausationID      byte = 0x16
+	tagRequestID        byte = 0x17
+	tagReplyTo          byte = 0x18
+	tagReplyGroup       byte = 0x19
+	tagIdempotencyKey   byte = 0x1A
+	tagDeduplicationID  byte = 0x1B
+	tagTenantID         byte = 0x1C
+	tagLeaseToken       byte = 0x1D
+	tagLastError        byte = 0x1E
+	tagMaxAttempts      byte = 0x1F
+	tagRedeliveries     byte = 0x20
+	tagExpiresAt        byte = 0x21
+	tagLeaseUntil       byte = 0x22
+	tagProducerID       byte = 0x23
+	tagConsumerID       byte = 0x24
+	tagConsumerGroup    byte = 0x25
+	tagTaskID           byte = 0x26
+	tagTaskName         byte = 0x27
 	tagDeadLetterReason byte = 0x28
-	tagOriginalTopic   byte = 0x29
-	tagOriginalQueue   byte = 0x2A
-	tagOriginalStream  byte = 0x2B
-	tagOriginalOffset  byte = 0x2C
-	tagHeaders         byte = 0x30
-	tagMetadata        byte = 0x31
-	tagPayloadChecksum byte = 0x3F
+	tagOriginalTopic    byte = 0x29
+	tagOriginalQueue    byte = 0x2A
+	tagOriginalStream   byte = 0x2B
+	tagOriginalOffset   byte = 0x2C
+	tagHeaders          byte = 0x30
+	tagMetadata         byte = 0x31
+	tagPayloadChecksum  byte = 0x3F
 
 	// Frame flags (compact)
 	fwb2FlagCompressed uint8 = 1 << 0
@@ -140,7 +140,7 @@ func (c *CompactMessageCodec) EncodeMessage(dst []byte, msg Message) ([]byte, er
 	if max <= 0 {
 		max = 1 << 20
 	}
-	payload := append([]byte(nil), msg.Payload...)
+	payload := msg.Payload
 
 	// Optional compression
 	flags := uint8(0)
@@ -156,8 +156,9 @@ func (c *CompactMessageCodec) EncodeMessage(dst []byte, msg Message) ([]byte, er
 	}
 
 	// Optional encryption
-	meta := cloneMap(msg.Metadata)
+	meta := msg.Metadata
 	if len(c.EncryptionKey) > 0 {
+		meta = cloneMap(meta)
 		sealed, nonce, err := sealPayload(c.EncryptionKey, payload, msg.ID)
 		if err != nil {
 			return nil, err

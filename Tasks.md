@@ -833,3 +833,16 @@ go run ./examples/stage12_audit/
 | Distributed microservices broker | **Not recommended** — use RabbitMQ/Kafka/NATS for multi-node |
 | Multi-region / disaster recovery | **Not recommended** — no replication |
 | Mission-critical with zero data loss | **Not recommended** — single node = single point of failure |
+
+
+## Native BWL1 WAL codec (2026-07-17)
+
+- [x] Replaced JSON mutation serialization in the binary WAL hot path with the dedicated BWL1 operation codec.
+- [x] Removed the generic Message-frame wrapper from new WAL writes.
+- [x] Added presence-bit message encoding and one-byte operation/status/destination codes.
+- [x] Added batch-common message, destination, queue, consumer, and acknowledgement fields.
+- [x] Preserved CRC32C, optional HMAC-SHA256, optional AES-GCM, compression, and maximum-size enforcement.
+- [x] Added bounded decompression and defensive collection/field-mask validation.
+- [x] Added mixed legacy FWB/JSON plus native BWL1 recovery.
+- [x] Added all-operation round-trip, corruption, encryption, recovery, size, benchmark, and race coverage.
+- [x] Added allocation-free length-prefix submission to group commit (no prefix+record copy).
