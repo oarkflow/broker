@@ -1,0 +1,52 @@
+services:
+  broker:
+    build:
+      context: .
+      target: brokerd
+    ports:
+      - "8090:8090"
+    command:
+      - "-addr=:8090"
+      - "-store=${BROKER_STORE:-wal}"
+      - "-wal=/data"
+      - "-token=bench-token"
+      - "-quiet"
+    volumes:
+      - broker-data:/data
+
+  producer:
+    build:
+      context: .
+      target: loadgen
+    depends_on:
+      - broker
+    command:
+      - "-addr=http://broker:8090"
+      - "-token=bench-token"
+      - "-queue=bench.q"
+      - "-mode=publish"
+      - "-c=${PRODUCER_CONCURRENCY:-50}"
+      - "-duration=${BENCH_DURATION:-30s}"
+      - "-payload=${PAYLOAD_SIZE:-256}"
+      - "-batch=${PUBLISH_BATCH:-1}"
+
+  consumer:
+    build:
+      context: .
+      target: loadgen
+    depends_on:
+      - broker
+    command:
+      - "-addr=http://broker:8090"
+      - "-token=bench-token"
+      - "-queue=bench.q"
+      - "-mode=pull"
+      - "-c=${CONSUMER_CONCURRENCY:-10}"
+      - "-duration=${BENCH_DURATION:-30s}"
+      - "-group=bench-group"
+      - "-pull-limit=${PULL_LIMIT:-32}"
+    deploy:
+      replicas: ${CONSUMER_REPLICAS:-3}
+
+volumes:
+  broker-data:

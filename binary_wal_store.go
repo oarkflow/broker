@@ -9,7 +9,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"sync"
 	"time"
 )
 
@@ -19,11 +18,11 @@ import (
 // AES-GCM payload protection.
 type BinaryFileWALStore struct {
 	*MemoryStore
-	mu      sync.Mutex
 	path    string
 	file    *os.File
 	codec   FrameCodec
 	keyName string
+	gc      *groupCommitWriter
 }
 
 func NewBinaryFileWALStore(dir string, opts ...BinaryMessageCodecOption) (*BinaryFileWALStore, error) {
@@ -48,6 +47,7 @@ func NewBinaryFileWALStoreWithCodec(dir string, codec FrameCodec) (*BinaryFileWA
 		return nil, err
 	}
 	st.file = f
+	st.gc = newGroupCommitWriter(f)
 	return st, nil
 }
 
@@ -151,8 +151,6 @@ func (s *BinaryFileWALStore) applyRecovered(r walRecord) {
 	}
 }
 func (s *BinaryFileWALStore) write(r walRecord) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.file == nil {
 		return ErrClosed
 	}
@@ -168,13 +166,10 @@ func (s *BinaryFileWALStore) write(r walRecord) error {
 	}
 	var lenBuf [binary.MaxVarintLen64]byte
 	n := binary.PutUvarint(lenBuf[:], uint64(len(frame)))
-	if _, err := s.file.Write(lenBuf[:n]); err != nil {
-		return err
-	}
-	if _, err := s.file.Write(frame); err != nil {
-		return err
-	}
-	return s.file.Sync()
+	buf := make([]byte, 0, n+len(frame))
+	buf = append(buf, lenBuf[:n]...)
+	buf = append(buf, frame...)
+	return s.gc.write(buf)
 }
 
 func uvarintLen(v uint64) int {
@@ -324,8 +319,9 @@ func (s *BinaryFileWALStore) CommitOffset(ctx context.Context, commit OffsetComm
 	return nil
 }
 func (s *BinaryFileWALStore) Close() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	if s.gc != nil {
+		_ = s.gc.close()
+	}
 	_ = s.MemoryStore.Close()
 	if s.file != nil {
 		return s.file.Close()

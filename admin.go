@@ -56,6 +56,7 @@ func (a AdminServer) Handler() http.Handler {
 	mux.HandleFunc("/lag", a.wrap(a.lag))
 	mux.HandleFunc("/audit", a.wrap(a.audit))
 	mux.HandleFunc("/publish", a.wrap(a.publish))
+	mux.HandleFunc("/publish/batch", a.wrap(a.publishBatch))
 	mux.HandleFunc("/topics", a.wrap(a.topics))
 	mux.HandleFunc("/queues", a.wrap(a.queues))
 	mux.HandleFunc("/queues/", a.wrap(a.queue))
@@ -64,6 +65,7 @@ func (a AdminServer) Handler() http.Handler {
 	mux.HandleFunc("/dlq", a.wrap(a.dlq))
 	mux.HandleFunc("/dlq/", a.wrap(a.dlqQueue))
 	mux.HandleFunc("/messages/", a.wrap(a.message))
+	mux.HandleFunc("/ack/batch", a.wrap(a.ackBatch))
 	mux.HandleFunc("/move", a.wrap(a.move))
 	mux.HandleFunc("/notifications", a.wrap(a.notifications))
 	mux.HandleFunc("/events", a.wrap(a.events))
@@ -380,6 +382,30 @@ func (a AdminServer) queue(w http.ResponseWriter, r *http.Request) {
 	}
 	http.NotFound(w, r)
 }
+// ackBatch acks many messages (possibly across queues/consumers) in one HTTP
+// call, amortizing per-request network and JSON overhead for consumers.
+func (a AdminServer) ackBatch(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodBroker(w)
+		return
+	}
+	var reqs []AckRequest
+	if json.NewDecoder(r.Body).Decode(&reqs) != nil {
+		http.Error(w, "invalid json", 400)
+		return
+	}
+	errs := make([]string, len(reqs))
+	ok := 0
+	for i, req := range reqs {
+		if err := a.Broker.store.Ack(r.Context(), req); err != nil {
+			errs[i] = err.Error()
+			continue
+		}
+		ok++
+		a.Broker.Consumers().AddStats(req.ConsumerID, 0, 1, 0, 0, "")
+	}
+	writeBrokerJSON(w, map[string]any{"acked": ok, "errors": errs})
+}
 func (a AdminServer) streams(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodPost {
 		var cfg StreamConfig
@@ -576,6 +602,47 @@ func (a AdminServer) publish(w http.ResponseWriter, r *http.Request) {
 	}
 	writeBrokerJSON(w, res)
 }
+
+// publishBatch accepts an array of publish requests (each may target a
+// different topic/queue/stream) in one HTTP call, amortizing per-request
+// network and JSON overhead across many messages.
+func (a AdminServer) publishBatch(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodBroker(w)
+		return
+	}
+	var items []struct {
+		Topic   string            `json:"topic"`
+		Queue   string            `json:"queue"`
+		Stream  string            `json:"stream"`
+		Type    string            `json:"type"`
+		Payload json.RawMessage   `json:"payload"`
+		Headers map[string]string `json:"headers"`
+	}
+	if json.NewDecoder(r.Body).Decode(&items) != nil {
+		http.Error(w, "invalid json", 400)
+		return
+	}
+	results := make([]PublishResult, len(items))
+	errs := make([]string, len(items))
+	pub := a.Broker.Publisher()
+	for i, req := range items {
+		opts := []PublishOption{WithHeaders(req.Headers), WithType(req.Type)}
+		if req.Queue != "" {
+			opts = append(opts, WithQueue(req.Queue))
+		}
+		if req.Stream != "" {
+			opts = append(opts, WithStream(req.Stream))
+		}
+		res, err := pub.Publish(r.Context(), req.Topic, []byte(req.Payload), opts...)
+		if err != nil {
+			errs[i] = err.Error()
+			continue
+		}
+		results[i] = res
+	}
+	writeBrokerJSON(w, map[string]any{"results": results, "errors": errs})
+}
 func (a AdminServer) move(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		methodBroker(w)
@@ -715,12 +782,14 @@ func adminAction(r *http.Request) string {
 	switch {
 	case path == "/healthz" || path == "/readyz" || path == "/stats":
 		return PermissionBrokerRead
-	case path == "/publish":
+	case path == "/publish" || path == "/publish/batch":
 		return PermissionPublish
 	case path == "/move":
 		return PermissionMessageMove
 	case path == "/notifications" || path == "/events" || strings.HasPrefix(path, "/v1/events"):
 		return PermissionNotification
+	case path == "/ack/batch":
+		return PermissionMessageAck
 	case strings.HasPrefix(path, "/v1/consumers/register"):
 		return PermissionConsumerRegister
 	case strings.HasPrefix(path, "/v1/consumers"):

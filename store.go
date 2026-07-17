@@ -69,10 +69,10 @@ type LeaseRequest struct {
 }
 
 type AckRequest struct {
-	MessageID  string
-	Queue      string
-	LeaseToken string
-	ConsumerID string
+	MessageID  string `json:"message_id,omitempty"`
+	Queue      string `json:"queue,omitempty"`
+	LeaseToken string `json:"lease_token,omitempty"`
+	ConsumerID string `json:"consumer_id,omitempty"`
 }
 
 type NackAction string
@@ -85,17 +85,17 @@ const (
 )
 
 type NackRequest struct {
-	MessageID        string
-	Queue            string
-	LeaseToken       string
-	ConsumerID       string
-	Action           NackAction
-	Reason           string
-	Error            string
-	Delay            time.Duration
-	DLQ              string
-	ResetLease       bool
-	IncrementAttempt bool
+	MessageID        string        `json:"message_id,omitempty"`
+	Queue            string        `json:"queue,omitempty"`
+	LeaseToken       string        `json:"lease_token,omitempty"`
+	ConsumerID       string        `json:"consumer_id,omitempty"`
+	Action           NackAction    `json:"action,omitempty"`
+	Reason           string        `json:"reason,omitempty"`
+	Error            string        `json:"error,omitempty"`
+	Delay            time.Duration `json:"delay,omitempty"`
+	DLQ              string        `json:"dlq,omitempty"`
+	ResetLease       bool          `json:"reset_lease,omitempty"`
+	IncrementAttempt bool          `json:"increment_attempt,omitempty"`
 }
 
 type MoveMode string
@@ -1228,11 +1228,11 @@ func strconvFormatInt(i int64) string { return strconv.FormatInt(i, 36) }
 // in the config to enable AES-GCM encryption of all WAL records at rest.
 type FileWALStore struct {
 	*MemoryStore
-	mu      sync.Mutex
 	path    string
 	file    *os.File
 	gcm     cipher.AEAD
 	keyName string
+	gc      *groupCommitWriter
 }
 
 // FileWALStoreConfig configures the FileWALStore.
@@ -1293,6 +1293,7 @@ func NewFileWALStoreWithConfig(cfg FileWALStoreConfig) (*FileWALStore, error) {
 		return nil, err
 	}
 	st.file = f
+	st.gc = newGroupCommitWriter(f)
 	return st, nil
 }
 
@@ -1446,8 +1447,6 @@ func (s *FileWALStore) applyRecovered(r walRecord) error {
 }
 
 func (s *FileWALStore) write(r walRecord) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.file == nil {
 		return ErrClosed
 	}
@@ -1476,10 +1475,7 @@ func (s *FileWALStore) write(r walRecord) error {
 		line = append([]byte("ENC:"), encoded...)
 	}
 	line = append(line, '\n')
-	if _, err := s.file.Write(line); err != nil {
-		return err
-	}
-	return s.file.Sync()
+	return s.gc.write(line)
 }
 
 func verifyWALRecord(r walRecord) error {
@@ -1655,12 +1651,11 @@ func (s *FileWALStore) CommitOffset(ctx context.Context, commit OffsetCommit) er
 }
 
 func (s *FileWALStore) Close() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	if s.gc != nil {
+		_ = s.gc.close()
+	}
 	_ = s.MemoryStore.Close()
 	if s.file != nil {
-		// Sync before close to ensure all buffered writes are flushed to disk.
-		_ = s.file.Sync()
 		return s.file.Close()
 	}
 	return nil
