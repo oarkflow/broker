@@ -334,6 +334,9 @@ type Config struct {
 	RateLimit                   *RateLimitConfig   `json:"rate_limit,omitempty"`
 	Tenancy                     *TenancyConfig     `json:"tenancy,omitempty"`
 	ACL                         *ACL               `json:"-"`
+	OTLPEndpoint                string             `json:"otlp_endpoint,omitempty"`
+	OTLPInterval                time.Duration      `json:"otlp_interval,omitempty"`
+	OTLPHeaders                 map[string]string  `json:"otlp_headers,omitempty"`
 	Partition                   *PartitionConfig   `json:"partition,omitempty"`
 	WebSocket                   *WebSocketConfig   `json:"websocket,omitempty"`
 	ExactlyOnce                 *ExactlyOnceConfig `json:"exactly_once,omitempty"`

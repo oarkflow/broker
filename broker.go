@@ -59,6 +59,7 @@ type Broker struct {
 	healthMonitor         *StoreHealthMonitor
 	producerRegistry      *ProducerRegistry
 	acl                   *ACL
+	otlpExporter          *OTLPExporter
 }
 
 func New(cfg Config) (*Broker, error) {
@@ -181,6 +182,16 @@ func New(cfg Config) (*Broker, error) {
 	b.healthMonitor = NewStoreHealthMonitor(b, b.store, 250*time.Millisecond)
 	b.producerRegistry = NewProducerRegistry()
 	b.acl = cfg.ACL
+	if cfg.OTLPEndpoint != "" {
+		opts := []OTLPOption{
+			WithOTLPServiceName(cfg.Name),
+			WithOTLPHeaders(cfg.OTLPHeaders),
+		}
+		exp, err := NewOTLPExporter(cfg.OTLPEndpoint, cfg.OTLPInterval, b.promMetrics, opts...)
+		if err == nil {
+			b.otlpExporter = exp
+		}
+	}
 	b.cfg = cfg
 	b.state.Store(BrokerConfigured)
 	if err := b.store.DeclareQueue(context.Background(), QueueConfig{Name: cfg.DefaultQueue, VisibilityTimeout: cfg.DefaultVisibility, RetryPolicy: cfg.DefaultRetry, DLQ: cfg.DefaultDLQ}); err != nil {
@@ -225,6 +236,13 @@ func (b *Broker) Start(ctx context.Context) error {
 	if b.healthMonitor != nil {
 		b.healthMonitor.Start(b.ctx)
 	}
+	if b.otlpExporter != nil {
+		b.wg.Add(1)
+		go func() {
+			defer b.wg.Done()
+			b.otlpExporter.Run(b.ctx)
+		}()
+	}
 	return nil
 }
 
@@ -233,6 +251,9 @@ func (b *Broker) Stop(ctx context.Context) error {
 	b.cancel()
 	if b.healthMonitor != nil {
 		b.healthMonitor.Stop()
+	}
+	if b.otlpExporter != nil {
+		b.otlpExporter.Stop()
 	}
 	b.subsMu.RLock()
 	subs := make([]*Subscription, 0, len(b.subs))
@@ -320,6 +341,7 @@ func (b *Broker) Cluster() *Cluster                     { return b.cluster }
 func (b *Broker) Publisher() *Publisher                 { return &Publisher{b: b} }
 func (b *Broker) AuditLogger() *AuditLogger             { return b.auditLogger }
 func (b *Broker) PrometheusMetrics() *PrometheusMetrics { return b.promMetrics }
+func (b *Broker) OTLPExporter() *OTLPExporter           { return b.otlpExporter }
 func (b *Broker) Tracer() *Tracer                       { return b.tracer }
 func (b *Broker) HealthMonitor() *StoreHealthMonitor    { return b.healthMonitor }
 func (b *Broker) IsStoreFenced() bool {

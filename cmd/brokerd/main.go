@@ -72,6 +72,8 @@ func main() {
 	retainCompleted := flag.Bool("retain-completed", envBool("BROKER_RETAIN_COMPLETED"), "retain completed message bodies in memory after durable acknowledgement")
 	publisherTracking := flag.Bool("publisher-tracking", envBool("BROKER_PUBLISHER_TRACKING"), "retain per-publisher counters/history")
 	consumerEventTracking := flag.Bool("consumer-event-tracking", envBool("BROKER_CONSUMER_EVENT_TRACKING"), "emit per-message consumer events")
+	otlpEndpoint := flag.String("otlp-endpoint", env("BROKER_OTLP_ENDPOINT", ""), "OpenTelemetry Protocol collector endpoint (e.g. http://localhost:4318)")
+	otlpInterval := flag.Duration("otlp-interval", time.Duration(envInt64("BROKER_OTLP_INTERVAL_SEC", 15))*time.Second, "OpenTelemetry metrics export interval")
 	flag.Parse()
 
 	if !*insecureDev && *token == "" {
@@ -190,6 +192,8 @@ func main() {
 		NotificationHistoryCapacity: *notificationHistory,
 		EnablePublisherTracking:     *publisherTracking,
 		EnableConsumerEventTracking: *consumerEventTracking,
+		OTLPEndpoint:                *otlpEndpoint,
+		OTLPInterval:                *otlpInterval,
 	})
 	if err != nil {
 		logger.Log.Fatal("create broker", zlog.Err(err))
