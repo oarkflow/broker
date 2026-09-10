@@ -291,8 +291,10 @@ type ConsumerConfig struct {
 	Strategy            StrategyType    `json:"strategy,omitempty"`
 	StrategyConfig      *StrategyConfig `json:"-"`
 	Priority            int             `json:"priority,omitempty"`
-	Idempotent          bool            `json:"idempotent,omitempty"`
-	DeduplicationWindow time.Duration   `json:"deduplication_window,omitempty"`
+	Idempotent          bool              `json:"idempotent,omitempty"`
+	DeduplicationWindow time.Duration     `json:"deduplication_window,omitempty"`
+	FilterExpression    string            `json:"filter_expression,omitempty"`
+	FilterHeaders       map[string]string `json:"filter_headers,omitempty"`
 }
 
 type Config struct {

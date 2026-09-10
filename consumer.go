@@ -198,6 +198,7 @@ type Subscription struct {
 	inFlight     atomic.Int64
 	strategy     ConsumerStrategy
 	dedup        *ConsumerDedup
+	filter       ConsumerFilter
 }
 
 // ConsumerDedup provides idempotent consumer processing by deduplicating messages
@@ -340,6 +341,9 @@ func (b *Broker) subscribe(ctx context.Context, cfg ConsumerConfig, handler Hand
 		}
 	}
 	s := &Subscription{id: b.nextID("sub"), b: b, cfg: cfg, handler: handler, batchHandler: batchHandler, ctx: cctx, cancel: cancel, stopped: make(chan struct{}), strategy: strategy}
+	if f, err := NewConsumerFilter(cfg); err == nil && f != nil {
+		s.filter = f
+	}
 	if cfg.DeduplicationWindow > 0 || cfg.Idempotent {
 		s.dedup = NewConsumerDedup(cfg.DeduplicationWindow)
 	}
@@ -400,6 +404,12 @@ func (s *Subscription) loop() {
 			}
 			if s.strategy != nil && len(msgs) > 0 {
 				msgs = s.filterByStrategy(msgs)
+				if len(msgs) == 0 {
+					continue
+				}
+			}
+			if s.filter != nil && len(msgs) > 0 {
+				msgs = s.filterMessages(msgs)
 				if len(msgs) == 0 {
 					continue
 				}
@@ -674,6 +684,21 @@ func (s *Subscription) filterByStrategy(msgs []Message) []Message {
 		}
 	}
 	return filtered
+}
+
+func (s *Subscription) filterMessages(msgs []Message) []Message {
+	if s.filter == nil || len(msgs) == 0 {
+		return msgs
+	}
+	matched := make([]Message, 0, len(msgs))
+	for _, m := range msgs {
+		if s.filter.Match(m) {
+			matched = append(matched, m)
+		} else {
+			_ = s.b.store.Ack(s.ctx, AckRequest{Queue: s.cfg.Queue, MessageID: m.ID, ConsumerID: s.cfg.Name, LeaseToken: m.LeaseToken})
+		}
+	}
+	return matched
 }
 
 func (b *Broker) QueueCandidates(queue, group string) []ConsumerCandidate {
