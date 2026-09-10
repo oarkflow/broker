@@ -172,6 +172,8 @@ type Message struct {
 	Redeliveries     int               `json:"redeliveries,omitempty"`
 	TenantID         string            `json:"tenant_id,omitempty"`
 	ProducerID       string            `json:"producer_id,omitempty"`
+	ProducerEpoch    int32             `json:"producer_epoch,omitempty"`
+	ProducerSequence *uint64           `json:"producer_sequence,omitempty"`
 	ConsumerID       string            `json:"consumer_id,omitempty"`
 	ConsumerGroup    string            `json:"consumer_group,omitempty"`
 	LeaseToken       string            `json:"lease_token,omitempty"`

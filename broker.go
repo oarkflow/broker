@@ -57,6 +57,7 @@ type Broker struct {
 	mqttServer            *MQTTServer
 	grpcServer            *GRPCServer
 	healthMonitor         *StoreHealthMonitor
+	producerRegistry      *ProducerRegistry
 }
 
 func New(cfg Config) (*Broker, error) {
@@ -177,6 +178,7 @@ func New(cfg Config) (*Broker, error) {
 	b.partitionOrdering = NewPartitionOrdering(b)
 	b.partitionReassignment = NewPartitionReassignment(b)
 	b.healthMonitor = NewStoreHealthMonitor(b, b.store, 250*time.Millisecond)
+	b.producerRegistry = NewProducerRegistry()
 	b.cfg = cfg
 	b.state.Store(BrokerConfigured)
 	if err := b.store.DeclareQueue(context.Background(), QueueConfig{Name: cfg.DefaultQueue, VisibilityTimeout: cfg.DefaultVisibility, RetryPolicy: cfg.DefaultRetry, DLQ: cfg.DefaultDLQ}); err != nil {

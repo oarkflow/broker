@@ -396,6 +396,18 @@ func (p *Publisher) publish(ctx context.Context, topic string, payload any, opts
 	if err := p.checkBackpressure(ctx, prep); err != nil {
 		return PublishResult{}, err
 	}
+	if prep.opts.ProducerID != "" && prep.opts.ProducerSequence != nil {
+		isDup, existingID, err := p.b.ProducerRegistry().CheckAndRecord(prep.opts.ProducerID, prep.opts.ProducerEpoch, *prep.opts.ProducerSequence, prep.msg.ID)
+		if err != nil {
+			return PublishResult{}, err
+		}
+		if isDup {
+			return PublishResult{
+				MessageID: existingID,
+				Duplicate: true,
+			}, nil
+		}
+	}
 	if p.b.tenantMgr != nil {
 		if err := p.b.tenantMgr.CheckPublishQuota(ctx, prep.msg.TenantID, prep.dests); err != nil {
 			return PublishResult{}, err
@@ -469,7 +481,7 @@ func (p *Publisher) preparePublish(ctx context.Context, topic string, payload an
 		}
 		meta["_dedup_window_ns"] = fmt.Sprintf("%d", o.DeduplicationWindow.Nanoseconds())
 	}
-	msg := Message{ID: id, Topic: topic, Queue: o.Queue, Stream: o.Stream, Key: o.Key, RoutingKey: o.RoutingKey, Type: o.Type, ContentType: firstNonEmpty(o.ContentType, p.b.codec.ContentType()), Schema: o.Schema, SchemaVersion: o.SchemaVersion, Payload: body, Headers: cloneMap(o.Headers), Metadata: meta, TraceID: o.TraceID, CorrelationID: o.CorrelationID, CausationID: o.CausationID, IdempotencyKey: o.IdempotencyKey, DeduplicationID: o.DeduplicationID, Priority: o.Priority, CreatedAt: now, AvailableAt: available, TenantID: o.TenantID, ProducerID: o.ProducerID, Status: status, MaxAttempts: o.MaxAttempts}
+	msg := Message{ID: id, Topic: topic, Queue: o.Queue, Stream: o.Stream, Key: o.Key, RoutingKey: o.RoutingKey, Type: o.Type, ContentType: firstNonEmpty(o.ContentType, p.b.codec.ContentType()), Schema: o.Schema, SchemaVersion: o.SchemaVersion, Payload: body, Headers: cloneMap(o.Headers), Metadata: meta, TraceID: o.TraceID, CorrelationID: o.CorrelationID, CausationID: o.CausationID, IdempotencyKey: o.IdempotencyKey, DeduplicationID: o.DeduplicationID, Priority: o.Priority, CreatedAt: now, AvailableAt: available, TenantID: o.TenantID, ProducerID: o.ProducerID, ProducerEpoch: o.ProducerEpoch, ProducerSequence: o.ProducerSequence, Status: status, MaxAttempts: o.MaxAttempts}
 	if msg.Headers != nil {
 		msg.TaskID = msg.Headers["x-task-id"]
 		msg.TaskName = msg.Headers["x-task-name"]

@@ -24,6 +24,8 @@ type PublishOptions struct {
 	TTL                 time.Duration
 	TenantID            string
 	ProducerID          string
+	ProducerEpoch       int32
+	ProducerSequence    *uint64
 	Queue               string
 	Stream              string
 	ConfirmLevel        ConfirmLevel
