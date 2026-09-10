@@ -18,6 +18,12 @@ import (
 // operation codec. BWL1 writes packed mutation records directly—without JSON
 // or a generic Message wrapper—and protects them with CRC32C plus optional
 // HMAC-SHA256 and AES-GCM.
+//
+// WAL-first ordering guarantee: every durable mutation (Lease, Ack, Nack,
+// Move, Update, PauseQueue, ResumeQueue, PurgeQueue, CommitOffset) encodes and
+// group-commits the WAL record BEFORE applying the change to the in-memory
+// index. A crash between WAL write and memory application is safe: on recovery
+// the WAL record is replayed and the in-memory state is rebuilt correctly.
 type BinaryFileWALStore struct {
 	*MemoryStore
 	path     string
@@ -36,6 +42,14 @@ func (s *BinaryFileWALStore) StoreHealth() error {
 		return ErrClosed
 	}
 	return s.gc.healthError()
+}
+
+func (s *BinaryFileWALStore) SetHealthCallback(fn func(error)) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if s.gc != nil {
+		s.gc.setFaultCallback(fn)
+	}
 }
 
 func NewBinaryFileWALStore(dir string, opts ...BinaryMessageCodecOption) (*BinaryFileWALStore, error) {
@@ -274,134 +288,184 @@ func (s *BinaryFileWALStore) durableAppend(ctx context.Context, entries []Append
 	}
 	return out, nil
 }
+
+// Lease implements WAL-first ordering: prepare the lease state (no mutation),
+// fsync the WAL record, then apply the mutation to the in-memory index.
 func (s *BinaryFileWALStore) Lease(ctx context.Context, req LeaseRequest) ([]Message, error) {
-	msgs, err := s.MemoryStore.Lease(ctx, req)
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	msgs, err := s.MemoryStore.prepareLease(ctx, req)
 	if err != nil || len(msgs) == 0 {
 		return msgs, err
 	}
+	// WAL-first: persist before applying to memory.
 	if err := s.write(walRecord{Op: "lease_batch", Messages: msgs, Lease: req}); err != nil {
-		return msgs, err
+		return nil, err
+	}
+	// Apply mutation only after successful WAL write.
+	if err := s.MemoryStore.applyLease(ctx, msgs, req); err != nil {
+		return nil, err
 	}
 	return msgs, nil
 }
+
+// Ack implements WAL-first ordering: validate (read-only), WAL, then apply.
 func (s *BinaryFileWALStore) Ack(ctx context.Context, req AckRequest) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	if err := s.MemoryStore.validateAckLease(ctx, req); err != nil {
 		return err
 	}
-	if err := s.MemoryStore.Ack(ctx, req); err != nil {
+	if err := s.write(walRecord{Op: "ack", Ack: req}); err != nil {
 		return err
 	}
-	return s.write(walRecord{Op: "ack", Ack: req})
+	return s.MemoryStore.Ack(ctx, req)
 }
+
+// AckBatch implements WAL-first ordering: validate all, WAL the valid subset, then apply.
 func (s *BinaryFileWALStore) AckBatch(ctx context.Context, reqs []AckRequest) []error {
-	errs := s.MemoryStore.AckBatch(ctx, reqs)
-	successful := make([]AckRequest, 0, len(reqs))
-	indices := make([]int, 0, len(reqs))
-	for i, err := range errs {
-		if err == nil {
-			successful = append(successful, reqs[i])
-			indices = append(indices, i)
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	errs := make([]error, len(reqs))
+	// Validate all first — no mutations yet.
+	valid := make([]int, 0, len(reqs))
+	for i, req := range reqs {
+		if err := s.MemoryStore.validateAckLease(ctx, req); err != nil {
+			errs[i] = err
+		} else {
+			valid = append(valid, i)
 		}
 	}
-	if len(successful) == 0 {
+	if len(valid) == 0 {
 		return errs
 	}
-	if err := s.write(walRecord{Op: "ack_batch", Acks: successful}); err != nil {
-		for _, i := range indices {
-			errs[i] = err
+	validReqs := make([]AckRequest, 0, len(valid))
+	for _, i := range valid {
+		validReqs = append(validReqs, reqs[i])
+	}
+	// WAL-first: persist before any mutation.
+	if walErr := s.write(walRecord{Op: "ack_batch", Acks: validReqs}); walErr != nil {
+		for _, i := range valid {
+			errs[i] = walErr
 		}
+		return errs
+	}
+	// Apply to memory only after WAL success.
+	applyErrs := s.MemoryStore.AckBatch(ctx, validReqs)
+	for j, i := range valid {
+		errs[i] = applyErrs[j]
 	}
 	return errs
 }
+
+// Nack implements WAL-first ordering: validate (read-only), WAL, then apply.
 func (s *BinaryFileWALStore) Nack(ctx context.Context, req NackRequest) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	if err := s.MemoryStore.validateNackLease(ctx, req); err != nil {
 		return err
 	}
-	if err := s.MemoryStore.Nack(ctx, req); err != nil {
+	if err := s.write(walRecord{Op: "nack", Nack: req}); err != nil {
 		return err
 	}
-	return s.write(walRecord{Op: "nack", Nack: req})
+	return s.MemoryStore.Nack(ctx, req)
 }
+// ExtendLease implements WAL-first ordering: validate, snapshot the updated
+// lease-until timestamp, WAL, then apply.
 func (s *BinaryFileWALStore) ExtendLease(ctx context.Context, req LeaseRequest) error {
-	if err := s.MemoryStore.ExtendLease(ctx, req); err != nil {
-		return err
-	}
-	m, ok, err := s.MemoryStore.Get(ctx, req.MessageID)
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	// Validate (read-only) and snapshot the current message state.
+	m, err := s.MemoryStore.validateExtendLease(ctx, req)
 	if err != nil {
 		return err
 	}
-	if !ok {
-		return ErrMessageNotFound
+	if req.VisibilityTimeout <= 0 {
+		req.VisibilityTimeout = 30 * time.Second
 	}
-	return s.write(walRecord{Op: "lease", Message: m, Lease: req})
-}
-func (s *BinaryFileWALStore) Update(ctx context.Context, msg Message) error {
-	if err := s.MemoryStore.Update(ctx, msg); err != nil {
+	m.LeaseUntil = time.Now().Add(req.VisibilityTimeout)
+	// WAL-first: persist the post-extension state.
+	if err := s.write(walRecord{Op: "lease", Message: m, Lease: req}); err != nil {
 		return err
 	}
-	return s.write(walRecord{Op: "update", Message: msg})
+	return s.MemoryStore.ExtendLease(ctx, req)
 }
-func (s *BinaryFileWALStore) UpdateBatch(ctx context.Context, messages []Message) []error {
-	errs := s.MemoryStore.UpdateBatch(ctx, messages)
-	successful := make([]Message, 0, len(messages))
-	indices := make([]int, 0, len(messages))
-	for i, err := range errs {
-		if err == nil {
-			successful = append(successful, messages[i])
-			indices = append(indices, i)
-		}
+// Update implements WAL-first ordering.
+func (s *BinaryFileWALStore) Update(ctx context.Context, msg Message) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if err := s.write(walRecord{Op: "update", Message: msg}); err != nil {
+		return err
 	}
-	if len(successful) == 0 {
+	return s.MemoryStore.Update(ctx, msg)
+}
+
+// UpdateBatch implements WAL-first ordering: WAL the full batch then apply.
+func (s *BinaryFileWALStore) UpdateBatch(ctx context.Context, messages []Message) []error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if walErr := s.write(walRecord{Op: "update_batch", Messages: messages}); walErr != nil {
+		errs := make([]error, len(messages))
+		for i := range errs {
+			errs[i] = walErr
+		}
 		return errs
 	}
-	if err := s.write(walRecord{Op: "update_batch", Messages: successful}); err != nil {
-		for _, i := range indices {
-			errs[i] = err
-		}
-	}
-	return errs
+	return s.MemoryStore.UpdateBatch(ctx, messages)
 }
+// Move implements WAL-first ordering.
 func (s *BinaryFileWALStore) Move(ctx context.Context, req MoveRequest) (MoveResult, error) {
-	res, err := s.MemoryStore.Move(ctx, req)
-	if err != nil {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if err := s.write(walRecord{Op: "move", Move: req}); err != nil {
 		return MoveResult{}, err
 	}
-	if err := s.write(walRecord{Op: "move", Move: req}); err != nil {
-		return res, err
-	}
-	return res, nil
+	return s.MemoryStore.Move(ctx, req)
 }
+
+// PauseQueue implements WAL-first ordering.
 func (s *BinaryFileWALStore) PauseQueue(ctx context.Context, name string) error {
-	if err := s.MemoryStore.PauseQueue(ctx, name); err != nil {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if err := s.write(walRecord{Op: "pause_queue", QueueName: name}); err != nil {
 		return err
 	}
-	return s.write(walRecord{Op: "pause_queue", QueueName: name})
+	return s.MemoryStore.PauseQueue(ctx, name)
 }
+
+// ResumeQueue implements WAL-first ordering.
 func (s *BinaryFileWALStore) ResumeQueue(ctx context.Context, name string) error {
-	if err := s.MemoryStore.ResumeQueue(ctx, name); err != nil {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if err := s.write(walRecord{Op: "resume_queue", QueueName: name}); err != nil {
 		return err
 	}
-	return s.write(walRecord{Op: "resume_queue", QueueName: name})
+	return s.MemoryStore.ResumeQueue(ctx, name)
 }
+
+// PurgeQueue implements WAL-first ordering.
 func (s *BinaryFileWALStore) PurgeQueue(ctx context.Context, name string) (int, error) {
-	n, err := s.MemoryStore.PurgeQueue(ctx, name)
-	if err != nil {
-		return n, err
-	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	if err := s.write(walRecord{Op: "purge_queue", QueueName: name}); err != nil {
-		return n, err
+		return 0, err
 	}
-	return n, nil
+	return s.MemoryStore.PurgeQueue(ctx, name)
 }
+
+// CommitOffset implements WAL-first ordering.
 func (s *BinaryFileWALStore) CommitOffset(ctx context.Context, commit OffsetCommit) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	persisted, err := durableOffsetCommit(ctx, commit)
 	if err != nil {
 		return err
 	}
-	if err := s.MemoryStore.CommitOffset(context.Background(), persisted); err != nil {
+	// WAL-first: persist before updating the in-memory offset map.
+	if err := s.write(walRecord{Op: "commit_offset", Offset: persisted}); err != nil {
 		return err
 	}
-	return s.write(walRecord{Op: "commit_offset", Offset: persisted})
+	return s.MemoryStore.CommitOffset(context.Background(), persisted)
 }
 
 func (s *BinaryFileWALStore) Close() error {

@@ -34,6 +34,7 @@ type Connection struct {
 	username        string
 	closed          chan struct{}
 	closeOnce       sync.Once
+	release         func()
 }
 
 // Connection states.
@@ -265,8 +266,19 @@ func (c *Connection) authenticate(mechanism string, response []byte) error {
 		if !ok {
 			return errors.New("invalid PLAIN authentication response")
 		}
+		if c.server.cfg.ACL != nil {
+			if principal, ok := c.server.cfg.ACL.Authenticate(password); ok {
+				release, err := c.server.cfg.ACL.AdmitConnection(principal)
+				if err != nil {
+					return err
+				}
+				c.release = release
+				c.username = principal.Name
+				return nil
+			}
+		}
 		if c.server.cfg.Username == "" && c.server.cfg.Password == "" {
-			if !c.server.cfg.AllowInsecure {
+			if !c.server.cfg.AllowInsecure && c.server.cfg.ACL == nil {
 				return errors.New("PLAIN authentication is not configured")
 			}
 		} else if !secureEqual(username, c.server.cfg.Username) || !secureEqual(password, c.server.cfg.Password) {
@@ -282,6 +294,17 @@ func (c *Connection) authenticate(mechanism string, response []byte) error {
 		state := tc.ConnectionState()
 		if len(state.PeerCertificates) == 0 || len(state.VerifiedChains) == 0 {
 			return errors.New("EXTERNAL authentication requires a verified client certificate")
+		}
+		if c.server.cfg.ACL != nil {
+			if principal, ok := c.server.cfg.ACL.AuthenticateCertificate(state.VerifiedChains[0][0]); ok {
+				release, err := c.server.cfg.ACL.AdmitConnection(principal)
+				if err != nil {
+					return err
+				}
+				c.release = release
+				c.username = principal.Name
+				return nil
+			}
 		}
 		c.username = state.PeerCertificates[0].Subject.String()
 		return nil
@@ -507,6 +530,9 @@ func (c *Connection) removeChannel(id uint16) {
 // Close closes the connection.
 func (c *Connection) Close() error {
 	c.closeOnce.Do(func() {
+		if c.release != nil {
+			c.release()
+		}
 		c.state.Store(connStateClosed)
 		close(c.closed)
 		c.netConn.Close()

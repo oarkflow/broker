@@ -44,6 +44,8 @@ type MQTTConfig struct {
 	// BrokerToken is the bearer token for MQTT CONNECT authentication.
 	// If set, the MQTT password field is validated against this token.
 	BrokerToken string
+	// ACL provides shared authentication and admission control across protocols.
+	ACL *ACL
 }
 
 // MQTT 3.1.1 packet types.
@@ -85,6 +87,7 @@ type mqttConn struct {
 	subs         map[string]uint8 // topic -> qos
 	incomingQoS2 map[uint16]mqttPendingPublish
 	closed       chan struct{}
+	release      func()
 }
 
 type mqttPendingPublish struct {
@@ -205,6 +208,9 @@ func (ms *MQTTServer) handleConn(conn net.Conn) {
 	ms.conns[id] = mc
 	ms.mu.Unlock()
 	defer func() {
+		if mc.release != nil {
+			mc.release()
+		}
 		ms.mu.Lock()
 		delete(ms.conns, id)
 		ms.mu.Unlock()
@@ -381,7 +387,36 @@ func (ms *MQTTServer) handleConnect(mc *mqttConn, payload []byte) bool {
 	}
 
 	// Auth check
-	if ms.cfg.BrokerToken != "" {
+	if ms.cfg.ACL != nil {
+		var principal AdminPrincipal
+		authenticated := false
+		if tc, isTLS := mc.conn.(*tls.Conn); isTLS {
+			state := tc.ConnectionState()
+			if len(state.VerifiedChains) > 0 && len(state.VerifiedChains[0]) > 0 {
+				if p, ok := ms.cfg.ACL.AuthenticateCertificate(state.VerifiedChains[0][0]); ok {
+					principal = p
+					authenticated = true
+				}
+			}
+		}
+		if !authenticated && password != "" {
+			if p, ok := ms.cfg.ACL.Authenticate(password); ok {
+				principal = p
+				authenticated = true
+			}
+		}
+		if authenticated {
+			release, err := ms.cfg.ACL.AdmitConnection(principal)
+			if err != nil {
+				ms.sendConnack(mc.conn, 0x03) // Server unavailable
+				return false
+			}
+			mc.release = release
+		} else if ms.cfg.RequireAuth {
+			ms.sendConnack(mc.conn, 0x05) // Connection Refused: not authorized
+			return false
+		}
+	} else if ms.cfg.BrokerToken != "" {
 		// Use broker token for authentication
 		if !constantTimeEqual(password, ms.cfg.BrokerToken) {
 			ms.sendConnack(mc.conn, 0x05) // Connection Refused: not authorized

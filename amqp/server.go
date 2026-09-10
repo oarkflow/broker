@@ -31,6 +31,8 @@ type ServerConfig struct {
 	AllowInsecure bool
 	// Broker is the underlying fastworker broker instance.
 	Broker *broker.Broker
+	// ACL provides shared authentication and admission control across protocols.
+	ACL *broker.ACL
 }
 
 // DefaultServerConfig returns a sensible default configuration.

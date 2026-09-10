@@ -3,6 +3,7 @@ package broker
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -28,6 +29,16 @@ const (
 	nativeOpFetchRaw   byte   = 6
 	nativeResponseFlag byte   = 0x80
 	nativeHeaderSize          = 20
+
+	NativeAuthAnonymous byte = 0x00
+	NativeAuthToken     byte = 0x01
+	NativeAuthMTLS      byte = 0x02
+
+	NativeStatusSuccess      byte = 0x00
+	NativeStatusUnauthorized byte = 0x01
+	NativeStatusForbidden    byte = 0x02
+	NativeStatusThrottled    byte = 0x03
+	NativeStatusErrProtocol  byte = 0x04
 )
 
 type NativeStreamConfig struct {
@@ -38,6 +49,9 @@ type NativeStreamConfig struct {
 	GroupCommitBytes int
 	MaxFrameBytes    int
 	Sync             bool
+	ACL              *ACL
+	InsecureDev      bool
+	TLSConfig        *tls.Config
 }
 
 type NativeStreamServer struct {
@@ -479,7 +493,13 @@ func (p *nativePartition) fetchRaw(offset uint64, maxRecords, maxBytes int) ([]b
 }
 
 func (s *NativeStreamServer) ListenAndServe(addr string) error {
-	ln, err := net.Listen("tcp", addr)
+	var ln net.Listener
+	var err error
+	if s.cfg.TLSConfig != nil {
+		ln, err = tls.Listen("tcp", addr, s.cfg.TLSConfig)
+	} else {
+		ln, err = net.Listen("tcp", addr)
+	}
 	if err != nil {
 		return err
 	}
@@ -497,11 +517,107 @@ func (s *NativeStreamServer) ListenAndServe(addr string) error {
 	}
 }
 
+func writeHandshakeResponse(w io.Writer, statusCode byte, principal string) error {
+	var h [8]byte
+	binary.BigEndian.PutUint32(h[:4], NativeStreamMagic)
+	h[4] = nativeVersion
+	h[5] = statusCode
+	binary.BigEndian.PutUint16(h[6:8], uint16(len(principal)))
+	if _, err := w.Write(h[:]); err != nil {
+		return err
+	}
+	if len(principal) > 0 {
+		_, err := io.WriteString(w, principal)
+		return err
+	}
+	return nil
+}
+
 func (s *NativeStreamServer) serveConn(c net.Conn) {
 	defer s.wg.Done()
 	defer c.Close()
 	r := bufio.NewReaderSize(c, 1<<20)
 	w := bufio.NewWriterSize(c, 1<<20)
+
+	// Perform BST1 authenticated handshake
+	var h [8]byte
+	if _, err := io.ReadFull(r, h[:]); err != nil {
+		return
+	}
+	if binary.BigEndian.Uint32(h[:4]) != NativeStreamMagic || h[4] != nativeVersion {
+		_ = writeHandshakeResponse(w, NativeStatusErrProtocol, "")
+		_ = w.Flush()
+		return
+	}
+	authType := h[5]
+	tokenLen := int(binary.BigEndian.Uint16(h[6:8]))
+	token := ""
+	if tokenLen > 0 {
+		tokenBytes := make([]byte, tokenLen)
+		if _, err := io.ReadFull(r, tokenBytes); err != nil {
+			return
+		}
+		token = string(tokenBytes)
+	}
+
+	var principal AdminPrincipal
+	statusCode := NativeStatusUnauthorized
+
+	switch authType {
+	case NativeAuthAnonymous:
+		if s.cfg.InsecureDev || s.cfg.ACL == nil {
+			principal = AdminPrincipal{Name: "anonymous", Permissions: []string{PermissionAdminAll}}
+			statusCode = NativeStatusSuccess
+		}
+	case NativeAuthToken:
+		if s.cfg.InsecureDev {
+			principal = AdminPrincipal{Name: "development", Permissions: []string{PermissionAdminAll}}
+			statusCode = NativeStatusSuccess
+		} else if s.cfg.ACL != nil {
+			if p, ok := s.cfg.ACL.Authenticate(token); ok {
+				principal = p
+				statusCode = NativeStatusSuccess
+			}
+		}
+	case NativeAuthMTLS:
+		if tc, ok := c.(*tls.Conn); ok {
+			state := tc.ConnectionState()
+			if len(state.VerifiedChains) > 0 && len(state.VerifiedChains[0]) > 0 && s.cfg.ACL != nil {
+				if p, ok := s.cfg.ACL.AuthenticateCertificate(state.VerifiedChains[0][0]); ok {
+					principal = p
+					statusCode = NativeStatusSuccess
+				}
+			}
+		}
+	}
+
+	if statusCode != NativeStatusSuccess {
+		_ = writeHandshakeResponse(w, statusCode, "")
+		_ = w.Flush()
+		return
+	}
+
+	var release func()
+	if s.cfg.ACL != nil {
+		var err error
+		release, err = s.cfg.ACL.AdmitConnection(principal)
+		if err != nil {
+			_ = writeHandshakeResponse(w, NativeStatusThrottled, "")
+			_ = w.Flush()
+			return
+		}
+	}
+	if release != nil {
+		defer release()
+	}
+
+	if err := writeHandshakeResponse(w, NativeStatusSuccess, principal.Name); err != nil {
+		return
+	}
+	if err := w.Flush(); err != nil {
+		return
+	}
+
 	for {
 		op, corr, body, err := readNativeFrame(r, s.cfg.MaxFrameBytes)
 		if err != nil {
@@ -512,13 +628,29 @@ func (s *NativeStreamServer) serveConn(c net.Conn) {
 		switch op {
 		case nativeOpPing:
 		case nativeOpProduce:
-			resp = s.handleProduce(body)
+			if s.cfg.ACL != nil && !s.cfg.ACL.Authorize(principal, PermissionStreamWrite) {
+				resp = appendNativeError(nil, "permission denied")
+			} else {
+				resp = s.handleProduce(body)
+			}
 		case nativeOpFetch:
-			resp = s.handleFetch(body)
+			if s.cfg.ACL != nil && !s.cfg.ACL.Authorize(principal, PermissionStreamRead) {
+				resp = appendNativeError(nil, "permission denied")
+			} else {
+				resp = s.handleFetch(body)
+			}
 		case nativeOpFetchRaw:
-			resp = s.handleFetchRaw(body)
+			if s.cfg.ACL != nil && !s.cfg.ACL.Authorize(principal, PermissionStreamRead) {
+				resp = appendNativeError(nil, "permission denied")
+			} else {
+				resp = s.handleFetchRaw(body)
+			}
 		case nativeOpCommit:
-			resp = s.handleCommit(body)
+			if s.cfg.ACL != nil && !s.cfg.ACL.Authorize(principal, PermissionStreamCommit) {
+				resp = appendNativeError(nil, "permission denied")
+			} else {
+				resp = s.handleCommit(body)
+			}
 		case nativeOpOffset:
 			resp = s.handleOffset(body)
 		default:
@@ -795,20 +927,123 @@ func writeNativeFrame(w io.Writer, op byte, corr uint64, body []byte) error {
 // be used concurrently; requests are serialized intentionally to avoid a
 // goroutine and allocation per in-flight response. Scale with a small pool.
 type NativeStreamClient struct {
-	conn net.Conn
-	r    *bufio.Reader
-	w    *bufio.Writer
-	mu   sync.Mutex
-	corr uint64
-	max  int
+	conn      net.Conn
+	r         *bufio.Reader
+	w         *bufio.Writer
+	mu        sync.Mutex
+	corr      uint64
+	max       int
+	principal string
 }
 
-func DialNativeStream(addr string, timeout time.Duration) (*NativeStreamClient, error) {
-	c, err := net.DialTimeout("tcp", addr, timeout)
+// NativeStreamDialOptions configures a BST1 client connection.
+type NativeStreamDialOptions struct {
+	Timeout   time.Duration
+	Token     string
+	TLSConfig *tls.Config
+	AuthType  byte
+}
+
+// DialNativeStreamWithOptions connects to a BST1 server with explicit auth and TLS options.
+func DialNativeStreamWithOptions(addr string, opts NativeStreamDialOptions) (*NativeStreamClient, error) {
+	if opts.Timeout <= 0 {
+		opts.Timeout = 10 * time.Second
+	}
+	var c net.Conn
+	var err error
+	if opts.TLSConfig != nil {
+		dialer := &net.Dialer{Timeout: opts.Timeout}
+		c, err = tls.DialWithDialer(dialer, "tcp", addr, opts.TLSConfig)
+	} else {
+		c, err = net.DialTimeout("tcp", addr, opts.Timeout)
+	}
 	if err != nil {
 		return nil, err
 	}
-	return &NativeStreamClient{conn: c, r: bufio.NewReaderSize(c, 1<<20), w: bufio.NewWriterSize(c, 1<<20), max: 128 << 20}, nil
+
+	r := bufio.NewReaderSize(c, 1<<20)
+	w := bufio.NewWriterSize(c, 1<<20)
+
+	authType := opts.AuthType
+	if authType == 0 && opts.Token != "" {
+		authType = NativeAuthToken
+	} else if authType == 0 && opts.TLSConfig != nil && len(opts.TLSConfig.Certificates) > 0 {
+		authType = NativeAuthMTLS
+	}
+
+	var reqH [8]byte
+	binary.BigEndian.PutUint32(reqH[:4], NativeStreamMagic)
+	reqH[4] = nativeVersion
+	reqH[5] = authType
+	binary.BigEndian.PutUint16(reqH[6:8], uint16(len(opts.Token)))
+	if _, err := w.Write(reqH[:]); err != nil {
+		c.Close()
+		return nil, err
+	}
+	if len(opts.Token) > 0 {
+		if _, err := io.WriteString(w, opts.Token); err != nil {
+			c.Close()
+			return nil, err
+		}
+	}
+	if err := w.Flush(); err != nil {
+		c.Close()
+		return nil, err
+	}
+
+	var respH [8]byte
+	if _, err := io.ReadFull(r, respH[:]); err != nil {
+		c.Close()
+		return nil, err
+	}
+	if binary.BigEndian.Uint32(respH[:4]) != NativeStreamMagic || respH[4] != nativeVersion {
+		c.Close()
+		return nil, errors.New("BST1 protocol error in handshake response")
+	}
+	status := respH[5]
+	principalLen := int(binary.BigEndian.Uint16(respH[6:8]))
+	principal := ""
+	if principalLen > 0 {
+		pBytes := make([]byte, principalLen)
+		if _, err := io.ReadFull(r, pBytes); err != nil {
+			c.Close()
+			return nil, err
+		}
+		principal = string(pBytes)
+	}
+
+	if status != NativeStatusSuccess {
+		c.Close()
+		switch status {
+		case NativeStatusUnauthorized:
+			return nil, ErrUnauthorized
+		case NativeStatusForbidden:
+			return nil, ErrUnauthorized
+		case NativeStatusThrottled:
+			return nil, ErrThrottled
+		default:
+			return nil, fmt.Errorf("BST1 handshake failed with status code %d", status)
+		}
+	}
+
+	return &NativeStreamClient{
+		conn:      c,
+		r:         r,
+		w:         w,
+		max:       128 << 20,
+		principal: principal,
+	}, nil
+}
+
+func DialNativeStream(addr string, timeout time.Duration) (*NativeStreamClient, error) {
+	return DialNativeStreamWithOptions(addr, NativeStreamDialOptions{Timeout: timeout})
+}
+
+func (c *NativeStreamClient) Principal() string {
+	if c == nil {
+		return ""
+	}
+	return c.principal
 }
 func (c *NativeStreamClient) call(op byte, body []byte) ([]byte, error) {
 	c.mu.Lock()

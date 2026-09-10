@@ -910,6 +910,100 @@ func (s *MemoryStore) leaseMessageLocked(m *Message, req LeaseRequest, now time.
 	s.addHistoryLocked(m.ID, MessageLeased, "leased", req.Queue, req.ConsumerID, "", req.ConsumerID, "")
 }
 
+// prepareLease computes the set of messages that would be leased for the given
+// request—including assigning lease tokens and updated statuses—without
+// mutating any visible in-memory state. Durable stores use this to capture the
+// exact post-lease message set for the WAL record before applying it.
+func (s *MemoryStore) prepareLease(ctx context.Context, req LeaseRequest) ([]Message, error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
+	if req.Limit <= 0 {
+		req.Limit = 1
+	}
+	if req.VisibilityTimeout <= 0 {
+		req.VisibilityTimeout = 30 * time.Second
+	}
+	now := time.Now()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.closed {
+		return nil, ErrClosed
+	}
+	q, ok := s.queues[req.Queue]
+	if !ok {
+		return nil, ErrQueueNotFound
+	}
+	if q.state == QueuePaused {
+		return nil, ErrPaused
+	}
+	out := make([]Message, 0, minInt(req.Limit, q.depth))
+	for i := q.head; i < len(q.ids) && len(out) < req.Limit; i++ {
+		m := s.messages[q.ids[i]]
+		if m == nil || m.Queue != req.Queue || isTerminalQueueStatus(m.Status) {
+			continue
+		}
+		if req.TenantID != "" && m.TenantID != req.TenantID {
+			continue
+		}
+		if !m.ExpiresAt.IsZero() && now.After(m.ExpiresAt) {
+			continue
+		}
+		if !isLeaseableQueueStatus(m.Status) || (!m.AvailableAt.IsZero() && m.AvailableAt.After(now)) {
+			continue
+		}
+		// Clone the message and assign the lease fields without touching the live record.
+		clone := cloneMessage(*m)
+		clone.Status = MessageLeased
+		clone.ConsumerID = req.ConsumerID
+		clone.ConsumerGroup = req.ConsumerGroup
+		clone.LeaseToken = newPreparedLeaseToken() // deterministic; not newIDLocked
+		clone.LeaseUntil = now.Add(req.VisibilityTimeout)
+		out = append(out, clone)
+	}
+	return out, nil
+}
+
+// applyLease applies the pre-computed lease state (from prepareLease) to the
+// in-memory index. It must only be called after the WAL record has been synced.
+func (s *MemoryStore) applyLease(ctx context.Context, prepared []Message, req LeaseRequest) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	q, ok := s.queues[req.Queue]
+	if !ok {
+		return ErrQueueNotFound
+	}
+	for _, prep := range prepared {
+		m, ok := s.messages[prep.ID]
+		if !ok {
+			continue // message was concurrently removed; skip
+		}
+		if m.Status != prep.Status || !isLeaseableQueueStatus(m.Status) {
+			// Status changed between prepare and apply (e.g., concurrent lease or ack).
+			// The WAL record already committed the lease; restore the prepared state.
+		}
+		m.Status = prep.Status
+		m.ConsumerID = prep.ConsumerID
+		m.ConsumerGroup = prep.ConsumerGroup
+		m.LeaseToken = prep.LeaseToken
+		m.LeaseUntil = prep.LeaseUntil
+		s.addHistoryLocked(m.ID, MessageLeased, "leased", req.Queue, req.ConsumerID, "", req.ConsumerID, "")
+	}
+	s.advanceQueueHeadLocked(q)
+	return nil
+}
+
+// newPreparedLeaseToken generates a lease token using crypto/rand without
+// holding the store lock. Called by prepareLease before WAL write.
+func newPreparedLeaseToken() string {
+	buf := make([]byte, 12)
+	_, _ = cryptorand.Read(buf)
+	return "lease-" + hex.EncodeToString(buf)
+}
+
+
 func (s *MemoryStore) Ack(ctx context.Context, req AckRequest) error {
 	select {
 	case <-ctx.Done():
@@ -1010,6 +1104,25 @@ func (s *MemoryStore) validateNackLease(ctx context.Context, req NackRequest) er
 		}
 	}
 	return nil
+}
+
+// validateExtendLease validates the lease extension request (read-only) and
+// returns a snapshot of the current message so durable stores can capture
+// the post-extension state for the WAL record before applying to memory.
+func (s *MemoryStore) validateExtendLease(ctx context.Context, req LeaseRequest) (Message, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	m, ok := s.messages[req.MessageID]
+	if !ok {
+		return Message{}, ErrMessageNotFound
+	}
+	if !tenantAllowed(ctx, m.TenantID) {
+		return Message{}, ErrUnauthorized
+	}
+	if m.LeaseToken != req.LeaseToken {
+		return Message{}, ErrLeaseLost
+	}
+	return cloneMessage(*m), nil
 }
 
 func (s *MemoryStore) Nack(ctx context.Context, req NackRequest) error {

@@ -37,6 +37,12 @@ func (s *PartitionedBinaryWALStore) StoreHealth() error {
 	return health
 }
 
+func (s *PartitionedBinaryWALStore) SetHealthCallback(fn func(error)) {
+	for _, shard := range s.shards {
+		shard.SetHealthCallback(fn)
+	}
+}
+
 func NewPartitionedBinaryWALStore(dir string, shardCount int, codec FrameCodec) (*PartitionedBinaryWALStore, error) {
 	if shardCount <= 0 {
 		return nil, errf(ErrInvalidMessage, "WAL shard count must be positive")

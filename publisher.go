@@ -225,6 +225,9 @@ func (p *Publisher) publishItemsMinimal(ctx context.Context, items []PublishBatc
 // closures, JSON re-marshalling, result cloning, and per-message callbacks when
 // those features are disabled.
 func (p *Publisher) publishMessagesMinimal(ctx context.Context, messages []Message) ([]error, error) {
+	if p.b != nil && (p.b.State() == BrokerDegraded || p.b.IsStoreFenced()) {
+		return nil, ErrStorageUnavailable
+	}
 	if p.hasPublishSideEffects() {
 		items := make([]PublishBatchItem, len(messages))
 		for i := range messages {
@@ -421,6 +424,9 @@ func (p *Publisher) preparePublish(ctx context.Context, topic string, payload an
 	}
 	if p.b.State() == BrokerPaused {
 		return preparedPublish{}, ErrPaused
+	}
+	if p.b.State() == BrokerDegraded || p.b.IsStoreFenced() {
+		return preparedPublish{}, ErrStorageUnavailable
 	}
 	var o PublishOptions
 	for _, fn := range opts {

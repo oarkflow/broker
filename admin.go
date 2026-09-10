@@ -247,6 +247,10 @@ func (a AdminServer) ready(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "not ready", 503)
 		return
 	}
+	if a.Broker.IsStoreFenced() {
+		http.Error(w, "storage fenced: storage unavailable", http.StatusServiceUnavailable)
+		return
+	}
 	if check := a.Broker.checkStore(r.Context()); check.Status == "fail" {
 		http.Error(w, "not ready: "+check.Detail, http.StatusServiceUnavailable)
 		return

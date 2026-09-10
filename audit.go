@@ -12,6 +12,7 @@ type AuditEvent struct {
 	ID        string         `json:"id"`
 	Timestamp time.Time      `json:"timestamp"`
 	Principal string         `json:"principal"`
+	TenantID  string         `json:"tenant_id,omitempty"`
 	Action    string         `json:"action"`
 	Resource  string         `json:"resource"`
 	Status    string         `json:"status"`

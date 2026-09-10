@@ -20,6 +20,7 @@ type groupCommitWriter struct {
 	doneCh   chan struct{}
 	closeErr error
 	faultErr error
+	onFault  func(error)
 }
 
 type groupCommitReq struct {
@@ -87,11 +88,17 @@ func (w *groupCommitWriter) run() {
 		}
 		if writeErr != nil {
 			w.closeMu.Lock()
+			firstFault := false
 			if w.faultErr == nil {
 				w.faultErr = fmt.Errorf("%w: WAL group commit failed: %v", ErrStorageUnavailable, writeErr)
+				firstFault = true
 			}
 			writeErr = w.faultErr
+			fn := w.onFault
 			w.closeMu.Unlock()
+			if firstFault && fn != nil {
+				go fn(writeErr)
+			}
 		}
 		for _, item := range batch {
 			item.done <- writeErr
@@ -179,4 +186,10 @@ func (w *groupCommitWriter) healthError() error {
 		return ErrClosed
 	}
 	return nil
+}
+
+func (w *groupCommitWriter) setFaultCallback(fn func(error)) {
+	w.closeMu.Lock()
+	defer w.closeMu.Unlock()
+	w.onFault = fn
 }

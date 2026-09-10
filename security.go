@@ -347,6 +347,44 @@ func (a *ACL) Admit(principal AdminPrincipal) (func(), error) {
 	}, nil
 }
 
+// AdmitConnection admits a long-lived protocol connection (MQTT, AMQP, gRPC, WebSocket, BST1)
+// enforcing per-principal MaxConcurrent connection limits across all protocols.
+// The returned release function must be called once the connection terminates.
+func (a *ACL) AdmitConnection(principal AdminPrincipal) (func(), error) {
+	if a == nil || principal.MaxConcurrent <= 0 {
+		return func() {}, nil
+	}
+	a.quotaMu.Lock()
+	if a.quotas == nil {
+		a.quotas = make(map[string]*principalQuota)
+	}
+	quota := a.quotas[principal.Name]
+	if quota == nil {
+		burst := principal.Burst
+		if burst <= 0 {
+			burst = principal.RequestsPerSecond
+		}
+		quota = &principalQuota{tokens: float64(burst), last: time.Now()}
+		a.quotas[principal.Name] = quota
+	}
+	if quota.concurrent >= principal.MaxConcurrent {
+		a.quotaMu.Unlock()
+		return nil, &RetryError{Class: RetryThrottled, Message: "principal connection concurrency limit reached", RetryAfter: time.Second, Cause: ErrThrottled}
+	}
+	quota.concurrent++
+	a.quotaMu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			a.quotaMu.Lock()
+			if quota.concurrent > 0 {
+				quota.concurrent--
+			}
+			a.quotaMu.Unlock()
+		})
+	}, nil
+}
+
 func certificateIdentities(cert *x509.Certificate) []string {
 	identities := make([]string, 0, 1+len(cert.DNSNames)+len(cert.EmailAddresses)+len(cert.IPAddresses)+len(cert.URIs))
 	if cert.Subject.CommonName != "" {

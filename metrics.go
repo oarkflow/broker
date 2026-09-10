@@ -25,6 +25,7 @@ type PrometheusMetrics struct {
 	moved          atomic.Uint64
 	publishedBytes atomic.Uint64
 	deliveredBytes atomic.Uint64
+	storeFenced    atomic.Uint64
 
 	// Per-queue counters
 	queueDepth  sync.Map // queue -> *atomic.Int64
@@ -143,6 +144,11 @@ func (m *PrometheusMetrics) RecordMoved() {
 	m.moved.Add(1)
 }
 
+// RecordStoreFenced records a storage fencing incident.
+func (m *PrometheusMetrics) RecordStoreFenced() {
+	m.storeFenced.Add(1)
+}
+
 // SetActiveConsumers sets the active consumer count.
 func (m *PrometheusMetrics) SetActiveConsumers(n int) {
 	m.activeConsumers.Store(int64(n))
@@ -244,6 +250,10 @@ func (m *PrometheusMetrics) exposition() string {
 	b.WriteString("# HELP broker_delivered_bytes_total Total bytes delivered.\n")
 	b.WriteString("# TYPE broker_delivered_bytes_total counter\n")
 	fmt.Fprintf(&b, "broker_delivered_bytes_total %d\n", m.deliveredBytes.Load())
+
+	b.WriteString("# HELP broker_store_fenced_total Total times storage subsystem entered fenced state.\n")
+	b.WriteString("# TYPE broker_store_fenced_total counter\n")
+	fmt.Fprintf(&b, "broker_store_fenced_total %d\n", m.storeFenced.Load())
 
 	b.WriteString("# HELP broker_active_consumers Number of active consumers.\n")
 	b.WriteString("# TYPE broker_active_consumers gauge\n")

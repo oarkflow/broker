@@ -229,7 +229,11 @@ func main() {
 				dir = filepath.Join(".broker-data", "native-stream")
 			}
 		}
-		native, err = broker.NewNativeStreamServer(broker.NativeStreamConfig{Dir: dir, Partitions: *nativePartitions, SegmentBytes: *nativeSegmentBytes, GroupCommitDelay: *nativeCommitDelay, GroupCommitBytes: *nativeCommitBytes, MaxFrameBytes: 128 << 20, Sync: *nativeSync})
+		tlsCfg, tlsErr := listenerTLSConfig(*tlsCert, *tlsKey, *clientCA, *requireClientCert)
+		if tlsErr != nil {
+			logger.Log.Fatal("configure native stream TLS", zlog.Err(tlsErr))
+		}
+		native, err = broker.NewNativeStreamServer(broker.NativeStreamConfig{Dir: dir, Partitions: *nativePartitions, SegmentBytes: *nativeSegmentBytes, GroupCommitDelay: *nativeCommitDelay, GroupCommitBytes: *nativeCommitBytes, MaxFrameBytes: 128 << 20, Sync: *nativeSync, ACL: admin.ACL, InsecureDev: *insecureDev, TLSConfig: tlsCfg})
 		if err != nil {
 			logger.Log.Fatal("open native stream", zlog.Err(err))
 		}
@@ -254,7 +258,7 @@ func main() {
 	}
 	var mqtt *broker.MQTTServer
 	if *mqttAddr != "" {
-		mqtt = broker.NewMQTTServer(b, broker.MQTTConfig{ListenAddr: *mqttAddr, TLSCertFile: *tlsCert, TLSKeyFile: *tlsKey, ClientCAFile: *clientCA, RequireClientCert: *requireClientCert, RequireAuth: true, BrokerToken: *token, MaxPacketSize: int(*maxBody)})
+		mqtt = broker.NewMQTTServer(b, broker.MQTTConfig{ListenAddr: *mqttAddr, TLSCertFile: *tlsCert, TLSKeyFile: *tlsKey, ClientCAFile: *clientCA, RequireClientCert: *requireClientCert, RequireAuth: true, BrokerToken: *token, MaxPacketSize: int(*maxBody), ACL: admin.ACL})
 		go func() { serverErr <- listenerFailure{"mqtt", mqtt.ListenAndServe()} }()
 	}
 	var amqpServer *amqp.Server
@@ -263,7 +267,7 @@ func main() {
 		if tlsErr != nil {
 			logger.Log.Fatal("configure AMQP TLS", zlog.Err(tlsErr))
 		}
-		amqpServer = amqp.NewServer(amqp.ServerConfig{ListenAddr: *amqpAddr, Broker: b, TLSConfig: tlsCfg, Username: *amqpUsername, Password: *amqpPassword, AllowInsecure: *insecureDev, FrameMaxSize: uint32(*maxBody)})
+		amqpServer = amqp.NewServer(amqp.ServerConfig{ListenAddr: *amqpAddr, Broker: b, TLSConfig: tlsCfg, Username: *amqpUsername, Password: *amqpPassword, AllowInsecure: *insecureDev, FrameMaxSize: uint32(*maxBody), ACL: admin.ACL})
 		if tlsCfg != nil {
 			err = amqpServer.ListenTLS(*amqpAddr)
 		} else {

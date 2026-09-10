@@ -82,7 +82,7 @@ func (s *RFC6455Server) Handler() http.Handler {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
-		release, err := s.cfg.ACL.Admit(principal)
+		release, err := s.cfg.ACL.AdmitConnection(principal)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusTooManyRequests)
 			return

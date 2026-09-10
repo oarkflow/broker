@@ -56,6 +56,7 @@ type Broker struct {
 	partitionReassignment *PartitionReassignment
 	mqttServer            *MQTTServer
 	grpcServer            *GRPCServer
+	healthMonitor         *StoreHealthMonitor
 }
 
 func New(cfg Config) (*Broker, error) {
@@ -175,6 +176,7 @@ func New(cfg Config) (*Broker, error) {
 	b.logCompaction = NewStreamLogCompaction(b)
 	b.partitionOrdering = NewPartitionOrdering(b)
 	b.partitionReassignment = NewPartitionReassignment(b)
+	b.healthMonitor = NewStoreHealthMonitor(b, b.store, 250*time.Millisecond)
 	b.cfg = cfg
 	b.state.Store(BrokerConfigured)
 	if err := b.store.DeclareQueue(context.Background(), QueueConfig{Name: cfg.DefaultQueue, VisibilityTimeout: cfg.DefaultVisibility, RetryPolicy: cfg.DefaultRetry, DLQ: cfg.DefaultDLQ}); err != nil {
@@ -216,12 +218,18 @@ func (b *Broker) Start(ctx context.Context) error {
 	b.wg.Add(1)
 	go b.consumerSweeper()
 	b.startGroupRebalancer()
+	if b.healthMonitor != nil {
+		b.healthMonitor.Start(b.ctx)
+	}
 	return nil
 }
 
 func (b *Broker) Stop(ctx context.Context) error {
 	b.setState(ctx, BrokerStopping, nil)
 	b.cancel()
+	if b.healthMonitor != nil {
+		b.healthMonitor.Stop()
+	}
 	b.subsMu.RLock()
 	subs := make([]*Subscription, 0, len(b.subs))
 	for _, s := range b.subs {
@@ -309,6 +317,25 @@ func (b *Broker) Publisher() *Publisher                 { return &Publisher{b: b
 func (b *Broker) AuditLogger() *AuditLogger             { return b.auditLogger }
 func (b *Broker) PrometheusMetrics() *PrometheusMetrics { return b.promMetrics }
 func (b *Broker) Tracer() *Tracer                       { return b.tracer }
+func (b *Broker) HealthMonitor() *StoreHealthMonitor    { return b.healthMonitor }
+func (b *Broker) IsStoreFenced() bool {
+	return b != nil && b.healthMonitor != nil && b.healthMonitor.IsFenced()
+}
+
+func (b *Broker) ListTasks(ctx context.Context) []TaskInfo {
+	b.taskMu.RLock()
+	defer b.taskMu.RUnlock()
+	out := make([]TaskInfo, 0, len(b.tasks))
+	for _, t := range b.tasks {
+		if t == nil {
+			continue
+		}
+		if tenantAllowed(ctx, t.TenantID) {
+			out = append(out, *t)
+		}
+	}
+	return out
+}
 
 func (b *Broker) setState(ctx context.Context, st BrokerState, err error) {
 	b.state.Store(st)

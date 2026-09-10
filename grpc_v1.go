@@ -55,6 +55,7 @@ func NewGRPCV1Server(b *Broker, cfg GRPCV1Config) (*GRPCV1Server, error) {
 		grpc.MaxRecvMsgSize(cfg.MaxMessageSize),
 		grpc.MaxSendMsgSize(cfg.MaxMessageSize),
 		grpc.UnaryInterceptor(s.authorizeUnary),
+		grpc.StreamInterceptor(s.authorizeStream),
 	}
 	if cfg.TLSConfig != nil {
 		options = append(options, grpc.Creds(credentials.NewTLS(cfg.TLSConfig.Clone())))
@@ -127,6 +128,53 @@ func (s *GRPCV1Server) authorizeUnary(ctx context.Context, req any, info *grpc.U
 		defer release()
 	}
 	return handler(context.WithValue(ctx, adminPrincipalKey{}, principal), req)
+}
+
+func (s *GRPCV1Server) authorizeStream(srv any, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+	ctx := ss.Context()
+	principal := AdminPrincipal{Name: "development", Permissions: []string{PermissionAdminAll}}
+	if !s.cfg.InsecureDev {
+		var ok bool
+		if remote, exists := peer.FromContext(ctx); exists {
+			if tlsInfo, isTLS := remote.AuthInfo.(credentials.TLSInfo); isTLS && len(tlsInfo.State.VerifiedChains) > 0 && len(tlsInfo.State.VerifiedChains[0]) > 0 {
+				principal, ok = s.cfg.ACL.AuthenticateCertificate(tlsInfo.State.VerifiedChains[0][0])
+			}
+		}
+		values := metadata.ValueFromIncomingContext(ctx, "authorization")
+		raw := ""
+		if len(values) > 0 {
+			raw = strings.TrimSpace(values[0])
+			if len(raw) >= 7 && strings.EqualFold(raw[:7], "Bearer ") {
+				raw = strings.TrimSpace(raw[7:])
+			}
+		}
+		if !ok {
+			principal, ok = s.cfg.ACL.Authenticate(raw)
+		}
+		if !ok {
+			return status.Error(codes.Unauthenticated, "invalid credential")
+		}
+		permission := grpcMethodPermission(info.FullMethod)
+		if !s.cfg.ACL.Authorize(principal, permission) {
+			return status.Error(codes.PermissionDenied, "credential lacks required permission")
+		}
+		release, err := s.cfg.ACL.AdmitConnection(principal)
+		if err != nil {
+			return status.Error(codes.ResourceExhausted, err.Error())
+		}
+		defer release()
+	}
+	wrapped := &wrappedStream{ServerStream: ss, ctx: context.WithValue(ctx, adminPrincipalKey{}, principal)}
+	return handler(srv, wrapped)
+}
+
+type wrappedStream struct {
+	grpc.ServerStream
+	ctx context.Context
+}
+
+func (w *wrappedStream) Context() context.Context {
+	return w.ctx
 }
 
 func grpcMethodPermission(method string) string {
