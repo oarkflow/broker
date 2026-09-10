@@ -448,8 +448,8 @@ func (c *RaftController) TransferLeadership(ctx context.Context, transferee uint
 }
 
 // ProposeConfChange proposes a membership change.
-func (c *RaftController) ProposeConfChange(ctx context.Context, cc raftpb.ConfChange) error {
+func (c *RaftController) ProposeConfChange(ctx context.Context, cc *raftpb.ConfChange) error {
 	c.nodeMu.Lock()
 	defer c.nodeMu.Unlock()
-	return c.core.RawNode.ProposeConfChange(&cc)
+	return c.core.RawNode.ProposeConfChange(cc)
 }

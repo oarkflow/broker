@@ -244,7 +244,7 @@ func TestEtcdRaftControllerConfChange(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	if err := ctrl.ProposeConfChange(ctx, cc); err != nil {
+	if err := ctrl.ProposeConfChange(ctx, &cc); err != nil {
 		t.Fatalf("failed to propose conf change: %v", err)
 	}
 }
