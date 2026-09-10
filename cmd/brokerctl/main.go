@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -24,6 +25,9 @@ func main() {
 	cmd := flag.Arg(0)
 	var err error
 	switch cmd {
+	case "tui":
+		app := NewTUIApp(*addr, *token)
+		err = app.Run(context.Background())
 	case "stats":
 		err = request(client, *addr, *token, http.MethodGet, "/stats", nil)
 	case "queues":
@@ -43,6 +47,30 @@ func main() {
 		} else {
 			err = request(client, *addr, *token, http.MethodGet, "/dlq/"+flag.Arg(1)+"/messages", nil)
 		}
+	case "dlq-dashboard":
+		err = request(client, *addr, *token, http.MethodGet, "/dlq/dashboard", nil)
+	case "dlq-errors":
+		if flag.NArg() < 2 {
+			die("dlq-errors requires queue name")
+		}
+		err = request(client, *addr, *token, http.MethodGet, "/dlq/"+flag.Arg(1)+"/errors", nil)
+	case "dlq-replay":
+		if flag.NArg() < 2 {
+			die("dlq-replay requires queue name")
+		}
+		err = request(client, *addr, *token, http.MethodPost, "/dlq/"+flag.Arg(1)+"/replay-all", nil)
+	case "dlq-archive":
+		if flag.NArg() < 2 {
+			die("dlq-archive requires queue name")
+		}
+		err = request(client, *addr, *token, http.MethodPost, "/dlq/"+flag.Arg(1)+"/archive", nil)
+	case "dlq-export":
+		if flag.NArg() < 2 {
+			die("dlq-export requires queue name")
+		}
+		err = request(client, *addr, *token, http.MethodGet, "/dlq/"+flag.Arg(1)+"/export", nil)
+	case "reload":
+		err = request(client, *addr, *token, http.MethodPost, "/config/reload", nil)
 	case "pull":
 		if flag.NArg() < 2 {
 			die("pull requires queue name")
@@ -213,12 +241,19 @@ func request(client *http.Client, addr, token, method, path string, body any) er
 
 func usage() {
 	fmt.Println(`brokerctl commands:
+  tui (interactive full-screen console)
   stats
   queues
   topics
   streams
   stream <stream>
   dlq [queue]
+  dlq-dashboard
+  dlq-errors <queue>
+  dlq-replay <queue>
+  dlq-archive <queue>
+  dlq-export <queue>
+  reload (trigger dynamic config hot-reload)
   pull <queue> [-consumer id] [-group group] [-limit n]
   ack <message-id> -queue <queue> -lease <lease-token>
   messages <queue>
