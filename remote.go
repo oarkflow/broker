@@ -20,6 +20,7 @@ type ConsumerRegistration struct {
 	ConsumerID        string            `json:"consumer_id"`
 	Group             string            `json:"group"`
 	Name              string            `json:"name,omitempty"`
+	TenantID          string            `json:"tenant_id,omitempty"`
 	Hostname          string            `json:"hostname,omitempty"`
 	Version           string            `json:"version,omitempty"`
 	Capabilities      []string          `json:"capabilities,omitempty"`
@@ -233,11 +234,17 @@ func (r *ConsumerRegistry) Get(id string) (ConsumerInfo, bool) {
 	return cloneConsumerInfo(*c), true
 }
 func (r *ConsumerRegistry) List() []ConsumerInfo {
+	return r.ListContext(context.Background())
+}
+
+func (r *ConsumerRegistry) ListContext(ctx context.Context) []ConsumerInfo {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	out := make([]ConsumerInfo, 0, len(r.consumers))
 	for _, c := range r.consumers {
-		out = append(out, cloneConsumerInfo(*c))
+		if tenantAllowed(ctx, c.TenantID) {
+			out = append(out, cloneConsumerInfo(*c))
+		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ConsumerID < out[j].ConsumerID })
 	return out
@@ -300,6 +307,11 @@ func (b *Broker) Consumers() *ConsumerRegistry {
 	return b.consumers
 }
 func (b *Broker) RegisterRemoteConsumer(ctx context.Context, reg ConsumerRegistration) (ConsumerInfo, error) {
+	tenant, err := resolveTenant(ctx, reg.TenantID)
+	if err != nil {
+		return ConsumerInfo{}, err
+	}
+	reg.TenantID = tenant
 	info := b.Consumers().Register(reg)
 	b.persistConsumer(ctx, info)
 	if info.Group != "" {
@@ -308,19 +320,33 @@ func (b *Broker) RegisterRemoteConsumer(ctx context.Context, reg ConsumerRegistr
 	if b.cfg.Hooks.OnConsumerRegistered != nil {
 		b.cfg.Hooks.OnConsumerRegistered(ctx, ConsumerEvent{Consumer: info.ConsumerID, Group: info.Group, State: ConsumerRegistered, Time: time.Now()})
 	}
-	b.emitConsumerNotification(info.ConsumerID, Notification{Type: "consumer.registered", Source: b.cfg.Name, Severity: SeverityInfo, Consumer: info.ConsumerID, ConsumerGroup: info.Group, Timestamp: time.Now()})
+	b.emitConsumerNotification(info.ConsumerID, Notification{Type: "consumer.registered", Source: b.cfg.Name, Severity: SeverityInfo, Consumer: info.ConsumerID, ConsumerGroup: info.Group, TenantID: info.TenantID, Timestamp: time.Now()})
 	return info, nil
 }
 func (b *Broker) RemoteConsumerHeartbeat(ctx context.Context, id string) (ConsumerInfo, error) {
+	curr, ok := b.Consumers().Get(id)
+	if !ok {
+		return ConsumerInfo{}, ErrMessageNotFound
+	}
+	if !tenantAllowed(ctx, curr.TenantID) {
+		return ConsumerInfo{}, ErrUnauthorized
+	}
 	info, ok := b.Consumers().Heartbeat(id)
 	if !ok {
 		return ConsumerInfo{}, ErrMessageNotFound
 	}
 	b.persistConsumer(ctx, info)
-	b.emitConsumerNotification(id, Notification{Type: "consumer.heartbeat", Source: b.cfg.Name, Severity: SeverityDebug, Consumer: id, ConsumerGroup: info.Group, Timestamp: time.Now()})
+	b.emitConsumerNotification(id, Notification{Type: "consumer.heartbeat", Source: b.cfg.Name, Severity: SeverityDebug, Consumer: id, ConsumerGroup: info.Group, TenantID: info.TenantID, Timestamp: time.Now()})
 	return info, nil
 }
 func (b *Broker) RemoteConsumerSubscribe(ctx context.Context, id string, sub RemoteSubscription) (ConsumerInfo, error) {
+	curr, ok := b.Consumers().Get(id)
+	if !ok {
+		return ConsumerInfo{}, ErrMessageNotFound
+	}
+	if !tenantAllowed(ctx, curr.TenantID) {
+		return ConsumerInfo{}, ErrUnauthorized
+	}
 	if sub.Type == "" {
 		sub.Type = "queue"
 	}
@@ -332,8 +358,11 @@ func (b *Broker) RemoteConsumerSubscribe(ctx context.Context, id string, sub Rem
 		if sub.Name == "" {
 			return ConsumerInfo{}, errf(ErrInvalidMessage, "queue subscription requires name")
 		}
+		if sub.Queue == "" {
+			sub.Queue = sub.Name
+		}
 		if sub.AutoCreate {
-			_ = b.DeclareQueue(ctx, QueueConfig{Name: sub.Name, VisibilityTimeout: b.cfg.DefaultVisibility, RetryPolicy: b.cfg.DefaultRetry})
+			_ = b.DeclareQueue(ctx, QueueConfig{Name: sub.Queue, VisibilityTimeout: b.cfg.DefaultVisibility, RetryPolicy: b.cfg.DefaultRetry})
 		}
 	case "topic", "pattern":
 		pattern := firstNonEmpty(sub.Pattern, sub.Name)
@@ -379,10 +408,17 @@ func (b *Broker) RemoteConsumerSubscribe(ctx context.Context, id string, sub Rem
 	if b.cfg.Hooks.OnConsumerAssigned != nil {
 		b.cfg.Hooks.OnConsumerAssigned(ctx, ConsumerEvent{Consumer: id, Group: info.Group, Queue: firstNonEmpty(sub.Queue, sub.Name), State: ConsumerAssigned, Time: time.Now()})
 	}
-	b.emitConsumerNotification(id, Notification{Type: "consumer.subscribed", Source: b.cfg.Name, Severity: SeverityInfo, Consumer: id, ConsumerGroup: info.Group, Queue: firstNonEmpty(sub.Queue, sub.Name), Timestamp: time.Now(), Data: map[string]any{"subscription": sub}})
+	b.emitConsumerNotification(id, Notification{Type: "consumer.subscribed", Source: b.cfg.Name, Severity: SeverityInfo, Consumer: id, ConsumerGroup: info.Group, Queue: firstNonEmpty(sub.Queue, sub.Name), TenantID: info.TenantID, Timestamp: time.Now(), Data: map[string]any{"subscription": sub}})
 	return info, nil
 }
 func (b *Broker) SetRemoteConsumerState(ctx context.Context, id string, st ConsumerState, reason string) (ConsumerInfo, error) {
+	curr, ok := b.Consumers().Get(id)
+	if !ok {
+		return ConsumerInfo{}, ErrMessageNotFound
+	}
+	if !tenantAllowed(ctx, curr.TenantID) {
+		return ConsumerInfo{}, ErrUnauthorized
+	}
 	info, ok := b.Consumers().SetState(id, st, reason)
 	if !ok {
 		return ConsumerInfo{}, ErrMessageNotFound

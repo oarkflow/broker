@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -51,19 +52,10 @@ func (a AdminServer) dataPlane(w http.ResponseWriter, r *http.Request) {
 	case path == "/request":
 		a.v1Request(w, r)
 	case path == "/consumers" && r.Method == http.MethodGet:
-		if rejectScopedControlPlane(w, r, "global consumer registry") {
-			return
-		}
-		writeBrokerJSON(w, a.Broker.Consumers().List())
+		writeBrokerJSON(w, a.Broker.Consumers().ListContext(r.Context()))
 	case path == "/consumers/register":
-		if rejectScopedControlPlane(w, r, "global consumer registry") {
-			return
-		}
 		a.v1ConsumerRegister(w, r)
 	case strings.HasPrefix(path, "/consumers/"):
-		if rejectScopedControlPlane(w, r, "global consumer registry") {
-			return
-		}
 		a.v1Consumer(w, r, strings.TrimPrefix(path, "/consumers/"))
 	case path == "/poll" || path == "/poll/batch":
 		a.v1Poll(w, r)
@@ -73,6 +65,8 @@ func (a AdminServer) dataPlane(w http.ResponseWriter, r *http.Request) {
 		a.v1AckFrameBatch(w, r)
 	case strings.HasPrefix(path, "/messages/"):
 		a.v1Message(w, r, strings.TrimPrefix(path, "/messages/"))
+	case path == "/tasks" && r.Method == http.MethodGet:
+		writeBrokerJSON(w, a.Broker.ListTasks(r.Context()))
 	case path == "/tasks/submit":
 		a.v1TaskSubmit(w, r)
 	case strings.HasPrefix(path, "/tasks/"):
@@ -500,6 +494,10 @@ func (a AdminServer) v1ConsumerRegister(w http.ResponseWriter, r *http.Request) 
 	}
 	info, err := a.Broker.RegisterRemoteConsumer(r.Context(), req)
 	if err != nil {
+		if errors.Is(err, ErrUnauthorized) {
+			http.Error(w, err.Error(), http.StatusForbidden)
+			return
+		}
 		http.Error(w, err.Error(), 409)
 		return
 	}
@@ -515,6 +513,10 @@ func (a AdminServer) v1Consumer(w http.ResponseWriter, r *http.Request, tail str
 	if len(parts) == 1 {
 		if r.Method == http.MethodGet {
 			if info, ok := a.Broker.Consumers().Get(id); ok {
+				if !tenantAllowed(r.Context(), info.TenantID) {
+					http.NotFound(w, r)
+					return
+				}
 				writeBrokerJSON(w, info)
 				return
 			}
@@ -532,6 +534,10 @@ func (a AdminServer) v1Consumer(w http.ResponseWriter, r *http.Request, tail str
 		}
 		info, err := a.Broker.RemoteConsumerHeartbeat(r.Context(), id)
 		if err != nil {
+			if errors.Is(err, ErrUnauthorized) {
+				http.Error(w, err.Error(), http.StatusForbidden)
+				return
+			}
 			http.Error(w, err.Error(), 404)
 			return
 		}
@@ -551,6 +557,10 @@ func (a AdminServer) v1Consumer(w http.ResponseWriter, r *http.Request, tail str
 		}
 		info, err := a.Broker.RemoteConsumerSubscribe(r.Context(), id, sub)
 		if err != nil {
+			if errors.Is(err, ErrUnauthorized) {
+				http.Error(w, err.Error(), http.StatusForbidden)
+				return
+			}
 			http.Error(w, err.Error(), 409)
 			return
 		}
@@ -558,6 +568,10 @@ func (a AdminServer) v1Consumer(w http.ResponseWriter, r *http.Request, tail str
 	case "pause":
 		info, err := a.Broker.SetRemoteConsumerState(r.Context(), id, ConsumerPaused, "remote pause")
 		if err != nil {
+			if errors.Is(err, ErrUnauthorized) {
+				http.Error(w, err.Error(), http.StatusForbidden)
+				return
+			}
 			http.Error(w, err.Error(), 404)
 			return
 		}
@@ -565,6 +579,10 @@ func (a AdminServer) v1Consumer(w http.ResponseWriter, r *http.Request, tail str
 	case "resume":
 		info, err := a.Broker.SetRemoteConsumerState(r.Context(), id, ConsumerReady, "remote resume")
 		if err != nil {
+			if errors.Is(err, ErrUnauthorized) {
+				http.Error(w, err.Error(), http.StatusForbidden)
+				return
+			}
 			http.Error(w, err.Error(), 404)
 			return
 		}
@@ -977,6 +995,12 @@ func (a AdminServer) v1TaskSubmit(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid json", 400)
 		return
 	}
+	tenant, err := resolveTenant(r.Context(), req.TenantID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusForbidden)
+		return
+	}
+	req.TenantID = tenant
 	h, err := a.Broker.Publisher().SubmitTask(r.Context(), req.Name, []byte(req.Payload), WithTaskQueue(req.Queue), WithTaskTenantID(req.TenantID), WithTaskPriority(req.Priority), WithTaskMaxAttempts(req.MaxAttempts), WithTaskMetadata(req.Metadata))
 	if err != nil {
 		http.Error(w, err.Error(), 409)
@@ -992,22 +1016,21 @@ func (a AdminServer) v1Task(w http.ResponseWriter, r *http.Request, tail string)
 		return
 	}
 	h := taskHandle{b: a.Broker, id: parts[0]}
+	info, err := h.Info(r.Context())
+	if err != nil {
+		http.Error(w, err.Error(), 404)
+		return
+	}
+	if !tenantAllowed(r.Context(), info.TenantID) {
+		http.Error(w, "task not found", http.StatusNotFound)
+		return
+	}
 	if len(parts) == 1 {
-		info, err := h.Info(r.Context())
-		if err != nil {
-			http.Error(w, err.Error(), 404)
-			return
-		}
 		writeBrokerJSON(w, info)
 		return
 	}
 	switch parts[1] {
 	case "result":
-		info, err := h.Info(r.Context())
-		if err != nil {
-			http.Error(w, err.Error(), 404)
-			return
-		}
 		writeBrokerJSON(w, map[string]any{"task": info, "payload": json.RawMessage(info.Result)})
 	case "cancel":
 		var req struct{ Reason string }

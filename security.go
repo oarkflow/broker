@@ -116,7 +116,7 @@ func tenantAllowed(ctx context.Context, tenant string) bool {
 		if allowed == "*" {
 			return true
 		}
-		if tenant != "" && allowed == tenant {
+		if tenant != "" && (allowed == tenant || strings.HasPrefix(tenant, allowed+".") || strings.HasPrefix(tenant, allowed+":") || strings.HasPrefix(tenant, allowed+"/")) {
 			return true
 		}
 	}

@@ -259,6 +259,49 @@ func (a AdminServer) ready(w http.ResponseWriter, r *http.Request) {
 }
 func (a AdminServer) stats(w http.ResponseWriter, r *http.Request) {
 	st, err := a.Broker.store.Stats(r.Context())
+	if hasRestrictedTenantScope(r.Context()) {
+		filteredQueues := make(map[string]int)
+		for k, v := range st.Queues {
+			if tenantAllowed(r.Context(), k) {
+				filteredQueues[k] = v
+			}
+		}
+		st.Queues = filteredQueues
+
+		filteredTopics := make(map[string]int)
+		for k, v := range st.Topics {
+			if tenantAllowed(r.Context(), k) {
+				filteredTopics[k] = v
+			}
+		}
+		st.Topics = filteredTopics
+
+		filteredStreams := make(map[string]int)
+		for k, v := range st.Streams {
+			if tenantAllowed(r.Context(), k) {
+				filteredStreams[k] = v
+			}
+		}
+		st.Streams = filteredStreams
+
+		filteredDLQ := make(map[string]int)
+		for k, v := range st.DLQ {
+			if tenantAllowed(r.Context(), k) {
+				filteredDLQ[k] = v
+			}
+		}
+		st.DLQ = filteredDLQ
+
+		if st.Offsets != nil {
+			filteredOffsets := make(map[string]map[string]uint64)
+			for k, v := range st.Offsets {
+				if tenantAllowed(r.Context(), k) {
+					filteredOffsets[k] = v
+				}
+			}
+			st.Offsets = filteredOffsets
+		}
+	}
 	writeBrokerJSON(w, map[string]any{"broker_state": a.Broker.State(), "store": st, "error": errString(err)})
 }
 func (a AdminServer) metrics(w http.ResponseWriter, r *http.Request) {
@@ -288,14 +331,22 @@ func (a AdminServer) lag(w http.ResponseWriter, r *http.Request) {
 	writeBrokerJSON(w, report)
 }
 func (a AdminServer) audit(w http.ResponseWriter, r *http.Request) {
-	if rejectScopedControlPlane(w, r, "global audit history") {
-		return
-	}
 	if a.Broker.auditLogger == nil {
 		writeBrokerJSON(w, []AuditEvent{})
 		return
 	}
-	writeBrokerJSON(w, a.Broker.auditLogger.History(queryLimit(r, 100)))
+	history := a.Broker.auditLogger.History(queryLimit(r, 100))
+	if hasRestrictedTenantScope(r.Context()) {
+		filtered := make([]AuditEvent, 0, len(history))
+		for _, ev := range history {
+			if ev.TenantID != "" && tenantAllowed(r.Context(), ev.TenantID) {
+				filtered = append(filtered, ev)
+			}
+		}
+		writeBrokerJSON(w, filtered)
+		return
+	}
+	writeBrokerJSON(w, history)
 }
 func (a AdminServer) topics(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodPost {

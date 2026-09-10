@@ -69,6 +69,11 @@ func (a *AuditLogger) Log(ctx context.Context, event AuditEvent) {
 	if event.Timestamp.IsZero() {
 		event.Timestamp = time.Now()
 	}
+	if event.TenantID == "" {
+		if p, ok := scopedPrincipalFromContext(ctx); ok && len(p.Tenants) == 1 && p.Tenants[0] != "*" {
+			event.TenantID = p.Tenants[0]
+		}
+	}
 	a.mu.Lock()
 	a.events = append(a.events, event)
 	if len(a.events) > a.cap {
