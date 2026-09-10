@@ -63,6 +63,7 @@ func (a AdminServer) Handler() http.Handler {
 	mux.HandleFunc("/streams", a.wrap(a.streams))
 	mux.HandleFunc("/streams/", a.wrap(a.stream))
 	mux.HandleFunc("/dlq", a.wrap(a.dlq))
+	mux.HandleFunc("/dlq/dashboard", a.wrap(a.dlqDashboard))
 	mux.HandleFunc("/dlq/", a.wrap(a.dlqQueue))
 	mux.HandleFunc("/messages/", a.wrap(a.message))
 	mux.HandleFunc("/ack/batch", a.wrap(a.ackBatch))
@@ -578,6 +579,10 @@ func (a AdminServer) dlqQueue(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	if parts[0] == "dashboard" {
+		a.dlqDashboard(w, r)
+		return
+	}
 	name := parts[0]
 	if len(parts) == 1 || (len(parts) == 2 && parts[1] == "messages") {
 		msgs, err := a.Broker.store.ListDLQ(r.Context(), name, queryLimit(r, 100))
@@ -588,22 +593,37 @@ func (a AdminServer) dlqQueue(w http.ResponseWriter, r *http.Request) {
 		writeBrokerJSON(w, msgs)
 		return
 	}
-	if len(parts) == 2 && parts[1] == "replay" {
-		if r.Method != http.MethodPost {
-			methodBroker(w)
+	if len(parts) == 2 {
+		switch parts[1] {
+		case "replay":
+			if r.Method != http.MethodPost {
+				methodBroker(w)
+				return
+			}
+			dest := r.URL.Query().Get("queue")
+			if dest == "" {
+				dest = strings.TrimSuffix(name, ".dlq")
+			}
+			res, err := a.Broker.store.Move(r.Context(), MoveRequest{SourceType: DestinationQueue, Source: name, DestinationType: DestinationQueue, Destination: dest, Mode: MoveReplay, ResetAttempts: true, ResetError: true, ResetLease: true, Reason: "dlq replay", Actor: "admin"})
+			if err != nil {
+				http.Error(w, err.Error(), 409)
+				return
+			}
+			writeBrokerJSON(w, res)
+			return
+		case "replay-all":
+			a.dlqReplayAll(w, r, name)
+			return
+		case "errors":
+			a.dlqErrors(w, r, name)
+			return
+		case "archive":
+			a.dlqArchive(w, r, name)
+			return
+		case "export":
+			a.dlqExport(w, r, name)
 			return
 		}
-		dest := r.URL.Query().Get("queue")
-		if dest == "" {
-			dest = strings.TrimSuffix(name, ".dlq")
-		}
-		res, err := a.Broker.store.Move(r.Context(), MoveRequest{SourceType: DestinationQueue, Source: name, DestinationType: DestinationQueue, Destination: dest, Mode: MoveReplay, ResetAttempts: true, ResetError: true, ResetLease: true, Reason: "dlq replay", Actor: "admin"})
-		if err != nil {
-			http.Error(w, err.Error(), 409)
-			return
-		}
-		writeBrokerJSON(w, res)
-		return
 	}
 	http.NotFound(w, r)
 }
@@ -991,7 +1011,7 @@ func adminAction(r *http.Request) string {
 		}
 		return PermissionStreamRead
 	case path == "/dlq" || strings.HasPrefix(path, "/dlq/"):
-		if strings.HasSuffix(path, "/replay") {
+		if strings.HasSuffix(path, "/replay") || strings.HasSuffix(path, "/replay-all") || strings.HasSuffix(path, "/archive") {
 			return PermissionDLQReplay
 		}
 		return PermissionDLQRead
