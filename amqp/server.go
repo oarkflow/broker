@@ -22,6 +22,13 @@ type ServerConfig struct {
 	MaxConnections int
 	FrameMaxSize   uint32
 	Heartbeat      time.Duration
+	// Username and Password enable AMQP PLAIN authentication. PLAIN is accepted
+	// only over TLS unless AllowInsecure is explicitly enabled for development.
+	Username string
+	Password string
+	// AllowInsecure permits an unauthenticated/plaintext development listener.
+	// It must never be enabled on a production listener.
+	AllowInsecure bool
 	// Broker is the underlying fastworker broker instance.
 	Broker *broker.Broker
 }
@@ -38,15 +45,15 @@ func DefaultServerConfig() ServerConfig {
 
 // Server is the AMQP protocol server.
 type Server struct {
-	cfg       ServerConfig
-	listener  net.Listener
-	conns     map[*Connection]struct{}
-	connsMu   sync.RWMutex
-	wg        sync.WaitGroup
-	ctx       context.Context
-	cancel    context.CancelFunc
-	nextID    atomic.Uint64
-	started   atomic.Bool
+	cfg      ServerConfig
+	listener net.Listener
+	conns    map[*Connection]struct{}
+	connsMu  sync.RWMutex
+	wg       sync.WaitGroup
+	ctx      context.Context
+	cancel   context.CancelFunc
+	nextID   atomic.Uint64
+	started  atomic.Bool
 }
 
 // NewServer creates a new AMQP server.
@@ -63,15 +70,18 @@ func NewServer(cfg ServerConfig) *Server {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Server{
-		cfg:   cfg,
-		conns: make(map[*Connection]struct{}),
-		ctx:   ctx,
+		cfg:    cfg,
+		conns:  make(map[*Connection]struct{}),
+		ctx:    ctx,
 		cancel: cancel,
 	}
 }
 
 // Listen starts the TCP listener.
 func (s *Server) Listen() error {
+	if !s.cfg.AllowInsecure {
+		return errors.New("amqp: plaintext listener disabled; configure TLS or explicitly enable AllowInsecure for development")
+	}
 	ln, err := net.Listen("tcp", s.cfg.ListenAddr)
 	if err != nil {
 		return fmt.Errorf("amqp: listen %s: %w", s.cfg.ListenAddr, err)
@@ -83,6 +93,12 @@ func (s *Server) Listen() error {
 
 // ListenTLS starts a TLS listener.
 func (s *Server) ListenTLS(addr string) error {
+	if s.cfg.TLSConfig == nil {
+		return errors.New("amqp: TLS configuration is required")
+	}
+	if s.cfg.Username == "" && s.cfg.Password == "" && s.cfg.TLSConfig.ClientAuth < tls.VerifyClientCertIfGiven {
+		return errors.New("amqp: TLS listener requires PLAIN credentials or verified client certificates")
+	}
 	ln, err := tls.Listen("tcp", addr, s.cfg.TLSConfig)
 	if err != nil {
 		return fmt.Errorf("amqp: listen tls %s: %w", addr, err)

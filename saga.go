@@ -18,27 +18,27 @@ const (
 )
 
 type SagaStepAction struct {
-	TaskName string      `json:"task_name"`
-	Queue    string      `json:"queue,omitempty"`
-	Payload  any         `json:"payload,omitempty"`
+	TaskName string            `json:"task_name"`
+	Queue    string            `json:"queue,omitempty"`
+	Payload  any               `json:"payload,omitempty"`
 	Metadata map[string]string `json:"metadata,omitempty"`
-	Timeout  time.Duration `json:"timeout,omitempty"`
+	Timeout  time.Duration     `json:"timeout,omitempty"`
 }
 
 type SagaStep struct {
-	Name        string         `json:"name"`
-	Action      SagaStepAction `json:"action"`
-	Compensate  SagaStepAction `json:"compensate,omitempty"`
-	Optional    bool           `json:"optional,omitempty"`
+	Name       string         `json:"name"`
+	Action     SagaStepAction `json:"action"`
+	Compensate SagaStepAction `json:"compensate,omitempty"`
+	Optional   bool           `json:"optional,omitempty"`
 }
 
 type SagaDefinition struct {
-	Name        string            `json:"name"`
-	ID          string            `json:"id,omitempty"`
-	Steps       []SagaStep        `json:"steps"`
-	Metadata    map[string]string `json:"metadata,omitempty"`
-	TenantID    string            `json:"tenant_id,omitempty"`
-	Timeout     time.Duration     `json:"timeout,omitempty"`
+	Name     string            `json:"name"`
+	ID       string            `json:"id,omitempty"`
+	Steps    []SagaStep        `json:"steps"`
+	Metadata map[string]string `json:"metadata,omitempty"`
+	TenantID string            `json:"tenant_id,omitempty"`
+	Timeout  time.Duration     `json:"timeout,omitempty"`
 }
 
 type SagaStepResult struct {
@@ -53,15 +53,15 @@ type SagaStepResult struct {
 
 type SagaInstance struct {
 	SagaDefinition
-	ID        string            `json:"id"`
-	Status    SagaStatus        `json:"status"`
-	Results   []SagaStepResult  `json:"results"`
-	CurrentStep int             `json:"current_step"`
-	CreatedAt time.Time         `json:"created_at"`
-	UpdatedAt time.Time         `json:"updated_at"`
-	FinishedAt time.Time        `json:"finished_at,omitempty"`
-	Error     string            `json:"error,omitempty"`
-	mu        sync.Mutex        `json:"-"`
+	ID          string           `json:"id"`
+	Status      SagaStatus       `json:"status"`
+	Results     []SagaStepResult `json:"results"`
+	CurrentStep int              `json:"current_step"`
+	CreatedAt   time.Time        `json:"created_at"`
+	UpdatedAt   time.Time        `json:"updated_at"`
+	FinishedAt  time.Time        `json:"finished_at,omitempty"`
+	Error       string           `json:"error,omitempty"`
+	mu          sync.Mutex       `json:"-"`
 }
 
 func (s *SagaInstance) clone() SagaInstance {
@@ -84,9 +84,9 @@ func (s *SagaInstance) clone() SagaInstance {
 }
 
 type SagaEngine struct {
-	b      *Broker
-	mu     sync.RWMutex
-	sagas  map[string]*SagaInstance
+	b     *Broker
+	mu    sync.RWMutex
+	sagas map[string]*SagaInstance
 }
 
 func NewSagaEngine(b *Broker) *SagaEngine {
@@ -365,8 +365,8 @@ func (e *SagaEngine) failSaga(s *SagaInstance, step int, stepName, errStr string
 	})
 	if e.b.cfg.Hooks.OnTaskFailed != nil {
 		e.b.cfg.Hooks.OnTaskFailed(context.Background(), TaskEvent{
-			Task: TaskInfo{ID: s.ID, Name: s.Name, Status: TaskFailed, LastError: errStr},
-			Error: errf(ErrPermanent, errStr), Time: time.Now(),
+			Task:  TaskInfo{ID: s.ID, Name: s.Name, Status: TaskFailed, LastError: errStr},
+			Error: errf(ErrPermanent, "%s", errStr), Time: time.Now(),
 		})
 	}
 }

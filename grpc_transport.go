@@ -13,7 +13,8 @@ import (
 	"time"
 )
 
-// GRPCConfig configures the gRPC-like transport server.
+// GRPCConfig configures the legacy native JSON/TCP RPC server.
+// Deprecated: use NativeRPCConfig. This transport is not gRPC.
 // Uses a custom protocol over TCP for environments without gRPC dependencies.
 type GRPCConfig struct {
 	// ListenAddr is the TCP address. Default: ":50051".
@@ -37,7 +38,8 @@ type GRPCConfig struct {
 	BrokerToken string
 }
 
-// GRPCServer provides a gRPC-like transport for the broker data plane.
+// GRPCServer provides the legacy native JSON/TCP transport.
+// Deprecated: use NativeRPCServer. This transport is not gRPC.
 // Uses length-prefixed JSON frames over TCP.
 type GRPCServer struct {
 	broker *Broker
@@ -57,9 +59,9 @@ type grpcConn struct {
 }
 
 type grpcRequest struct {
-	ID      string          `json:"id"`
-	Method  string          `json:"method"`
-	Body    json.RawMessage `json:"body"`
+	ID      string            `json:"id"`
+	Method  string            `json:"method"`
+	Body    json.RawMessage   `json:"body"`
 	Headers map[string]string `json:"headers,omitempty"`
 }
 
@@ -71,26 +73,26 @@ type grpcResponse struct {
 }
 
 const (
-	GRPCMethodPublish      = "broker.Publish"
-	GRPCMethodSubscribe    = "broker.Subscribe"
-	GRPCMethodAck          = "broker.Ack"
-	GRPCMethodNack         = "broker.Nack"
-	GRPCMethodPoll         = "broker.Poll"
-	GRPCMethodRequest      = "broker.Request"
-	GRPCMethodStats        = "broker.Stats"
-	GRPCMethodHealth       = "broker.Health"
-	GRPCMethodDeclareQueue = "broker.DeclareQueue"
-	GRPCMethodDeclareTopic = "broker.DeclareTopic"
+	GRPCMethodPublish       = "broker.Publish"
+	GRPCMethodSubscribe     = "broker.Subscribe"
+	GRPCMethodAck           = "broker.Ack"
+	GRPCMethodNack          = "broker.Nack"
+	GRPCMethodPoll          = "broker.Poll"
+	GRPCMethodRequest       = "broker.Request"
+	GRPCMethodStats         = "broker.Stats"
+	GRPCMethodHealth        = "broker.Health"
+	GRPCMethodDeclareQueue  = "broker.DeclareQueue"
+	GRPCMethodDeclareTopic  = "broker.DeclareTopic"
 	GRPCMethodDeclareStream = "broker.DeclareStream"
-	GRPCMethodReadStream   = "broker.ReadStream"
-	GRPCMethodCommitOffset = "broker.CommitOffset"
-	GRPCMethodMove         = "broker.Move"
-	GRPCMethodPauseQueue   = "broker.PauseQueue"
-	GRPCMethodResumeQueue  = "broker.ResumeQueue"
-	GRPCMethodPurgeQueue   = "broker.PurgeQueue"
+	GRPCMethodReadStream    = "broker.ReadStream"
+	GRPCMethodCommitOffset  = "broker.CommitOffset"
+	GRPCMethodMove          = "broker.Move"
+	GRPCMethodPauseQueue    = "broker.PauseQueue"
+	GRPCMethodResumeQueue   = "broker.ResumeQueue"
+	GRPCMethodPurgeQueue    = "broker.PurgeQueue"
 )
 
-// NewGRPCServer creates a new gRPC-like server.
+// NewGRPCServer creates the legacy native JSON/TCP server.
 func NewGRPCServer(b *Broker, cfg GRPCConfig) *GRPCServer {
 	if cfg.ListenAddr == "" {
 		cfg.ListenAddr = ":50051"
@@ -114,7 +116,17 @@ func NewGRPCServer(b *Broker, cfg GRPCConfig) *GRPCServer {
 	}
 }
 
-// ListenAndServe starts the gRPC-like server.
+// NativeRPCConfig accurately names the legacy JSON/TCP RPC configuration.
+type NativeRPCConfig = GRPCConfig
+
+// NativeRPCServer accurately names the legacy JSON/TCP RPC server.
+type NativeRPCServer = GRPCServer
+
+func NewNativeRPCServer(b *Broker, cfg NativeRPCConfig) *NativeRPCServer {
+	return NewGRPCServer(b, cfg)
+}
+
+// ListenAndServe starts the legacy native JSON/TCP server.
 func (gs *GRPCServer) ListenAndServe() error {
 	var err error
 	// Set up TLS if configured

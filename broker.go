@@ -59,6 +59,11 @@ type Broker struct {
 }
 
 func New(cfg Config) (*Broker, error) {
+	profile, err := DefaultsForProfile(cfg.PerformanceProfile)
+	if err != nil {
+		return nil, err
+	}
+	cfg.PerformanceProfile = profile.Profile
 	if cfg.Name == "" {
 		cfg.Name = "fastworker-broker"
 	}
@@ -78,7 +83,7 @@ func New(cfg Config) (*Broker, error) {
 		cfg.DefaultRetry = DefaultRetryPolicy()
 	}
 	if cfg.PollInterval <= 0 {
-		cfg.PollInterval = 5 * time.Millisecond
+		cfg.PollInterval = profile.PollInterval
 	}
 	if cfg.LeaseSweepInterval <= 0 {
 		cfg.LeaseSweepInterval = time.Second

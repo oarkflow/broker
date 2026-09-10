@@ -19,11 +19,14 @@ import (
 // The store is crash-recoverable: in-flight leased/processing messages are
 // restored as queued on startup so they can be redelivered.
 type MessageStore struct {
-	mu  sync.Mutex
-	db  *sql.DB
-	mem *broker.MemoryStore
-	own bool
+	mu        sync.Mutex
+	db        *sql.DB
+	mem       *broker.MemoryStore
+	committed broker.MemoryStoreSnapshot
+	own       bool
 }
+
+func (*MessageStore) ConfirmationLevel() broker.ConfirmLevel { return broker.ConfirmPersisted }
 
 // OpenMessageStore opens a persistent message data-plane store using any
 // registered SQLite driver name.
@@ -52,6 +55,7 @@ func NewMessageStore(db *sql.DB) (*MessageStore, error) {
 	if err := s.load(context.Background()); err != nil {
 		return nil, err
 	}
+	s.committed = s.mem.Snapshot()
 	return s, nil
 }
 
@@ -60,7 +64,7 @@ func (s *MessageStore) init(ctx context.Context) error {
 	// not support all of them; failures are ignored so custom test drivers can be
 	// used too.
 	_, _ = s.db.ExecContext(ctx, `PRAGMA journal_mode=WAL`)
-	_, _ = s.db.ExecContext(ctx, `PRAGMA synchronous=NORMAL`)
+	_, _ = s.db.ExecContext(ctx, `PRAGMA synchronous=FULL`)
 	_, _ = s.db.ExecContext(ctx, `PRAGMA busy_timeout=5000`)
 	_, err := s.db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS fw_message_store_snapshots (id TEXT PRIMARY KEY, updated_at INTEGER NOT NULL, data_json BLOB NOT NULL)`)
 	return err
@@ -84,12 +88,27 @@ func (s *MessageStore) load(ctx context.Context) error {
 }
 
 func (s *MessageStore) persistLocked(ctx context.Context) error {
-	b, err := json.Marshal(s.mem.Snapshot())
+	next := s.mem.Snapshot()
+	b, err := json.Marshal(next)
 	if err != nil {
+		s.mem.Restore(s.committed)
 		return err
 	}
-	_, err = s.db.ExecContext(ctx, `INSERT INTO fw_message_store_snapshots(id,updated_at,data_json) VALUES('default',?,?) ON CONFLICT(id) DO UPDATE SET updated_at=excluded.updated_at, data_json=excluded.data_json`, time.Now().UnixNano(), b)
-	return err
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err == nil {
+		_, err = tx.ExecContext(ctx, `INSERT INTO fw_message_store_snapshots(id,updated_at,data_json) VALUES('default',?,?) ON CONFLICT(id) DO UPDATE SET updated_at=excluded.updated_at, data_json=excluded.data_json`, time.Now().UnixNano(), b)
+	}
+	if err == nil {
+		err = tx.Commit()
+	} else if tx != nil {
+		_ = tx.Rollback()
+	}
+	if err != nil {
+		s.mem.Restore(s.committed)
+		return err
+	}
+	s.committed = next
+	return nil
 }
 
 func (s *MessageStore) DeclareQueue(ctx context.Context, cfg broker.QueueConfig) error {
@@ -121,6 +140,7 @@ func (s *MessageStore) Append(ctx context.Context, msg broker.Message, dests []b
 	defer s.mu.Unlock()
 	out, err := s.mem.Append(ctx, msg, dests)
 	if err != nil {
+		s.mem.Restore(s.committed)
 		return out, err
 	}
 	return out, s.persistLocked(ctx)
@@ -176,15 +196,23 @@ func (s *MessageStore) Update(ctx context.Context, msg broker.Message) error {
 	return s.persistLocked(ctx)
 }
 func (s *MessageStore) Get(ctx context.Context, id string) (broker.Message, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return s.mem.Get(ctx, id)
 }
 func (s *MessageStore) History(ctx context.Context, id string) ([]broker.MessageHistory, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return s.mem.History(ctx, id)
 }
 func (s *MessageStore) ListQueue(ctx context.Context, name string, limit int) ([]broker.Message, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return s.mem.ListQueue(ctx, name, limit)
 }
 func (s *MessageStore) ListDLQ(ctx context.Context, name string, limit int) ([]broker.Message, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return s.mem.ListDLQ(ctx, name, limit)
 }
 func (s *MessageStore) Move(ctx context.Context, req broker.MoveRequest) (broker.MoveResult, error) {
@@ -222,6 +250,8 @@ func (s *MessageStore) PurgeQueue(ctx context.Context, name string) (int, error)
 	return n, s.persistLocked(ctx)
 }
 func (s *MessageStore) ReadStream(ctx context.Context, req broker.StreamReadRequest) ([]broker.Message, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return s.mem.ReadStream(ctx, req)
 }
 func (s *MessageStore) CommitOffset(ctx context.Context, commit broker.OffsetCommit) error {
@@ -233,9 +263,15 @@ func (s *MessageStore) CommitOffset(ctx context.Context, commit broker.OffsetCom
 	return s.persistLocked(ctx)
 }
 func (s *MessageStore) ConsumerOffset(ctx context.Context, commit broker.OffsetCommit) (uint64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return s.mem.ConsumerOffset(ctx, commit)
 }
-func (s *MessageStore) Stats(ctx context.Context) (broker.StoreStats, error) { return s.mem.Stats(ctx) }
+func (s *MessageStore) Stats(ctx context.Context) (broker.StoreStats, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.mem.Stats(ctx)
+}
 func (s *MessageStore) SweepLeases(ctx context.Context, now time.Time) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

@@ -6,11 +6,16 @@ import (
 )
 
 type PublishResult struct {
-	MessageID    string        `json:"message_id"`
-	Messages     []Message     `json:"messages,omitempty"`
-	Destinations []Destination `json:"destinations,omitempty"`
-	Confirmed    ConfirmLevel  `json:"confirmed"`
-	Duplicate    bool          `json:"duplicate,omitempty"`
+	MessageID    string          `json:"message_id"`
+	Messages     []Message       `json:"messages,omitempty"`
+	Destinations []Destination   `json:"destinations,omitempty"`
+	Confirmed    ConfirmLevel    `json:"confirmed"`
+	Partition    int             `json:"partition,omitempty"`
+	Offset       uint64          `json:"offset,omitempty"`
+	LeaderEpoch  uint64          `json:"leader_epoch,omitempty"`
+	Replicas     int             `json:"replicas,omitempty"`
+	Durability   DurabilityScope `json:"durability"`
+	Duplicate    bool            `json:"duplicate,omitempty"`
 }
 type BatchPublishResult struct {
 	Results []PublishResult `json:"results"`

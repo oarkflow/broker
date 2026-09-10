@@ -295,6 +295,7 @@ type ConsumerConfig struct {
 
 type Config struct {
 	Name                        string             `json:"name"`
+	PerformanceProfile          PerformanceProfile `json:"performance_profile,omitempty"`
 	Mode                        Mode               `json:"mode"`
 	NodeID                      string             `json:"node_id"`
 	Store                       Store              `json:"-"`

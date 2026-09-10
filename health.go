@@ -7,7 +7,8 @@ import (
 	"time"
 )
 
-const Version = "1.0.0"
+// Version remains pre-v1 until the documented production release gates pass.
+const Version = "0.1.0-dev"
 
 type HealthStatus struct {
 	Status  string        `json:"status"` // "healthy", "degraded", "unhealthy"
@@ -28,23 +29,23 @@ type HealthCheck struct {
 }
 
 type BrokerMetrics struct {
-	MessagesPublished   uint64        `json:"messages_published"`
-	MessagesDelivered   uint64        `json:"messages_delivered"`
-	MessagesAcked       uint64        `json:"messages_acked"`
-	MessagesNacked      uint64        `json:"messages_nacked"`
-	MessagesDeadLettered uint64       `json:"messages_dead_lettered"`
-	ActiveConsumers     int           `json:"active_consumers"`
-	ActiveSubscriptions int           `json:"active_subscriptions"`
-	QueueCount          int           `json:"queue_count"`
-	TopicCount          int           `json:"topic_count"`
-	StreamCount         int           `json:"stream_count"`
-	StoreStats          StoreStats    `json:"store_stats"`
-	Uptime              time.Duration `json:"uptime"`
-	RaftState           string        `json:"raft_state"`
-	RaftTerm            uint64        `json:"raft_term"`
-	RaftCommitIndex     uint64        `json:"raft_commit_index"`
-	RaftAppliedIndex    uint64        `json:"raft_applied_index"`
-	IsLeader            bool          `json:"is_leader"`
+	MessagesPublished    uint64        `json:"messages_published"`
+	MessagesDelivered    uint64        `json:"messages_delivered"`
+	MessagesAcked        uint64        `json:"messages_acked"`
+	MessagesNacked       uint64        `json:"messages_nacked"`
+	MessagesDeadLettered uint64        `json:"messages_dead_lettered"`
+	ActiveConsumers      int           `json:"active_consumers"`
+	ActiveSubscriptions  int           `json:"active_subscriptions"`
+	QueueCount           int           `json:"queue_count"`
+	TopicCount           int           `json:"topic_count"`
+	StreamCount          int           `json:"stream_count"`
+	StoreStats           StoreStats    `json:"store_stats"`
+	Uptime               time.Duration `json:"uptime"`
+	RaftState            string        `json:"raft_state"`
+	RaftTerm             uint64        `json:"raft_term"`
+	RaftCommitIndex      uint64        `json:"raft_commit_index"`
+	RaftAppliedIndex     uint64        `json:"raft_applied_index"`
+	IsLeader             bool          `json:"is_leader"`
 }
 
 func (b *Broker) StartTime() time.Time {

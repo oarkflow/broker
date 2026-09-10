@@ -114,8 +114,9 @@ func TestServerStartStop(t *testing.T) {
 	defer b.Stop(ctx)
 
 	server := NewServer(ServerConfig{
-		ListenAddr: ":0",
-		Broker:     b,
+		ListenAddr:    ":0",
+		Broker:        b,
+		AllowInsecure: true,
 	})
 
 	if err := server.Listen(); err != nil {
@@ -155,8 +156,9 @@ func TestConnectionHandshake(t *testing.T) {
 	defer b.Stop(ctx)
 
 	server := NewServer(ServerConfig{
-		ListenAddr: ":0",
-		Broker:     b,
+		ListenAddr:    ":0",
+		Broker:        b,
+		AllowInsecure: true,
 	})
 
 	if err := server.Listen(); err != nil {
@@ -196,6 +198,45 @@ func TestConnectionHandshake(t *testing.T) {
 	// Verify frame type is method (1)
 	if buf[0] != FrameMethod {
 		t.Errorf("Expected frame type %d, got %d", FrameMethod, buf[0])
+	}
+}
+
+func TestPlainAuthentication(t *testing.T) {
+	serverSide, clientSide := net.Pipe()
+	defer serverSide.Close()
+	defer clientSide.Close()
+
+	b, err := broker.New(broker.Config{Mode: broker.ModeEmbedded, DefaultQueue: "test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := NewServer(ServerConfig{Broker: b, Username: "worker", Password: "secret", AllowInsecure: true})
+	conn := NewConnection(server, serverSide, FrameMaxSize, time.Second)
+
+	if err := conn.authenticate("PLAIN", []byte("\x00worker\x00secret")); err != nil {
+		t.Fatalf("valid credentials rejected: %v", err)
+	}
+	if err := conn.authenticate("PLAIN", []byte("\x00worker\x00wrong")); err == nil {
+		t.Fatal("invalid credentials accepted")
+	}
+	if err := conn.authenticate("PLAIN", []byte("malformed")); err == nil {
+		t.Fatal("malformed PLAIN response accepted")
+	}
+}
+
+func TestPlainAuthenticationRequiresTLS(t *testing.T) {
+	serverSide, clientSide := net.Pipe()
+	defer serverSide.Close()
+	defer clientSide.Close()
+
+	b, err := broker.New(broker.Config{Mode: broker.ModeEmbedded, DefaultQueue: "test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := NewServer(ServerConfig{Broker: b, Username: "worker", Password: "secret"})
+	conn := NewConnection(server, serverSide, FrameMaxSize, time.Second)
+	if err := conn.authenticate("PLAIN", []byte("\x00worker\x00secret")); err == nil {
+		t.Fatal("PLAIN credentials accepted over plaintext")
 	}
 }
 

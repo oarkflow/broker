@@ -91,8 +91,8 @@ func TestRaftStateTransitions(t *testing.T) {
 
 func TestQuorumSize(t *testing.T) {
 	tests := []struct {
-		nodes    int
-		quorum   int
+		nodes  int
+		quorum int
 	}{
 		{1, 1},
 		{3, 2},
@@ -155,7 +155,7 @@ func TestSplitBrainDetector(t *testing.T) {
 	})
 
 	cluster := &Cluster{
-		id:   "node-1",
+		id:    "node-1",
 		nodes: make(map[string]*NodeInfo),
 		raft:  raft,
 	}
@@ -164,9 +164,9 @@ func TestSplitBrainDetector(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		id := "node-" + string(rune('a'+i))
 		cluster.nodes[id] = &NodeInfo{
-			ID:        id,
-			State:     NodeActive,
-			LastSeen:  time.Now(),
+			ID:       id,
+			State:    NodeActive,
+			LastSeen: time.Now(),
 		}
 	}
 
@@ -193,12 +193,12 @@ func TestSplitBrainDetector(t *testing.T) {
 func TestWALReplicator(t *testing.T) {
 	// Create a mock cluster
 	cluster := &Cluster{
-		id:   "node-1",
+		id:    "node-1",
 		nodes: make(map[string]*NodeInfo),
 		raft: &Raft{
-			id:     "node-1",
-			peers:  []string{"node-1"},
-			state:  StateLeader,
+			id:    "node-1",
+			peers: []string{"node-1"},
+			state: StateLeader,
 		},
 	}
 
@@ -275,9 +275,12 @@ func TestMemoryTransport(t *testing.T) {
 	tr2 := NewMemoryTransport("node-2")
 
 	// Set up handler for node-2 before registering
-	var receivedMsg *RaftMessage
+	received := make(chan *RaftMessage, 1)
 	tr2.handler = func(from string, msg *RaftMessage) {
-		receivedMsg = msg
+		select {
+		case received <- msg:
+		default:
+		}
 	}
 
 	// Register transports
@@ -293,14 +296,13 @@ func TestMemoryTransport(t *testing.T) {
 		t.Fatalf("send: %v", err)
 	}
 
-	// Wait for message delivery
-	time.Sleep(100 * time.Millisecond)
-
-	if receivedMsg == nil {
+	select {
+	case receivedMsg := <-received:
+		if receivedMsg.Type != MsgHeartbeat {
+			t.Errorf("expected heartbeat message, got %d", receivedMsg.Type)
+		}
+	case <-time.After(time.Second):
 		t.Fatal("expected to receive message")
-	}
-	if receivedMsg.Type != MsgHeartbeat {
-		t.Errorf("expected heartbeat message, got %d", receivedMsg.Type)
 	}
 }
 
@@ -336,9 +338,9 @@ type mockCluster struct {
 	raft  *Raft
 }
 
-func (m *mockCluster) ID() string          { return m.id }
-func (m *mockCluster) IsLeader() bool      { return m.raft.IsLeader() }
-func (m *mockCluster) Leader() string      { return m.raft.Leader() }
+func (m *mockCluster) ID() string     { return m.id }
+func (m *mockCluster) IsLeader() bool { return m.raft.IsLeader() }
+func (m *mockCluster) Leader() string { return m.raft.Leader() }
 func (m *mockCluster) ActiveNodes() []*NodeInfo {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -608,7 +610,7 @@ func (m *mockBrokerStore) ReplicateDeclareStream(ctx context.Context, cmd Declar
 func (m *mockBrokerStore) ReplicateAppend(ctx context.Context, cmd AppendCommand) error {
 	return nil
 }
-func (m *mockBrokerStore) ReplicateAck(ctx context.Context, cmd AckCommand) error  { return nil }
+func (m *mockBrokerStore) ReplicateAck(ctx context.Context, cmd AckCommand) error   { return nil }
 func (m *mockBrokerStore) ReplicateNack(ctx context.Context, cmd NackCommand) error { return nil }
 func (m *mockBrokerStore) ReplicatePauseQueue(ctx context.Context, name string) error {
 	m.mu.Lock()

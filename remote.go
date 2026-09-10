@@ -425,7 +425,7 @@ func (b *Broker) BanRemoteConsumer(ctx context.Context, id string, reason string
 		return ConsumerInfo{}, ErrMessageNotFound
 	}
 	b.persistConsumer(ctx, info)
-	ce := ConsumerEvent{Consumer: id, Group: info.Group, State: ConsumerBanned, Error: errf(ErrPermanent, reason), Time: time.Now()}
+	ce := ConsumerEvent{Consumer: id, Group: info.Group, State: ConsumerBanned, Error: errf(ErrPermanent, "%s", reason), Time: time.Now()}
 	if b.cfg.Hooks.OnConsumerBanned != nil {
 		b.cfg.Hooks.OnConsumerBanned(ctx, ce)
 	}

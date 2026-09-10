@@ -12,6 +12,63 @@ import (
 	"time"
 )
 
+func TestTenantScopedPrincipalCannotCrossTenant(t *testing.T) {
+	store := NewMemoryStore()
+	b := MustNew(Config{Store: store})
+	if err := b.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer b.Stop(context.Background())
+
+	ctxA := context.WithValue(context.Background(), adminPrincipalKey{}, AdminPrincipal{Name: "tenant-a", Tenants: []string{"a"}})
+	ctxB := context.WithValue(context.Background(), adminPrincipalKey{}, AdminPrincipal{Name: "tenant-b", Tenants: []string{"b"}})
+	result, err := b.Publisher().Publish(ctxA, "events", []byte("secret"), WithQueue("shared"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Messages[0].TenantID != "a" {
+		t.Fatalf("tenant was not derived from credential: %q", result.Messages[0].TenantID)
+	}
+	if _, err := b.Publisher().Publish(ctxA, "events", []byte("x"), WithQueue("shared"), WithTenantID("b")); !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("cross-tenant publish should fail, got %v", err)
+	}
+	msgs, err := store.Lease(ctxB, LeaseRequest{Queue: "shared", ConsumerID: "b", TenantID: "b"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 0 {
+		t.Fatalf("tenant b leased tenant a messages: %+v", msgs)
+	}
+	if _, ok, err := store.Get(ctxB, result.MessageID); !errors.Is(err, ErrUnauthorized) || ok {
+		t.Fatalf("cross-tenant get: ok=%t err=%v", ok, err)
+	}
+	if err := store.Update(ctxB, result.Messages[0]); !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("cross-tenant update should fail, got %v", err)
+	}
+	if _, err := store.History(ctxB, result.MessageID); !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("cross-tenant history should fail, got %v", err)
+	}
+	if err := store.DeclareStream(context.Background(), StreamConfig{Name: "shared-stream"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Append(context.Background(), Message{ID: "stream-a", TenantID: "a"}, []Destination{{Kind: DestinationStream, Name: "shared-stream"}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Append(context.Background(), Message{ID: "stream-b", TenantID: "b"}, []Destination{{Kind: DestinationStream, Name: "shared-stream"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CommitOffset(ctxA, OffsetCommit{Stream: "shared-stream", ConsumerGroup: "workers", Offset: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if off, err := store.ConsumerOffset(ctxB, OffsetCommit{Stream: "shared-stream", ConsumerGroup: "workers"}); err != nil || off != 0 {
+		t.Fatalf("tenant offset leaked: offset=%d err=%v", off, err)
+	}
+	readB, err := store.ReadStream(ctxB, StreamReadRequest{Stream: "shared-stream", ConsumerGroup: "workers", Limit: 10})
+	if err != nil || len(readB) != 1 || readB[0].TenantID != "b" {
+		t.Fatalf("tenant stream isolation failed: messages=%+v err=%v", readB, err)
+	}
+}
+
 func TestAckNackRequireLeaseToken(t *testing.T) {
 	ctx := context.Background()
 	st := NewMemoryStore()
@@ -72,6 +129,26 @@ func TestAdminServerRequiresAuthAndACL(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("expected admin publish ok, got %d", resp.StatusCode)
+	}
+}
+
+func TestACLCredentialHashExpiryAndRevocation(t *testing.T) {
+	acl := NewACL(AdminToken{Name: "worker", Token: "high-entropy-secret", Permissions: []string{PermissionPublish}})
+	if len(acl.Tokens) != 1 || acl.Tokens[0].Token != "" {
+		t.Fatal("ACL retained plaintext credential")
+	}
+	if _, ok := acl.Authenticate("high-entropy-secret"); !ok {
+		t.Fatal("hashed credential did not authenticate")
+	}
+	if !acl.Revoke("worker") {
+		t.Fatal("credential was not revoked")
+	}
+	if _, ok := acl.Authenticate("high-entropy-secret"); ok {
+		t.Fatal("revoked credential authenticated")
+	}
+	acl.AddToken(AdminToken{Name: "expired", Token: "old-secret", ExpiresAt: time.Now().Add(-time.Second)})
+	if _, ok := acl.Authenticate("old-secret"); ok {
+		t.Fatal("expired credential authenticated")
 	}
 }
 

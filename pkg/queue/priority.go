@@ -118,18 +118,29 @@ func (q *PriorityQueue[T]) Push(it Item[T]) bool {
 	return true
 }
 func (q *PriorityQueue[T]) DropOldestPush(it Item[T]) bool {
+	_, _, ok := q.DropOldestPushValue(it)
+	return ok
+}
+
+// DropOldestPushValue inserts it and reports the item evicted to make room.
+// The second return value is false when no item was evicted.
+func (q *PriorityQueue[T]) DropOldestPushValue(it Item[T]) (Item[T], bool, bool) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	if q.closed {
-		return false
+		var zero Item[T]
+		return zero, false, false
 	}
+	var dropped Item[T]
+	var didDrop bool
 	if q.cap > 0 && len(q.items) >= q.cap {
-		_ = q.items.pop()
+		dropped = q.items.pop()
+		didDrop = true
 	}
 	q.items.push(it)
 	q.signalLocked()
 	q.notEmpty.Signal()
-	return true
+	return dropped, didDrop, true
 }
 func (q *PriorityQueue[T]) Pop() (Item[T], bool) {
 	for {

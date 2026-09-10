@@ -81,3 +81,48 @@ func TestBinaryFileWALStoreRecovery(t *testing.T) {
 		t.Fatalf("wal perm=%v", info.Mode().Perm())
 	}
 }
+
+func TestBinaryWALReplaysAssignedMessageState(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	store, err := NewBinaryFileWALStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DeclareStream(ctx, StreamConfig{Name: "events"}); err != nil {
+		t.Fatal(err)
+	}
+	written, err := store.Append(ctx, Message{ID: "message-1", Payload: []byte("payload"), DeduplicationID: "dedup-1"}, []Destination{{Kind: DestinationQueue, Name: "jobs"}, {Kind: DestinationStream, Name: "events"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(written) != 2 || written[0].CreatedAt.IsZero() || written[1].Offset == 0 {
+		t.Fatalf("unexpected assigned state: %+v", written)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	recovered, err := NewBinaryFileWALStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer recovered.Close()
+	queued, err := recovered.ListQueue(ctx, "jobs", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	streamed, err := recovered.ReadStream(ctx, StreamReadRequest{Stream: "events", Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(queued) != 1 || len(streamed) != 1 {
+		t.Fatalf("recovered queue=%+v stream=%+v", queued, streamed)
+	}
+	if queued[0].ID != written[0].ID || !queued[0].CreatedAt.Equal(written[0].CreatedAt) {
+		t.Fatalf("queue assigned state changed: before=%+v after=%+v", written[0], queued[0])
+	}
+	if streamed[0].ID != written[1].ID || streamed[0].Offset != written[1].Offset {
+		t.Fatalf("stream assigned state changed: before=%+v after=%+v", written[1], streamed[0])
+	}
+}

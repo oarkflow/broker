@@ -46,9 +46,9 @@ type Raft struct {
 	matchIndex map[string]uint64
 
 	// Cluster information
-	id          string
-	peers       []string
-	quorumSize  int
+	id         string
+	peers      []string
+	quorumSize int
 
 	// Components
 	transport    Transport
@@ -62,9 +62,9 @@ type Raft struct {
 	commitCh    chan uint64
 
 	// Control
-	stopCh   chan struct{}
-	wg       sync.WaitGroup
-	running  atomic.Bool
+	stopCh  chan struct{}
+	wg      sync.WaitGroup
+	running atomic.Bool
 
 	// Configuration
 	electionTimeout   time.Duration
@@ -111,26 +111,26 @@ func NewRaft(cfg RaftConfig) *Raft {
 	quorumSize := (len(cfg.Peers) / 2) + 1
 
 	r := &Raft{
-		id:               cfg.ID,
-		peers:            cfg.Peers,
-		quorumSize:       quorumSize,
-		transport:        cfg.Transport,
-		stateMachine:     cfg.StateMachine,
-		wal:              cfg.WAL,
-		state:            StateFollower,
-		nextIndex:        make(map[string]uint64),
-		matchIndex:       make(map[string]uint64),
-		heartbeatCh:      make(chan struct{}, 1),
-		voteCh:           make(chan bool, 1),
-		commitCh:         make(chan uint64, 100),
-		readIndexCh:      make(chan uint64, 100),
-		stopCh:           make(chan struct{}),
-		electionTimeout:  cfg.ElectionTimeout,
-		heartbeatTimeout: cfg.HeartbeatTimeout,
+		id:                cfg.ID,
+		peers:             cfg.Peers,
+		quorumSize:        quorumSize,
+		transport:         cfg.Transport,
+		stateMachine:      cfg.StateMachine,
+		wal:               cfg.WAL,
+		state:             StateFollower,
+		nextIndex:         make(map[string]uint64),
+		matchIndex:        make(map[string]uint64),
+		heartbeatCh:       make(chan struct{}, 1),
+		voteCh:            make(chan bool, 1),
+		commitCh:          make(chan uint64, 100),
+		readIndexCh:       make(chan uint64, 100),
+		stopCh:            make(chan struct{}),
+		electionTimeout:   cfg.ElectionTimeout,
+		heartbeatTimeout:  cfg.HeartbeatTimeout,
 		snapshotThreshold: cfg.SnapshotThreshold,
-		onStateChange:    cfg.OnStateChange,
-		onLeaderChange:   cfg.OnLeaderChange,
-		onConfigChange:  cfg.OnConfigChange,
+		onStateChange:     cfg.OnStateChange,
+		onLeaderChange:    cfg.OnLeaderChange,
+		onConfigChange:    cfg.OnConfigChange,
 	}
 
 	return r
@@ -246,7 +246,9 @@ func (r *Raft) runFollower() {
 		case <-time.After(timeout):
 			// Election timeout - become candidate
 			log.Printf("[raft:%s] election timeout, becoming candidate", r.id)
+			r.mu.Lock()
 			r.setState(StateCandidate)
+			r.mu.Unlock()
 			return
 		}
 	}

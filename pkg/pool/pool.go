@@ -53,6 +53,7 @@ type Pool struct {
 	cancel         context.CancelFunc
 	wg             sync.WaitGroup
 	workers        atomic.Int64
+	outstanding    atomic.Int64
 	state          atomic.Uint32
 	seq            atomic.Uint64
 	started        time.Time
@@ -184,9 +185,11 @@ func (p *Pool) SubmitFast(job Job) error {
 	if st == stateStopping || st == stateStopped {
 		return ErrClosed
 	}
+	p.outstanding.Add(1)
 	if p.pushBasic(job) {
 		return nil
 	}
+	p.outstanding.Add(-1)
 	return ErrQueueFull
 }
 
@@ -265,12 +268,14 @@ func (p *Pool) submit(job Job, f *futureAny, opts ...JobOptions) (*queuedJob, er
 		opt.Timeout = p.cfg.DefaultTimeout
 	}
 	if p.useBasicFastPath(job, opt, f) {
+		p.outstanding.Add(1)
 		if p.pushBasic(job) {
 			if !p.cfg.DisableStats {
 				p.c.accepted.Add(1)
 			}
 			return nil, nil
 		}
+		p.outstanding.Add(-1)
 		p.c.rejected.Add(1)
 		return nil, ErrQueueFull
 	}
@@ -321,6 +326,9 @@ func (p *Pool) submit(job Job, f *futureAny, opts ...JobOptions) (*queuedJob, er
 	if p.store != nil {
 		_ = p.store.SaveJob(context.Background(), qj.info())
 	}
+	// Count accepted work before it becomes visible to a worker. This closes the
+	// dequeue-before-busy window that otherwise lets WaitIdle return early.
+	p.outstanding.Add(1)
 	ok := false
 	if p.useFastQueue(opt, now, runAt) {
 		ok = p.pushFast(qj)
@@ -330,7 +338,11 @@ func (p *Pool) submit(job Job, f *futureAny, opts ...JobOptions) (*queuedJob, er
 		case BackpressureReject:
 			ok = p.q.Push(item)
 		case BackpressureDropOldest:
-			ok = p.q.DropOldestPush(item)
+			dropped, didDrop, pushed := p.q.DropOldestPushValue(item)
+			ok = pushed
+			if didDrop && dropped.Value != nil {
+				p.deadletter(dropped.Value, ErrQueueFull)
+			}
 		case BackpressureDropNewest:
 			ok = p.q.Push(item)
 		default:
@@ -346,6 +358,7 @@ func (p *Pool) submit(job Job, f *futureAny, opts ...JobOptions) (*queuedJob, er
 			p.emitJob(EventJobAccepted, qj, 0, nil, "spilled")
 			return qj, nil
 		}
+		p.outstanding.Add(-1)
 		p.c.rejected.Add(1)
 		p.emitJob(EventJobRejected, qj, 0, ErrQueueFull, "")
 		if p.cfg.EnableJobTracking && opt.ID != "" {
@@ -542,6 +555,7 @@ func (p *Pool) worker(id int) {
 }
 
 func (p *Pool) executeBasic(job Job) {
+	defer p.outstanding.Add(-1)
 	if !p.cfg.DisableStats {
 		p.c.started.Add(1)
 		p.c.busy.Add(1)
@@ -620,6 +634,7 @@ func (p *Pool) execute(id int, qj *queuedJob) {
 			qj.opts.Callback.OnFinally(context.Background(), qj.info(), ErrCancelled)
 		}
 		p.emitJob(EventJobCancelled, qj, qj.attempt, ErrCancelled, "")
+		p.outstanding.Add(-1)
 		p.releaseJob(qj)
 		return
 	}
@@ -724,6 +739,7 @@ func (p *Pool) execute(id int, qj *queuedJob) {
 		if qj.opts.IdempotencyKey != "" {
 			p.idemp.Delete(qj.opts.IdempotencyKey)
 		}
+		p.outstanding.Add(-1)
 		p.releaseJob(qj)
 		return
 	}
@@ -791,6 +807,7 @@ func (p *Pool) deadletter(qj *queuedJob, err error) {
 	if qj.opts.IdempotencyKey != "" {
 		p.idemp.Delete(qj.opts.IdempotencyKey)
 	}
+	p.outstanding.Add(-1)
 }
 
 func (p *Pool) releaseJob(qj *queuedJob) {

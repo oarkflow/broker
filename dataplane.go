@@ -15,9 +15,13 @@ import (
 )
 
 type PollRequest struct {
-	Queue, ConsumerID, ConsumerGroup string
-	Limit                            int
-	WaitNS, VisibilityTimeoutNS      int64
+	Queue               string `json:"queue"`
+	ConsumerID          string `json:"consumer_id"`
+	ConsumerGroup       string `json:"consumer_group"`
+	TenantID            string `json:"tenant_id,omitempty"`
+	Limit               int    `json:"limit"`
+	WaitNS              int64  `json:"wait_ns,omitempty"`
+	VisibilityTimeoutNS int64  `json:"visibility_timeout_ns,omitempty"`
 }
 type PublishHTTPPayload struct {
 	Topic, Queue, Stream, Type string
@@ -631,6 +635,11 @@ func (a AdminServer) v1PollFrame(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "consumer_id and queue required", 400)
 		return
 	}
+	tenant, err := resolveTenant(r.Context(), req.TenantID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusForbidden)
+		return
+	}
 	wait := time.Duration(req.WaitNS)
 	if wait <= 0 {
 		wait = queryDuration(r, "wait", 0)
@@ -641,7 +650,7 @@ func (a AdminServer) v1PollFrame(w http.ResponseWriter, r *http.Request) {
 		vis = queryDuration(r, "visibility_timeout", 0)
 	}
 	for {
-		msgs, err := a.Broker.store.Lease(r.Context(), LeaseRequest{Queue: req.Queue, ConsumerID: req.ConsumerID, ConsumerGroup: firstNonEmpty(req.ConsumerGroup, req.ConsumerID), Limit: req.Limit, VisibilityTimeout: vis})
+		msgs, err := a.Broker.store.Lease(r.Context(), LeaseRequest{Queue: req.Queue, ConsumerID: req.ConsumerID, ConsumerGroup: firstNonEmpty(req.ConsumerGroup, req.ConsumerID), Limit: req.Limit, VisibilityTimeout: vis, TenantID: tenant})
 		if err != nil {
 			http.Error(w, err.Error(), 409)
 			return
@@ -700,6 +709,11 @@ func (a AdminServer) v1Poll(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "consumer_id and queue required", 400)
 		return
 	}
+	tenant, err := resolveTenant(r.Context(), req.TenantID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusForbidden)
+		return
+	}
 	if info, ok := a.Broker.Consumers().Get(req.ConsumerID); ok && (info.Paused || info.Draining || info.Banned || info.State == ConsumerPaused || info.State == ConsumerDraining || info.State == ConsumerStopped || info.State == ConsumerBanned) {
 		writeBrokerJSON(w, []Message{})
 		return
@@ -714,7 +728,7 @@ func (a AdminServer) v1Poll(w http.ResponseWriter, r *http.Request) {
 		vis = queryDuration(r, "visibility_timeout", 0)
 	}
 	for {
-		msgs, err := a.Broker.store.Lease(r.Context(), LeaseRequest{Queue: req.Queue, ConsumerID: req.ConsumerID, ConsumerGroup: firstNonEmpty(req.ConsumerGroup, req.ConsumerID), Limit: req.Limit, VisibilityTimeout: vis})
+		msgs, err := a.Broker.store.Lease(r.Context(), LeaseRequest{Queue: req.Queue, ConsumerID: req.ConsumerID, ConsumerGroup: firstNonEmpty(req.ConsumerGroup, req.ConsumerID), Limit: req.Limit, VisibilityTimeout: vis, TenantID: tenant})
 		if err != nil {
 			http.Error(w, err.Error(), 409)
 			return
@@ -809,7 +823,7 @@ func (a AdminServer) v1Message(w http.ResponseWriter, r *http.Request, tail stri
 			if hadMessage {
 				tid := firstNonEmpty(m.TaskID, m.Headers["x-task-id"])
 				if tid != "" {
-					a.Broker.failTask(r.Context(), tid, errf(ErrPermanent, firstNonEmpty(req.Error, req.Reason)))
+					a.Broker.failTask(r.Context(), tid, errf(ErrPermanent, "%s", firstNonEmpty(req.Error, req.Reason)))
 				}
 			}
 		}

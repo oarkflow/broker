@@ -9,7 +9,7 @@ import (
 )
 
 // Stage 10: gRPC Transport
-// Demonstrates the gRPC-like transport server.
+// Demonstrates the legacy native JSON/TCP transport (not gRPC).
 // Uses length-prefixed JSON over TCP for high-performance communication.
 
 func main() {
@@ -37,7 +37,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	// Start gRPC-like server
+	// Start the native JSON/TCP server.
 	grpcServer := broker.NewGRPCServer(b, broker.GRPCConfig{
 		ListenAddr:     ":50051",
 		MaxConnections: 100,

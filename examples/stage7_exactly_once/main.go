@@ -8,9 +8,9 @@ import (
 	"github.com/oarkflow/broker"
 )
 
-// Stage 7: Exactly-Once Delivery
+// Stage 7: Deduplicated Delivery (Legacy API)
 // Demonstrates transactional outbox pattern and idempotent consumers
-// for exactly-once delivery semantics.
+// for effectively-once handling within a configured deduplication window.
 
 func main() {
 	ctx := context.Background()

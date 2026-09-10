@@ -2,6 +2,7 @@ package amqp
 
 import (
 	"bufio"
+	"crypto/subtle"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -11,26 +12,28 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	broker "github.com/oarkflow/broker"
 )
 
 // Connection represents an AMQP client connection.
 type Connection struct {
-	server    *Server
-	netConn   net.Conn
-	codec     *Codec
-	reader    *bufio.Reader
-	writer    *bufio.Writer
-	rwc       *connReadWriteCloser
-	channels  map[uint16]*Channel
-	channelsMu sync.RWMutex
-	state     atomic.Int32
-	frameMax  uint32
-	heartbeat time.Duration
+	server          *Server
+	netConn         net.Conn
+	codec           *Codec
+	reader          *bufio.Reader
+	writer          *bufio.Writer
+	rwc             *connReadWriteCloser
+	channels        map[uint16]*Channel
+	channelsMu      sync.RWMutex
+	state           atomic.Int32
+	frameMax        uint32
+	heartbeat       time.Duration
 	clientHeartbeat uint16
-	vhost     string
-	username  string
-	closed    chan struct{}
-	closeOnce sync.Once
+	vhost           string
+	username        string
+	closed          chan struct{}
+	closeOnce       sync.Once
 }
 
 // Connection states.
@@ -85,13 +88,13 @@ func NewConnection(s *Server, netConn net.Conn, frameMax uint32, heartbeat time.
 func (c *Connection) Handle() error {
 	defer c.Close()
 
-	// Read and discard the AMQP protocol header
-	header := make([]byte, 7)
+	// AMQP 0-9-1 protocol header is exactly eight octets.
+	header := make([]byte, 8)
 	if _, err := io.ReadFull(c.reader, header); err != nil {
 		return fmt.Errorf("failed to read protocol header: %w", err)
 	}
-	if string(header[:4]) != "AMQP" {
-		return fmt.Errorf("invalid protocol header: %q", header[:4])
+	if string(header) != "AMQP\x00\x00\x09\x01" {
+		return fmt.Errorf("unsupported protocol header: %x", header)
 	}
 
 	// AMQP handshake: send Connection.Start
@@ -182,7 +185,7 @@ func (c *Connection) handleConnectionMethod(method *MethodFrame) error {
 func (c *Connection) sendStart() error {
 	serverProps := table{
 		"product":   "fastworker-broker",
-		"version":   "1.0.0",
+		"version":   broker.Version,
 		"platform":  "Go",
 		"copyright": "Fastworker",
 		"capabilities": table{
@@ -194,11 +197,11 @@ func (c *Connection) sendStart() error {
 	}
 
 	args := EncodeMethodArgs(
-		uint8(ProtocolMajor),  // version-major
-		uint8(ProtocolMinor),  // version-minor
-		table(serverProps),    // server-properties
-		"PLAIN EXTERNAL",     // mechanisms
-		"en_US",              // locales
+		uint8(ProtocolMajor),     // version-major
+		uint8(ProtocolMinor),     // version-minor
+		table(serverProps),       // server-properties
+		c.advertisedMechanisms(), // mechanisms
+		"en_US",                  // locales
 	)
 
 	return c.codec.WriteMethodFrame(0, ClassConnection, MethodConnectionStart, args)
@@ -209,43 +212,113 @@ func (c *Connection) handleStartOk(args []byte) error {
 	r := &argsReader{data: args}
 
 	// Client properties
-	_, _ = r.ReadTable()
-	// Mechanism
-	mechanism, _ := r.ReadString()
-	// Response
-	response, _ := r.ReadBytes()
-	// Locale
-	locale, _ := r.ReadString()
-
-	if mechanism == "PLAIN" {
-		// PLAIN mechanism: \0username\0password
-		// Parse but don't enforce authentication (handled at server level)
-		_ = response
-	} else if mechanism == "EXTERNAL" {
-		// EXTERNAL mechanism: client certificate authentication
-		// The TLS handshake has already provided the client certificate
-		// Verify that a valid TLS connection exists
-		if tc, ok := c.netConn.(*tls.Conn); ok {
-			state := tc.ConnectionState()
-			if len(state.PeerCertificates) == 0 {
-				return fmt.Errorf("EXTERNAL auth: no client certificate provided")
-			}
-		}
-		_ = response
+	if _, err := r.ReadTable(); err != nil {
+		return fmt.Errorf("connection.start-ok client properties: %w", err)
 	}
-
-	_ = locale
+	// Mechanism
+	mechanism, err := r.ReadString()
+	if err != nil {
+		return fmt.Errorf("connection.start-ok mechanism: %w", err)
+	}
+	// Response
+	response, err := r.ReadBytes()
+	if err != nil {
+		return fmt.Errorf("connection.start-ok response: %w", err)
+	}
+	// Locale
+	if _, err := r.ReadString(); err != nil {
+		return fmt.Errorf("connection.start-ok locale: %w", err)
+	}
+	if err := c.authenticate(mechanism, response); err != nil {
+		return err
+	}
 	c.state.Store(connStateStart)
 
 	// Send Connection.Tune
 	return c.sendTune()
 }
 
+func (c *Connection) advertisedMechanisms() string {
+	mechanisms := ""
+	if c.server.cfg.Username != "" || c.server.cfg.Password != "" || c.server.cfg.AllowInsecure {
+		mechanisms = "PLAIN"
+	}
+	if tc, ok := c.netConn.(*tls.Conn); ok {
+		state := tc.ConnectionState()
+		if len(state.PeerCertificates) > 0 && len(state.VerifiedChains) > 0 {
+			if mechanisms != "" {
+				mechanisms += " "
+			}
+			mechanisms += "EXTERNAL"
+		}
+	}
+	return mechanisms
+}
+
+func (c *Connection) authenticate(mechanism string, response []byte) error {
+	switch mechanism {
+	case "PLAIN":
+		if _, ok := c.netConn.(*tls.Conn); !ok && !c.server.cfg.AllowInsecure {
+			return errors.New("PLAIN authentication requires TLS")
+		}
+		username, password, ok := parsePlainResponse(response)
+		if !ok {
+			return errors.New("invalid PLAIN authentication response")
+		}
+		if c.server.cfg.Username == "" && c.server.cfg.Password == "" {
+			if !c.server.cfg.AllowInsecure {
+				return errors.New("PLAIN authentication is not configured")
+			}
+		} else if !secureEqual(username, c.server.cfg.Username) || !secureEqual(password, c.server.cfg.Password) {
+			return errors.New("invalid AMQP credentials")
+		}
+		c.username = username
+		return nil
+	case "EXTERNAL":
+		tc, ok := c.netConn.(*tls.Conn)
+		if !ok {
+			return errors.New("EXTERNAL authentication requires TLS")
+		}
+		state := tc.ConnectionState()
+		if len(state.PeerCertificates) == 0 || len(state.VerifiedChains) == 0 {
+			return errors.New("EXTERNAL authentication requires a verified client certificate")
+		}
+		c.username = state.PeerCertificates[0].Subject.String()
+		return nil
+	default:
+		return fmt.Errorf("unsupported AMQP authentication mechanism %q", mechanism)
+	}
+}
+
+func parsePlainResponse(response []byte) (string, string, bool) {
+	first := -1
+	second := -1
+	for i, b := range response {
+		if b != 0 {
+			continue
+		}
+		if first < 0 {
+			first = i
+		} else {
+			second = i
+			break
+		}
+	}
+	if first < 0 || second < 0 || second == len(response)-1 {
+		return "", "", false
+	}
+	return string(response[first+1 : second]), string(response[second+1:]), true
+}
+
+func secureEqual(got, want string) bool {
+	return subtle.ConstantTimeCompare([]byte(got), []byte(want)) == 1
+}
+
 // sendTune sends Connection.Tune to the client.
 func (c *Connection) sendTune() error {
 	args := EncodeMethodArgs(
-		uint16(ChannelMax),       // channel-max
-		uint32(c.frameMax),       // frame-max
+		uint16(ChannelMax),            // channel-max
+		uint32(c.frameMax),            // frame-max
 		uint16(c.heartbeat.Seconds()), // heartbeat
 	)
 	return c.codec.WriteMethodFrame(0, ClassConnection, MethodConnectionTune, args)

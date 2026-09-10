@@ -1,0 +1,116 @@
+openapi: 3.1.0
+info:
+  title: Fastworker Broker HTTP API
+  version: 0.1.0-dev
+  description: Pre-v1 contract. Stable compatibility is not yet guaranteed.
+servers:
+  - url: https://localhost:8090
+security:
+  - bearerAuth: []
+paths:
+  /healthz:
+    get:
+      operationId: health
+      responses:
+        "200": {description: Broker health}
+  /readyz:
+    get:
+      operationId: readiness
+      responses:
+        "200": {description: Broker is ready}
+        "503": {description: Broker is not ready}
+  /publish:
+    post:
+      operationId: publish
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/PublishRequest"}
+      responses:
+        "200":
+          description: Achieved acknowledgement
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/PublishResult"}
+        "400": {description: Invalid request}
+        "401": {description: Missing or invalid credential}
+        "403": {description: Permission or tenant denied}
+        "409": {description: Broker semantic conflict}
+  /v1/queues/{queue}/poll:
+    post:
+      operationId: pollQueue
+      parameters:
+        - {name: queue, in: path, required: true, schema: {type: string}}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/PollRequest"}
+      responses:
+        "200": {description: Leased messages}
+        "401": {description: Missing or invalid credential}
+        "403": {description: Permission or tenant denied}
+  /streams/{stream}/messages:
+    get:
+      operationId: readStream
+      parameters:
+        - {name: stream, in: path, required: true, schema: {type: string}}
+        - {name: consumer_group, in: query, schema: {type: string}}
+        - {name: after_offset, in: query, schema: {type: integer, minimum: 0}}
+      responses:
+        "200": {description: Stream records}
+  /streams/{stream}/commit:
+    post:
+      operationId: commitOffset
+      parameters:
+        - {name: stream, in: path, required: true, schema: {type: string}}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/OffsetCommit"}
+      responses:
+        "200": {description: Offset committed monotonically}
+components:
+  securitySchemes:
+    bearerAuth: {type: http, scheme: bearer}
+  schemas:
+    PublishRequest:
+      type: object
+      required: [payload]
+      properties:
+        topic: {type: string}
+        queue: {type: string}
+        stream: {type: string}
+        tenant_id: {type: string}
+        payload: {}
+        headers: {type: object, additionalProperties: {type: string}}
+        idempotency_key: {type: string}
+    PublishResult:
+      type: object
+      required: [message_id, confirmed, durability]
+      properties:
+        message_id: {type: string}
+        confirmed: {type: string, enum: [accepted, validated, routed, enqueued, persisted, replicated, committed, delivered, processed]}
+        durability: {type: string, enum: [memory, local_fsync, quorum_fsync]}
+        partition: {type: integer}
+        offset: {type: integer, minimum: 0}
+        leader_epoch: {type: integer, minimum: 0}
+        replicas: {type: integer, minimum: 0}
+    PollRequest:
+      type: object
+      required: [consumer_id]
+      properties:
+        consumer_id: {type: string}
+        consumer_group: {type: string}
+        tenant_id: {type: string}
+        limit: {type: integer, minimum: 1}
+        visibility_timeout: {type: integer, description: Nanoseconds}
+    OffsetCommit:
+      type: object
+      required: [consumer_group, offset]
+      properties:
+        consumer_group: {type: string}
+        offset: {type: integer, minimum: 0}
+        tenant_id: {type: string}

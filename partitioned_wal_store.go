@@ -22,6 +22,8 @@ type PartitionedBinaryWALStore struct {
 	retainCompleted atomic.Bool
 }
 
+func (*PartitionedBinaryWALStore) ConfirmationLevel() ConfirmLevel { return ConfirmPersisted }
+
 func NewPartitionedBinaryWALStore(dir string, shardCount int, codec FrameCodec) (*PartitionedBinaryWALStore, error) {
 	if shardCount <= 0 {
 		return nil, errf(ErrInvalidMessage, "WAL shard count must be positive")

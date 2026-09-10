@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        go: [stable, oldstable]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ${{ matrix.go }}
+          check-latest: true
+          cache-dependency-path: |
+            go.sum
+            cmd/go.sum
+            contrib/go.sum
+            examples/go.sum
+      - run: bash scripts/ci_all_modules.sh test
+
+  correctness:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          check-latest: true
+          cache-dependency-path: |
+            go.sum
+            cmd/go.sum
+            contrib/go.sum
+            examples/go.sum
+      - name: Reject machine-specific module replacements
+        run: |
+          if grep -R -nE '^[[:space:]]*replace .*=>[[:space:]]*(/|[A-Za-z]:\\)' --include=go.mod .; then
+            echo 'absolute replace directives are not portable' >&2
+            exit 1
+          fi
+      - name: Check formatting
+        run: test -z "$(gofmt -l -- $(git ls-files '*.go'))"
+      - run: bash scripts/ci_all_modules.sh vet
+      - run: bash scripts/ci_all_modules.sh race
+
+  vulnerability-scan:
+    strategy:
+      fail-fast: false
+      matrix:
+        module: ['.', cmd, contrib, examples]
+    runs-on: ubuntu-latest
+    steps:
+      - id: govulncheck
+        uses: golang/govulncheck-action@v1
+        with:
+          go-version-input: stable
+          work-dir: ${{ matrix.module }}
+          go-package: ./...

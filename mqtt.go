@@ -77,13 +77,20 @@ type MQTTServer struct {
 }
 
 type mqttConn struct {
-	id        string
-	conn      net.Conn
-	clientID  string
-	username  string
-	keepAlive uint16
-	subs      map[string]uint8 // topic -> qos
-	closed    chan struct{}
+	id           string
+	conn         net.Conn
+	clientID     string
+	username     string
+	keepAlive    uint16
+	subs         map[string]uint8 // topic -> qos
+	incomingQoS2 map[uint16]mqttPendingPublish
+	closed       chan struct{}
+}
+
+type mqttPendingPublish struct {
+	topic   string
+	payload []byte
+	qos     byte
 }
 
 // NewMQTTServer creates a new MQTT server.
@@ -188,7 +195,7 @@ func (ms *MQTTServer) Stop() {
 func (ms *MQTTServer) handleConn(conn net.Conn) {
 	defer ms.wg.Done()
 	id := fmt.Sprintf("mqtt-%d", time.Now().UnixNano())
-	mc := &mqttConn{id: id, conn: conn, subs: make(map[string]uint8), closed: make(chan struct{})}
+	mc := &mqttConn{id: id, conn: conn, subs: make(map[string]uint8), incomingQoS2: make(map[uint16]mqttPendingPublish), closed: make(chan struct{})}
 	ms.mu.Lock()
 	if len(ms.conns) >= ms.cfg.MaxConnections {
 		ms.mu.Unlock()
@@ -206,11 +213,11 @@ func (ms *MQTTServer) handleConn(conn net.Conn) {
 	}()
 
 	// Read first packet (must be CONNECT)
-	pktType, remaining, err := ms.readPacketHeader(conn)
+	fixedHeader, remaining, err := ms.readPacketHeader(conn)
 	if err != nil {
 		return
 	}
-	if pktType != MQTTConnect {
+	if fixedHeader != MQTTConnect {
 		return
 	}
 	if remaining > ms.cfg.MaxPacketSize {
@@ -245,7 +252,7 @@ func (ms *MQTTServer) handleConn(conn net.Conn) {
 			return
 		default:
 		}
-		pktType, remaining, err := ms.readPacketHeader(conn)
+		fixedHeader, remaining, err := ms.readPacketHeader(conn)
 		if err != nil {
 			return
 		}
@@ -259,9 +266,9 @@ func (ms *MQTTServer) handleConn(conn net.Conn) {
 		if keepAliveTimer != nil {
 			keepAliveTimer.Reset(time.Duration(mc.keepAlive) * time.Second * 3 / 2)
 		}
-		switch pktType {
+		switch fixedHeader & 0xF0 {
 		case MQTTPublish:
-			ms.handlePublish(mc, payload)
+			ms.handlePublish(mc, fixedHeader, payload)
 		case MQTTPuback:
 			// QoS 1 ack - no action needed for now
 		case MQTTPubrec:
@@ -271,16 +278,25 @@ func (ms *MQTTServer) handleConn(conn net.Conn) {
 				ms.sendPubrel(conn, pktID)
 			}
 		case MQTTPubrel:
-			// QoS 2 step 2 - send pubcomp
 			if len(payload) >= 2 {
 				pktID := binary.BigEndian.Uint16(payload[:2])
+				if err := ms.completeIncomingQoS2(mc, pktID); err != nil {
+					log.Printf("[mqtt] qos2 publish error: %v", err)
+					continue
+				}
 				ms.sendPubcomp(conn, pktID)
 			}
 		case MQTTPubcomp:
 			// QoS 2 complete
-		case MQTTSubscribe:
+		case MQTTSubscribe & 0xF0:
+			if fixedHeader&0x0F != 0x02 {
+				return
+			}
 			ms.handleSubscribe(mc, payload)
-		case MQTTUnsubscribe:
+		case MQTTUnsubscribe & 0xF0:
+			if fixedHeader&0x0F != 0x02 {
+				return
+			}
 			ms.handleUnsubscribe(mc, payload)
 		case MQTTPingreq:
 			ms.sendPacket(conn, MQTTPingresp, nil)
@@ -367,11 +383,11 @@ func (ms *MQTTServer) handleConnect(mc *mqttConn, payload []byte) bool {
 	// Auth check
 	if ms.cfg.BrokerToken != "" {
 		// Use broker token for authentication
-		if password != ms.cfg.BrokerToken {
+		if !constantTimeEqual(password, ms.cfg.BrokerToken) {
 			ms.sendConnack(mc.conn, 0x05) // Connection Refused: not authorized
 			return false
 		}
-	} else if ms.cfg.RequireAuth && mc.username != ms.cfg.Username {
+	} else if ms.cfg.RequireAuth && (!constantTimeEqual(mc.username, ms.cfg.Username) || !constantTimeEqual(password, ms.cfg.Password)) {
 		ms.sendConnack(mc.conn, 0x05) // Connection Refused: not authorized
 		return false
 	}
@@ -380,7 +396,7 @@ func (ms *MQTTServer) handleConnect(mc *mqttConn, payload []byte) bool {
 	return true
 }
 
-func (ms *MQTTServer) handlePublish(mc *mqttConn, payload []byte) {
+func (ms *MQTTServer) handlePublish(mc *mqttConn, fixedHeader byte, payload []byte) {
 	if len(payload) < 4 {
 		return
 	}
@@ -391,7 +407,10 @@ func (ms *MQTTServer) handlePublish(mc *mqttConn, payload []byte) {
 	topic := string(payload[2 : 2+topicLen])
 	offset := 2 + topicLen
 	var pktID uint16
-	qos := (payload[0] >> 1) & 0x03
+	qos := (fixedHeader >> 1) & 0x03
+	if qos == 3 {
+		return
+	}
 	if qos > 0 {
 		if offset+2 > len(payload) {
 			return
@@ -399,8 +418,27 @@ func (ms *MQTTServer) handlePublish(mc *mqttConn, payload []byte) {
 		pktID = binary.BigEndian.Uint16(payload[offset:])
 		offset += 2
 	}
-	msgPayload := payload[offset:]
+	msgPayload := append([]byte(nil), payload[offset:]...)
+	if qos == 2 {
+		if _, exists := mc.incomingQoS2[pktID]; !exists {
+			if len(mc.incomingQoS2) >= ms.cfg.MaxInflight {
+				return
+			}
+			mc.incomingQoS2[pktID] = mqttPendingPublish{topic: topic, payload: msgPayload, qos: qos}
+		}
+		ms.sendPubrec(mc.conn, pktID)
+		return
+	}
+	if err := ms.publishMQTT(mc, topic, msgPayload, qos); err != nil {
+		log.Printf("[mqtt] publish error: %v", err)
+		return
+	}
+	if qos == 1 {
+		ms.sendPuback(mc.conn, pktID)
+	}
+}
 
+func (ms *MQTTServer) publishMQTT(mc *mqttConn, topic string, msgPayload []byte, qos byte) error {
 	// Map MQTT topic to broker topic/queue
 	brokerTopic := strings.ReplaceAll(topic, "/", ".")
 	opts := []PublishOption{
@@ -412,18 +450,21 @@ func (ms *MQTTServer) handlePublish(mc *mqttConn, payload []byte) {
 	}
 
 	_, err := ms.broker.Publisher().Publish(ms.ctx, brokerTopic, msgPayload, opts...)
-	if err != nil {
-		log.Printf("[mqtt] publish error: %v", err)
-		return
-	}
+	return err
+}
 
-	// Send ack based on QoS
-	switch qos {
-	case 1:
-		ms.sendPuback(mc.conn, pktID)
-	case 2:
-		ms.sendPubrec(mc.conn, pktID)
+func (ms *MQTTServer) completeIncomingQoS2(mc *mqttConn, packetID uint16) error {
+	pending, ok := mc.incomingQoS2[packetID]
+	if !ok {
+		// PUBREL is idempotent; a duplicate receives PUBCOMP without publishing
+		// the application message a second time.
+		return nil
 	}
+	if err := ms.publishMQTT(mc, pending.topic, pending.payload, pending.qos); err != nil {
+		return err
+	}
+	delete(mc.incomingQoS2, packetID)
+	return nil
 }
 
 func (ms *MQTTServer) handleSubscribe(mc *mqttConn, payload []byte) {
@@ -457,8 +498,8 @@ func (ms *MQTTServer) handleSubscribe(mc *mqttConn, payload []byte) {
 			To:    []Destination{{Kind: DestinationQueue, Name: queue}},
 		})
 		ms.broker.Subscribe(ms.ctx, ConsumerConfig{
-			Name:  "mqtt-" + mc.clientID + "-" + queue,
-			Queue: queue,
+			Name:    "mqtt-" + mc.clientID + "-" + queue,
+			Queue:   queue,
 			AckMode: AckAuto,
 		}, func(ctx context.Context, d Delivery) error {
 			mqttTopic := topicFilter
@@ -558,7 +599,7 @@ func (ms *MQTTServer) readPacketHeader(conn net.Conn) (byte, int, error) {
 	if _, err := io.ReadFull(conn, buf); err != nil {
 		return 0, 0, err
 	}
-	pktType := buf[0] & 0xF0
+	fixedHeader := buf[0]
 	// Read remaining length
 	multiplier := 1
 	remaining := 0
@@ -572,5 +613,5 @@ func (ms *MQTTServer) readPacketHeader(conn net.Conn) (byte, int, error) {
 		}
 		multiplier *= 128
 	}
-	return pktType, remaining, nil
+	return fixedHeader, remaining, nil
 }

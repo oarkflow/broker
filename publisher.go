@@ -82,6 +82,9 @@ func (p *Publisher) publishItemsAligned(ctx context.Context, items []PublishBatc
 		if err == nil {
 			err = p.checkBackpressure(ctx, prep)
 		}
+		if err == nil {
+			err = validateConfirmation(prep.opts.ConfirmLevel, p.b.store)
+		}
 		if err != nil {
 			errs[i] = err
 			if first == nil {
@@ -107,7 +110,7 @@ func (p *Publisher) publishItemsAligned(ctx context.Context, items []PublishBatc
 				if end > len(stored) {
 					end = len(stored)
 				}
-				res := PublishResult{MessageID: prep.msg.ID, Messages: stored[pos:end], Destinations: prep.dests, Confirmed: firstConfirm(prep.opts.ConfirmLevel, ConfirmPersisted)}
+				res := p.publishResult(prep.msg.ID, stored[pos:end], prep.dests)
 				results[indices[j]] = res
 				if p.hasPublishSideEffects() {
 					p.afterPublish(ctx, prep, res)
@@ -137,7 +140,7 @@ func (p *Publisher) publishItemsAligned(ctx context.Context, items []PublishBatc
 			}
 			continue
 		}
-		res := PublishResult{MessageID: prep.msg.ID, Messages: stored, Destinations: prep.dests, Confirmed: firstConfirm(prep.opts.ConfirmLevel, ConfirmPersisted)}
+		res := p.publishResult(prep.msg.ID, stored, prep.dests)
 		results[idx] = res
 		if p.hasPublishSideEffects() {
 			p.afterPublish(ctx, prep, res)
@@ -390,6 +393,9 @@ func (p *Publisher) publish(ctx context.Context, topic string, payload any, opts
 	if err := p.checkBackpressure(ctx, prep); err != nil {
 		return PublishResult{}, err
 	}
+	if err := validateConfirmation(prep.opts.ConfirmLevel, p.b.store); err != nil {
+		return PublishResult{}, err
+	}
 	stored, err := p.b.store.Append(ctx, prep.msg, prep.dests)
 	if err != nil {
 		if p.b.cfg.Hooks.OnPublishFailed != nil {
@@ -399,7 +405,7 @@ func (p *Publisher) publish(ctx context.Context, topic string, payload any, opts
 		p.b.recordPublisher(ctx, PublisherRecord{ID: prep.msg.ID, Operation: "publish", Topic: prep.msg.Topic, Queue: prep.msg.Queue, Stream: prep.msg.Stream, MessageID: prep.msg.ID, Status: "failed", Error: err.Error(), CreatedAt: prep.msg.CreatedAt, UpdatedAt: time.Now()})
 		return PublishResult{}, err
 	}
-	res := PublishResult{MessageID: prep.msg.ID, Messages: stored, Destinations: prep.dests, Confirmed: firstConfirm(prep.opts.ConfirmLevel, ConfirmPersisted)}
+	res := p.publishResult(prep.msg.ID, stored, prep.dests)
 	p.afterPublish(ctx, prep, res)
 	return res, nil
 }
@@ -417,6 +423,11 @@ func (p *Publisher) preparePublish(ctx context.Context, topic string, payload an
 			fn(&o)
 		}
 	}
+	resolvedTenant, err := resolveTenant(ctx, o.TenantID)
+	if err != nil {
+		return preparedPublish{}, err
+	}
+	o.TenantID = resolvedTenant
 	body, err := p.b.codec.Marshal(payload)
 	if err != nil {
 		return preparedPublish{}, err
@@ -527,11 +538,18 @@ func (p *Publisher) afterPublish(ctx context.Context, prep preparedPublish, res 
 	p.b.recordPublisher(ctx, PublisherRecord{ID: prep.msg.ID, Operation: "publish", Topic: prep.msg.Topic, Queue: prep.msg.Queue, Stream: prep.msg.Stream, MessageID: prep.msg.ID, Status: "succeeded", CreatedAt: prep.msg.CreatedAt, UpdatedAt: time.Now()})
 }
 
-func firstConfirm(v, d ConfirmLevel) ConfirmLevel {
-	if v != "" {
-		return v
+func (p *Publisher) publishResult(messageID string, stored []Message, dests []Destination) PublishResult {
+	level := confirmationLevel(p.b.store)
+	res := PublishResult{MessageID: messageID, Messages: stored, Destinations: dests, Confirmed: level, Durability: DurabilityMemory}
+	if level == ConfirmPersisted {
+		res.Durability = DurabilityLocalFsync
+		res.Replicas = 1
 	}
-	return d
+	if len(stored) > 0 {
+		res.Partition = stored[0].Partition
+		res.Offset = stored[0].Offset
+	}
+	return res
 }
 
 func (b *Broker) recordPublisher(ctx context.Context, rec PublisherRecord) {
@@ -776,6 +794,9 @@ func (tx *publishTx) Commit(ctx context.Context) ([]PublishResult, error) {
 		if err != nil {
 			return nil, err
 		}
+		if err := validateConfirmation(prep.opts.ConfirmLevel, tx.p.b.store); err != nil {
+			return nil, err
+		}
 		preps = append(preps, prep)
 		entries = append(entries, AppendEntry{Message: prep.msg, Destinations: prep.dests})
 	}
@@ -804,7 +825,7 @@ func (tx *publishTx) Commit(ctx context.Context) ([]PublishResult, error) {
 		if end > len(stored) {
 			end = len(stored)
 		}
-		res := PublishResult{MessageID: prep.msg.ID, Messages: append([]Message(nil), stored[pos:end]...), Destinations: prep.dests, Confirmed: firstConfirm(prep.opts.ConfirmLevel, ConfirmCommitted)}
+		res := tx.p.publishResult(prep.msg.ID, append([]Message(nil), stored[pos:end]...), prep.dests)
 		tx.p.afterPublish(ctx, prep, res)
 		results = append(results, res)
 		pos = end

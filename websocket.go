@@ -10,7 +10,8 @@ import (
 	"time"
 )
 
-// WebSocketConfig configures the WebSocket transport.
+// WebSocketConfig configures the legacy SSE transport.
+// Deprecated: use SSEConfig. This implementation is not RFC 6455 WebSocket.
 type WebSocketConfig struct {
 	// Path is the WebSocket endpoint path. Default: "/ws".
 	Path string
@@ -20,15 +21,15 @@ type WebSocketConfig struct {
 	HeartbeatInterval time.Duration
 }
 
-// WebSocketServer provides WebSocket transport for the broker data plane.
-// Uses HTTP long-polling fallback for environments without WebSocket libraries.
+// WebSocketServer provides the legacy SSE transport for the broker data plane.
+// Deprecated: use SSEServer. This implementation is not RFC 6455 WebSocket.
 type WebSocketServer struct {
-	broker *Broker
-	cfg    WebSocketConfig
+	broker  *Broker
+	cfg     WebSocketConfig
 	clients map[string]*wsClient
-	mu     sync.RWMutex
-	wg     sync.WaitGroup
-	token  string
+	mu      sync.RWMutex
+	wg      sync.WaitGroup
+	token   string
 }
 
 type wsClient struct {
@@ -50,6 +51,13 @@ func NewWebSocketServer(b *Broker, cfg WebSocketConfig) *WebSocketServer {
 		cfg.HeartbeatInterval = 30 * time.Second
 	}
 	return &WebSocketServer{broker: b, cfg: cfg, clients: make(map[string]*wsClient)}
+}
+
+type SSEConfig = WebSocketConfig
+type SSEServer = WebSocketServer
+
+func NewSSEServer(b *Broker, cfg SSEConfig) *SSEServer {
+	return NewWebSocketServer(b, cfg)
 }
 
 // SetToken sets the authentication token for WebSocket connections.
@@ -183,13 +191,13 @@ func (ws *WebSocketServer) handleAction(w http.ResponseWriter, msg wsMessage, cl
 }
 
 type wsMessage struct {
-	ID      string          `json:"id"`
-	Action  string          `json:"action"`
-	Topic   string          `json:"topic,omitempty"`
-	Queue   string          `json:"queue,omitempty"`
-	Payload json.RawMessage `json:"payload,omitempty"`
+	ID      string            `json:"id"`
+	Action  string            `json:"action"`
+	Topic   string            `json:"topic,omitempty"`
+	Queue   string            `json:"queue,omitempty"`
+	Payload json.RawMessage   `json:"payload,omitempty"`
 	Headers map[string]string `json:"headers,omitempty"`
-	Type    string          `json:"type,omitempty"`
+	Type    string            `json:"type,omitempty"`
 }
 
 type wsResponse struct {

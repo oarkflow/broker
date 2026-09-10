@@ -23,6 +23,10 @@ type DistributedConfig struct {
 	WALDir     string
 	TLSConfig  *tls.Config
 	Cluster    *cluster.Cluster
+	// AllowExperimentalCustomRaft explicitly enables the legacy custom
+	// consensus path. It is unsafe for production and will be removed when the
+	// etcd/raft controller and partition groups replace it.
+	AllowExperimentalCustomRaft bool
 
 	SubmitTimeout  time.Duration
 	ForwardTimeout time.Duration
@@ -34,13 +38,13 @@ type DistributedConfig struct {
 }
 
 type circuitBreaker struct {
-	mu                 sync.Mutex
-	consecutiveFails   int
-	state              string // "closed", "open", "half-open"
-	trippedAt          time.Time
-	threshold          int
-	tripDuration       time.Duration
-	cooldownExpiry     func() bool
+	mu               sync.Mutex
+	consecutiveFails int
+	state            string // "closed", "open", "half-open"
+	trippedAt        time.Time
+	threshold        int
+	tripDuration     time.Duration
+	cooldownExpiry   func() bool
 }
 
 func newCircuitBreaker(threshold int, tripDuration time.Duration) *circuitBreaker {
@@ -120,6 +124,9 @@ type DistributedBroker struct {
 }
 
 func NewDistributed(cfg Config, distCfg DistributedConfig) (*DistributedBroker, error) {
+	if !distCfg.AllowExperimentalCustomRaft {
+		return nil, fmt.Errorf("%w: distributed mode is disabled until the etcd/raft replicated data plane is integrated; set AllowExperimentalCustomRaft only for development tests", ErrUnsupportedMode)
+	}
 	b, err := New(cfg)
 	if err != nil {
 		return nil, err
@@ -147,33 +154,33 @@ func NewDistributed(cfg Config, distCfg DistributedConfig) (*DistributedBroker, 
 	sm := cluster.NewBrokerStateMachine(storeAdapter)
 
 	raftCfg := cluster.RaftConfig{
-		ID:               cfg.NodeID,
-		Peers:            distCfg.Peers,
-		Transport:        transport,
-		StateMachine:     sm,
-		WAL:              wal,
-		OnLeaderChange:   distCfg.OnLeaderChange,
-		OnStateChange:    wrapStateCallback(distCfg.OnStateChange),
-		OnConfigChange:   nil,
+		ID:             cfg.NodeID,
+		Peers:          distCfg.Peers,
+		Transport:      transport,
+		StateMachine:   sm,
+		WAL:            wal,
+		OnLeaderChange: distCfg.OnLeaderChange,
+		OnStateChange:  wrapStateCallback(distCfg.OnStateChange),
+		OnConfigChange: nil,
 	}
 	raft := cluster.NewRaft(raftCfg)
 
 	origStore := b.store
 	b.store = &ReplicatedStore{
-		Store:         origStore,
-		raft:          raft,
-		commitTimeout: distCfg.SubmitTimeout,
+		Store:          origStore,
+		raft:           raft,
+		commitTimeout:  distCfg.SubmitTimeout,
 		forwardTimeout: distCfg.ForwardTimeout,
-		cb:            newCircuitBreaker(5, 10*time.Second),
+		cb:             newCircuitBreaker(5, 10*time.Second),
 	}
 
 	db := &DistributedBroker{
-		Broker:   b,
-		distCfg:  distCfg,
-		raft:     raft,
-		wal:      wal,
+		Broker:    b,
+		distCfg:   distCfg,
+		raft:      raft,
+		wal:       wal,
 		transport: transport,
-		cb:       newCircuitBreaker(5, 10*time.Second),
+		cb:        newCircuitBreaker(5, 10*time.Second),
 	}
 
 	db.lastSubmitAt.Store(time.Time{})
@@ -341,6 +348,13 @@ type ReplicatedStore struct {
 	commitTimeout  time.Duration
 	forwardTimeout time.Duration
 	cb             *circuitBreaker
+}
+
+// ConfirmationLevel deliberately delegates to the local durable store. The
+// legacy replication layer cannot prove follower fsync and therefore must not
+// advertise replicated or quorum durability.
+func (s *ReplicatedStore) ConfirmationLevel() ConfirmLevel {
+	return confirmationLevel(s.Store)
 }
 
 func (s *ReplicatedStore) submit(ctx context.Context, cmdType cluster.BrokerCommandType, payload any) error {

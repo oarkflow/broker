@@ -36,7 +36,7 @@ func (p *Pool) WaitIdle(ctx context.Context) error {
 	t := time.NewTicker(time.Millisecond)
 	defer t.Stop()
 	for {
-		if p.QueueDepth() == 0 && p.c.busy.Load() == 0 {
+		if p.outstanding.Load() == 0 {
 			return nil
 		}
 		select {

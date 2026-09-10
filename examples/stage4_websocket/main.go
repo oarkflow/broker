@@ -40,7 +40,7 @@ func main() {
 
 	pub := b.Publisher()
 
-	// Start WebSocket/SSE server
+	// Start the legacy SSE server (not RFC 6455 WebSocket).
 	wsServer := broker.NewWebSocketServer(b, broker.WebSocketConfig{
 		Path:              "/ws",
 		MaxConnections:    100,
@@ -65,7 +65,7 @@ func main() {
 		}
 	}()
 
-	log.Println("[server] WebSocket/SSE available at http://localhost:8080/ws")
+	log.Println("[server] SSE available at http://localhost:8080/ws")
 	log.Println("[server] Health available at http://localhost:8080/health")
 	log.Fatal(http.ListenAndServe(":8080", mux))
 }

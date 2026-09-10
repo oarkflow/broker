@@ -85,6 +85,7 @@ type LeaseRequest struct {
 	VisibilityTimeout time.Duration
 	LeaseToken        string
 	MessageID         string
+	TenantID          string `json:"tenant_id,omitempty"`
 }
 
 type AckRequest struct {
@@ -134,12 +135,14 @@ type StreamReadRequest struct {
 	ConsumerGroup string `json:"consumer_group,omitempty"`
 	AfterOffset   uint64 `json:"after_offset,omitempty"`
 	Limit         int    `json:"limit,omitempty"`
+	TenantID      string `json:"tenant_id,omitempty"`
 }
 
 type OffsetCommit struct {
 	Stream        string `json:"stream"`
 	ConsumerGroup string `json:"consumer_group"`
 	Offset        uint64 `json:"offset"`
+	TenantID      string `json:"tenant_id,omitempty"`
 }
 
 type MoveRequest struct {
@@ -232,6 +235,8 @@ func NewMemoryStore() *MemoryStore {
 	return &MemoryStore{queues: map[string]*memoryQueue{}, topics: map[string]*memoryTopic{}, streams: map[string]*memoryStream{}, messages: map[string]*Message{}, history: map[string][]MessageHistory{}, offsets: map[string]map[string]uint64{}, dedup: map[string]time.Time{}, idemp: map[string]string{}, rand: mathrand.New(mathrand.NewSource(time.Now().UnixNano())), historyLimit: 32, retainCompleted: true, completed: map[string]struct{}{}, completedLimit: 65536}
 }
 
+func (*MemoryStore) ConfirmationLevel() ConfirmLevel { return ConfirmEnqueued }
+
 func (s *MemoryStore) addCompletedTombstoneLocked(id string) {
 	if id == "" || s.completedLimit <= 0 {
 		return
@@ -293,6 +298,9 @@ func (s *MemoryStore) SetHistoryLimit(limit int) {
 }
 
 func (s *MemoryStore) DeclareQueue(ctx context.Context, cfg QueueConfig) error {
+	if _, scoped := restrictedTenant(ctx); scoped {
+		return errf(ErrUnauthorized, "tenant-scoped credentials cannot alter shared queue configuration")
+	}
 	if cfg.Name == "" {
 		return errf(ErrInvalidMessage, "queue name required")
 	}
@@ -316,6 +324,9 @@ func (s *MemoryStore) DeclareQueue(ctx context.Context, cfg QueueConfig) error {
 }
 
 func (s *MemoryStore) DeclareTopic(ctx context.Context, cfg TopicConfig) error {
+	if _, scoped := restrictedTenant(ctx); scoped {
+		return errf(ErrUnauthorized, "tenant-scoped credentials cannot alter shared topic configuration")
+	}
 	if cfg.Name == "" {
 		return errf(ErrInvalidMessage, "topic name required")
 	}
@@ -330,6 +341,9 @@ func (s *MemoryStore) DeclareTopic(ctx context.Context, cfg TopicConfig) error {
 }
 
 func (s *MemoryStore) DeclareStream(ctx context.Context, cfg StreamConfig) error {
+	if _, scoped := restrictedTenant(ctx); scoped {
+		return errf(ErrUnauthorized, "tenant-scoped credentials cannot alter shared stream configuration")
+	}
 	if cfg.Name == "" {
 		return errf(ErrInvalidMessage, "stream name required")
 	}
@@ -383,16 +397,21 @@ func (s *MemoryStore) Append(ctx context.Context, msg Message, dests []Destinati
 		return nil, ctx.Err()
 	default:
 	}
+	tenant, err := resolveTenant(ctx, msg.TenantID)
+	if err != nil {
+		return nil, err
+	}
+	msg.TenantID = tenant
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.appendLockedCollect(msg, dests, true, false)
+	return s.appendLockedCollect(msg, dests, true, false, false)
 }
 
 func (s *MemoryStore) appendLocked(msg Message, dests []Destination) ([]Message, error) {
-	return s.appendLockedCollect(msg, dests, true, false)
+	return s.appendLockedCollect(msg, dests, true, false, false)
 }
 
-func (s *MemoryStore) appendLockedCollect(msg Message, dests []Destination, collect, owned bool) ([]Message, error) {
+func (s *MemoryStore) appendLockedCollect(msg Message, dests []Destination, collect, owned, replay bool) ([]Message, error) {
 	if s.closed {
 		return nil, ErrClosed
 	}
@@ -408,12 +427,12 @@ func (s *MemoryStore) appendLockedCollect(msg Message, dests []Destination, coll
 	if msg.Status == "" {
 		msg.Status = MessageAccepted
 	}
-	if msg.DeduplicationID != "" {
+	if !replay && msg.DeduplicationID != "" {
 		if until, ok := s.dedup[msg.DeduplicationID]; ok && until.After(time.Now()) {
 			return nil, ErrDuplicateMessage
 		}
 	}
-	if msg.IdempotencyKey != "" {
+	if !replay && msg.IdempotencyKey != "" {
 		if existing, ok := s.idemp[msg.IdempotencyKey]; ok && existing != "" {
 			return nil, ErrDuplicateMessage
 		}
@@ -525,11 +544,44 @@ func (s *MemoryStore) AppendAtomicOwned(ctx context.Context, entries []AppendEnt
 	return err
 }
 
+// storedAppendEntries captures the exact IDs, timestamps, offsets and copy
+// metadata assigned by the in-memory index before the durable acknowledgement.
+// Replaying caller inputs would lose those generated values.
+func storedAppendEntries(messages []Message) []AppendEntry {
+	entries := make([]AppendEntry, 0, len(messages))
+	for _, message := range messages {
+		var destination Destination
+		switch {
+		case message.Queue != "":
+			destination = Destination{Kind: DestinationQueue, Name: message.Queue}
+			if message.Status == MessageDeadLettered {
+				destination.Kind = DestinationDLQ
+			}
+		case message.Stream != "":
+			destination = Destination{Kind: DestinationStream, Name: message.Stream}
+		case message.Topic != "":
+			destination = Destination{Kind: DestinationTopic, Name: message.Topic}
+		default:
+			continue
+		}
+		entries = append(entries, AppendEntry{Message: message, Destinations: []Destination{destination}})
+	}
+	return entries
+}
+
 func (s *MemoryStore) appendAtomic(ctx context.Context, entries []AppendEntry, collect, owned bool) ([]Message, error) {
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	default:
+	}
+	entries = append([]AppendEntry(nil), entries...)
+	for i := range entries {
+		tenant, err := resolveTenant(ctx, entries[i].Message.TenantID)
+		if err != nil {
+			return nil, err
+		}
+		entries[i].Message.TenantID = tenant
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -541,7 +593,7 @@ func (s *MemoryStore) appendAtomic(ctx context.Context, entries []AppendEntry, c
 		out = make([]Message, 0, len(entries))
 	}
 	for _, entry := range entries {
-		stored, err := s.appendLockedCollect(entry.Message, entry.Destinations, collect, owned)
+		stored, err := s.appendLockedCollect(entry.Message, entry.Destinations, collect, owned, false)
 		if err != nil {
 			return nil, err
 		}
@@ -550,6 +602,17 @@ func (s *MemoryStore) appendAtomic(ctx context.Context, entries []AppendEntry, c
 		}
 	}
 	return out, nil
+}
+
+func (s *MemoryStore) appendRecoveredAtomic(entries []AppendEntry) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, entry := range entries {
+		if _, err := s.appendLockedCollect(entry.Message, entry.Destinations, false, false, true); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *MemoryStore) validateAtomicLocked(entries []AppendEntry) error {
@@ -637,6 +700,9 @@ func (s *MemoryStore) Lease(ctx context.Context, req LeaseRequest) ([]Message, e
 			if m == nil || m.Queue != req.Queue || isTerminalQueueStatus(m.Status) {
 				continue
 			}
+			if req.TenantID != "" && m.TenantID != req.TenantID {
+				continue
+			}
 			if !m.ExpiresAt.IsZero() && now.After(m.ExpiresAt) {
 				m.Status = MessageExpired
 				m.LeaseToken = ""
@@ -662,6 +728,9 @@ func (s *MemoryStore) Lease(ctx context.Context, req LeaseRequest) ([]Message, e
 	for i := q.head; i < len(q.ids); i++ {
 		m := s.messages[q.ids[i]]
 		if m == nil || m.Queue != req.Queue || isTerminalQueueStatus(m.Status) {
+			continue
+		}
+		if req.TenantID != "" && m.TenantID != req.TenantID {
 			continue
 		}
 		if !m.ExpiresAt.IsZero() && now.After(m.ExpiresAt) {
@@ -736,6 +805,9 @@ func (s *MemoryStore) Ack(ctx context.Context, req AckRequest) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if m := s.messages[req.MessageID]; m != nil && !tenantAllowed(ctx, m.TenantID) {
+		return ErrUnauthorized
+	}
 	return s.ackLocked(req)
 }
 
@@ -779,12 +851,16 @@ func (s *MemoryStore) AckBatch(ctx context.Context, reqs []AckRequest) []error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for i := range reqs {
-		errs[i] = s.ackLocked(reqs[i])
+		if m := s.messages[reqs[i].MessageID]; m != nil && !tenantAllowed(ctx, m.TenantID) {
+			errs[i] = ErrUnauthorized
+		} else {
+			errs[i] = s.ackLocked(reqs[i])
+		}
 	}
 	return errs
 }
 
-func (s *MemoryStore) validateAckLease(req AckRequest) error {
+func (s *MemoryStore) validateAckLease(ctx context.Context, req AckRequest) error {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	m, ok := s.messages[req.MessageID]
@@ -794,6 +870,9 @@ func (s *MemoryStore) validateAckLease(req AckRequest) error {
 		}
 		return ErrMessageNotFound
 	}
+	if !tenantAllowed(ctx, m.TenantID) {
+		return ErrUnauthorized
+	}
 	if m.LeaseToken != "" {
 		if req.LeaseToken == "" || m.LeaseToken != req.LeaseToken {
 			return ErrLeaseLost
@@ -802,12 +881,18 @@ func (s *MemoryStore) validateAckLease(req AckRequest) error {
 	return nil
 }
 
-func (s *MemoryStore) validateNackLease(req NackRequest) error {
+func (s *MemoryStore) validateNackLease(ctx context.Context, req NackRequest) error {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	m, ok := s.messages[req.MessageID]
 	if !ok {
 		return ErrMessageNotFound
+	}
+	if !tenantAllowed(ctx, m.TenantID) {
+		return ErrUnauthorized
+	}
+	if !tenantAllowed(ctx, m.TenantID) {
+		return ErrUnauthorized
 	}
 	if m.LeaseToken != "" {
 		if req.LeaseToken == "" || m.LeaseToken != req.LeaseToken {
@@ -823,6 +908,9 @@ func (s *MemoryStore) Nack(ctx context.Context, req NackRequest) error {
 	m, ok := s.messages[req.MessageID]
 	if !ok {
 		return ErrMessageNotFound
+	}
+	if !tenantAllowed(ctx, m.TenantID) {
+		return ErrUnauthorized
 	}
 	if m.LeaseToken != "" {
 		if req.LeaseToken == "" || m.LeaseToken != req.LeaseToken {
@@ -876,6 +964,9 @@ func (s *MemoryStore) ExtendLease(ctx context.Context, req LeaseRequest) error {
 	if !ok {
 		return ErrMessageNotFound
 	}
+	if !tenantAllowed(ctx, m.TenantID) {
+		return ErrUnauthorized
+	}
 	if m.LeaseToken != req.LeaseToken {
 		return ErrLeaseLost
 	}
@@ -890,9 +981,18 @@ func (s *MemoryStore) ExtendLease(ctx context.Context, req LeaseRequest) error {
 func (s *MemoryStore) Update(ctx context.Context, msg Message) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.messages[msg.ID]; !ok {
+	existing, ok := s.messages[msg.ID]
+	if !ok {
 		return ErrMessageNotFound
 	}
+	if !tenantAllowed(ctx, existing.TenantID) {
+		return ErrUnauthorized
+	}
+	tenant, err := resolveTenant(ctx, msg.TenantID)
+	if err != nil || tenant != existing.TenantID {
+		return ErrUnauthorized
+	}
+	msg.TenantID = tenant
 	m := cloneMessage(msg)
 	s.messages[msg.ID] = &m
 	s.addHistoryLocked(m.ID, m.Status, "updated", m.Queue, "", "", m.ConsumerID, m.LastError)
@@ -913,10 +1013,21 @@ func (s *MemoryStore) UpdateBatch(ctx context.Context, messages []Message) []err
 	defer s.mu.Unlock()
 	for i := range messages {
 		msg := messages[i]
-		if _, ok := s.messages[msg.ID]; !ok {
+		existing, ok := s.messages[msg.ID]
+		if !ok {
 			errs[i] = ErrMessageNotFound
 			continue
 		}
+		if !tenantAllowed(ctx, existing.TenantID) {
+			errs[i] = ErrUnauthorized
+			continue
+		}
+		tenant, err := resolveTenant(ctx, msg.TenantID)
+		if err != nil || tenant != existing.TenantID {
+			errs[i] = ErrUnauthorized
+			continue
+		}
+		msg.TenantID = tenant
 		m := cloneMessage(msg)
 		s.messages[msg.ID] = &m
 		s.addHistoryLocked(m.ID, m.Status, "updated", m.Queue, "", "", m.ConsumerID, m.LastError)
@@ -931,12 +1042,18 @@ func (s *MemoryStore) Get(ctx context.Context, id string) (Message, bool, error)
 	if !ok {
 		return Message{}, false, nil
 	}
+	if !tenantAllowed(ctx, m.TenantID) {
+		return Message{}, false, ErrUnauthorized
+	}
 	return cloneMessage(*m), true, nil
 }
 
 func (s *MemoryStore) History(ctx context.Context, id string) ([]MessageHistory, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	if m := s.messages[id]; m != nil && !tenantAllowed(ctx, m.TenantID) {
+		return nil, ErrUnauthorized
+	}
 	h := s.history[id]
 	out := append([]MessageHistory(nil), h...)
 	return out, nil
@@ -949,7 +1066,17 @@ func (s *MemoryStore) ListQueue(ctx context.Context, name string, limit int) ([]
 	if !ok {
 		return nil, ErrQueueNotFound
 	}
-	return s.listQueueIDsLocked(q, name, limit), nil
+	messages := s.listQueueIDsLocked(q, name, 0)
+	out := messages[:0]
+	for _, message := range messages {
+		if tenantAllowed(ctx, message.TenantID) {
+			out = append(out, message)
+			if limit > 0 && len(out) >= limit {
+				break
+			}
+		}
+	}
+	return out, nil
 }
 
 func (s *MemoryStore) ListDLQ(ctx context.Context, name string, limit int) ([]Message, error) {
@@ -964,6 +1091,10 @@ func (s *MemoryStore) Move(ctx context.Context, req MoveRequest) (MoveResult, er
 	for _, id := range ids {
 		m, ok := s.messages[id]
 		if !ok {
+			res.Skipped++
+			continue
+		}
+		if !tenantAllowed(ctx, m.TenantID) {
 			res.Skipped++
 			continue
 		}
@@ -1112,6 +1243,9 @@ func (s *MemoryStore) appendCloneLocked(m Message, d Destination, req MoveReques
 }
 
 func (s *MemoryStore) PauseQueue(ctx context.Context, name string) error {
+	if _, scoped := restrictedTenant(ctx); scoped {
+		return errf(ErrUnauthorized, "tenant-scoped credentials cannot pause a shared queue")
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	q, ok := s.queues[name]
@@ -1123,6 +1257,9 @@ func (s *MemoryStore) PauseQueue(ctx context.Context, name string) error {
 }
 
 func (s *MemoryStore) ResumeQueue(ctx context.Context, name string) error {
+	if _, scoped := restrictedTenant(ctx); scoped {
+		return errf(ErrUnauthorized, "tenant-scoped credentials cannot resume a shared queue")
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	q, ok := s.queues[name]
@@ -1140,9 +1277,12 @@ func (s *MemoryStore) PurgeQueue(ctx context.Context, name string) (int, error) 
 	if !ok {
 		return 0, ErrQueueNotFound
 	}
-	n := q.depth
+	n := 0
 	for _, id := range q.ids[q.head:] {
 		if m := s.messages[id]; m != nil && m.Queue == name && !isTerminalQueueStatus(m.Status) {
+			if !tenantAllowed(ctx, m.TenantID) {
+				continue
+			}
 			m.Status = MessagePurged
 			m.LeaseToken = ""
 			m.LeaseUntil = time.Time{}
@@ -1151,12 +1291,21 @@ func (s *MemoryStore) PurgeQueue(ctx context.Context, name string) (int, error) 
 				delete(s.messages, id)
 				delete(s.history, id)
 			}
+			n++
 		}
 	}
-	q.head = len(q.ids)
-	q.depth = 0
-	q.hasPriority = false
-	q.state = QueuePurged
+	if _, scoped := restrictedTenant(ctx); !scoped {
+		q.head = len(q.ids)
+		q.depth = 0
+		q.hasPriority = false
+		q.state = QueuePurged
+	} else {
+		q.depth -= n
+		if q.depth < 0 {
+			q.depth = 0
+		}
+		s.advanceQueueHeadLocked(q)
+	}
 	return n, nil
 }
 
@@ -1169,6 +1318,11 @@ func (s *MemoryStore) ReadStream(ctx context.Context, req StreamReadRequest) ([]
 	if req.Limit <= 0 {
 		req.Limit = 100
 	}
+	tenant, err := resolveTenant(ctx, req.TenantID)
+	if err != nil {
+		return nil, err
+	}
+	req.TenantID = tenant
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	stream, ok := s.streams[req.Stream]
@@ -1178,13 +1332,16 @@ func (s *MemoryStore) ReadStream(ctx context.Context, req StreamReadRequest) ([]
 	after := req.AfterOffset
 	if after == 0 && req.ConsumerGroup != "" {
 		if groups := s.offsets[req.Stream]; groups != nil {
-			after = groups[req.ConsumerGroup]
+			after = groups[offsetGroupKey(req.TenantID, req.ConsumerGroup)]
 		}
 	}
 	out := make([]Message, 0, minInt(req.Limit, len(stream.ids)))
 	for _, id := range stream.ids {
 		m := s.messages[id]
 		if m == nil {
+			continue
+		}
+		if !tenantAllowed(ctx, m.TenantID) || (req.TenantID != "" && m.TenantID != req.TenantID) {
 			continue
 		}
 		if m.Offset <= after {
@@ -1207,6 +1364,11 @@ func (s *MemoryStore) CommitOffset(ctx context.Context, commit OffsetCommit) err
 	if commit.Stream == "" || commit.ConsumerGroup == "" {
 		return errf(ErrInvalidMessage, "stream and consumer group required")
 	}
+	tenant, err := resolveTenant(ctx, commit.TenantID)
+	if err != nil {
+		return err
+	}
+	commit.TenantID = tenant
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, ok := s.streams[commit.Stream]; !ok {
@@ -1215,13 +1377,18 @@ func (s *MemoryStore) CommitOffset(ctx context.Context, commit OffsetCommit) err
 	if s.offsets[commit.Stream] == nil {
 		s.offsets[commit.Stream] = map[string]uint64{}
 	}
-	if commit.Offset > s.offsets[commit.Stream][commit.ConsumerGroup] {
-		s.offsets[commit.Stream][commit.ConsumerGroup] = commit.Offset
+	group := offsetGroupKey(commit.TenantID, commit.ConsumerGroup)
+	if commit.Offset > s.offsets[commit.Stream][group] {
+		s.offsets[commit.Stream][group] = commit.Offset
 	}
 	return nil
 }
 
 func (s *MemoryStore) ConsumerOffset(ctx context.Context, commit OffsetCommit) (uint64, error) {
+	tenant, err := resolveTenant(ctx, commit.TenantID)
+	if err != nil {
+		return 0, err
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	if _, ok := s.streams[commit.Stream]; !ok {
@@ -1230,7 +1397,27 @@ func (s *MemoryStore) ConsumerOffset(ctx context.Context, commit OffsetCommit) (
 	if s.offsets[commit.Stream] == nil {
 		return 0, nil
 	}
-	return s.offsets[commit.Stream][commit.ConsumerGroup], nil
+	return s.offsets[commit.Stream][offsetGroupKey(tenant, commit.ConsumerGroup)], nil
+}
+
+func offsetGroupKey(tenant, group string) string {
+	if tenant == "" {
+		return group
+	}
+	return tenant + "\x00" + group
+}
+
+// durableOffsetCommit folds the tenant into the persisted consumer-group key.
+// This preserves tenant isolation without changing the read-only BWL1 format.
+// BWL2 will carry tenant_id as an explicit field.
+func durableOffsetCommit(ctx context.Context, commit OffsetCommit) (OffsetCommit, error) {
+	tenant, err := resolveTenant(ctx, commit.TenantID)
+	if err != nil {
+		return OffsetCommit{}, err
+	}
+	commit.ConsumerGroup = offsetGroupKey(tenant, commit.ConsumerGroup)
+	commit.TenantID = ""
+	return commit, nil
 }
 
 func (s *MemoryStore) Stats(ctx context.Context) (StoreStats, error) {
@@ -1556,6 +1743,8 @@ type FileWALStore struct {
 	gc      *groupCommitWriter
 }
 
+func (*FileWALStore) ConfirmationLevel() ConfirmLevel { return ConfirmPersisted }
+
 // FileWALStoreConfig configures the FileWALStore.
 type FileWALStoreConfig struct {
 	Dir           string
@@ -1743,8 +1932,7 @@ func (s *FileWALStore) applyRecovered(r walRecord) error {
 		_, err := s.MemoryStore.Append(ctx, r.Message, r.Dests)
 		return err
 	case "append_atomic":
-		_, err := s.MemoryStore.AppendAtomic(ctx, r.Entries)
-		return err
+		return s.MemoryStore.appendRecoveredAtomic(r.Entries)
 	case "lease":
 		return s.MemoryStore.Update(ctx, r.Message)
 	case "lease_batch", "update_batch":
@@ -1826,29 +2014,48 @@ func verifyWALRecord(r walRecord) error {
 }
 
 func (s *FileWALStore) DeclareQueue(ctx context.Context, cfg QueueConfig) error {
+	if err := validateSharedDeclaration(ctx, cfg.Name, "queue"); err != nil {
+		return err
+	}
 	if err := s.write(walRecord{Op: "declare_queue", Queue: cfg}); err != nil {
 		return err
 	}
 	return s.MemoryStore.DeclareQueue(ctx, cfg)
 }
 func (s *FileWALStore) DeclareTopic(ctx context.Context, cfg TopicConfig) error {
+	if err := validateSharedDeclaration(ctx, cfg.Name, "topic"); err != nil {
+		return err
+	}
 	if err := s.write(walRecord{Op: "declare_topic", Topic: cfg}); err != nil {
 		return err
 	}
 	return s.MemoryStore.DeclareTopic(ctx, cfg)
 }
 func (s *FileWALStore) DeclareStream(ctx context.Context, cfg StreamConfig) error {
+	if err := validateSharedDeclaration(ctx, cfg.Name, "stream"); err != nil {
+		return err
+	}
 	if err := s.write(walRecord{Op: "declare_stream", Stream: cfg}); err != nil {
 		return err
 	}
 	return s.MemoryStore.DeclareStream(ctx, cfg)
+}
+
+func validateSharedDeclaration(ctx context.Context, name, kind string) error {
+	if _, scoped := restrictedTenant(ctx); scoped {
+		return errf(ErrUnauthorized, "tenant-scoped credentials cannot alter shared %s configuration", kind)
+	}
+	if name == "" {
+		return errf(ErrInvalidMessage, "%s name required", kind)
+	}
+	return nil
 }
 func (s *FileWALStore) Append(ctx context.Context, msg Message, dests []Destination) ([]Message, error) {
 	out, err := s.MemoryStore.Append(ctx, msg, dests)
 	if err != nil {
 		return nil, err
 	}
-	if err := s.write(walRecord{Op: "append", Message: msg, Dests: dests}); err != nil {
+	if err := s.write(walRecord{Op: "append_atomic", Entries: storedAppendEntries(out)}); err != nil {
 		return out, err
 	}
 	return out, nil
@@ -1858,22 +2065,24 @@ func (s *FileWALStore) AppendAtomic(ctx context.Context, entries []AppendEntry) 
 	if err != nil {
 		return nil, err
 	}
-	if err := s.write(walRecord{Op: "append_atomic", Entries: entries}); err != nil {
+	if err := s.write(walRecord{Op: "append_atomic", Entries: storedAppendEntries(out)}); err != nil {
 		return out, err
 	}
 	return out, nil
 }
 func (s *FileWALStore) AppendAtomicMinimal(ctx context.Context, entries []AppendEntry) error {
-	if err := s.MemoryStore.AppendAtomicMinimal(ctx, entries); err != nil {
+	out, err := s.MemoryStore.AppendAtomic(ctx, entries)
+	if err != nil {
 		return err
 	}
-	return s.write(walRecord{Op: "append_atomic", Entries: entries})
+	return s.write(walRecord{Op: "append_atomic", Entries: storedAppendEntries(out)})
 }
 func (s *FileWALStore) AppendAtomicOwned(ctx context.Context, entries []AppendEntry) error {
-	if err := s.MemoryStore.AppendAtomicOwned(ctx, entries); err != nil {
+	out, err := s.MemoryStore.AppendAtomic(ctx, entries)
+	if err != nil {
 		return err
 	}
-	return s.write(walRecord{Op: "append_atomic", Entries: entries})
+	return s.write(walRecord{Op: "append_atomic", Entries: storedAppendEntries(out)})
 }
 func (s *FileWALStore) Lease(ctx context.Context, req LeaseRequest) ([]Message, error) {
 	msgs, err := s.MemoryStore.Lease(ctx, req)
@@ -1886,7 +2095,7 @@ func (s *FileWALStore) Lease(ctx context.Context, req LeaseRequest) ([]Message, 
 	return msgs, nil
 }
 func (s *FileWALStore) Ack(ctx context.Context, req AckRequest) error {
-	if err := s.MemoryStore.validateAckLease(req); err != nil {
+	if err := s.MemoryStore.validateAckLease(ctx, req); err != nil {
 		return err
 	}
 	if err := s.MemoryStore.Ack(ctx, req); err != nil {
@@ -1915,7 +2124,7 @@ func (s *FileWALStore) AckBatch(ctx context.Context, reqs []AckRequest) []error 
 	return errs
 }
 func (s *FileWALStore) Nack(ctx context.Context, req NackRequest) error {
-	if err := s.MemoryStore.validateNackLease(req); err != nil {
+	if err := s.MemoryStore.validateNackLease(ctx, req); err != nil {
 		return err
 	}
 	if err := s.MemoryStore.Nack(ctx, req); err != nil {
@@ -1995,10 +2204,14 @@ func (s *FileWALStore) PurgeQueue(ctx context.Context, name string) (int, error)
 	return n, nil
 }
 func (s *FileWALStore) CommitOffset(ctx context.Context, commit OffsetCommit) error {
-	if err := s.MemoryStore.CommitOffset(ctx, commit); err != nil {
+	persisted, err := durableOffsetCommit(ctx, commit)
+	if err != nil {
 		return err
 	}
-	return s.write(walRecord{Op: "commit_offset", Offset: commit})
+	if err := s.MemoryStore.CommitOffset(context.Background(), persisted); err != nil {
+		return err
+	}
+	return s.write(walRecord{Op: "commit_offset", Offset: persisted})
 }
 
 func (s *FileWALStore) Close() error {

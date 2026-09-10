@@ -44,6 +44,8 @@ func main() {
 		MaxConnections: 1000,
 		FrameMaxSize:   131072,
 		Heartbeat:      60 * time.Second,
+		// This example intentionally uses a plaintext development listener.
+		AllowInsecure: true,
 	})
 
 	// Start AMQP server

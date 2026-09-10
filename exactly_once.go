@@ -6,11 +6,15 @@ import (
 	"time"
 )
 
-// ExactlyOnceConfig configures exactly-once delivery semantics.
+// ExactlyOnceConfig configures legacy deduplication and offset behavior.
+// Deprecated: this does not provide universal exactly-once delivery. Use
+// explicit deduplication windows and durable stream transactions when those
+// APIs become available.
 type ExactlyOnceConfig struct {
-	// Enabled activates exactly-once delivery. Default: false.
+	// Enabled activates the legacy helpers. Default: false.
 	Enabled bool `json:"enabled"`
-	// TransactionalOutbox uses the transactional outbox pattern.
+	// TransactionalOutbox enables an in-memory publish retry buffer. It is not
+	// atomic with an application database and is not durable.
 	TransactionalOutbox bool `json:"transactional_outbox,omitempty"`
 	// DeduplicationWindow is the window for deduplicating messages. Default: 5m.
 	DeduplicationWindow time.Duration `json:"deduplication_window,omitempty"`
@@ -24,39 +28,49 @@ type ConsumerCommitMode string
 const (
 	// CommitAuto commits after each message (at-least-once).
 	CommitAuto ConsumerCommitMode = "auto"
-	// CommitManual commits only on explicit request (exactly-once possible).
+	// CommitManual commits only on explicit request.
 	CommitManual ConsumerCommitMode = "manual"
 	// CommitBatched commits in batches for throughput.
 	CommitBatched ConsumerCommitMode = "batched"
 )
 
-// TransactionalOutbox provides transactional outbox pattern for exactly-once publishing.
-type TransactionalOutbox struct {
+// PublishRetryBuffer tracks failed publishes in memory for explicit retries.
+// It is neither durable nor an application-database transactional outbox.
+type PublishRetryBuffer struct {
 	broker *Broker
 	mu     sync.Mutex
 	events []OutboxEvent
 }
 
+// TransactionalOutbox is retained as a pre-v1 compatibility alias.
+// Deprecated: use PublishRetryBuffer and do not treat it as transactional.
+type TransactionalOutbox = PublishRetryBuffer
+
 type OutboxEvent struct {
-	ID          string        `json:"id"`
-	Topic       string        `json:"topic"`
-	Queue       string        `json:"queue"`
-	Payload     []byte        `json:"payload"`
+	ID          string            `json:"id"`
+	Topic       string            `json:"topic"`
+	Queue       string            `json:"queue"`
+	Payload     []byte            `json:"payload"`
 	Headers     map[string]string `json:"headers,omitempty"`
-	Status      string        `json:"status"`
-	CreatedAt   time.Time     `json:"created_at"`
-	PublishedAt *time.Time    `json:"published_at,omitempty"`
-	RetryCount  int           `json:"retry_count"`
-	LastError   string        `json:"last_error,omitempty"`
+	Status      string            `json:"status"`
+	CreatedAt   time.Time         `json:"created_at"`
+	PublishedAt *time.Time        `json:"published_at,omitempty"`
+	RetryCount  int               `json:"retry_count"`
+	LastError   string            `json:"last_error,omitempty"`
 }
 
-// NewTransactionalOutbox creates a new transactional outbox.
+// NewTransactionalOutbox creates an in-memory publish retry buffer.
+// Deprecated: use NewPublishRetryBuffer.
 func NewTransactionalOutbox(b *Broker) *TransactionalOutbox {
-	return &TransactionalOutbox{broker: b}
+	return NewPublishRetryBuffer(b)
 }
 
-// Publish records an event in the outbox and publishes it atomically.
-func (to *TransactionalOutbox) Publish(ctx context.Context, topic string, payload any, opts ...PublishOption) (PublishResult, error) {
+func NewPublishRetryBuffer(b *Broker) *PublishRetryBuffer {
+	return &PublishRetryBuffer{broker: b}
+}
+
+// Publish records an attempt and publishes it. The two actions are not atomic.
+func (to *PublishRetryBuffer) Publish(ctx context.Context, topic string, payload any, opts ...PublishOption) (PublishResult, error) {
 	to.mu.Lock()
 	defer to.mu.Unlock()
 	body, err := to.broker.codec.Marshal(payload)
@@ -98,7 +112,7 @@ func (to *TransactionalOutbox) Publish(ctx context.Context, topic string, payloa
 }
 
 // Pending returns all pending outbox events.
-func (to *TransactionalOutbox) Pending() []OutboxEvent {
+func (to *PublishRetryBuffer) Pending() []OutboxEvent {
 	to.mu.Lock()
 	defer to.mu.Unlock()
 	var pending []OutboxEvent
@@ -111,7 +125,7 @@ func (to *TransactionalOutbox) Pending() []OutboxEvent {
 }
 
 // RetryPending retries all pending outbox events.
-func (to *TransactionalOutbox) RetryPending(ctx context.Context) (int, error) {
+func (to *PublishRetryBuffer) RetryPending(ctx context.Context) (int, error) {
 	to.mu.Lock()
 	events := make([]OutboxEvent, len(to.events))
 	copy(events, to.events)
@@ -149,7 +163,7 @@ func (to *TransactionalOutbox) RetryPending(ctx context.Context) (int, error) {
 }
 
 // Cleanup removes published events older than the given age.
-func (to *TransactionalOutbox) Cleanup(maxAge time.Duration) {
+func (to *PublishRetryBuffer) Cleanup(maxAge time.Duration) {
 	to.mu.Lock()
 	defer to.mu.Unlock()
 	cutoff := time.Now().Add(-maxAge)
@@ -166,10 +180,13 @@ func (to *TransactionalOutbox) Cleanup(maxAge time.Duration) {
 	to.events = kept
 }
 
-// ExactlyOnceAccessor on Broker.
+// TransactionalOutbox returns the legacy in-memory publish retry buffer.
+// Deprecated: use PublishRetryBuffer.
 func (b *Broker) TransactionalOutbox() *TransactionalOutbox {
 	return b.outbox
 }
+
+func (b *Broker) PublishRetryBuffer() *PublishRetryBuffer { return b.outbox }
 
 // ConsumerOffsetManager provides external consumer offset management.
 type ConsumerOffsetManager struct {

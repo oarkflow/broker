@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/hex"
 	"flag"
 	"fmt"
@@ -14,6 +16,7 @@ import (
 	"time"
 
 	"github.com/oarkflow/broker"
+	"github.com/oarkflow/broker/amqp"
 	"github.com/oarkflow/broker/contrib/sqlitestore"
 	"github.com/oarkflow/broker/pkg/logger"
 	"github.com/oarkflow/zlog"
@@ -21,7 +24,18 @@ import (
 
 func main() {
 	addr := flag.String("addr", env("BROKER_ADDR", ":8090"), "HTTP listen address")
-	nativeAddr := flag.String("native-addr", env("BROKER_NATIVE_ADDR", ":8091"), "native BST1 stream listen address; empty disables")
+	profileName := flag.String("profile", env("BROKER_PROFILE", string(broker.ProfileDurable)), "performance profile: durable, latency, throughput, lightweight")
+	nativeAddr := flag.String("native-addr", env("BROKER_NATIVE_ADDR", ""), "unauthenticated native BST1 stream listen address; empty disables; development only")
+	nativeRPCAddr := flag.String("native-rpc-addr", env("BROKER_NATIVE_RPC_ADDR", ""), "native JSON/TCP RPC listen address; empty disables")
+	grpcAddr := flag.String("grpc-addr", env("BROKER_GRPC_ADDR", ""), "protobuf/HTTP2 gRPC listen address; empty disables")
+	mqttAddr := flag.String("mqtt-addr", env("BROKER_MQTT_ADDR", ""), "MQTT 3.1.1 listen address; empty disables")
+	amqpAddr := flag.String("amqp-addr", env("BROKER_AMQP_ADDR", ""), "AMQP 0-9-1 listen address; empty disables")
+	amqpUsername := flag.String("amqp-username", env("BROKER_AMQP_USERNAME", ""), "AMQP PLAIN username")
+	amqpPassword := flag.String("amqp-password", env("BROKER_AMQP_PASSWORD", ""), "AMQP PLAIN password")
+	sseAddr := flag.String("sse-addr", env("BROKER_SSE_ADDR", ""), "SSE data-plane listen address; empty disables")
+	ssePath := flag.String("sse-path", env("BROKER_SSE_PATH", "/events"), "SSE endpoint path")
+	webSocketAddr := flag.String("websocket-addr", env("BROKER_WEBSOCKET_ADDR", ""), "RFC 6455 WebSocket listen address; empty disables")
+	webSocketPath := flag.String("websocket-path", env("BROKER_WEBSOCKET_PATH", "/ws"), "RFC 6455 WebSocket endpoint path")
 	nativeDir := flag.String("native-dir", env("BROKER_NATIVE_DIR", ""), "native segmented stream directory; defaults to <wal>/native-stream")
 	nativePartitions := flag.Int("native-partitions", int(envInt64("BROKER_NATIVE_PARTITIONS", 8)), "native stream partitions")
 	nativeSegmentBytes := flag.Int64("native-segment-bytes", envInt64("BROKER_NATIVE_SEGMENT_BYTES", 1<<30), "native stream segment size")
@@ -64,6 +78,15 @@ func main() {
 	if (*tlsCert == "") != (*tlsKey == "") {
 		logger.Log.Fatal("both -tls-cert and -tls-key must be provided together")
 	}
+	if !*insecureDev && *tlsCert == "" {
+		logger.Log.Fatal("production mode requires TLS. Configure -tls-cert and -tls-key, or use --insecure-dev only for local development.")
+	}
+	if !*insecureDev && *nativeAddr != "" {
+		logger.Log.Fatal("native BST1 has no authentication layer and may only be enabled with --insecure-dev")
+	}
+	if *amqpAddr != "" && !*insecureDev && *amqpUsername == "" && *amqpPassword == "" && !*requireClientCert {
+		logger.Log.Fatal("AMQP requires PLAIN credentials or mTLS in production mode")
+	}
 
 	frameCodec := broker.NewFrameCodec(broker.FrameCodecConfig{
 		Type:              broker.CodecType(*codecType),
@@ -73,6 +96,10 @@ func main() {
 		EncryptionKey:     []byte(*frameEncryptionKey),
 	})
 	var store broker.Store
+	profile, profileErr := broker.DefaultsForProfile(broker.PerformanceProfile(*profileName))
+	if profileErr != nil {
+		logger.Log.Fatal("invalid performance profile", zlog.Err(profileErr))
+	}
 	kind := strings.ToLower(strings.TrimSpace(*storeKind))
 	if kind == "" && *wal != "" {
 		kind = "wal"
@@ -127,6 +154,9 @@ func main() {
 	default:
 		logger.Log.Fatal("unsupported store", zlog.String("store", *storeKind))
 	}
+	if !*insecureDev && profile.Profile != broker.ProfileLightweight && kind == "memory" {
+		logger.Log.Fatal("production durable, latency, and throughput profiles require a durable store; configure -store=wal or -store=sqlite")
+	}
 
 	if configurable, ok := store.(interface{ SetHistoryLimit(int) }); ok {
 		configurable.SetHistoryLimit(*messageHistory)
@@ -137,6 +167,7 @@ func main() {
 
 	b, err := broker.New(broker.Config{
 		Mode:                        broker.ModeStandalone,
+		PerformanceProfile:          profile.Profile,
 		Store:                       store,
 		DefaultQueue:                *queue,
 		FrameCodec:                  frameCodec,
@@ -169,23 +200,26 @@ func main() {
 	}
 	admin := broker.AdminServer{Broker: b, ACL: broker.NewACL(tokens...), InsecureDev: *insecureDev, MaxBodyBytes: *maxBody, TLSCertFile: *tlsCert, TLSKeyFile: *tlsKey, ClientCAFile: *clientCA, RequireClientCert: *requireClientCert}
 	srv := admin.HTTPServer(*addr)
-	serverErr := make(chan error, 1)
+	type listenerFailure struct {
+		name string
+		err  error
+	}
+	serverErr := make(chan listenerFailure, 8)
 	go func() {
 		if *tlsCert != "" || *tlsKey != "" {
-			serverErr <- srv.ListenAndServeTLS(*tlsCert, *tlsKey)
+			serverErr <- listenerFailure{"http", srv.ListenAndServeTLS(*tlsCert, *tlsKey)}
 			return
 		}
-		serverErr <- srv.ListenAndServe()
+		serverErr <- listenerFailure{"http", srv.ListenAndServe()}
 	}()
 	select {
-	case err := <-serverErr:
-		if err != nil && err != http.ErrServerClosed {
-			logger.Log.Fatal("broker listen failed", zlog.String("addr", *addr), zlog.Err(err))
+	case failure := <-serverErr:
+		if failure.err != nil && failure.err != http.ErrServerClosed {
+			logger.Log.Fatal("broker listen failed", zlog.String("listener", failure.name), zlog.Err(failure.err))
 		}
 	case <-time.After(200 * time.Millisecond):
 	}
 	var native *broker.NativeStreamServer
-	var nativeErr chan error
 	if *nativeAddr != "" {
 		dir := *nativeDir
 		if dir == "" {
@@ -199,12 +233,95 @@ func main() {
 		if err != nil {
 			logger.Log.Fatal("open native stream", zlog.Err(err))
 		}
-		nativeErr = make(chan error, 1)
-		go func() { nativeErr <- native.ListenAndServe(*nativeAddr) }()
+		go func() { serverErr <- listenerFailure{"native-stream", native.ListenAndServe(*nativeAddr)} }()
+	}
+	var nativeRPC *broker.NativeRPCServer
+	if *nativeRPCAddr != "" {
+		nativeRPC = broker.NewNativeRPCServer(b, broker.NativeRPCConfig{ListenAddr: *nativeRPCAddr, TLSCertFile: *tlsCert, TLSKeyFile: *tlsKey, ClientCAFile: *clientCA, RequireClientCert: *requireClientCert, BrokerToken: *token, MaxMessageSize: int(*maxBody)})
+		go func() { serverErr <- listenerFailure{"native-rpc", nativeRPC.ListenAndServe()} }()
+	}
+	var grpcServer *broker.GRPCV1Server
+	if *grpcAddr != "" {
+		tlsCfg, tlsErr := listenerTLSConfig(*tlsCert, *tlsKey, *clientCA, *requireClientCert)
+		if tlsErr != nil {
+			logger.Log.Fatal("configure gRPC TLS", zlog.Err(tlsErr))
+		}
+		grpcServer, err = broker.NewGRPCV1Server(b, broker.GRPCV1Config{ListenAddr: *grpcAddr, TLSConfig: tlsCfg, ACL: admin.ACL, InsecureDev: *insecureDev, MaxMessageSize: int(*maxBody)})
+		if err != nil {
+			logger.Log.Fatal("configure gRPC", zlog.Err(err))
+		}
+		go func() { serverErr <- listenerFailure{"grpc", grpcServer.ListenAndServe()} }()
+	}
+	var mqtt *broker.MQTTServer
+	if *mqttAddr != "" {
+		mqtt = broker.NewMQTTServer(b, broker.MQTTConfig{ListenAddr: *mqttAddr, TLSCertFile: *tlsCert, TLSKeyFile: *tlsKey, ClientCAFile: *clientCA, RequireClientCert: *requireClientCert, RequireAuth: true, BrokerToken: *token, MaxPacketSize: int(*maxBody)})
+		go func() { serverErr <- listenerFailure{"mqtt", mqtt.ListenAndServe()} }()
+	}
+	var amqpServer *amqp.Server
+	if *amqpAddr != "" {
+		tlsCfg, tlsErr := listenerTLSConfig(*tlsCert, *tlsKey, *clientCA, *requireClientCert)
+		if tlsErr != nil {
+			logger.Log.Fatal("configure AMQP TLS", zlog.Err(tlsErr))
+		}
+		amqpServer = amqp.NewServer(amqp.ServerConfig{ListenAddr: *amqpAddr, Broker: b, TLSConfig: tlsCfg, Username: *amqpUsername, Password: *amqpPassword, AllowInsecure: *insecureDev, FrameMaxSize: uint32(*maxBody)})
+		if tlsCfg != nil {
+			err = amqpServer.ListenTLS(*amqpAddr)
+		} else {
+			err = amqpServer.Listen()
+		}
+		if err != nil {
+			logger.Log.Fatal("AMQP listen failed", zlog.Err(err))
+		}
+		go func() { serverErr <- listenerFailure{"amqp", amqpServer.Serve()} }()
+	}
+	var sse *broker.SSEServer
+	var sseHTTP *http.Server
+	if *sseAddr != "" {
+		sse = broker.NewSSEServer(b, broker.SSEConfig{Path: *ssePath})
+		sse.SetToken(*token)
+		sseHTTP = &http.Server{Addr: *sseAddr, Handler: sse.Handler(), ReadHeaderTimeout: 5 * time.Second}
+		go func() {
+			if *tlsCert != "" {
+				serverErr <- listenerFailure{"sse", sseHTTP.ListenAndServeTLS(*tlsCert, *tlsKey)}
+				return
+			}
+			serverErr <- listenerFailure{"sse", sseHTTP.ListenAndServe()}
+		}()
+	}
+	var webSocket *broker.RFC6455Server
+	var webSocketHTTP *http.Server
+	if *webSocketAddr != "" {
+		webSocket = broker.NewRFC6455Server(b, broker.RFC6455Config{Path: *webSocketPath, ACL: admin.ACL, InsecureDev: *insecureDev, MaxMessageSize: *maxBody})
+		webSocketHTTP = &http.Server{Addr: *webSocketAddr, Handler: webSocket.Handler(), ReadHeaderTimeout: 5 * time.Second}
+		go func() {
+			if *tlsCert != "" {
+				serverErr <- listenerFailure{"websocket", webSocketHTTP.ListenAndServeTLS(*tlsCert, *tlsKey)}
+				return
+			}
+			serverErr <- listenerFailure{"websocket", webSocketHTTP.ListenAndServe()}
+		}()
 	}
 	fmt.Printf("fastworker broker listening on %s\n", *addr)
 	if native != nil {
 		fmt.Printf("native BST1 stream listening on %s partitions=%d sync=%t\n", *nativeAddr, *nativePartitions, *nativeSync)
+	}
+	if nativeRPC != nil {
+		fmt.Printf("native JSON/TCP RPC listening on %s\n", *nativeRPCAddr)
+	}
+	if grpcServer != nil {
+		fmt.Printf("protobuf/HTTP2 gRPC listening on %s\n", *grpcAddr)
+	}
+	if mqtt != nil {
+		fmt.Printf("MQTT 3.1.1 listening on %s\n", *mqttAddr)
+	}
+	if amqpServer != nil {
+		fmt.Printf("AMQP 0-9-1 listening on %s\n", *amqpAddr)
+	}
+	if sse != nil {
+		fmt.Printf("SSE listening on %s%s\n", *sseAddr, *ssePath)
+	}
+	if webSocket != nil {
+		fmt.Printf("RFC 6455 WebSocket listening on %s%s\n", *webSocketAddr, *webSocketPath)
 	}
 	if *insecureDev {
 		fmt.Println("WARNING: authentication disabled by --insecure-dev")
@@ -224,7 +341,13 @@ func main() {
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
-	<-sig
+	select {
+	case <-sig:
+	case failure := <-serverErr:
+		if failure.err != nil && failure.err != http.ErrServerClosed {
+			logger.Log.Error("listener stopped", zlog.String("listener", failure.name), zlog.Err(failure.err))
+		}
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
@@ -232,17 +355,66 @@ func main() {
 	if native != nil {
 		_ = native.Close()
 	}
+	if nativeRPC != nil {
+		nativeRPC.Stop()
+	}
+	if grpcServer != nil {
+		_ = grpcServer.Stop(ctx)
+	}
+	if mqtt != nil {
+		mqtt.Stop()
+	}
+	if amqpServer != nil {
+		_ = amqpServer.Stop(ctx)
+	}
+	if sseHTTP != nil {
+		_ = sseHTTP.Shutdown(ctx)
+		sse.Stop()
+	}
+	if webSocketHTTP != nil {
+		_ = webSocketHTTP.Shutdown(ctx)
+		webSocket.Stop()
+	}
 	_ = b.Stop(ctx)
 	if srvErr := srv.Close(); srvErr != nil && srvErr != http.ErrServerClosed {
 		logger.Log.Warn("server close", zlog.Err(srvErr))
 	}
 	select {
-	case err := <-serverErr:
-		if err != nil && err != http.ErrServerClosed {
-			logger.Log.Warn("server error", zlog.Err(err))
+	case failure := <-serverErr:
+		if failure.err != nil && failure.err != http.ErrServerClosed {
+			logger.Log.Warn("server error", zlog.String("listener", failure.name), zlog.Err(failure.err))
 		}
 	default:
 	}
+}
+
+func listenerTLSConfig(certFile, keyFile, clientCAFile string, requireClientCert bool) (*tls.Config, error) {
+	if certFile == "" || keyFile == "" {
+		return nil, nil
+	}
+	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		return nil, err
+	}
+	cfg := &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}
+	if clientCAFile != "" {
+		pem, err := os.ReadFile(clientCAFile)
+		if err != nil {
+			return nil, err
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(pem) {
+			return nil, fmt.Errorf("no valid certificates in client CA file")
+		}
+		cfg.ClientCAs = pool
+	}
+	if requireClientCert {
+		if cfg.ClientCAs == nil {
+			return nil, fmt.Errorf("client CA is required when client certificates are mandatory")
+		}
+		cfg.ClientAuth = tls.RequireAndVerifyClientCert
+	}
+	return cfg, nil
 }
 
 func env(k, d string) string {

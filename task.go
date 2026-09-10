@@ -137,7 +137,7 @@ func (h taskHandle) Cancel(ctx context.Context, reason string) error {
 			}
 		}
 		if h.b.cfg.Hooks.OnTaskCancelled != nil {
-			h.b.cfg.Hooks.OnTaskCancelled(ctx, TaskEvent{Task: ti, Error: errf(ErrCancelled, reason), Time: time.Now()})
+			h.b.cfg.Hooks.OnTaskCancelled(ctx, TaskEvent{Task: ti, Error: errf(ErrCancelled, "%s", reason), Time: time.Now()})
 		}
 	}
 	h.b.finishTaskWaiters(h.id)
@@ -169,6 +169,11 @@ func (p *Publisher) SubmitTask(ctx context.Context, name string, payload any, op
 			fn(&o)
 		}
 	}
+	resolvedTenant, err := resolveTenant(ctx, o.TenantID)
+	if err != nil {
+		return nil, err
+	}
+	o.TenantID = resolvedTenant
 	id := o.ID
 	if id == "" {
 		id = p.b.nextID("task")

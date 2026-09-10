@@ -1,18 +1,18 @@
-# fastworker Broker
+# fastworker Broker (pre-v1)
 
-A production-oriented, feature-complete message broker for Go — supporting embedded and single-node standalone deployments with 4 protocols, optional encryption at rest, and enterprise-grade security.
+An experimental message broker for Go with embedded, single-node, and distributed prototypes. Correctness, durability, protocol conformance, and security hardening are still in progress.
 
 ## What This Is
 
 | Capability | Status |
 |------------|--------|
-| Embedded broker (in-process) | Production-ready |
-| Standalone broker (HTTP server) | Production-ready |
-| Distributed broker (multi-node) | Extension points only |
+| Embedded broker (in-process) | Pre-v1; functional, hardening in progress |
+| Standalone broker (HTTP/native server) | Pre-v1; functional, hardening in progress |
+| Distributed broker (multi-node) | Experimental; not production-safe |
 | Encryption at rest (AES-GCM) | Optional, configurable |
-| Encryption in transit (TLS/mTLS) | Optional, all protocols |
+| Encryption in transit (TLS/mTLS) | Listener-dependent; conformance in progress |
 
-> **Honest scope**: Production-hardened for embedded and single-node standalone. Cluster metadata and extension points exist, but Raft/quorum consensus and cross-node replication are not implemented.
+> **Release status**: No current mode has a stable production-support contract. See the [release gates](docs/RELEASE_GATES.md) and [pre-v1 migration notes](docs/MIGRATION_PRE_V1.md).
 
 ---
 
@@ -163,7 +163,7 @@ go build -o broker-worker ./cmd/broker-worker/
 | Retry policy | Exponential backoff with jitter |
 | DLQ | Dead-letter queue with replay |
 | Idempotency | Publisher and consumer dedup |
-| Exactly-once | Transactional outbox pattern |
+| Delivery semantics | At-least-once queues with bounded idempotency helpers |
 | Circuit breaker | Automatic failure detection and recovery |
 | Rate limiting | Per-queue and per-topic token bucket |
 | Backpressure | Block, reject, drop-oldest, drop-newest, DLQ |
@@ -179,11 +179,11 @@ go build -o broker-worker ./cmd/broker-worker/
 | SSE streaming | Real-time event stream |
 | Schema evolution | Versioned schema registry |
 | Stream lag monitoring | Consumer lag per stream |
-| WAL compaction | Segment rotation and garbage collection |
+| WAL compaction | Experimental detached JSON-WAL utility; not active-store compaction |
 | Consumer priority | Weighted routing based on consumer capacity |
 | Consumer group rebalancing | Weighted, graceful drain |
 | Partitioning | Hash, round-robin, key-based routing |
-| Multi-tenancy | Vhost, queue prefix, shared isolation |
+| Multi-tenancy | Tenant-scoped core data paths; full control-plane isolation is pending |
 | Federation | Inter-broker message forwarding |
 | Shovel | Queue-to-queue message movement |
 | Graceful shutdown | HTTP connection draining |
@@ -194,13 +194,18 @@ go build -o broker-worker ./cmd/broker-worker/
 
 | Protocol | Transport | Port | Status |
 |----------|-----------|------|--------|
-| HTTP/JSON | TCP | 8090 | Complete |
-| AMQP 0-9-1 | TCP | 5672 | Complete (transactions, confirm, bind) |
-| MQTT 3.1.1 | TCP | 1883 | Complete (QoS 0/1/2, keep-alive) |
-| gRPC-like | TCP | 50051 | Complete (JSON over TCP) |
-| WebSocket/SSE | HTTP | 8090 | Complete (via admin server) |
+| HTTP/JSON | TCP | 8090 | Pre-v1; daemon-integrated |
+| Native stream | TCP | configurable | Pre-v1; unauthenticated development listener |
+| AMQP 0-9-1 | TCP/TLS | configurable | Experimental; conformance not established |
+| MQTT 3.1.1 | TCP/TLS | configurable | Experimental; persistent sessions remain incomplete |
+| Native RPC | TCP/TLS | configurable | Experimental JSON/TCP; not gRPC |
+| SSE | HTTP(S) | configurable | Experimental event stream, separate from WebSocket |
+| WebSocket | RFC 6455 | configurable | Pre-v1; protobuf-independent JSON data plane |
+| gRPC | protobuf/HTTP2 | configurable | Pre-v1 versioned `broker.v1` API |
 
-All protocols support TLS/mTLS when configured.
+`brokerd` supervises every enabled listener. Protocol listeners are opt-in by
+address; production mode requires TLS and authentication, while the native BST1
+stream remains development-only until it has its own authenticated handshake.
 
 ---
 
@@ -221,11 +226,14 @@ All protocols support TLS/mTLS when configured.
 |-----------|-----|------|---------------|
 | HTTP Admin | ✅ | ✅ | `-tls-cert`, `-tls-key`, `-client-ca`, `-require-client-cert` |
 | MQTT | ✅ | ✅ | `MQTTConfig.TLSCertFile`, etc. |
-| gRPC | ✅ | ✅ | `GRPCConfig.TLSCertFile`, etc. |
+| Native JSON/TCP RPC | ✅ | ✅ | `NativeRPCConfig.TLSCertFile`, etc.; this is not gRPC |
 | AMQP | ✅ | ✅ | `ListenTLS()`, `EXTERNAL` auth |
+| gRPC v1 | ✅ | ✅ | `GRPCV1Config.TLSConfig` |
+| RFC 6455 WebSocket | ✅ | via HTTPS client identity | `RFC6455Config` behind a TLS HTTP server |
 | Client SDK | ✅ | ✅ | `Config.TLSCertFile`, etc. |
 
-**All encryption is optional and backward-compatible.** No encryption by default.
+At-rest encryption remains opt-in. `brokerd` rejects plaintext production mode;
+plaintext listeners require the explicit `--insecure-dev` flag.
 
 ---
 
@@ -737,11 +745,11 @@ broker/
   schema.go              Schema registry
   errors.go              Error types
   mqtt.go                MQTT 3.1.1 server
-  grpc_transport.go      gRPC-like transport
-  websocket.go           WebSocket/SSE transport
+  grpc_transport.go      Experimental native JSON/TCP RPC transport
+  websocket.go           Server-Sent Events (SSE) transport
   federation.go          Federation and shovel
   tenancy.go             Multi-tenancy
-  exactly_once.go        Transactional outbox, replay
+  exactly_once.go        Legacy in-memory publish retry buffer and replay helpers
   partition_ordering.go  Partition routing
   wal_compaction.go      WAL segment management
   metrics.go             Prometheus metrics
@@ -769,7 +777,7 @@ broker/
 
 ## License
 
-See [LICENSE](LICENSE) for details.
+No license has been selected. Source visibility does not grant public-use rights; this blocks a stable public release until the project owner adds a license.
 
 ## High-throughput BST1 stream mode
 
