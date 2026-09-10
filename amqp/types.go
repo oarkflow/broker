@@ -136,11 +136,11 @@ const (
 	MethodBasicGetOk        = 71
 	MethodBasicGetEmpty     = 72
 	MethodBasicAck          = 80
-	MethodBasicNack         = 90
-	MethodBasicReject       = 90 // AMQP uses same ID for nack and reject
+	MethodBasicReject       = 90
 	MethodBasicRecoverAsync = 100
 	MethodBasicRecover      = 110
 	MethodBasicRecoverOk    = 111
+	MethodBasicNack         = 120 // AMQP publisher confirms / nack extension
 )
 
 // Confirm method IDs.

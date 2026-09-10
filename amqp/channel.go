@@ -15,6 +15,7 @@ type Channel struct {
 	conn          *Connection
 	id            uint16
 	confirmed     atomic.Bool
+	flowActive    atomic.Bool
 	unacked       map[uint64]*pendingDelivery
 	unackedMu     sync.Mutex
 	deliverySeq   atomic.Uint64
@@ -54,12 +55,14 @@ type amqpConsumer struct {
 
 // NewChannel creates a new AMQP channel.
 func NewChannel(conn *Connection, id uint16) *Channel {
-	return &Channel{
+	ch := &Channel{
 		conn:      conn,
 		id:        id,
 		unacked:   make(map[uint64]*pendingDelivery),
 		consumers: make(map[string]*amqpConsumer),
 	}
+	ch.flowActive.Store(true)
+	return ch
 }
 
 // handleMethod processes a method frame for this channel.
@@ -89,8 +92,12 @@ func (ch *Channel) handleChannelMethod(method *MethodFrame) error {
 		return ch.handleChannelOpen()
 	case MethodChannelClose:
 		return ch.handleChannelClose(method.Args)
+	case MethodChannelCloseOk:
+		return nil
 	case MethodChannelFlow:
 		return ch.handleChannelFlow(method.Args)
+	case MethodChannelFlowOk:
+		return ch.handleChannelFlowOk(method.Args)
 	default:
 		return ch.sendChannelError(ReplySyntaxError, fmt.Sprintf("unknown channel method %d", method.MethodID))
 	}
@@ -107,8 +114,27 @@ func (ch *Channel) handleChannelClose(args []byte) error {
 
 func (ch *Channel) handleChannelFlow(args []byte) error {
 	r := &argsReader{data: args}
-	_, _ = r.ReadBool() // flow active
-	return ch.codec().WriteMethodFrame(ch.id, ClassChannel, MethodChannelFlowOk, EncodeMethodArgs(true))
+	active, _ := r.ReadBool()
+	ch.flowActive.Store(active)
+	return ch.codec().WriteMethodFrame(ch.id, ClassChannel, MethodChannelFlowOk, EncodeMethodArgs(active))
+}
+
+func (ch *Channel) handleChannelFlowOk(args []byte) error {
+	r := &argsReader{data: args}
+	active, _ := r.ReadBool()
+	ch.flowActive.Store(active)
+	return nil
+}
+
+// FlowActive returns true if flow is enabled on this channel.
+func (ch *Channel) FlowActive() bool {
+	return ch.flowActive.Load()
+}
+
+// SetFlow enables or disables flow control on the channel and notifies the client.
+func (ch *Channel) SetFlow(active bool) error {
+	ch.flowActive.Store(active)
+	return ch.codec().WriteMethodFrame(ch.id, ClassChannel, MethodChannelFlow, EncodeMethodArgs(active))
 }
 
 // handleExchangeMethod handles exchange methods.
@@ -300,13 +326,13 @@ func (ch *Channel) handleBasicMethod(method *MethodFrame) error {
 		return ch.handleBasicPublish(method.Args)
 	case MethodBasicAck:
 		return ch.handleBasicAck(method.Args)
-	case 90: // MethodBasicNack/MethodBasicReject - AMQP uses same ID for both
-		// Distinguish by checking args length: nack has multiple+requeue (9 bytes), reject has just delivery-tag+requeue (9 bytes)
-		// Actually both are same length, so we'll treat both as nack
+	case MethodBasicReject:
 		if len(method.Args) >= 9 {
 			return ch.handleBasicNack(method.Args)
 		}
 		return ch.handleBasicReject(method.Args)
+	case MethodBasicNack:
+		return ch.handleBasicNack(method.Args)
 	case MethodBasicRecover:
 		return ch.handleBasicRecover(method.Args)
 	case MethodBasicGet:
@@ -432,6 +458,9 @@ func (ch *Channel) convertMessage(msg broker.Message, queue string, autoAck bool
 }
 
 func (ch *Channel) sendDelivery(delivery Delivery) {
+	if !ch.flowActive.Load() {
+		return
+	}
 	// Build properties
 	props := delivery.Properties
 	if props == nil {
@@ -676,6 +705,9 @@ func (ch *Channel) handleBasicPublish(args []byte) error {
 			body:  body,
 			opts:  opts,
 		})
+	} else if !ch.flowActive.Load() {
+		err = fmt.Errorf("channel flow inactive")
+		log.Printf("[amqp] publish paused by flow control on channel %d", ch.id)
 	} else {
 		_, err = ch.conn.server.cfg.Broker.Publisher().Publish(ch.conn.server.ctx, exchange, body, opts...)
 		if err != nil {
@@ -683,10 +715,13 @@ func (ch *Channel) handleBasicPublish(args []byte) error {
 		}
 	}
 
-	// If in confirm mode, send ack
+	// If in confirm mode, send ack or nack
 	if ch.confirmed.Load() {
 		deliveryTag := ch.deliverySeq.Add(1)
-		return ch.codec().WriteMethodFrame(ch.id, ClassConfirm, 80, EncodeMethodArgs(deliveryTag, true))
+		if err != nil {
+			return ch.codec().WriteMethodFrame(ch.id, ClassBasic, MethodBasicNack, EncodeMethodArgs(deliveryTag, false, false))
+		}
+		return ch.codec().WriteMethodFrame(ch.id, ClassBasic, MethodBasicAck, EncodeMethodArgs(deliveryTag, false))
 	}
 
 	return nil
@@ -952,10 +987,32 @@ func (ch *Channel) handleConfirmMethod(method *MethodFrame) error {
 	switch method.MethodID {
 	case MethodConfirmSelect:
 		ch.confirmed.Store(true)
-		return ch.codec().WriteMethodFrame(ch.id, ClassConfirm, MethodConfirmSelectOk, nil)
+		var noWait bool
+		if len(method.Args) > 0 {
+			r := &argsReader{data: method.Args}
+			noWait, _ = r.ReadBool()
+		}
+		if !noWait {
+			return ch.codec().WriteMethodFrame(ch.id, ClassConfirm, MethodConfirmSelectOk, nil)
+		}
+		return nil
 	default:
 		return ch.sendChannelError(ReplySyntaxError, fmt.Sprintf("unknown confirm method %d", method.MethodID))
 	}
+}
+
+// Confirmed returns whether publisher confirms are enabled on this channel.
+func (ch *Channel) Confirmed() bool {
+	return ch.confirmed.Load()
+}
+
+// SelectConfirm enables publisher confirms on this channel.
+func (ch *Channel) SelectConfirm(noWait bool) error {
+	ch.confirmed.Store(true)
+	if !noWait {
+		return ch.codec().WriteMethodFrame(ch.id, ClassConfirm, MethodConfirmSelectOk, nil)
+	}
+	return nil
 }
 
 // handleTxMethod handles transaction methods.

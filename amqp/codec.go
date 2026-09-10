@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sync"
 )
 
 // Codec handles encoding and decoding of AMQP frames.
@@ -14,6 +15,8 @@ type Codec struct {
 	frameMax uint32
 	reader   *bytes.Reader
 	buf      *bytes.Buffer
+	writeMu  sync.Mutex
+	readMu   sync.Mutex
 }
 
 // NewCodec creates a new AMQP codec for the given connection.
@@ -32,6 +35,9 @@ func (c *Codec) SetFrameMax(size uint32) {
 
 // ReadFrame reads a single frame from the connection.
 func (c *Codec) ReadFrame() (*Frame, error) {
+	c.readMu.Lock()
+	defer c.readMu.Unlock()
+
 	// Read frame type (1 byte)
 	var frameType uint8
 	if err := binary.Read(c.rw, binary.BigEndian, &frameType); err != nil {
@@ -77,6 +83,9 @@ func (c *Codec) ReadFrame() (*Frame, error) {
 
 // WriteFrame writes a frame to the connection.
 func (c *Codec) WriteFrame(frame *Frame) error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+
 	c.buf.Reset()
 
 	// Write frame type
