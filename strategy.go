@@ -78,16 +78,16 @@ type ConsumerStrategy interface {
 
 // StrategyConfig holds configuration for a consumer strategy.
 type StrategyConfig struct {
-	Type              StrategyType    `json:"type"`
-	Queue             string          `json:"queue,omitempty"`
-	Topic             string          `json:"topic,omitempty"`
-	Weight            int             `json:"weight,omitempty"`
-	HashKey           string          `json:"hash_key,omitempty"`
-	StickyKey         string          `json:"sticky_key,omitempty"`
-	PriorityThreshold int             `json:"priority_threshold,omitempty"`
-	Capabilities      []string        `json:"capabilities,omitempty"`
-	FallbackStrategy  StrategyType    `json:"fallback_strategy,omitempty"`
-	Rules             []RoutingRule   `json:"rules,omitempty"`
+	Type              StrategyType      `json:"type"`
+	Queue             string            `json:"queue,omitempty"`
+	Topic             string            `json:"topic,omitempty"`
+	Weight            int               `json:"weight,omitempty"`
+	HashKey           string            `json:"hash_key,omitempty"`
+	StickyKey         string            `json:"sticky_key,omitempty"`
+	PriorityThreshold int               `json:"priority_threshold,omitempty"`
+	Capabilities      []string          `json:"capabilities,omitempty"`
+	FallbackStrategy  StrategyType      `json:"fallback_strategy,omitempty"`
+	Rules             []RoutingRule     `json:"rules,omitempty"`
 	Metadata          map[string]string `json:"metadata,omitempty"`
 }
 
@@ -154,10 +154,10 @@ func (s *roundRobinStrategy) Select(_ context.Context, _ Message, candidates []C
 // ---------------------------------------------------------------------------
 
 type weightedRoundRobinStrategy struct {
-	mu           sync.Mutex
-	current      int
+	mu            sync.Mutex
+	current       int
 	currentWeight int
-	candidates   []ConsumerCandidate
+	candidates    []ConsumerCandidate
 }
 
 func NewWeightedRoundRobinStrategy() ConsumerStrategy {
@@ -480,7 +480,7 @@ func NewStickySessionStrategy(stickyKey string) ConsumerStrategy {
 	}
 	return &stickySessionStrategy{
 		stickyKey: stickyKey,
-		binding:  make(map[string]string),
+		binding:   make(map[string]string),
 	}
 }
 

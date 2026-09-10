@@ -21,11 +21,11 @@ func main() {
 	defer stop()
 
 	b, err := broker.New(broker.Config{
-		Name:              "routing-demo",
-		Mode:              broker.ModeEmbedded,
-		DefaultQueue:      "default",
-		DefaultVisibility: 30 * time.Second,
-		EnableTaskTracking: true,
+		Name:                "routing-demo",
+		Mode:                broker.ModeEmbedded,
+		DefaultQueue:        "default",
+		DefaultVisibility:   30 * time.Second,
+		EnableTaskTracking:  true,
 		EnableNotifications: true,
 	})
 	if err != nil {
@@ -242,7 +242,7 @@ func demoLeastLoaded(b *broker.Broker) {
 	})
 
 	configs := []struct {
-		name       string
+		name        string
 		maxInFlight int
 	}{
 		{"ll-worker-1", 5},
@@ -410,8 +410,8 @@ func demoCapabilityBased(b *broker.Broker) {
 	})
 
 	type capConfig struct {
-		name   string
-		caps   []string
+		name string
+		caps []string
 	}
 	configs := []capConfig{
 		{"cap-worker-ml", []string{"ml", "gpu"}},
@@ -809,20 +809,20 @@ func demoRouteLevelStrategy(b *broker.Broker) {
 	_ = b.DeclareQueue(context.Background(), broker.QueueConfig{Name: qLow, VisibilityTimeout: 10 * time.Second})
 
 	b.AddRoute(broker.Route{
-		Name:     "high-pri-route",
-		Mode:     broker.RoutePriority,
-		Match:    "demo.route.*",
+		Name:        "high-pri-route",
+		Mode:        broker.RoutePriority,
+		Match:       "demo.route.*",
 		PriorityMin: 5,
-		To:       []broker.Destination{{Kind: broker.DestinationQueue, Name: qHigh}},
-		Enabled:  true,
-		Strategy: broker.StrategyLeastLoaded,
+		To:          []broker.Destination{{Kind: broker.DestinationQueue, Name: qHigh}},
+		Enabled:     true,
+		Strategy:    broker.StrategyLeastLoaded,
 	})
 	b.AddRoute(broker.Route{
-		Name:     "low-pri-route",
-		Mode:     broker.RouteTopic,
-		Match:    "demo.route.*",
-		To:       []broker.Destination{{Kind: broker.DestinationQueue, Name: qLow}},
-		Enabled:  true,
+		Name:    "low-pri-route",
+		Mode:    broker.RouteTopic,
+		Match:   "demo.route.*",
+		To:      []broker.Destination{{Kind: broker.DestinationQueue, Name: qLow}},
+		Enabled: true,
 	})
 
 	for _, name := range []string{"rl-worker-high-1", "rl-worker-high-2"} {

@@ -34,6 +34,21 @@ removed because several described APIs rather than verified guarantees.
   AMQP 0-9-1 protocol-header parser.
 - [x] Added hashed API credentials with expiry, revocation, and safe rotation
   through concurrent credential addition.
+- [x] Added verified-client-certificate identity mapping for HTTP, gRPC,
+  WebSocket, and SSE ACL principals.
+- [x] Tenant-filtered store statistics, stream lag/offsets, notifications,
+  tasks, sagas, and SSE broadcasts; tenant-scoped credentials are fenced from
+  global routes, audit, metrics, consumers, and consumer groups.
+- [x] Durable publish appends are prepared and synced before becoming visible;
+  forced WAL failures cannot expose an unacknowledged ghost message.
+- [x] Added backup-preserving BWL1 verify/tail-repair plus verified JSON
+  export and exclusive import tooling.
+- [x] Added codec fuzz targets and CI smoke execution.
+- [x] Added and locally verified reproducible command builds plus a Go 1.26
+  distroless, non-root broker image with a writable non-root WAL directory.
+- [x] Vulnerability scanning reports no known Go vulnerabilities in all four
+  public modules; CycloneDX 1.7 image SBOM generation is scripted and locally
+  verified.
 - [x] Added the etcd/raft `RawNode` foundation with safe election/quorum defaults;
   the durable controller/partition group runtime is still pending.
 
@@ -41,14 +56,18 @@ removed because several described APIs rather than verified guarantees.
 
 - [x] Make the complete repository race-free under the current repository-wide run.
 - [ ] Eliminate memory-before-WAL mutation windows for every durable operation.
-- [ ] Add persistent store health/fencing after disk and `fsync` failures.
+  Publish append is WAL-first; lease, acknowledgement, nack, movement, purge,
+  update, and offset mutation paths still require the same ordering.
+- [x] Add persistent store health/fencing after disk and `fsync` failures.
 - [ ] Finish tenant enforcement for every admin, stream-offset, notification,
   task, schema, route, and control-plane read/write operation.
 - [ ] The legacy outbox has been renamed/documented as an in-memory retry buffer;
   provide the real transactional integration contract.
-- [ ] Establish 80% core and 90% critical-path coverage.
-- [ ] Remove the machine-specific `examples/go.mod` replacement once dagflow is
-  available as a portable versioned module, or isolate that example.
+- [ ] Establish 80% core and 90% critical-path coverage. Current package
+  coverage is 44.1% root, 33.2% cluster, 22.1% AMQP, 12.4% client, and 42.2%
+  pool; generated API and queue packages remain at 0%.
+- [x] Removed the machine-specific public examples replacement; the optional
+  private dagflow example is isolated in its own nested module.
 
 ## P1 — segmented durable storage
 
@@ -59,8 +78,10 @@ removed because several described APIs rather than verified guarantees.
   and disk accounting into the primary binary store.
 - [ ] Handle torn writes, middle-record corruption, disk full, permission loss,
   interrupted compaction, and encryption-key rotation.
-- [ ] Add non-destructive offline verify, repair, export, and import commands.
-- [ ] Make SQLite mutations transactional or retain an experimental label.
+- [x] Add non-destructive offline verify, tail repair, export, and exclusive
+  import commands for BWL1. BWL2 repair/migration remains pending.
+- [x] Make SQLite mutations transactional with a registered supported driver
+  and restart/rollback integration tests.
 
 ## P2 — production distributed broker
 
@@ -95,7 +116,10 @@ removed because several described APIs rather than verified guarantees.
   including reconnect, flow control, confirms, sessions, and QoS state recovery.
 - [ ] Centralize listener authentication, tenant-aware RBAC, credential hashing,
   rotation/revocation, certificate mapping, quotas, deadlines, and frame limits.
-- [ ] Refuse anonymous or unsafe plaintext production operation.
+  Hashing, rotation/revocation, certificate mapping, core RBAC, deadlines, and
+  frame limits are implemented; cross-protocol per-principal quotas remain.
+- [x] Refuse anonymous or unsafe plaintext `brokerd` production operation;
+  insecure operation requires the explicit development flag.
 
 ## P5 — release evidence
 

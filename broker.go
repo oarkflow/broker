@@ -175,6 +175,7 @@ func New(cfg Config) (*Broker, error) {
 	b.logCompaction = NewStreamLogCompaction(b)
 	b.partitionOrdering = NewPartitionOrdering(b)
 	b.partitionReassignment = NewPartitionReassignment(b)
+	b.cfg = cfg
 	b.state.Store(BrokerConfigured)
 	if err := b.store.DeclareQueue(context.Background(), QueueConfig{Name: cfg.DefaultQueue, VisibilityTimeout: cfg.DefaultVisibility, RetryPolicy: cfg.DefaultRetry, DLQ: cfg.DefaultDLQ}); err != nil {
 		return nil, fmt.Errorf("declare default queue: %w", err)
@@ -252,6 +253,9 @@ func (b *Broker) Stop(ctx context.Context) error {
 	}
 	if b.rateLimiter != nil {
 		b.rateLimiter.Stop()
+	}
+	if b.tenantMgr != nil {
+		b.tenantMgr.Stop()
 	}
 	if b.federationMgr != nil {
 		b.federationMgr.Stop()
@@ -464,9 +468,14 @@ func (b *Broker) ReadStream(ctx context.Context, req StreamReadRequest) ([]Messa
 }
 
 func (b *Broker) CommitOffset(ctx context.Context, commit OffsetCommit) error {
-	err := b.store.CommitOffset(ctx, commit)
+	tenant, err := resolveTenant(ctx, commit.TenantID)
+	if err != nil {
+		return err
+	}
+	commit.TenantID = tenant
+	err = b.store.CommitOffset(ctx, commit)
 	if err == nil {
-		b.notify.Publish(Notification{Type: "stream.offset_committed", Source: b.cfg.Name, Severity: SeverityInfo, Stream: commit.Stream, Timestamp: time.Now(), Data: map[string]any{"group": commit.ConsumerGroup, "offset": commit.Offset}})
+		b.notify.Publish(Notification{Type: "stream.offset_committed", Source: b.cfg.Name, Severity: SeverityInfo, Stream: commit.Stream, TenantID: tenant, Timestamp: time.Now(), Data: map[string]any{"group": commit.ConsumerGroup, "offset": commit.Offset}})
 	}
 	return err
 }
@@ -477,32 +486,32 @@ func (b *Broker) ConsumerOffset(ctx context.Context, commit OffsetCommit) (uint6
 
 // StreamLag returns the consumer lag (messages behind) for a given stream and consumer group.
 func (b *Broker) StreamLag(ctx context.Context, stream, consumerGroup string) (uint64, error) {
-	if ms, ok := b.store.(*FileWALStore); ok {
-		return ms.MemoryStore.StreamLag(stream, consumerGroup)
-	} else if ms, ok := b.store.(*MemoryStore); ok {
-		return ms.StreamLag(stream, consumerGroup)
+	if store, ok := b.store.(streamLagStore); ok {
+		return store.StreamLagContext(ctx, stream, consumerGroup, "")
 	}
 	return 0, ErrStreamNotFound
 }
 
 // StreamLagAll returns consumer lag for all consumer groups on a stream.
 func (b *Broker) StreamLagAll(ctx context.Context, stream string) (map[string]uint64, error) {
-	if ms, ok := b.store.(*FileWALStore); ok {
-		return ms.MemoryStore.StreamLagAll(stream)
-	} else if ms, ok := b.store.(*MemoryStore); ok {
-		return ms.StreamLagAll(stream)
+	if store, ok := b.store.(streamLagStore); ok {
+		return store.StreamLagAllContext(ctx, stream, "")
 	}
 	return nil, ErrStreamNotFound
 }
 
 // StreamHeadOffset returns the latest offset for a stream.
 func (b *Broker) StreamHeadOffset(ctx context.Context, stream string) (uint64, error) {
-	if ms, ok := b.store.(*FileWALStore); ok {
-		return ms.MemoryStore.StreamHeadOffset(stream)
-	} else if ms, ok := b.store.(*MemoryStore); ok {
-		return ms.StreamHeadOffset(stream)
+	if store, ok := b.store.(streamLagStore); ok {
+		return store.StreamHeadOffsetContext(ctx, stream, "")
 	}
 	return 0, ErrStreamNotFound
+}
+
+type streamLagStore interface {
+	StreamLagContext(context.Context, string, string, string) (uint64, error)
+	StreamLagAllContext(context.Context, string, string) (map[string]uint64, error)
+	StreamHeadOffsetContext(context.Context, string, string) (uint64, error)
 }
 
 // StreamConsumerLag is a result type for stream lag queries.

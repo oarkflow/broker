@@ -47,23 +47,23 @@ func (s RaftState) String() string {
 type EntryType uint8
 
 const (
-	EntryNormal    EntryType = 0
-	EntryConfig    EntryType = 1
-	EntrySnapshot  EntryType = 2
+	EntryNormal   EntryType = 0
+	EntryConfig   EntryType = 1
+	EntrySnapshot EntryType = 2
 )
 
 // Raft message types.
 type MessageType uint8
 
 const (
-	MsgAppendEntries    MessageType = 0
-	MsgAppendEntriesResp MessageType = 1
-	MsgRequestVote      MessageType = 2
-	MsgRequestVoteResp  MessageType = 3
-	MsgInstallSnapshot  MessageType = 4
+	MsgAppendEntries       MessageType = 0
+	MsgAppendEntriesResp   MessageType = 1
+	MsgRequestVote         MessageType = 2
+	MsgRequestVoteResp     MessageType = 3
+	MsgInstallSnapshot     MessageType = 4
 	MsgInstallSnapshotResp MessageType = 5
-	MsgHeartbeat        MessageType = 6
-	MsgHeartbeatResp    MessageType = 7
+	MsgHeartbeat           MessageType = 6
+	MsgHeartbeatResp       MessageType = 7
 )
 
 // LogEntry represents a single entry in the Raft log.
@@ -176,15 +176,15 @@ func DecodeUint64(b []byte) uint64 {
 
 // Common errors.
 var (
-	ErrNotLeader       = errors.New("cluster: not leader")
-	ErrLeaderLost      = errors.New("cluster: leader lost")
-	ErrNodeNotFound    = errors.New("cluster: node not found")
-	ErrPartitioned     = errors.New("cluster: node partitioned")
-	ErrSnapshotFailed  = errors.New("cluster: snapshot failed")
-	ErrLogCorrupted    = errors.New("cluster: log corrupted")
-	ErrTermMismatch    = errors.New("cluster: term mismatch")
-	ErrQuorumLost      = errors.New("cluster: quorum lost")
-	ErrSplitBrain      = errors.New("cluster: split-brain detected")
+	ErrNotLeader      = errors.New("cluster: not leader")
+	ErrLeaderLost     = errors.New("cluster: leader lost")
+	ErrNodeNotFound   = errors.New("cluster: node not found")
+	ErrPartitioned    = errors.New("cluster: node partitioned")
+	ErrSnapshotFailed = errors.New("cluster: snapshot failed")
+	ErrLogCorrupted   = errors.New("cluster: log corrupted")
+	ErrTermMismatch   = errors.New("cluster: term mismatch")
+	ErrQuorumLost     = errors.New("cluster: quorum lost")
+	ErrSplitBrain     = errors.New("cluster: split-brain detected")
 )
 
 // StateMachine defines the interface for the replicated state machine.

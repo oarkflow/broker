@@ -16,22 +16,22 @@ type PrometheusMetrics struct {
 	mu sync.RWMutex
 
 	// Counters
-	published   atomic.Uint64
-	delivered   atomic.Uint64
-	acked       atomic.Uint64
-	nacked      atomic.Uint64
-	deadLettered atomic.Uint64
-	retried     atomic.Uint64
-	moved       atomic.Uint64
+	published      atomic.Uint64
+	delivered      atomic.Uint64
+	acked          atomic.Uint64
+	nacked         atomic.Uint64
+	deadLettered   atomic.Uint64
+	retried        atomic.Uint64
+	moved          atomic.Uint64
 	publishedBytes atomic.Uint64
 	deliveredBytes atomic.Uint64
 
 	// Per-queue counters
-	queueDepth   sync.Map // queue -> *atomic.Int64
-	queueLeased  sync.Map // queue -> *atomic.Int64
-	queueAcked   sync.Map // queue -> *atomic.Int64
-	queueNacked  sync.Map // queue -> *atomic.Int64
-	queueDLQ     sync.Map // queue -> *atomic.Int64
+	queueDepth  sync.Map // queue -> *atomic.Int64
+	queueLeased sync.Map // queue -> *atomic.Int64
+	queueAcked  sync.Map // queue -> *atomic.Int64
+	queueNacked sync.Map // queue -> *atomic.Int64
+	queueDLQ    sync.Map // queue -> *atomic.Int64
 
 	// Per-topic counters
 	topicPublished sync.Map // topic -> *atomic.Uint64
@@ -46,7 +46,7 @@ type PrometheusMetrics struct {
 	memoryAllocBytes    atomic.Int64
 
 	// Histograms (simple bucket-based)
-	publishLatencyBuckets  [10]atomic.Uint64 // 1ms, 5ms, 10ms, 25ms, 50ms, 100ms, 250ms, 500ms, 1s, 5s
+	publishLatencyBuckets [10]atomic.Uint64 // 1ms, 5ms, 10ms, 25ms, 50ms, 100ms, 250ms, 500ms, 1s, 5s
 	consumeLatencyBuckets [10]atomic.Uint64
 	ackLatencyBuckets     [10]atomic.Uint64
 

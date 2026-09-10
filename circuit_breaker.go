@@ -10,8 +10,8 @@ import (
 type CircuitState string
 
 const (
-	CircuitClosed   CircuitState = "closed"   // normal operation
-	CircuitOpen     CircuitState = "open"     // rejecting requests
+	CircuitClosed   CircuitState = "closed"    // normal operation
+	CircuitOpen     CircuitState = "open"      // rejecting requests
 	CircuitHalfOpen CircuitState = "half_open" // testing recovery
 )
 

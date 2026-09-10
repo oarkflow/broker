@@ -20,12 +20,12 @@ import (
 // and decrypted on read. The encryption key must be 16, 24, or 32 bytes for
 // AES-128, AES-192, or AES-256 respectively.
 type EncryptedMessageStore struct {
-	mu    sync.Mutex
-	db    *sql.DB
-	mem   *broker.MemoryStore
-	own   bool
-	key   []byte
-	gcm   cipher.AEAD
+	mu     sync.Mutex
+	db     *sql.DB
+	mem    *broker.MemoryStore
+	own    bool
+	key    []byte
+	gcm    cipher.AEAD
 	closed bool
 }
 

@@ -431,6 +431,12 @@ curl -X POST -H "Authorization: Bearer $TOKEN" \
 
 ### SSE Events
 
+The standalone SSE listener is secure by default: configure its ACL (or call
+`SetToken` for the pre-v1 compatibility path), or explicitly set
+`InsecureDev` for isolated development. Tenant-scoped connections receive only
+tenant-tagged broadcasts for an allowed tenant; unowned global events are not
+forwarded.
+
 ```bash
 curl -N -H "Authorization: Bearer $TOKEN" http://localhost:8090/events
 ```

@@ -10,10 +10,10 @@ import (
 
 // Codec handles encoding and decoding of AMQP frames.
 type Codec struct {
-	rw          io.ReadWriter
-	frameMax    uint32
-	reader      *bytes.Reader
-	buf         *bytes.Buffer
+	rw       io.ReadWriter
+	frameMax uint32
+	reader   *bytes.Reader
+	buf      *bytes.Buffer
 }
 
 // NewCodec creates a new AMQP codec for the given connection.

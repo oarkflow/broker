@@ -20,10 +20,10 @@ func main() {
 		DefaultQueue:      "default",
 		DefaultVisibility: 30 * time.Second,
 		Tenancy: &broker.TenancyConfig{
-			Enabled:     true,
-			DefaultTenant: "default",
+			Enabled:        true,
+			DefaultTenant:  "default",
 			IsolationLevel: broker.IsolationQueuePrefix,
-			QueuePrefix: "t.",
+			QueuePrefix:    "t.",
 		},
 	})
 	if err := b.Start(ctx); err != nil {

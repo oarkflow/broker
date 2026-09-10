@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"sync"
 	"time"
 
@@ -27,6 +28,18 @@ type MessageStore struct {
 }
 
 func (*MessageStore) ConfirmationLevel() broker.ConfirmLevel { return broker.ConfirmPersisted }
+
+func (s *MessageStore) StoreHealth() error {
+	if s == nil || s.db == nil {
+		return broker.ErrClosed
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := s.db.PingContext(ctx); err != nil {
+		return errors.Join(broker.ErrStorageUnavailable, err)
+	}
+	return nil
+}
 
 // OpenMessageStore opens a persistent message data-plane store using any
 // registered SQLite driver name.
@@ -266,6 +279,21 @@ func (s *MessageStore) ConsumerOffset(ctx context.Context, commit broker.OffsetC
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.mem.ConsumerOffset(ctx, commit)
+}
+func (s *MessageStore) StreamLagContext(ctx context.Context, stream, group, tenant string) (uint64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.mem.StreamLagContext(ctx, stream, group, tenant)
+}
+func (s *MessageStore) StreamLagAllContext(ctx context.Context, stream, tenant string) (map[string]uint64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.mem.StreamLagAllContext(ctx, stream, tenant)
+}
+func (s *MessageStore) StreamHeadOffsetContext(ctx context.Context, stream, tenant string) (uint64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.mem.StreamHeadOffsetContext(ctx, stream, tenant)
 }
 func (s *MessageStore) Stats(ctx context.Context) (broker.StoreStats, error) {
 	s.mu.Lock()

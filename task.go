@@ -60,6 +60,9 @@ func (h taskHandle) Info(ctx context.Context) (TaskInfo, error) {
 	if t := h.b.tasks[h.id]; t != nil {
 		out := cloneTask(*t)
 		h.b.taskMu.RUnlock()
+		if !tenantAllowed(ctx, out.TenantID) {
+			return TaskInfo{}, ErrUnauthorized
+		}
 		return out, nil
 	}
 	h.b.taskMu.RUnlock()
@@ -67,6 +70,9 @@ func (h taskHandle) Info(ctx context.Context) (TaskInfo, error) {
 		if t, ok, err := h.b.stateStore.GetTask(ctx, h.id); err != nil {
 			return TaskInfo{}, err
 		} else if ok {
+			if !tenantAllowed(ctx, t.TenantID) {
+				return TaskInfo{}, ErrUnauthorized
+			}
 			return t, nil
 		}
 	}
@@ -91,6 +97,9 @@ func (h taskHandle) Result(ctx context.Context, out any) error {
 	return nil
 }
 func (h taskHandle) Wait(ctx context.Context) (TaskResult, error) {
+	if _, err := h.Info(ctx); err != nil {
+		return TaskResult{}, err
+	}
 	ch := make(chan TaskResult, 1)
 	h.b.taskMu.Lock()
 	if t := h.b.tasks[h.id]; t != nil && (t.Status == TaskSucceeded || t.Status == TaskFailed || t.Status == TaskCancelled || t.Status == TaskDeadLettered) {
@@ -111,6 +120,9 @@ func (h taskHandle) Wait(ctx context.Context) (TaskResult, error) {
 	}
 }
 func (h taskHandle) Cancel(ctx context.Context, reason string) error {
+	if _, err := h.Info(ctx); err != nil {
+		return err
+	}
 	h.b.taskMu.Lock()
 	t := h.b.tasks[h.id]
 	var ti TaskInfo
@@ -122,11 +134,11 @@ func (h taskHandle) Cancel(ctx context.Context, reason string) error {
 		ti = cloneTask(*t)
 	}
 	h.b.taskMu.Unlock()
-	if t != nil {
+	if ti.ID != "" {
 		h.b.persistTask(ctx, ti)
 	}
-	if t != nil {
-		if msg, ok, _ := h.b.store.Get(ctx, t.MessageID); ok {
+	if ti.ID != "" {
+		if msg, ok, _ := h.b.store.Get(ctx, ti.MessageID); ok {
 			msg.Status = MessageCancelled
 			msg.LastError = reason
 			_ = h.b.store.Update(ctx, msg)

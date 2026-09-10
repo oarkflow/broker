@@ -144,6 +144,11 @@ func (b *Broker) Metrics() BrokerMetrics {
 }
 
 func (b *Broker) checkStore(ctx context.Context) HealthCheck {
+	if provider, ok := b.store.(StoreHealthProvider); ok {
+		if err := provider.StoreHealth(); err != nil {
+			return HealthCheck{Name: "store", Status: "fail", Detail: err.Error()}
+		}
+	}
 	_, err := b.store.Stats(ctx)
 	if err != nil {
 		return HealthCheck{

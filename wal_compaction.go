@@ -49,10 +49,10 @@ type WALCompactionConfig struct {
 
 func defaultWALCompactionConfig() WALCompactionConfig {
 	return WALCompactionConfig{
-		MaxSegmentSize:    128 << 20,
-		MaxSegments:       10,
+		MaxSegmentSize:     128 << 20,
+		MaxSegments:        10,
 		CompactionInterval: 5 * time.Minute,
-		MinSegmentFiles:   1,
+		MinSegmentFiles:    1,
 	}
 }
 
@@ -97,11 +97,12 @@ func NewWALCompactor(dir string, cfg WALCompactionConfig, store *MemoryStore) *W
 		cfg.CompactionInterval = 5 * time.Minute
 	}
 	if cfg.MinSegmentFiles <= 0 {
-		cfg.MinSegmentFiles = 1}
+		cfg.MinSegmentFiles = 1
+	}
 	return &WALCompactor{
-		dir:   dir,
-		cfg:   cfg,
-		store: store,
+		dir:    dir,
+		cfg:    cfg,
+		store:  store,
 		stopCh: make(chan struct{}),
 	}
 }

@@ -51,54 +51,54 @@ type CommandDestination struct {
 // AppendCommand contains the message fields and destinations for replication.
 // Fields mirror the broker.Message struct.
 type AppendCommand struct {
-	ID               string              `json:"id"`
-	ParentID         string              `json:"parent_id,omitempty"`
-	Topic            string              `json:"topic,omitempty"`
-	Queue            string              `json:"queue,omitempty"`
-	Stream           string              `json:"stream,omitempty"`
-	Partition        int                 `json:"partition,omitempty"`
-	Offset           uint64              `json:"offset,omitempty"`
-	Key              string              `json:"key,omitempty"`
-	RoutingKey       string              `json:"routing_key,omitempty"`
-	Type             string              `json:"type,omitempty"`
-	ContentType      string              `json:"content_type,omitempty"`
-	Schema           string              `json:"schema,omitempty"`
-	SchemaVersion    string              `json:"schema_version,omitempty"`
-	Payload          []byte              `json:"payload,omitempty"`
-	Headers          map[string]string   `json:"headers,omitempty"`
-	Metadata         map[string]string   `json:"metadata,omitempty"`
-	TraceID          string              `json:"trace_id,omitempty"`
-	SpanID           string              `json:"span_id,omitempty"`
-	CorrelationID    string              `json:"correlation_id,omitempty"`
-	CausationID      string              `json:"causation_id,omitempty"`
-	RequestID        string              `json:"request_id,omitempty"`
-	ReplyTo          string              `json:"reply_to,omitempty"`
-	ReplyGroup       string              `json:"reply_group,omitempty"`
-	IdempotencyKey   string              `json:"idempotency_key,omitempty"`
-	DeduplicationID  string              `json:"deduplication_id,omitempty"`
-	Checksum         string              `json:"checksum,omitempty"`
-	Priority         int                 `json:"priority,omitempty"`
-	CreatedAt        time.Time           `json:"created_at"`
-	AvailableAt      time.Time           `json:"available_at,omitempty"`
-	ExpiresAt        time.Time           `json:"expires_at,omitempty"`
-	Attempts         int                 `json:"attempts,omitempty"`
-	MaxAttempts      int                 `json:"max_attempts,omitempty"`
-	Redeliveries     int                 `json:"redeliveries,omitempty"`
-	TenantID         string              `json:"tenant_id,omitempty"`
-	ProducerID       string              `json:"producer_id,omitempty"`
-	ConsumerID       string              `json:"consumer_id,omitempty"`
-	ConsumerGroup    string              `json:"consumer_group,omitempty"`
-	LeaseToken       string              `json:"lease_token,omitempty"`
-	LeaseUntil       time.Time           `json:"lease_until,omitempty"`
-	OriginalTopic    string              `json:"original_topic,omitempty"`
-	OriginalQueue    string              `json:"original_queue,omitempty"`
-	OriginalStream   string              `json:"original_stream,omitempty"`
-	OriginalOffset   uint64              `json:"original_offset,omitempty"`
-	Status           string              `json:"status"`
-	LastError        string              `json:"last_error,omitempty"`
-	DeadLetterReason string              `json:"dead_letter_reason,omitempty"`
-	TaskID           string              `json:"task_id,omitempty"`
-	TaskName         string              `json:"task_name,omitempty"`
+	ID               string               `json:"id"`
+	ParentID         string               `json:"parent_id,omitempty"`
+	Topic            string               `json:"topic,omitempty"`
+	Queue            string               `json:"queue,omitempty"`
+	Stream           string               `json:"stream,omitempty"`
+	Partition        int                  `json:"partition,omitempty"`
+	Offset           uint64               `json:"offset,omitempty"`
+	Key              string               `json:"key,omitempty"`
+	RoutingKey       string               `json:"routing_key,omitempty"`
+	Type             string               `json:"type,omitempty"`
+	ContentType      string               `json:"content_type,omitempty"`
+	Schema           string               `json:"schema,omitempty"`
+	SchemaVersion    string               `json:"schema_version,omitempty"`
+	Payload          []byte               `json:"payload,omitempty"`
+	Headers          map[string]string    `json:"headers,omitempty"`
+	Metadata         map[string]string    `json:"metadata,omitempty"`
+	TraceID          string               `json:"trace_id,omitempty"`
+	SpanID           string               `json:"span_id,omitempty"`
+	CorrelationID    string               `json:"correlation_id,omitempty"`
+	CausationID      string               `json:"causation_id,omitempty"`
+	RequestID        string               `json:"request_id,omitempty"`
+	ReplyTo          string               `json:"reply_to,omitempty"`
+	ReplyGroup       string               `json:"reply_group,omitempty"`
+	IdempotencyKey   string               `json:"idempotency_key,omitempty"`
+	DeduplicationID  string               `json:"deduplication_id,omitempty"`
+	Checksum         string               `json:"checksum,omitempty"`
+	Priority         int                  `json:"priority,omitempty"`
+	CreatedAt        time.Time            `json:"created_at"`
+	AvailableAt      time.Time            `json:"available_at,omitempty"`
+	ExpiresAt        time.Time            `json:"expires_at,omitempty"`
+	Attempts         int                  `json:"attempts,omitempty"`
+	MaxAttempts      int                  `json:"max_attempts,omitempty"`
+	Redeliveries     int                  `json:"redeliveries,omitempty"`
+	TenantID         string               `json:"tenant_id,omitempty"`
+	ProducerID       string               `json:"producer_id,omitempty"`
+	ConsumerID       string               `json:"consumer_id,omitempty"`
+	ConsumerGroup    string               `json:"consumer_group,omitempty"`
+	LeaseToken       string               `json:"lease_token,omitempty"`
+	LeaseUntil       time.Time            `json:"lease_until,omitempty"`
+	OriginalTopic    string               `json:"original_topic,omitempty"`
+	OriginalQueue    string               `json:"original_queue,omitempty"`
+	OriginalStream   string               `json:"original_stream,omitempty"`
+	OriginalOffset   uint64               `json:"original_offset,omitempty"`
+	Status           string               `json:"status"`
+	LastError        string               `json:"last_error,omitempty"`
+	DeadLetterReason string               `json:"dead_letter_reason,omitempty"`
+	TaskID           string               `json:"task_id,omitempty"`
+	TaskName         string               `json:"task_name,omitempty"`
 	Destinations     []CommandDestination `json:"destinations"`
 }
 
@@ -112,17 +112,17 @@ type AckCommand struct {
 
 // NackCommand mirrors broker.NackRequest for replication.
 type NackCommand struct {
-	MessageID        string `json:"message_id"`
-	Queue            string `json:"queue"`
-	LeaseToken       string `json:"lease_token"`
-	ConsumerID       string `json:"consumer_id"`
-	Action           string `json:"action"`
-	Reason           string `json:"reason"`
-	Error            string `json:"error"`
+	MessageID        string        `json:"message_id"`
+	Queue            string        `json:"queue"`
+	LeaseToken       string        `json:"lease_token"`
+	ConsumerID       string        `json:"consumer_id"`
+	Action           string        `json:"action"`
+	Reason           string        `json:"reason"`
+	Error            string        `json:"error"`
 	Delay            time.Duration `json:"delay"`
-	DLQ              string `json:"dlq"`
-	ResetLease       bool   `json:"reset_lease"`
-	IncrementAttempt bool   `json:"increment_attempt"`
+	DLQ              string        `json:"dlq"`
+	ResetLease       bool          `json:"reset_lease"`
+	IncrementAttempt bool          `json:"increment_attempt"`
 }
 
 // BrokerStore is the subset of the broker's Store interface needed for

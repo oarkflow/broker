@@ -41,24 +41,25 @@ const (
 
 // TenantManager manages multi-tenancy isolation.
 type TenantManager struct {
-	broker    *Broker
-	config    TenancyConfig
-	tenants   map[string]*TenantState
-	mu        sync.RWMutex
+	broker  *Broker
+	config  TenancyConfig
+	tenants map[string]*TenantState
+	limiter *RateLimiter
+	mu      sync.RWMutex
 }
 
 type TenantState struct {
-	Name         string    `json:"name"`
-	QueueCount   int       `json:"queue_count"`
-	MessageCount int       `json:"message_count"`
-	CreatedAt    time.Time `json:"created_at"`
+	Name         string       `json:"name"`
+	QueueCount   int          `json:"queue_count"`
+	MessageCount int          `json:"message_count"`
+	CreatedAt    time.Time    `json:"created_at"`
 	Quotas       TenantQuotas `json:"quotas"`
 }
 
 type TenantQuotas struct {
-	MaxQueues     int `json:"max_queues"`
-	MaxMessages   int `json:"max_messages"`
-	RateLimit     int `json:"rate_limit"`
+	MaxQueues   int `json:"max_queues"`
+	MaxMessages int `json:"max_messages"`
+	RateLimit   int `json:"rate_limit"`
 }
 
 // NewTenantManager creates a new tenant manager.
@@ -72,18 +73,27 @@ func NewTenantManager(b *Broker, cfg TenancyConfig) *TenantManager {
 	if cfg.QueuePrefix == "" {
 		cfg.QueuePrefix = "t."
 	}
-	return &TenantManager{
+	manager := &TenantManager{
 		broker:  b,
 		config:  cfg,
 		tenants: make(map[string]*TenantState),
 	}
+	if cfg.RateLimitPerTenant > 0 {
+		manager.limiter = NewRateLimiter(cfg.RateLimitPerTenant, cfg.RateLimitPerTenant)
+	}
+	return manager
 }
 
 // GetTenant returns the state for a tenant.
 func (tm *TenantManager) GetTenant(name string) *TenantState {
 	tm.mu.RLock()
 	defer tm.mu.RUnlock()
-	return tm.tenants[name]
+	state := tm.tenants[name]
+	if state == nil {
+		return nil
+	}
+	copy := *state
+	return &copy
 }
 
 // ListTenants returns all tenant states.
@@ -92,7 +102,8 @@ func (tm *TenantManager) ListTenants() []*TenantState {
 	defer tm.mu.RUnlock()
 	out := make([]*TenantState, 0, len(tm.tenants))
 	for _, t := range tm.tenants {
-		out = append(out, t)
+		copy := *t
+		out = append(out, &copy)
 	}
 	return out
 }
@@ -102,7 +113,8 @@ func (tm *TenantManager) EnsureTenant(name string) *TenantState {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 	if t, ok := tm.tenants[name]; ok {
-		return t
+		copy := *t
+		return &copy
 	}
 	t := &TenantState{
 		Name:      name,
@@ -114,7 +126,8 @@ func (tm *TenantManager) EnsureTenant(name string) *TenantState {
 		},
 	}
 	tm.tenants[name] = t
-	return t
+	copy := *t
+	return &copy
 }
 
 // QueueName returns the tenant-isolated queue name.
@@ -150,19 +163,39 @@ func (tm *TenantManager) TopicName(tenant, topic string) string {
 }
 
 // CheckQuota checks if a tenant has exceeded its quotas.
-func (tm *TenantManager) CheckQuota(tenant string) error {
-	if !tm.config.Enabled {
+func (tm *TenantManager) CheckQuota(ctx context.Context, tenant string) error {
+	return tm.CheckPublishQuota(ctx, tenant, nil)
+}
+
+func (tm *TenantManager) CheckPublishQuota(ctx context.Context, tenant string, destinations []Destination) error {
+	if !tm.config.Enabled || tenant == "" {
 		return nil
 	}
-	t := tm.GetTenant(tenant)
-	if t == nil {
-		return nil
+	t := tm.EnsureTenant(tenant)
+	principalCtx := context.WithValue(ctx, adminPrincipalKey{}, AdminPrincipal{Name: "tenant-quota", Tenants: []string{tenant}})
+	stats, err := tm.broker.Store().Stats(principalCtx)
+	if err != nil {
+		return err
 	}
-	if t.Quotas.MaxQueues > 0 && t.QueueCount >= t.Quotas.MaxQueues {
-		return errf(ErrBackpressure, "tenant %s queue quota exceeded: %d/%d", tenant, t.QueueCount, t.Quotas.MaxQueues)
+	if t.Quotas.MaxQueues > 0 {
+		newQueues := make(map[string]struct{})
+		for _, destination := range destinations {
+			if destination.Kind != DestinationQueue && destination.Kind != DestinationDLQ {
+				continue
+			}
+			if _, exists := stats.Queues[destination.Name]; !exists {
+				newQueues[destination.Name] = struct{}{}
+			}
+		}
+		if len(stats.Queues)+len(newQueues) > t.Quotas.MaxQueues {
+			return errf(ErrBackpressure, "tenant %s queue quota exceeded: %d/%d", tenant, len(stats.Queues)+len(newQueues), t.Quotas.MaxQueues)
+		}
 	}
-	if t.Quotas.MaxMessages > 0 && t.MessageCount >= t.Quotas.MaxMessages {
-		return errf(ErrBackpressure, "tenant %s message quota exceeded: %d/%d", tenant, t.MessageCount, t.Quotas.MaxMessages)
+	if t.Quotas.MaxMessages > 0 && stats.Messages >= t.Quotas.MaxMessages {
+		return errf(ErrBackpressure, "tenant %s message quota exceeded: %d/%d", tenant, stats.Messages, t.Quotas.MaxMessages)
+	}
+	if tm.limiter != nil && !tm.limiter.Allow("tenant:"+tenant) {
+		return errf(ErrRateLimited, "tenant %s publish rate exceeded", tenant)
 	}
 	return nil
 }
@@ -191,16 +224,17 @@ func (tm *TenantManager) TenantAwareSubscribe(ctx context.Context, tenant string
 
 // TenantStats returns stats filtered by tenant.
 type TenantStats struct {
-	Tenant      string     `json:"tenant"`
-	QueueCount  int        `json:"queue_count"`
-	TopicCount  int        `json:"topic_count"`
-	MessageCount int       `json:"message_count"`
-	LeasedCount int        `json:"leased_count"`
-	DLQCount    int        `json:"dlq_count"`
+	Tenant       string `json:"tenant"`
+	QueueCount   int    `json:"queue_count"`
+	TopicCount   int    `json:"topic_count"`
+	MessageCount int    `json:"message_count"`
+	LeasedCount  int    `json:"leased_count"`
+	DLQCount     int    `json:"dlq_count"`
 }
 
 // StatsForTenant returns stats for a specific tenant.
 func (tm *TenantManager) StatsForTenant(ctx context.Context, tenant string) (*TenantStats, error) {
+	ctx = context.WithValue(ctx, adminPrincipalKey{}, AdminPrincipal{Name: "tenant-stats", Tenants: []string{tenant}})
 	stats, err := tm.broker.Store().Stats(ctx)
 	if err != nil {
 		return nil, err
@@ -208,19 +242,25 @@ func (tm *TenantManager) StatsForTenant(ctx context.Context, tenant string) (*Te
 	ts := &TenantStats{Tenant: tenant}
 	prefix := tm.config.QueuePrefix + tenant + "."
 	for name, count := range stats.Queues {
-		if tm.config.Enabled && len(name) > len(prefix) && name[:len(prefix)] == prefix {
+		if tm.config.IsolationLevel == IsolationShared || (len(name) > len(prefix) && name[:len(prefix)] == prefix) {
 			ts.QueueCount++
 			ts.MessageCount += count
 		}
 	}
 	for name := range stats.Topics {
-		if tm.config.Enabled && len(name) > len(prefix) && name[:len(prefix)] == prefix {
+		if tm.config.IsolationLevel == IsolationShared || (len(name) > len(prefix) && name[:len(prefix)] == prefix) {
 			ts.TopicCount++
 		}
 	}
 	ts.LeasedCount = stats.Leased
 	ts.DLQCount = stats.DeadLetter
 	return ts, nil
+}
+
+func (tm *TenantManager) Stop() {
+	if tm != nil && tm.limiter != nil {
+		tm.limiter.Stop()
+	}
 }
 
 // TenantAccessor on Broker.
@@ -240,10 +280,10 @@ type PartitionConfig struct {
 type PartitionStrategy string
 
 const (
-	PartitionHash      PartitionStrategy = "hash"
+	PartitionHash       PartitionStrategy = "hash"
 	PartitionRoundRobin PartitionStrategy = "round_robin"
-	PartitionRandom    PartitionStrategy = "random"
-	PartitionKey       PartitionStrategy = "key"
+	PartitionRandom     PartitionStrategy = "random"
+	PartitionKey        PartitionStrategy = "key"
 )
 
 // PartitionRouter routes messages to specific partitions.

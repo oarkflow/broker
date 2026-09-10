@@ -24,6 +24,19 @@ type PartitionedBinaryWALStore struct {
 
 func (*PartitionedBinaryWALStore) ConfirmationLevel() ConfirmLevel { return ConfirmPersisted }
 
+func (s *PartitionedBinaryWALStore) StoreHealth() error {
+	if s == nil || len(s.shards) == 0 {
+		return ErrClosed
+	}
+	var health error
+	for i, shard := range s.shards {
+		if err := shard.StoreHealth(); err != nil {
+			health = errors.Join(health, fmt.Errorf("WAL shard %d: %w", i, err))
+		}
+	}
+	return health
+}
+
 func NewPartitionedBinaryWALStore(dir string, shardCount int, codec FrameCodec) (*PartitionedBinaryWALStore, error) {
 	if shardCount <= 0 {
 		return nil, errf(ErrInvalidMessage, "WAL shard count must be positive")
@@ -523,6 +536,15 @@ func (s *PartitionedBinaryWALStore) CommitOffset(ctx context.Context, c OffsetCo
 }
 func (s *PartitionedBinaryWALStore) ConsumerOffset(ctx context.Context, c OffsetCommit) (uint64, error) {
 	return s.shards[s.shardForStable("stream:"+c.Stream)].ConsumerOffset(ctx, c)
+}
+func (s *PartitionedBinaryWALStore) StreamLagContext(ctx context.Context, stream, group, tenant string) (uint64, error) {
+	return s.shards[s.shardForStable("stream:"+stream)].StreamLagContext(ctx, stream, group, tenant)
+}
+func (s *PartitionedBinaryWALStore) StreamLagAllContext(ctx context.Context, stream, tenant string) (map[string]uint64, error) {
+	return s.shards[s.shardForStable("stream:"+stream)].StreamLagAllContext(ctx, stream, tenant)
+}
+func (s *PartitionedBinaryWALStore) StreamHeadOffsetContext(ctx context.Context, stream, tenant string) (uint64, error) {
+	return s.shards[s.shardForStable("stream:"+stream)].StreamHeadOffsetContext(ctx, stream, tenant)
 }
 func (s *PartitionedBinaryWALStore) Stats(ctx context.Context) (StoreStats, error) {
 	result := StoreStats{Queues: map[string]int{}, Topics: map[string]int{}, Streams: map[string]int{}, Offsets: map[string]map[string]uint64{}, DLQ: map[string]int{}}

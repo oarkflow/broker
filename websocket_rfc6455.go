@@ -24,10 +24,11 @@ type RFC6455Config struct {
 }
 
 type RFC6455Server struct {
-	broker *Broker
-	cfg    RFC6455Config
-	mu     sync.Mutex
-	conns  map[*websocket.Conn]struct{}
+	broker  *Broker
+	cfg     RFC6455Config
+	mu      sync.Mutex
+	conns   map[*websocket.Conn]struct{}
+	pending int
 }
 
 func NewRFC6455Server(b *Broker, cfg RFC6455Config) *RFC6455Server {
@@ -70,25 +71,39 @@ func (s *RFC6455Server) Handler() http.Handler {
 		}
 		principal, ok := AdminPrincipal{Name: "development", Permissions: []string{PermissionAdminAll}}, s.cfg.InsecureDev
 		if !ok {
-			principal, ok = s.cfg.ACL.Authenticate(bearerToken(r))
+			if r.TLS != nil && len(r.TLS.VerifiedChains) > 0 && len(r.TLS.VerifiedChains[0]) > 0 {
+				principal, ok = s.cfg.ACL.AuthenticateCertificate(r.TLS.VerifiedChains[0][0])
+			}
+			if !ok {
+				principal, ok = s.cfg.ACL.Authenticate(bearerToken(r))
+			}
 		}
 		if !ok {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
+		release, err := s.cfg.ACL.Admit(principal)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusTooManyRequests)
+			return
+		}
+		defer release()
 		s.mu.Lock()
-		if len(s.conns) >= s.cfg.MaxConnections {
+		if len(s.conns)+s.pending >= s.cfg.MaxConnections {
 			s.mu.Unlock()
 			http.Error(w, "too many connections", http.StatusServiceUnavailable)
 			return
 		}
+		s.pending++
 		s.mu.Unlock()
 		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{OriginPatterns: s.cfg.OriginPatterns})
+		s.mu.Lock()
+		s.pending--
 		if err != nil {
+			s.mu.Unlock()
 			return
 		}
 		conn.SetReadLimit(s.cfg.MaxMessageSize)
-		s.mu.Lock()
 		s.conns[conn] = struct{}{}
 		s.mu.Unlock()
 		defer func() {

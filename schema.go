@@ -18,14 +18,14 @@ type SchemaRegistry interface {
 }
 
 type SchemaDefinition struct {
-	Name         string   `json:"name"`
-	Version      string   `json:"version"`
-	ContentType  string   `json:"content_type"`
-	Required     []string `json:"required,omitempty"`
-	AllowUnknown bool     `json:"allow_unknown"`
-	CompatibleWith string `json:"compatible_with,omitempty"` // previous version this is compatible with
-	Deprecated   bool     `json:"deprecated,omitempty"`
-	Description  string   `json:"description,omitempty"`
+	Name           string   `json:"name"`
+	Version        string   `json:"version"`
+	ContentType    string   `json:"content_type"`
+	Required       []string `json:"required,omitempty"`
+	AllowUnknown   bool     `json:"allow_unknown"`
+	CompatibleWith string   `json:"compatible_with,omitempty"` // previous version this is compatible with
+	Deprecated     bool     `json:"deprecated,omitempty"`
+	Description    string   `json:"description,omitempty"`
 }
 
 // SchemaCompatibility represents the compatibility level between two schema versions.
@@ -39,13 +39,13 @@ const (
 
 // VersionedSchema stores a schema version and its metadata.
 type VersionedSchema struct {
-	Definition  SchemaDefinition    `json:"definition"`
-	RegisteredAt time.Time         `json:"registered_at"`
+	Definition   SchemaDefinition `json:"definition"`
+	RegisteredAt time.Time        `json:"registered_at"`
 }
 
 type MemorySchemaRegistry struct {
-	mu      sync.RWMutex
-	schemas map[string]SchemaDefinition
+	mu       sync.RWMutex
+	schemas  map[string]SchemaDefinition
 	versions map[string][]SchemaDefinition // name -> ordered versions
 }
 

@@ -19,6 +19,8 @@ type WebSocketConfig struct {
 	MaxConnections int
 	// HeartbeatInterval is the ping/pong interval. Default: 30s.
 	HeartbeatInterval time.Duration
+	ACL               *ACL
+	InsecureDev       bool
 }
 
 // WebSocketServer provides the legacy SSE transport for the broker data plane.
@@ -37,6 +39,7 @@ type wsClient struct {
 	send      chan []byte
 	closed    chan struct{}
 	closeOnce sync.Once
+	principal AdminPrincipal
 }
 
 // NewWebSocketServer creates a new WebSocket server.
@@ -77,17 +80,38 @@ func (ws *WebSocketServer) Handler() http.Handler {
 }
 
 func (ws *WebSocketServer) handleUpgrade(w http.ResponseWriter, r *http.Request) {
-	// Check authentication if token is configured
-	if ws.token != "" {
-		token := r.Header.Get("Authorization")
-		if len(token) > 7 && token[:7] == "Bearer " {
-			token = token[7:]
+	principal := AdminPrincipal{Name: "development", Permissions: []string{PermissionAdminAll}}
+	authenticated := ws.cfg.InsecureDev
+	if !authenticated && ws.cfg.ACL != nil {
+		if r.TLS != nil && len(r.TLS.VerifiedChains) > 0 && len(r.TLS.VerifiedChains[0]) > 0 {
+			principal, authenticated = ws.cfg.ACL.AuthenticateCertificate(r.TLS.VerifiedChains[0][0])
 		}
-		if token != ws.token {
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
+		if !authenticated {
+			principal, authenticated = ws.cfg.ACL.Authenticate(bearerToken(r))
+		}
+	}
+	if !authenticated && ws.token != "" && constantTimeEqual(bearerToken(r), ws.token) {
+		principal = AdminPrincipal{Name: "legacy-token", Permissions: []string{PermissionNotification}}
+		authenticated = true
+	}
+	if !authenticated {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	if ws.cfg.ACL != nil && !ws.cfg.InsecureDev && !ws.cfg.ACL.Authorize(principal, PermissionNotification) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	release := func() {}
+	if ws.cfg.ACL != nil {
+		var err error
+		release, err = ws.cfg.ACL.Admit(principal)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusTooManyRequests)
 			return
 		}
 	}
+	defer release()
 	ws.mu.RLock()
 	count := len(ws.clients)
 	ws.mu.RUnlock()
@@ -106,7 +130,7 @@ func (ws *WebSocketServer) handleUpgrade(w http.ResponseWriter, r *http.Request)
 	w.Header().Set("X-Accel-Buffering", "no")
 
 	clientID := fmt.Sprintf("ws-%d", time.Now().UnixNano())
-	client := &wsClient{id: clientID, send: make(chan []byte, 256), closed: make(chan struct{})}
+	client := &wsClient{id: clientID, send: make(chan []byte, 256), closed: make(chan struct{}), principal: principal}
 	ws.mu.Lock()
 	ws.clients[clientID] = client
 	ws.mu.Unlock()
@@ -220,10 +244,29 @@ func (ws *WebSocketServer) Broadcast(msgType string, data any) {
 	payload, _ := json.Marshal(resp)
 	event := fmt.Sprintf("event: %s\ndata: %s\n\n", msgType, payload)
 	for _, c := range clients {
+		if !broadcastAllowed(c.principal, data) {
+			continue
+		}
 		select {
 		case c.send <- []byte(event):
 		default:
 		}
+	}
+}
+
+func broadcastAllowed(principal AdminPrincipal, data any) bool {
+	ctx := context.WithValue(context.Background(), adminPrincipalKey{}, principal)
+	switch value := data.(type) {
+	case Notification:
+		return tenantAllowed(ctx, value.TenantID)
+	case Message:
+		return tenantAllowed(ctx, value.TenantID)
+	case TaskInfo:
+		return tenantAllowed(ctx, value.TenantID)
+	case SagaInstance:
+		return tenantAllowed(ctx, value.TenantID)
+	default:
+		return !hasRestrictedTenantScope(ctx)
 	}
 }
 

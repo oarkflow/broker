@@ -1,0 +1,9 @@
+.git
+.github
+.broker-data
+benchmark-results
+coverage*
+*.prof
+*.test
+*.log
+examples/pipeline_consumer

@@ -3,6 +3,7 @@ package broker
 import (
 	"bufio"
 	"encoding/binary"
+	"fmt"
 	"os"
 	"sync"
 )
@@ -18,6 +19,7 @@ type groupCommitWriter struct {
 	writeCh  chan *groupCommitReq
 	doneCh   chan struct{}
 	closeErr error
+	faultErr error
 }
 
 type groupCommitReq struct {
@@ -59,8 +61,13 @@ func (w *groupCommitWriter) run() {
 				break drain
 			}
 		}
-		var writeErr error
+		w.closeMu.RLock()
+		writeErr := w.faultErr
+		w.closeMu.RUnlock()
 		for _, item := range batch {
+			if writeErr != nil {
+				break
+			}
 			if item.prefixN > 0 {
 				if _, err := w.buf.Write(item.prefix[:item.prefixN]); err != nil {
 					writeErr = err
@@ -78,22 +85,41 @@ func (w *groupCommitWriter) run() {
 		if writeErr == nil {
 			writeErr = w.file.Sync()
 		}
+		if writeErr != nil {
+			w.closeMu.Lock()
+			if w.faultErr == nil {
+				w.faultErr = fmt.Errorf("%w: WAL group commit failed: %v", ErrStorageUnavailable, writeErr)
+			}
+			writeErr = w.faultErr
+			w.closeMu.Unlock()
+		}
 		for _, item := range batch {
 			item.done <- writeErr
 		}
 	}
-	if err := w.buf.Flush(); err != nil {
-		w.closeErr = err
-	}
-	if w.closeErr == nil {
-		w.closeErr = w.file.Sync()
+	w.closeMu.RLock()
+	faultErr := w.faultErr
+	w.closeMu.RUnlock()
+	if faultErr != nil {
+		w.closeErr = faultErr
+	} else {
+		if err := w.buf.Flush(); err != nil {
+			w.closeErr = err
+		}
+		if w.closeErr == nil {
+			w.closeErr = w.file.Sync()
+		}
 	}
 }
 
 func (w *groupCommitWriter) write(data []byte) error {
 	w.closeMu.RLock()
-	if w.closed {
+	if w.closed || w.faultErr != nil {
+		err := w.faultErr
 		w.closeMu.RUnlock()
+		if err != nil {
+			return err
+		}
 		return ErrClosed
 	}
 	req := groupCommitReqPool.Get().(*groupCommitReq)
@@ -112,8 +138,12 @@ func (w *groupCommitWriter) write(data []byte) error {
 // slice on every durable mutation.
 func (w *groupCommitWriter) writeUvarintPrefixed(data []byte) error {
 	w.closeMu.RLock()
-	if w.closed {
+	if w.closed || w.faultErr != nil {
+		err := w.faultErr
 		w.closeMu.RUnlock()
+		if err != nil {
+			return err
+		}
 		return ErrClosed
 	}
 	req := groupCommitReqPool.Get().(*groupCommitReq)
@@ -137,4 +167,16 @@ func (w *groupCommitWriter) close() error {
 	w.closeMu.Unlock()
 	<-w.doneCh
 	return w.closeErr
+}
+
+func (w *groupCommitWriter) healthError() error {
+	w.closeMu.RLock()
+	defer w.closeMu.RUnlock()
+	if w.faultErr != nil {
+		return w.faultErr
+	}
+	if w.closed {
+		return ErrClosed
+	}
+	return nil
 }

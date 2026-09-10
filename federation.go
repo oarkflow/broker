@@ -33,10 +33,10 @@ type FederationConfig struct {
 
 // FederationFilter filters messages during federation.
 type FederationFilter struct {
-	Types   []string          `json:"types,omitempty"`
-	Tenants []string          `json:"tenants,omitempty"`
-	Headers map[string]string `json:"headers,omitempty"`
-	MinPriority int           `json:"min_priority,omitempty"`
+	Types       []string          `json:"types,omitempty"`
+	Tenants     []string          `json:"tenants,omitempty"`
+	Headers     map[string]string `json:"headers,omitempty"`
+	MinPriority int               `json:"min_priority,omitempty"`
 }
 
 // FederationTransform transforms messages during federation.
@@ -189,9 +189,9 @@ func (fm *FederationManager) federateOnce(link *FederationLink) error {
 			)
 			if err != nil {
 				_ = fm.broker.Store().Nack(ctx, NackRequest{
-					MessageID:  msg.ID,
-					Queue:      queue,
-					Action:     NackRetry,
+					MessageID:        msg.ID,
+					Queue:            queue,
+					Action:           NackRetry,
 					IncrementAttempt: true,
 				})
 				link.Errors++
@@ -282,10 +282,10 @@ type ShovelConfig struct {
 
 // ShovelManager manages shovels.
 type ShovelManager struct {
-	broker   *Broker
-	shovels  map[string]*shovelState
-	mu       sync.RWMutex
-	wg       sync.WaitGroup
+	broker  *Broker
+	shovels map[string]*shovelState
+	mu      sync.RWMutex
+	wg      sync.WaitGroup
 }
 
 type shovelState struct {
@@ -369,9 +369,9 @@ func (sm *ShovelManager) runShovel(s *shovelState) {
 			)
 			if err != nil {
 				_ = sm.broker.Store().Nack(ctx, NackRequest{
-					MessageID:  msg.ID,
-					Queue:      s.cfg.Source,
-					Action:     NackRetry,
+					MessageID:        msg.ID,
+					Queue:            s.cfg.Source,
+					Action:           NackRetry,
 					IncrementAttempt: true,
 				})
 				continue

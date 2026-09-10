@@ -20,25 +20,25 @@ type OpsConfig struct {
 }
 
 type StatsResponse struct {
-	State        BrokerState      `json:"state"`
-	StoreStats   StoreStats       `json:"store_stats"`
-	Goroutines   int              `json:"goroutines"`
-	Memory       runtime.MemStats `json:"memory"`
-	Uptime       string           `json:"uptime"`
-	StartedAt    time.Time        `json:"started_at"`
-	LastGCDuration string         `json:"last_gc_duration"`
-	NumGC        uint32           `json:"num_gc"`
-	PauseTotal   string           `json:"pause_total"`
+	State          BrokerState      `json:"state"`
+	StoreStats     StoreStats       `json:"store_stats"`
+	Goroutines     int              `json:"goroutines"`
+	Memory         runtime.MemStats `json:"memory"`
+	Uptime         string           `json:"uptime"`
+	StartedAt      time.Time        `json:"started_at"`
+	LastGCDuration string           `json:"last_gc_duration"`
+	NumGC          uint32           `json:"num_gc"`
+	PauseTotal     string           `json:"pause_total"`
 }
 
 type RaftStateResponse struct {
-	State       string   `json:"state"`
-	Term        uint64   `json:"term"`
-	CommitIndex uint64   `json:"commit_index"`
-	AppliedIndex uint64  `json:"applied_index"`
-	IsLeader    bool     `json:"is_leader"`
-	Leader      string   `json:"leader"`
-	Peers       []string `json:"peers"`
+	State        string   `json:"state"`
+	Term         uint64   `json:"term"`
+	CommitIndex  uint64   `json:"commit_index"`
+	AppliedIndex uint64   `json:"applied_index"`
+	IsLeader     bool     `json:"is_leader"`
+	Leader       string   `json:"leader"`
+	Peers        []string `json:"peers"`
 }
 
 func NewOpsServer(cfg OpsConfig) *OpsServer {
@@ -83,7 +83,7 @@ func (s *OpsServer) handleHealthz(w http.ResponseWriter, r *http.Request) {
 
 func (s *OpsServer) handleReadyz(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	if s.broker.State() == BrokerRunning {
+	if s.broker.State() == BrokerRunning && s.broker.checkStore(r.Context()).Status != "fail" {
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 	} else {
@@ -108,13 +108,13 @@ func (s *OpsServer) handleStats(w http.ResponseWriter, r *http.Request) {
 	runtime.ReadMemStats(&mem)
 
 	resp := StatsResponse{
-		State:         s.broker.State(),
-		StoreStats:    storeStats,
-		Goroutines:    runtime.NumGoroutine(),
-		Memory:        mem,
-		Uptime:        time.Since(s.broker.startedAt).String(),
-		StartedAt:     s.broker.startedAt,
-		NumGC:         mem.NumGC,
+		State:      s.broker.State(),
+		StoreStats: storeStats,
+		Goroutines: runtime.NumGoroutine(),
+		Memory:     mem,
+		Uptime:     time.Since(s.broker.startedAt).String(),
+		StartedAt:  s.broker.startedAt,
+		NumGC:      mem.NumGC,
 	}
 	if mem.NumGC > 0 {
 		resp.LastGCDuration = time.Duration(mem.PauseNs[(mem.NumGC-1)%256]).String()

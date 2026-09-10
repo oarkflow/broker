@@ -10,9 +10,9 @@ import (
 type SplitBrainDetector struct {
 	mu sync.RWMutex
 
-	cluster    *Cluster
+	cluster       *Cluster
 	checkInterval time.Duration
-	quorumSize int
+	quorumSize    int
 
 	// State
 	lastCheck    time.Time
@@ -27,11 +27,11 @@ type SplitBrainDetector struct {
 
 // Partition represents a network partition.
 type Partition struct {
-	ID        string    `json:"id"`
-	Nodes     []string  `json:"nodes"`
-	StartTime time.Time `json:"start_time"`
+	ID        string     `json:"id"`
+	Nodes     []string   `json:"nodes"`
+	StartTime time.Time  `json:"start_time"`
 	EndTime   *time.Time `json:"end_time,omitempty"`
-	Resolved  bool      `json:"resolved"`
+	Resolved  bool       `json:"resolved"`
 }
 
 // SplitBrainConfig holds configuration for split-brain detection.

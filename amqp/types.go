@@ -13,7 +13,7 @@ const (
 	FrameBody      = 3
 	FrameHeartbeat = 8
 
-FrameEnd = 0xCE
+	FrameEnd = 0xCE
 
 	// Default port for AMQP connections.
 	DefaultPort = 5672
@@ -37,7 +37,7 @@ FrameEnd = 0xCE
 	ExchangeHeaders = "headers"
 
 	// Delivery modes.
-	DeliveryModeTransient = 1
+	DeliveryModeTransient  = 1
 	DeliveryModePersistent = 2
 
 	// Message properties flags (bitmask).
@@ -50,7 +50,7 @@ FrameEnd = 0xCE
 	PropReplyTo         = 0x0200
 	PropExpiration      = 0x0100
 	PropMessageID       = 0x0080
-	PropTimestamp        = 0x0040
+	PropTimestamp       = 0x0040
 	PropType            = 0x0020
 	PropUserID          = 0x0010
 	PropAppID           = 0x0008
@@ -71,54 +71,54 @@ const (
 
 // Connection method IDs.
 const (
-	MethodConnectionStart    = 10
-	MethodConnectionStartOk  = 11
-	MethodConnectionTune     = 30
-	MethodConnectionTuneOk   = 31
-	MethodConnectionOpen     = 40
-	MethodConnectionOpenOk   = 41
-	MethodConnectionClose    = 50
-	MethodConnectionCloseOk  = 51
-	MethodConnectionBlocked  = 60
+	MethodConnectionStart     = 10
+	MethodConnectionStartOk   = 11
+	MethodConnectionTune      = 30
+	MethodConnectionTuneOk    = 31
+	MethodConnectionOpen      = 40
+	MethodConnectionOpenOk    = 41
+	MethodConnectionClose     = 50
+	MethodConnectionCloseOk   = 51
+	MethodConnectionBlocked   = 60
 	MethodConnectionUnblocked = 61
 )
 
 // Channel method IDs.
 const (
-	MethodChannelOpen      = 10
-	MethodChannelOpenOk    = 11
-	MethodChannelFlow      = 20
-	MethodChannelFlowOk    = 21
-	MethodChannelClose     = 40
-	MethodChannelCloseOk   = 41
-	MethodChannelReturn    = 50
-	MethodChannelAck       = 60
+	MethodChannelOpen    = 10
+	MethodChannelOpenOk  = 11
+	MethodChannelFlow    = 20
+	MethodChannelFlowOk  = 21
+	MethodChannelClose   = 40
+	MethodChannelCloseOk = 41
+	MethodChannelReturn  = 50
+	MethodChannelAck     = 60
 )
 
 // Exchange method IDs.
 const (
-	MethodExchangeDeclare    = 10
-	MethodExchangeDeclareOk  = 11
-	MethodExchangeDelete     = 20
-	MethodExchangeDeleteOk   = 21
-	MethodExchangeBind       = 30
-	MethodExchangeBindOk     = 31
-	MethodExchangeUnbind     = 40
-	MethodExchangeUnbindOk   = 41
+	MethodExchangeDeclare   = 10
+	MethodExchangeDeclareOk = 11
+	MethodExchangeDelete    = 20
+	MethodExchangeDeleteOk  = 21
+	MethodExchangeBind      = 30
+	MethodExchangeBindOk    = 31
+	MethodExchangeUnbind    = 40
+	MethodExchangeUnbindOk  = 41
 )
 
 // Queue method IDs.
 const (
-	MethodQueueDeclare      = 10
-	MethodQueueDeclareOk    = 11
-	MethodQueueBind         = 20
-	MethodQueueBindOk       = 21
-	MethodQueueUnbind       = 30
-	MethodQueueUnbindOk     = 31
-	MethodQueuePurge        = 40
-	MethodQueuePurgeOk      = 41
-	MethodQueueDelete       = 50
-	MethodQueueDeleteOk     = 51
+	MethodQueueDeclare   = 10
+	MethodQueueDeclareOk = 11
+	MethodQueueBind      = 20
+	MethodQueueBindOk    = 21
+	MethodQueueUnbind    = 30
+	MethodQueueUnbindOk  = 31
+	MethodQueuePurge     = 40
+	MethodQueuePurgeOk   = 41
+	MethodQueueDelete    = 50
+	MethodQueueDeleteOk  = 51
 )
 
 // Basic method IDs.
@@ -145,42 +145,42 @@ const (
 
 // Confirm method IDs.
 const (
-	MethodConfirmSelect    = 10
-	MethodConfirmSelectOk  = 11
+	MethodConfirmSelect   = 10
+	MethodConfirmSelectOk = 11
 )
 
 // Transaction method IDs.
 const (
-	MethodTxSelect    = 10
-	MethodTxSelectOk  = 11
-	MethodTxCommit    = 20
-	MethodTxCommitOk  = 21
-	MethodTxRollback    = 30
-	MethodTxRollbackOk  = 31
+	MethodTxSelect     = 10
+	MethodTxSelectOk   = 11
+	MethodTxCommit     = 20
+	MethodTxCommitOk   = 21
+	MethodTxRollback   = 30
+	MethodTxRollbackOk = 31
 )
 
 // Reply codes.
 const (
-	ReplySuccess        = 200
-	ReplyContentTooLarge = 311
-	ReplyNoRoute        = 312
-	ReplyNoConsumers    = 313
-	ReplyAccessRefused  = 403
-	ReplyNotFound       = 404
-	ReplyResourceLocked = 405
+	ReplySuccess            = 200
+	ReplyContentTooLarge    = 311
+	ReplyNoRoute            = 312
+	ReplyNoConsumers        = 313
+	ReplyAccessRefused      = 403
+	ReplyNotFound           = 404
+	ReplyResourceLocked     = 405
 	ReplyPreconditionFailed = 406
-	ReplyChannelError    = 504
-	ReplyUnexpectedFrame = 505
-	ReplySyntaxError     = 502
-	ReplyCommandInvalid  = 503
-	ReplyInternalError   = 541
+	ReplyChannelError       = 504
+	ReplyUnexpectedFrame    = 505
+	ReplySyntaxError        = 502
+	ReplyCommandInvalid     = 503
+	ReplyInternalError      = 541
 )
 
 // Frame represents an AMQP frame.
 type Frame struct {
-	Type       uint8
-	ChannelID  uint16
-	Payload    []byte
+	Type      uint8
+	ChannelID uint16
+	Payload   []byte
 }
 
 // MethodFrame represents an AMQP method frame.
@@ -192,17 +192,17 @@ type MethodFrame struct {
 
 // HeaderFrame represents an AMQP content header frame.
 type HeaderFrame struct {
-	ClassID     uint16
-	BodySize    uint64
+	ClassID       uint16
+	BodySize      uint64
 	PropertyFlags uint16
-	PropertyBuf []byte
+	PropertyBuf   []byte
 }
 
 // Content carries a full AMQP message (method + header + body).
 type Content struct {
-	Method       *MethodFrame
-	Header       *HeaderFrame
-	Body         []byte
+	Method *MethodFrame
+	Header *HeaderFrame
+	Body   []byte
 }
 
 // PropertyFlags returns a bitmask of which properties are set.

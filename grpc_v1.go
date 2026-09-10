@@ -13,6 +13,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 )
 
@@ -95,6 +96,12 @@ func (s *GRPCV1Server) Stop(ctx context.Context) error {
 func (s *GRPCV1Server) authorizeUnary(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
 	principal := AdminPrincipal{Name: "development", Permissions: []string{PermissionAdminAll}}
 	if !s.cfg.InsecureDev {
+		var ok bool
+		if remote, exists := peer.FromContext(ctx); exists {
+			if tlsInfo, isTLS := remote.AuthInfo.(credentials.TLSInfo); isTLS && len(tlsInfo.State.VerifiedChains) > 0 && len(tlsInfo.State.VerifiedChains[0]) > 0 {
+				principal, ok = s.cfg.ACL.AuthenticateCertificate(tlsInfo.State.VerifiedChains[0][0])
+			}
+		}
 		values := metadata.ValueFromIncomingContext(ctx, "authorization")
 		raw := ""
 		if len(values) > 0 {
@@ -103,8 +110,9 @@ func (s *GRPCV1Server) authorizeUnary(ctx context.Context, req any, info *grpc.U
 				raw = strings.TrimSpace(raw[7:])
 			}
 		}
-		var ok bool
-		principal, ok = s.cfg.ACL.Authenticate(raw)
+		if !ok {
+			principal, ok = s.cfg.ACL.Authenticate(raw)
+		}
 		if !ok {
 			return nil, status.Error(codes.Unauthenticated, "invalid credential")
 		}
@@ -112,6 +120,11 @@ func (s *GRPCV1Server) authorizeUnary(ctx context.Context, req any, info *grpc.U
 		if !s.cfg.ACL.Authorize(principal, permission) {
 			return nil, status.Error(codes.PermissionDenied, "credential lacks required permission")
 		}
+		release, err := s.cfg.ACL.Admit(principal)
+		if err != nil {
+			return nil, status.Error(codes.ResourceExhausted, err.Error())
+		}
+		defer release()
 	}
 	return handler(context.WithValue(ctx, adminPrincipalKey{}, principal), req)
 }

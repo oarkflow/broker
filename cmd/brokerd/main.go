@@ -277,9 +277,13 @@ func main() {
 	var sse *broker.SSEServer
 	var sseHTTP *http.Server
 	if *sseAddr != "" {
-		sse = broker.NewSSEServer(b, broker.SSEConfig{Path: *ssePath})
+		sse = broker.NewSSEServer(b, broker.SSEConfig{Path: *ssePath, ACL: admin.ACL, InsecureDev: *insecureDev})
 		sse.SetToken(*token)
-		sseHTTP = &http.Server{Addr: *sseAddr, Handler: sse.Handler(), ReadHeaderTimeout: 5 * time.Second}
+		sseTLS, tlsErr := listenerTLSConfig(*tlsCert, *tlsKey, *clientCA, *requireClientCert)
+		if tlsErr != nil {
+			logger.Log.Fatal("configure SSE TLS", zlog.Err(tlsErr))
+		}
+		sseHTTP = &http.Server{Addr: *sseAddr, Handler: sse.Handler(), ReadHeaderTimeout: 5 * time.Second, TLSConfig: sseTLS}
 		go func() {
 			if *tlsCert != "" {
 				serverErr <- listenerFailure{"sse", sseHTTP.ListenAndServeTLS(*tlsCert, *tlsKey)}
@@ -292,7 +296,11 @@ func main() {
 	var webSocketHTTP *http.Server
 	if *webSocketAddr != "" {
 		webSocket = broker.NewRFC6455Server(b, broker.RFC6455Config{Path: *webSocketPath, ACL: admin.ACL, InsecureDev: *insecureDev, MaxMessageSize: *maxBody})
-		webSocketHTTP = &http.Server{Addr: *webSocketAddr, Handler: webSocket.Handler(), ReadHeaderTimeout: 5 * time.Second}
+		webSocketTLS, tlsErr := listenerTLSConfig(*tlsCert, *tlsKey, *clientCA, *requireClientCert)
+		if tlsErr != nil {
+			logger.Log.Fatal("configure WebSocket TLS", zlog.Err(tlsErr))
+		}
+		webSocketHTTP = &http.Server{Addr: *webSocketAddr, Handler: webSocket.Handler(), ReadHeaderTimeout: 5 * time.Second, TLSConfig: webSocketTLS}
 		go func() {
 			if *tlsCert != "" {
 				serverErr <- listenerFailure{"websocket", webSocketHTTP.ListenAndServeTLS(*tlsCert, *tlsKey)}

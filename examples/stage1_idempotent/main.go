@@ -19,8 +19,8 @@ func main() {
 	ctx := context.Background()
 
 	b := broker.MustNew(broker.Config{
-		Name:             "idempotent-example",
-		DefaultQueue:     "orders",
+		Name:              "idempotent-example",
+		DefaultQueue:      "orders",
 		DefaultVisibility: 30 * time.Second,
 	})
 	if err := b.Start(ctx); err != nil {

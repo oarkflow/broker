@@ -45,6 +45,7 @@ func main() {
 		Path:              "/ws",
 		MaxConnections:    100,
 		HeartbeatInterval: 30 * time.Second,
+		InsecureDev:       true,
 	})
 
 	mux := http.NewServeMux()

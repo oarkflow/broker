@@ -55,27 +55,27 @@ func (r *RoutingRule) Matches(msg Message) bool {
 
 // RoutingPlan defines a complete routing configuration for a queue or topic.
 type RoutingPlan struct {
-	Name          string          `json:"name"`
-	Queue         string          `json:"queue,omitempty"`
-	Topic         string          `json:"topic,omitempty"`
-	Strategy      StrategyType    `json:"strategy"`
-	Fallback      StrategyType    `json:"fallback,omitempty"`
-	Weight        int             `json:"weight,omitempty"`
-	HashKey       string          `json:"hash_key,omitempty"`
-	StickyKey     string          `json:"sticky_key,omitempty"`
-	Capabilities  []string        `json:"capabilities,omitempty"`
-	PriorityThreshold int         `json:"priority_threshold,omitempty"`
-	Rules         []RoutingRule   `json:"rules,omitempty"`
-	Enabled       bool            `json:"enabled"`
-	UpdatedAt     time.Time       `json:"updated_at"`
+	Name              string        `json:"name"`
+	Queue             string        `json:"queue,omitempty"`
+	Topic             string        `json:"topic,omitempty"`
+	Strategy          StrategyType  `json:"strategy"`
+	Fallback          StrategyType  `json:"fallback,omitempty"`
+	Weight            int           `json:"weight,omitempty"`
+	HashKey           string        `json:"hash_key,omitempty"`
+	StickyKey         string        `json:"sticky_key,omitempty"`
+	Capabilities      []string      `json:"capabilities,omitempty"`
+	PriorityThreshold int           `json:"priority_threshold,omitempty"`
+	Rules             []RoutingRule `json:"rules,omitempty"`
+	Enabled           bool          `json:"enabled"`
+	UpdatedAt         time.Time     `json:"updated_at"`
 }
 
 // RoutingConfig is the top-level configuration for the task routing system.
 type RoutingConfig struct {
-	Plans          []RoutingPlan     `json:"plans,omitempty"`
-	DefaultStrategy StrategyType     `json:"default_strategy"`
-	GlobalHashKey  string            `json:"global_hash_key,omitempty"`
-	Metadata       map[string]string `json:"metadata,omitempty"`
+	Plans           []RoutingPlan     `json:"plans,omitempty"`
+	DefaultStrategy StrategyType      `json:"default_strategy"`
+	GlobalHashKey   string            `json:"global_hash_key,omitempty"`
+	Metadata        map[string]string `json:"metadata,omitempty"`
 }
 
 // DefaultRoutingConfig returns a RoutingConfig with sensible defaults.
@@ -88,15 +88,15 @@ func DefaultRoutingConfig() RoutingConfig {
 
 // RoutingConfigLoader handles loading and parsing routing configurations.
 type RoutingConfigLoader struct {
-	mu      sync.RWMutex
-	config  RoutingConfig
+	mu       sync.RWMutex
+	config   RoutingConfig
 	registry *StrategyRegistry
 }
 
 // NewRoutingConfigLoader creates a new config loader with default strategies registered.
 func NewRoutingConfigLoader() *RoutingConfigLoader {
 	loader := &RoutingConfigLoader{
-		config:  DefaultRoutingConfig(),
+		config:   DefaultRoutingConfig(),
 		registry: NewStrategyRegistry(),
 	}
 	loader.registerDefaults()
@@ -259,12 +259,12 @@ func (l *RoutingConfigLoader) cloneConfig() RoutingConfig {
 // This struct can be populated from BCL decision tables or from standard
 // JSON/YAML config files.
 type BCLRoutingConfig struct {
-	Version     string                   `json:"version"`
-	Description string                   `json:"description,omitempty"`
+	Version     string                  `json:"version"`
+	Description string                  `json:"description,omitempty"`
 	Strategies  []BCLStrategyDefinition `json:"strategies"`
 	Rules       []BCLRuleDefinition     `json:"rules"`
 	Plans       []BCLPlanDefinition     `json:"plans"`
-	Policies    []BCLPolicyDefinition    `json:"policies,omitempty"`
+	Policies    []BCLPolicyDefinition   `json:"policies,omitempty"`
 }
 
 type BCLStrategyDefinition struct {
@@ -275,11 +275,11 @@ type BCLStrategyDefinition struct {
 }
 
 type BCLRuleDefinition struct {
-	Name       string         `json:"name"`
-	Priority   int            `json:"priority"`
-	When       []BCLCondition `json:"when"`
-	Then       BCLAction      `json:"then"`
-	Enabled    bool           `json:"enabled"`
+	Name     string         `json:"name"`
+	Priority int            `json:"priority"`
+	When     []BCLCondition `json:"when"`
+	Then     BCLAction      `json:"then"`
+	Enabled  bool           `json:"enabled"`
 }
 
 type BCLCondition struct {
@@ -289,24 +289,24 @@ type BCLCondition struct {
 }
 
 type BCLAction struct {
-	Strategy     string   `json:"strategy,omitempty"`
-	Consumers    []string `json:"consumers,omitempty"`
-	Queue        string   `json:"queue,omitempty"`
-	Weight       int      `json:"weight,omitempty"`
+	Strategy  string   `json:"strategy,omitempty"`
+	Consumers []string `json:"consumers,omitempty"`
+	Queue     string   `json:"queue,omitempty"`
+	Weight    int      `json:"weight,omitempty"`
 }
 
 type BCLPlanDefinition struct {
-	Name     string `json:"name"`
-	Queue    string `json:"queue,omitempty"`
-	Topic    string `json:"topic,omitempty"`
-	Strategy string `json:"strategy"`
-	Fallback string `json:"fallback,omitempty"`
+	Name     string   `json:"name"`
+	Queue    string   `json:"queue,omitempty"`
+	Topic    string   `json:"topic,omitempty"`
+	Strategy string   `json:"strategy"`
+	Fallback string   `json:"fallback,omitempty"`
 	Rules    []string `json:"rules,omitempty"`
 }
 
 type BCLPolicyDefinition struct {
-	Name   string `json:"name"`
-	Type   string `json:"type"`
+	Name   string         `json:"name"`
+	Type   string         `json:"type"`
 	Config map[string]any `json:"config,omitempty"`
 }
 

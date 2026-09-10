@@ -12,6 +12,22 @@ middle BWL1 record currently stops recovery; an incomplete tail is truncated.
 BWL1 does not yet provide segment manifests, sparse indexes, atomic snapshots,
 or integrated compaction and is not the target production format.
 
+`broker-wal` provides read-only verification, backup-preserving torn-tail
+repair, decoded newline-delimited JSON export, and import into a new path. An
+import never overwrites an existing WAL and verifies the resulting native WAL
+before reporting success. Middle-record corruption is reported and is never
+silently discarded.
+
+Examples:
+
+```sh
+cd cmd
+go run ./broker-wal -path ../data/broker.wal.fwb
+go run ./broker-wal -path ../data/broker.wal.fwb -repair-tail
+go run ./broker-wal -path ../data/broker.wal.fwb -export-json ../backup.jsonl
+go run ./broker-wal -path ../restored/broker.wal.fwb -import-json ../backup.jsonl
+```
+
 ## BWL2 and BST2
 
 BWL2/BST2 are reserved for the segmented production formats. No implementation

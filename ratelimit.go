@@ -8,13 +8,14 @@ import (
 
 // RateLimiter provides per-key rate limiting using a token bucket algorithm.
 type RateLimiter struct {
-	mu      sync.Mutex
-	buckets map[string]*tokenBucket
-	rate    int           // tokens per second
-	burst   int           // max burst size
-	cleanup time.Duration // how often to clean stale buckets
-	stopCh  chan struct{}
-	wg      sync.WaitGroup
+	mu       sync.Mutex
+	buckets  map[string]*tokenBucket
+	rate     int           // tokens per second
+	burst    int           // max burst size
+	cleanup  time.Duration // how often to clean stale buckets
+	stopCh   chan struct{}
+	stopOnce sync.Once
+	wg       sync.WaitGroup
 }
 
 type tokenBucket struct {
@@ -116,7 +117,7 @@ func (rl *RateLimiter) WaitN(ctx context.Context, key string, n int) error {
 
 // Stop halts the cleanup goroutine.
 func (rl *RateLimiter) Stop() {
-	close(rl.stopCh)
+	rl.stopOnce.Do(func() { close(rl.stopCh) })
 	rl.wg.Wait()
 }
 

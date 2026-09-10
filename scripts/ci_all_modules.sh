@@ -17,6 +17,9 @@ for module in "${modules[@]}"; do
     vet)
       (cd "$repo_dir/$module" && go vet ./...)
       ;;
+    vuln)
+      (cd "$repo_dir/$module" && govulncheck ./...)
+      ;;
     *)
       echo "unknown mode: $mode" >&2
       exit 2

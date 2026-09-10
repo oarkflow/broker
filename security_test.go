@@ -3,6 +3,9 @@ package broker
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -66,6 +69,136 @@ func TestTenantScopedPrincipalCannotCrossTenant(t *testing.T) {
 	readB, err := store.ReadStream(ctxB, StreamReadRequest{Stream: "shared-stream", ConsumerGroup: "workers", Limit: 10})
 	if err != nil || len(readB) != 1 || readB[0].TenantID != "b" {
 		t.Fatalf("tenant stream isolation failed: messages=%+v err=%v", readB, err)
+	}
+}
+
+func TestTenantScopedStatsLagAndNotificationsDoNotLeak(t *testing.T) {
+	ctx := context.Background()
+	ctxA := context.WithValue(ctx, adminPrincipalKey{}, AdminPrincipal{Name: "tenant-a", Tenants: []string{"a"}})
+	ctxB := context.WithValue(ctx, adminPrincipalKey{}, AdminPrincipal{Name: "tenant-b", Tenants: []string{"b"}})
+	store := NewMemoryStore()
+	if err := store.DeclareQueue(ctx, QueueConfig{Name: "shared"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DeclareStream(ctx, StreamConfig{Name: "events"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, msg := range []Message{
+		{ID: "a-1", TenantID: "a"},
+		{ID: "b-1", TenantID: "b"},
+		{ID: "a-2", TenantID: "a"},
+		{ID: "unowned"},
+	} {
+		if _, err := store.Append(ctx, msg, []Destination{{Kind: DestinationQueue, Name: "shared"}, {Kind: DestinationStream, Name: "events"}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.CommitOffset(ctxA, OffsetCommit{Stream: "events", ConsumerGroup: "workers", Offset: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CommitOffset(ctxB, OffsetCommit{Stream: "events", ConsumerGroup: "workers", Offset: 2}); err != nil {
+		t.Fatal(err)
+	}
+	statsA, err := store.Stats(ctxA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if statsA.Messages != 4 || statsA.Queues["shared"] != 2 || statsA.Streams["events"] != 2 {
+		t.Fatalf("tenant A stats leaked or omitted data: %+v", statsA)
+	}
+	if len(statsA.Offsets["events"]) != 1 || statsA.Offsets["events"]["workers"] != 1 {
+		t.Fatalf("tenant A offsets leaked: %+v", statsA.Offsets)
+	}
+	lag, err := store.StreamLagContext(ctxA, "events", "workers", "")
+	if err != nil || lag != 1 {
+		t.Fatalf("tenant A lag=%d err=%v, want one visible message", lag, err)
+	}
+	head, err := store.StreamHeadOffsetContext(ctxA, "events", "")
+	if err != nil || head != 3 {
+		t.Fatalf("tenant A head=%d err=%v", head, err)
+	}
+	history := []Notification{
+		{ID: "a", TenantID: "a"},
+		{ID: "b", TenantID: "b"},
+		{ID: "global"},
+	}
+	visible := visibleNotifications(ctxA, history)
+	if len(visible) != 1 || visible[0].ID != "a" {
+		t.Fatalf("notification metadata leaked: %+v", visible)
+	}
+}
+
+func TestTenantScopedCredentialCannotAccessGlobalRoutes(t *testing.T) {
+	b := MustNew(Config{})
+	server := httptest.NewServer(AdminServer{Broker: b, ACL: NewACL(AdminToken{
+		Name:        "tenant-router",
+		Token:       "tenant-token",
+		Permissions: []string{PermissionRouteRead, PermissionRouteWrite},
+		Tenants:     []string{"a"},
+	})}.Handler())
+	defer server.Close()
+	for _, method := range []string{http.MethodGet, http.MethodPost} {
+		req, err := http.NewRequest(method, server.URL+"/routes", bytes.NewBufferString(`{"name":"private"}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Authorization", "Bearer tenant-token")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusForbidden {
+			t.Fatalf("%s /routes status=%d, want 403", method, resp.StatusCode)
+		}
+	}
+}
+
+func TestTenantScopedTaskAndSagaIsolation(t *testing.T) {
+	ctx := context.Background()
+	ctxA := context.WithValue(ctx, adminPrincipalKey{}, AdminPrincipal{Name: "tenant-a", Tenants: []string{"a"}})
+	ctxB := context.WithValue(ctx, adminPrincipalKey{}, AdminPrincipal{Name: "tenant-b", Tenants: []string{"b"}})
+	b := MustNew(Config{})
+	now := time.Now()
+	b.taskMu.Lock()
+	b.tasks["task-a"] = &TaskInfo{ID: "task-a", TenantID: "a", Status: TaskQueued, CreatedAt: now, UpdatedAt: now}
+	b.taskMu.Unlock()
+	if _, err := (taskHandle{b: b, id: "task-a"}).Info(ctxB); !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("cross-tenant task read error=%v", err)
+	}
+	if _, err := (taskHandle{b: b, id: "task-a"}).Info(ctxA); err != nil {
+		t.Fatalf("own task read failed: %v", err)
+	}
+	created, err := b.SagaEngine().CreateSagaChecked(ctxA, SagaDefinition{Name: "saga-a"})
+	if err != nil || created.TenantID != "a" {
+		t.Fatalf("tenant saga create=%+v err=%v", created, err)
+	}
+	if _, ok := b.SagaEngine().GetSagaContext(ctxB, created.ID); ok {
+		t.Fatal("cross-tenant saga read succeeded")
+	}
+	if err := b.SagaEngine().ExecuteSaga(ctxB, created.ID); !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("cross-tenant saga execute error=%v", err)
+	}
+}
+
+func TestSSESecureDefaultAndTenantBroadcastFilter(t *testing.T) {
+	b := MustNew(Config{})
+	server := httptest.NewServer(NewSSEServer(b, SSEConfig{Path: "/events"}).Handler())
+	defer server.Close()
+	resp, err := http.Get(server.URL + "/events")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("SSE without configured authentication status=%d", resp.StatusCode)
+	}
+	tenantA := AdminPrincipal{Name: "a", Tenants: []string{"a"}}
+	if !broadcastAllowed(tenantA, Notification{TenantID: "a"}) {
+		t.Fatal("own tenant broadcast was rejected")
+	}
+	if broadcastAllowed(tenantA, Notification{TenantID: "b"}) || broadcastAllowed(tenantA, map[string]string{"global": "metadata"}) {
+		t.Fatal("tenant-scoped SSE principal received foreign or global broadcast")
 	}
 }
 
@@ -149,6 +282,55 @@ func TestACLCredentialHashExpiryAndRevocation(t *testing.T) {
 	acl.AddToken(AdminToken{Name: "expired", Token: "old-secret", ExpiresAt: time.Now().Add(-time.Second)})
 	if _, ok := acl.Authenticate("old-secret"); ok {
 		t.Fatal("expired credential authenticated")
+	}
+}
+
+func TestACLCertificateIdentityMapping(t *testing.T) {
+	certificate := &x509.Certificate{Subject: pkix.Name{CommonName: "worker-a"}, DNSNames: []string{"worker.internal"}}
+	acl := NewACL(AdminToken{Name: "mtls-worker", CertificateIdentities: []string{"dns:worker.internal"}, Permissions: []string{PermissionPublish}, Tenants: []string{"a"}})
+	if _, ok := acl.Authenticate(""); ok {
+		t.Fatal("certificate-only ACL entry authenticated an empty bearer token")
+	}
+	principal, ok := acl.AuthenticateCertificate(certificate)
+	if !ok || principal.Name != "mtls-worker" || len(principal.Tenants) != 1 || principal.Tenants[0] != "a" {
+		t.Fatalf("certificate principal=%+v ok=%t", principal, ok)
+	}
+	request := httptest.NewRequest(http.MethodGet, "https://broker/stats", nil)
+	request.TLS = &tls.ConnectionState{VerifiedChains: [][]*x509.Certificate{{certificate}}}
+	server := AdminServer{ACL: acl}
+	if got, ok := server.authenticate(request); !ok || got.Name != "mtls-worker" {
+		t.Fatalf("HTTP certificate mapping principal=%+v ok=%t", got, ok)
+	}
+}
+
+func TestACLPrincipalAdmissionLimits(t *testing.T) {
+	concurrencyACL := NewACL(AdminToken{Name: "limited", Token: "secret", MaxConcurrent: 1})
+	principal, ok := concurrencyACL.Authenticate("secret")
+	if !ok {
+		t.Fatal("principal did not authenticate")
+	}
+	release, err := concurrencyACL.Admit(principal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := concurrencyACL.Admit(principal); !errors.Is(err, ErrThrottled) {
+		t.Fatalf("concurrency admission error=%v", err)
+	}
+	release()
+	if releaseAgain, err := concurrencyACL.Admit(principal); err != nil {
+		t.Fatalf("admission after release failed: %v", err)
+	} else {
+		releaseAgain()
+	}
+	rateACL := NewACL(AdminToken{Name: "rate", Token: "rate-secret", RequestsPerSecond: 1, Burst: 1})
+	ratePrincipal, _ := rateACL.Authenticate("rate-secret")
+	release, err = rateACL.Admit(ratePrincipal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	release()
+	if _, err := rateACL.Admit(ratePrincipal); !errors.Is(err, ErrThrottled) {
+		t.Fatalf("rate admission error=%v", err)
 	}
 }
 

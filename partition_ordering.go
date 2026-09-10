@@ -174,9 +174,9 @@ func (pr *PartitionReassignment) reassignOne(ctx context.Context, rule Reassignm
 		)
 		if err != nil {
 			_ = pr.broker.Store().Nack(ctx, NackRequest{
-				MessageID:  msg.ID,
-				Queue:      rule.SourceTopic,
-				Action:     NackRetry,
+				MessageID:        msg.ID,
+				Queue:            rule.SourceTopic,
+				Action:           NackRetry,
 				IncrementAttempt: true,
 			})
 			continue
@@ -220,9 +220,9 @@ func (b *Broker) PartitionReassignment() *PartitionReassignment {
 
 // TopicPartitionStats returns statistics for a topic's partitions.
 type TopicPartitionStats struct {
-	Topic      string                `json:"topic"`
-	Partitions []PartitionInfo      `json:"partitions"`
-	TotalMsgs  int                  `json:"total_messages"`
+	Topic      string          `json:"topic"`
+	Partitions []PartitionInfo `json:"partitions"`
+	TotalMsgs  int             `json:"total_messages"`
 }
 
 type PartitionInfo struct {

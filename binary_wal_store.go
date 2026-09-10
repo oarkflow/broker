@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 )
 
@@ -25,9 +26,17 @@ type BinaryFileWALStore struct {
 	walCodec *WALRecordCodec
 	keyName  string
 	gc       *groupCommitWriter
+	writeMu  sync.Mutex
 }
 
 func (*BinaryFileWALStore) ConfirmationLevel() ConfirmLevel { return ConfirmPersisted }
+
+func (s *BinaryFileWALStore) StoreHealth() error {
+	if s == nil || s.gc == nil {
+		return ErrClosed
+	}
+	return s.gc.healthError()
+}
 
 func NewBinaryFileWALStore(dir string, opts ...BinaryMessageCodecOption) (*BinaryFileWALStore, error) {
 	return NewBinaryFileWALStoreWithCodec(dir, NewBinaryMessageCodec(opts...))
@@ -236,38 +245,34 @@ func (s *BinaryFileWALStore) DeclareStream(ctx context.Context, cfg StreamConfig
 	return s.MemoryStore.DeclareStream(ctx, cfg)
 }
 func (s *BinaryFileWALStore) Append(ctx context.Context, msg Message, dests []Destination) ([]Message, error) {
-	out, err := s.MemoryStore.Append(ctx, msg, dests)
-	if err != nil {
-		return nil, err
-	}
-	if err := s.write(walRecord{Op: "append_atomic", Entries: storedAppendEntries(out)}); err != nil {
-		return out, err
-	}
-	return out, nil
+	return s.durableAppend(ctx, []AppendEntry{{Message: msg, Destinations: dests}})
 }
 func (s *BinaryFileWALStore) AppendAtomic(ctx context.Context, entries []AppendEntry) ([]Message, error) {
-	out, err := s.MemoryStore.AppendAtomic(ctx, entries)
+	return s.durableAppend(ctx, entries)
+}
+func (s *BinaryFileWALStore) AppendAtomicMinimal(ctx context.Context, entries []AppendEntry) error {
+	_, err := s.durableAppend(ctx, entries)
+	return err
+}
+func (s *BinaryFileWALStore) AppendAtomicOwned(ctx context.Context, entries []AppendEntry) error {
+	_, err := s.durableAppend(ctx, entries)
+	return err
+}
+func (s *BinaryFileWALStore) durableAppend(ctx context.Context, entries []AppendEntry) ([]Message, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	out, err := s.MemoryStore.prepareAppendAtomic(ctx, entries)
 	if err != nil {
 		return nil, err
 	}
-	if err := s.write(walRecord{Op: "append_atomic", Entries: storedAppendEntries(out)}); err != nil {
-		return out, err
+	persisted := storedAppendEntries(out)
+	if err := s.write(walRecord{Op: "append_atomic", Entries: persisted}); err != nil {
+		return nil, err
+	}
+	if err := s.MemoryStore.appendRecoveredAtomic(persisted); err != nil {
+		return nil, fmt.Errorf("apply durable append: %w", err)
 	}
 	return out, nil
-}
-func (s *BinaryFileWALStore) AppendAtomicMinimal(ctx context.Context, entries []AppendEntry) error {
-	out, err := s.MemoryStore.AppendAtomic(ctx, entries)
-	if err != nil {
-		return err
-	}
-	return s.write(walRecord{Op: "append_atomic", Entries: storedAppendEntries(out)})
-}
-func (s *BinaryFileWALStore) AppendAtomicOwned(ctx context.Context, entries []AppendEntry) error {
-	out, err := s.MemoryStore.AppendAtomic(ctx, entries)
-	if err != nil {
-		return err
-	}
-	return s.write(walRecord{Op: "append_atomic", Entries: storedAppendEntries(out)})
 }
 func (s *BinaryFileWALStore) Lease(ctx context.Context, req LeaseRequest) ([]Message, error) {
 	msgs, err := s.MemoryStore.Lease(ctx, req)

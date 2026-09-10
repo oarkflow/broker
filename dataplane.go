@@ -51,10 +51,19 @@ func (a AdminServer) dataPlane(w http.ResponseWriter, r *http.Request) {
 	case path == "/request":
 		a.v1Request(w, r)
 	case path == "/consumers" && r.Method == http.MethodGet:
+		if rejectScopedControlPlane(w, r, "global consumer registry") {
+			return
+		}
 		writeBrokerJSON(w, a.Broker.Consumers().List())
 	case path == "/consumers/register":
+		if rejectScopedControlPlane(w, r, "global consumer registry") {
+			return
+		}
 		a.v1ConsumerRegister(w, r)
 	case strings.HasPrefix(path, "/consumers/"):
+		if rejectScopedControlPlane(w, r, "global consumer registry") {
+			return
+		}
 		a.v1Consumer(w, r, strings.TrimPrefix(path, "/consumers/"))
 	case path == "/poll" || path == "/poll/batch":
 		a.v1Poll(w, r)
@@ -86,13 +95,19 @@ func (a AdminServer) dataPlane(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost {
 			a.v1SagaCreate(w, r)
 		} else {
-			writeBrokerJSON(w, a.Broker.SagaEngine().ListSagas())
+			writeBrokerJSON(w, a.Broker.SagaEngine().ListSagasContext(r.Context()))
 		}
 	case strings.HasPrefix(path, "/sagas/"):
 		a.v1Saga(w, r, strings.TrimPrefix(path, "/sagas/"))
 	case path == "/groups":
+		if rejectScopedControlPlane(w, r, "global consumer groups") {
+			return
+		}
 		writeBrokerJSON(w, a.Broker.GroupRebalancer().ListGroups())
 	case strings.HasPrefix(path, "/groups/"):
+		if rejectScopedControlPlane(w, r, "global consumer groups") {
+			return
+		}
 		group := strings.TrimPrefix(path, "/groups/")
 		g := a.Broker.GroupRebalancer().GetGroup(group)
 		if g == nil {
@@ -744,7 +759,7 @@ func (a AdminServer) v1Poll(w http.ResponseWriter, r *http.Request) {
 						a.Broker.startTask(r.Context(), tid)
 					}
 					if a.Broker.cfg.EnableNotifications || a.Broker.cfg.EnableConsumerEventTracking {
-						a.Broker.emitConsumerNotification(req.ConsumerID, Notification{Type: "message.leased", Source: a.Broker.cfg.Name, Severity: SeverityInfo, MessageID: msgs[i].ID, TaskID: firstNonEmpty(msgs[i].TaskID, msgs[i].Headers["x-task-id"]), Topic: msgs[i].Topic, Queue: req.Queue, Consumer: req.ConsumerID, ConsumerGroup: req.ConsumerGroup, Timestamp: time.Now(), Data: map[string]any{"lease_until": msgs[i].LeaseUntil, "attempts": msgs[i].Attempts}})
+						a.Broker.emitConsumerNotification(req.ConsumerID, Notification{Type: "message.leased", Source: a.Broker.cfg.Name, Severity: SeverityInfo, MessageID: msgs[i].ID, TaskID: firstNonEmpty(msgs[i].TaskID, msgs[i].Headers["x-task-id"]), Topic: msgs[i].Topic, Queue: req.Queue, Consumer: req.ConsumerID, ConsumerGroup: req.ConsumerGroup, TenantID: msgs[i].TenantID, Timestamp: time.Now(), Data: map[string]any{"lease_until": msgs[i].LeaseUntil, "attempts": msgs[i].Attempts}})
 					}
 				}
 			}
@@ -787,7 +802,7 @@ func (a AdminServer) v1Message(w http.ResponseWriter, r *http.Request, tail stri
 		a.Broker.Consumers().AddStats(req.ConsumerID, 0, 1, 0, 0, "")
 		if hadMessage {
 			a.Broker.completeTask(r.Context(), m, nil, nil)
-			a.Broker.notify.Publish(Notification{Type: "message.acked", Source: firstNonEmpty(req.ConsumerID, "remote-consumer"), Severity: SeverityInfo, MessageID: id, TaskID: firstNonEmpty(m.TaskID, m.Headers["x-task-id"]), Topic: m.Topic, Queue: firstNonEmpty(req.Queue, m.Queue), Consumer: req.ConsumerID, ConsumerGroup: m.ConsumerGroup, Timestamp: time.Now()})
+			a.Broker.notify.Publish(Notification{Type: "message.acked", Source: firstNonEmpty(req.ConsumerID, "remote-consumer"), Severity: SeverityInfo, MessageID: id, TaskID: firstNonEmpty(m.TaskID, m.Headers["x-task-id"]), Topic: m.Topic, Queue: firstNonEmpty(req.Queue, m.Queue), Consumer: req.ConsumerID, ConsumerGroup: m.ConsumerGroup, TenantID: m.TenantID, Timestamp: time.Now()})
 		} else {
 			a.Broker.notify.Publish(Notification{Type: "message.acked", Source: firstNonEmpty(req.ConsumerID, "remote-consumer"), Severity: SeverityInfo, MessageID: id, Queue: req.Queue, Consumer: req.ConsumerID, Timestamp: time.Now()})
 		}
@@ -828,7 +843,7 @@ func (a AdminServer) v1Message(w http.ResponseWriter, r *http.Request, tail stri
 			}
 		}
 		if hadMessage {
-			a.Broker.notify.Publish(Notification{Type: "message." + op, Source: firstNonEmpty(req.ConsumerID, "remote-consumer"), Severity: SeverityWarn, MessageID: id, TaskID: firstNonEmpty(m.TaskID, m.Headers["x-task-id"]), Topic: m.Topic, Queue: firstNonEmpty(req.Queue, m.Queue), Consumer: req.ConsumerID, ConsumerGroup: m.ConsumerGroup, Timestamp: time.Now(), Data: map[string]any{"action": req.Action, "reason": firstNonEmpty(req.Reason, req.Error)}})
+			a.Broker.notify.Publish(Notification{Type: "message." + op, Source: firstNonEmpty(req.ConsumerID, "remote-consumer"), Severity: SeverityWarn, MessageID: id, TaskID: firstNonEmpty(m.TaskID, m.Headers["x-task-id"]), Topic: m.Topic, Queue: firstNonEmpty(req.Queue, m.Queue), Consumer: req.ConsumerID, ConsumerGroup: m.ConsumerGroup, TenantID: m.TenantID, Timestamp: time.Now(), Data: map[string]any{"action": req.Action, "reason": firstNonEmpty(req.Reason, req.Error)}})
 		}
 		writeBrokerJSON(w, map[string]bool{"ok": true})
 	case "extend":
@@ -840,7 +855,7 @@ func (a AdminServer) v1Message(w http.ResponseWriter, r *http.Request, tail stri
 			http.Error(w, err.Error(), 409)
 			return
 		}
-		a.Broker.notify.Publish(Notification{Type: "message.lease_extended", Source: firstNonEmpty(req.ConsumerID, "remote-consumer"), Severity: SeverityDebug, MessageID: id, TaskID: firstNonEmpty(m.TaskID, m.Headers["x-task-id"]), Topic: m.Topic, Queue: firstNonEmpty(req.Queue, m.Queue), Consumer: req.ConsumerID, ConsumerGroup: m.ConsumerGroup, Timestamp: time.Now(), Data: map[string]any{"extend_by": req.VisibilityTimeout.String()}})
+		a.Broker.notify.Publish(Notification{Type: "message.lease_extended", Source: firstNonEmpty(req.ConsumerID, "remote-consumer"), Severity: SeverityDebug, MessageID: id, TaskID: firstNonEmpty(m.TaskID, m.Headers["x-task-id"]), Topic: m.Topic, Queue: firstNonEmpty(req.Queue, m.Queue), Consumer: req.ConsumerID, ConsumerGroup: m.ConsumerGroup, TenantID: m.TenantID, Timestamp: time.Now(), Data: map[string]any{"extend_by": req.VisibilityTimeout.String()}})
 		writeBrokerJSON(w, map[string]bool{"ok": true})
 	case "progress":
 		var req struct {
@@ -878,7 +893,7 @@ func (a AdminServer) v1Message(w http.ResponseWriter, r *http.Request, tail stri
 		if m.TaskID != "" {
 			a.Broker.updateTaskProgress(r.Context(), m.TaskID, req.Progress)
 		}
-		a.Broker.notify.Publish(Notification{Type: "message.progress", Source: firstNonEmpty(req.ConsumerID, "remote-consumer"), Severity: SeverityInfo, MessageID: id, TaskID: m.TaskID, Topic: m.Topic, Queue: firstNonEmpty(req.Queue, m.Queue), Consumer: req.ConsumerID, ConsumerGroup: m.ConsumerGroup, Timestamp: time.Now(), Data: map[string]any{"percent": req.Progress.Percent, "message": req.Progress.Message}})
+		a.Broker.notify.Publish(Notification{Type: "message.progress", Source: firstNonEmpty(req.ConsumerID, "remote-consumer"), Severity: SeverityInfo, MessageID: id, TaskID: m.TaskID, Topic: m.Topic, Queue: firstNonEmpty(req.Queue, m.Queue), Consumer: req.ConsumerID, ConsumerGroup: m.ConsumerGroup, TenantID: m.TenantID, Timestamp: time.Now(), Data: map[string]any{"percent": req.Progress.Percent, "message": req.Progress.Message}})
 		writeBrokerJSON(w, map[string]bool{"ok": true})
 	case "respond", "complete", "fail":
 		var req struct {
@@ -938,7 +953,7 @@ func (a AdminServer) v1Message(w http.ResponseWriter, r *http.Request, tail stri
 			}
 			severity = SeverityError
 		}
-		a.Broker.notify.Publish(Notification{Type: eventType, Source: firstNonEmpty(req.ConsumerID, "remote-consumer"), Severity: severity, MessageID: id, TaskID: firstNonEmpty(m.TaskID, m.Headers["x-task-id"]), Topic: m.Topic, Queue: firstNonEmpty(req.Queue, m.Queue), Consumer: req.ConsumerID, ConsumerGroup: m.ConsumerGroup, Timestamp: time.Now(), Data: map[string]any{"correlation_id": corr, "delivered": delivered}})
+		a.Broker.notify.Publish(Notification{Type: eventType, Source: firstNonEmpty(req.ConsumerID, "remote-consumer"), Severity: severity, MessageID: id, TaskID: firstNonEmpty(m.TaskID, m.Headers["x-task-id"]), Topic: m.Topic, Queue: firstNonEmpty(req.Queue, m.Queue), Consumer: req.ConsumerID, ConsumerGroup: m.ConsumerGroup, TenantID: m.TenantID, Timestamp: time.Now(), Data: map[string]any{"correlation_id": corr, "delivered": delivered}})
 		writeBrokerJSON(w, map[string]any{"ok": true, "delivered": delivered})
 	default:
 		http.NotFound(w, r)
@@ -1037,7 +1052,11 @@ func (a AdminServer) v1SagaCreate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "saga steps required", 400)
 		return
 	}
-	inst := a.Broker.SagaEngine().CreateSaga(r.Context(), def)
+	inst, err := a.Broker.SagaEngine().CreateSagaChecked(r.Context(), def)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusForbidden)
+		return
+	}
 	if err := a.Broker.SagaEngine().ExecuteSaga(r.Context(), inst.ID); err != nil {
 		http.Error(w, err.Error(), 409)
 		return
@@ -1052,7 +1071,7 @@ func (a AdminServer) v1Saga(w http.ResponseWriter, r *http.Request, tail string)
 		http.NotFound(w, r)
 		return
 	}
-	s, ok := a.Broker.SagaEngine().GetSaga(id)
+	s, ok := a.Broker.SagaEngine().GetSagaContext(r.Context(), id)
 	if !ok {
 		http.NotFound(w, r)
 		return

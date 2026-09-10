@@ -184,6 +184,13 @@ func (a AdminServer) wrap(next http.HandlerFunc) http.HandlerFunc {
 			http.Error(w, "forbidden", http.StatusForbidden)
 			return
 		}
+		release, err := acl.Admit(principal)
+		if err != nil {
+			w.Header().Set("Retry-After", "1")
+			http.Error(w, err.Error(), http.StatusTooManyRequests)
+			return
+		}
+		defer release()
 		rr := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 		ctx := context.WithValue(r.Context(), adminPrincipalKey{}, principal)
 		next(rr, r.WithContext(ctx))
@@ -203,6 +210,11 @@ func (a AdminServer) authenticate(r *http.Request) (AdminPrincipal, bool) {
 		return AdminPrincipal{Name: "insecure-dev", Permissions: []string{PermissionAdminAll}}, true
 	}
 	acl := a.effectiveACL()
+	if r.TLS != nil && len(r.TLS.VerifiedChains) > 0 && len(r.TLS.VerifiedChains[0]) > 0 {
+		if principal, ok := acl.AuthenticateCertificate(r.TLS.VerifiedChains[0][0]); ok {
+			return principal, true
+		}
+	}
 	return acl.Authenticate(bearerToken(r))
 }
 
@@ -231,8 +243,12 @@ func (r *statusRecorder) WriteHeader(code int) {
 }
 func (a AdminServer) health(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte("ok\n")) }
 func (a AdminServer) ready(w http.ResponseWriter, r *http.Request) {
-	if a.Broker == nil || a.Broker.State() == BrokerStopped {
+	if a.Broker == nil || a.Broker.State() != BrokerRunning {
 		http.Error(w, "not ready", 503)
+		return
+	}
+	if check := a.Broker.checkStore(r.Context()); check.Status == "fail" {
+		http.Error(w, "not ready: "+check.Detail, http.StatusServiceUnavailable)
 		return
 	}
 	_, _ = w.Write([]byte("ready\n"))
@@ -242,6 +258,9 @@ func (a AdminServer) stats(w http.ResponseWriter, r *http.Request) {
 	writeBrokerJSON(w, map[string]any{"broker_state": a.Broker.State(), "store": st, "error": errString(err)})
 }
 func (a AdminServer) metrics(w http.ResponseWriter, r *http.Request) {
+	if rejectScopedControlPlane(w, r, "global metrics") {
+		return
+	}
 	if a.Broker.promMetrics == nil {
 		http.Error(w, "prometheus metrics not enabled", 503)
 		return
@@ -265,6 +284,9 @@ func (a AdminServer) lag(w http.ResponseWriter, r *http.Request) {
 	writeBrokerJSON(w, report)
 }
 func (a AdminServer) audit(w http.ResponseWriter, r *http.Request) {
+	if rejectScopedControlPlane(w, r, "global audit history") {
+		return
+	}
 	if a.Broker.auditLogger == nil {
 		writeBrokerJSON(w, []AuditEvent{})
 		return
@@ -689,7 +711,7 @@ func (a AdminServer) move(w http.ResponseWriter, r *http.Request) {
 	writeBrokerJSON(w, res)
 }
 func (a AdminServer) notifications(w http.ResponseWriter, r *http.Request) {
-	writeBrokerJSON(w, a.Broker.notify.History(queryLimit(r, 100)))
+	writeBrokerJSON(w, visibleNotifications(r.Context(), a.Broker.notify.History(queryLimit(r, 100))))
 }
 func (a AdminServer) events(w http.ResponseWriter, r *http.Request) {
 	flusher, ok := w.(http.Flusher)
@@ -703,6 +725,9 @@ func (a AdminServer) events(w http.ResponseWriter, r *http.Request) {
 	id := "sse-" + strconv.FormatInt(time.Now().UnixNano(), 36)
 	ch := make(chan Notification, 128)
 	a.Broker.Notifications().Subscribe(id, CallbackFunc(func(ctx context.Context, n Notification) error {
+		if !tenantAllowed(r.Context(), n.TenantID) {
+			return nil
+		}
 		select {
 		case ch <- n:
 		default:
@@ -711,7 +736,9 @@ func (a AdminServer) events(w http.ResponseWriter, r *http.Request) {
 	}))
 	defer a.Broker.Notifications().Unsubscribe(id)
 	for _, n := range a.Broker.Notifications().History(queryLimit(r, 25)) {
-		writeSSE(w, n)
+		if tenantAllowed(r.Context(), n.TenantID) {
+			writeSSE(w, n)
+		}
 	}
 	flusher.Flush()
 	for {
@@ -725,6 +752,9 @@ func (a AdminServer) events(w http.ResponseWriter, r *http.Request) {
 	}
 }
 func (a AdminServer) routes(w http.ResponseWriter, r *http.Request) {
+	if rejectScopedControlPlane(w, r, "global routes") {
+		return
+	}
 	if r.Method == http.MethodPost {
 		var route Route
 		if json.NewDecoder(r.Body).Decode(&route) != nil {
@@ -736,6 +766,25 @@ func (a AdminServer) routes(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeBrokerJSON(w, a.Broker.router.Routes())
+}
+func rejectScopedControlPlane(w http.ResponseWriter, r *http.Request, resource string) bool {
+	if !hasRestrictedTenantScope(r.Context()) {
+		return false
+	}
+	http.Error(w, "tenant-scoped credentials cannot access "+resource, http.StatusForbidden)
+	return true
+}
+func visibleNotifications(ctx context.Context, history []Notification) []Notification {
+	if !hasRestrictedTenantScope(ctx) {
+		return history
+	}
+	out := make([]Notification, 0, len(history))
+	for _, n := range history {
+		if tenantAllowed(ctx, n.TenantID) {
+			out = append(out, n)
+		}
+	}
+	return out
 }
 func queryLimit(r *http.Request, d int) int {
 	if raw := r.URL.Query().Get("limit"); raw != "" {

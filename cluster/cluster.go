@@ -13,22 +13,22 @@ type Cluster struct {
 	mu sync.RWMutex
 
 	// Node information
-	id      string
-	addr    string
-	raft    *Raft
+	id        string
+	addr      string
+	raft      *Raft
 	transport Transport
 
 	// State
-	state     RaftState
-	leader    string
-	term      uint64
+	state  RaftState
+	leader string
+	term   uint64
 
 	// Node registry
-	nodes     map[string]*NodeInfo
-	nodesMu   sync.RWMutex
+	nodes   map[string]*NodeInfo
+	nodesMu sync.RWMutex
 
 	// Health checking
-	healthTicker *time.Ticker
+	healthTicker  *time.Ticker
 	healthTimeout time.Duration
 
 	// Callbacks
@@ -56,16 +56,16 @@ type NodeInfo struct {
 
 // ClusterConfig holds configuration for the cluster.
 type ClusterConfig struct {
-	ID              string
-	Address         string
-	Peers           []string
-	Transport       Transport
-	StateMachine    StateMachine
-	HealthTimeout   time.Duration
-	OnLeaderChange  func(leader string)
-	OnNodeJoin      func(node *NodeInfo)
-	OnNodeLeave     func(nodeID string)
-	OnNodeFail      func(nodeID string)
+	ID             string
+	Address        string
+	Peers          []string
+	Transport      Transport
+	StateMachine   StateMachine
+	HealthTimeout  time.Duration
+	OnLeaderChange func(leader string)
+	OnNodeJoin     func(node *NodeInfo)
+	OnNodeLeave    func(nodeID string)
+	OnNodeFail     func(nodeID string)
 }
 
 // NewCluster creates a new cluster instance.
@@ -89,12 +89,12 @@ func NewCluster(cfg ClusterConfig) *Cluster {
 
 	// Create Raft instance
 	raftCfg := RaftConfig{
-		ID:               cfg.ID,
-		Peers:            cfg.Peers,
-		Transport:        cfg.Transport,
-		StateMachine:     cfg.StateMachine,
-		OnStateChange:    c.onRaftStateChange,
-		OnLeaderChange:   c.onRaftLeaderChange,
+		ID:             cfg.ID,
+		Peers:          cfg.Peers,
+		Transport:      cfg.Transport,
+		StateMachine:   cfg.StateMachine,
+		OnStateChange:  c.onRaftStateChange,
+		OnLeaderChange: c.onRaftLeaderChange,
 	}
 	c.raft = NewRaft(raftCfg)
 
@@ -360,15 +360,15 @@ func (c *Cluster) Stats() map[string]any {
 	c.nodesMu.RUnlock()
 
 	return map[string]any{
-		"id":          c.id,
-		"leader":      leader,
-		"state":       state.String(),
-		"term":        c.raft.CurrentTerm(),
+		"id":           c.id,
+		"leader":       leader,
+		"state":        state.String(),
+		"term":         c.raft.CurrentTerm(),
 		"commit_index": c.raft.CommitIndex(),
 		"last_applied": c.raft.LastApplied(),
-		"node_count":  nodeCount,
+		"node_count":   nodeCount,
 		"active_nodes": activeCount,
-		"quorum_size": c.raft.QuorumSize(),
+		"quorum_size":  c.raft.QuorumSize(),
 	}
 }
 
@@ -389,9 +389,9 @@ func (c *Cluster) MarshalJSON() ([]byte, error) {
 	nodes := c.Nodes()
 
 	return json.Marshal(map[string]any{
-		"id":         c.id,
-		"leader":     leader,
-		"nodes":      nodes,
-		"stats":      c.Stats(),
+		"id":     c.id,
+		"leader": leader,
+		"nodes":  nodes,
+		"stats":  c.Stats(),
 	})
 }

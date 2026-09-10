@@ -10,6 +10,7 @@ services:
       - "-store=${BROKER_STORE:-wal}"
       - "-wal=/data"
       - "-token=bench-token"
+      - "-insecure-dev"
       - "-quiet"
     volumes:
       - broker-data:/data

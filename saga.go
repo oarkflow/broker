@@ -61,7 +61,7 @@ type SagaInstance struct {
 	UpdatedAt   time.Time        `json:"updated_at"`
 	FinishedAt  time.Time        `json:"finished_at,omitempty"`
 	Error       string           `json:"error,omitempty"`
-	mu          sync.Mutex       `json:"-"`
+	mu          *sync.Mutex      `json:"-"`
 }
 
 func (s *SagaInstance) clone() SagaInstance {
@@ -80,6 +80,7 @@ func (s *SagaInstance) clone() SagaInstance {
 		ID: s.ID, Status: s.Status, Results: results,
 		CurrentStep: s.CurrentStep, CreatedAt: s.CreatedAt,
 		UpdatedAt: s.UpdatedAt, FinishedAt: s.FinishedAt, Error: s.Error,
+		mu: &sync.Mutex{},
 	}
 }
 
@@ -112,6 +113,18 @@ func (e *SagaEngine) CleanupSagas(maxAge time.Duration) int {
 }
 
 func (e *SagaEngine) CreateSaga(ctx context.Context, def SagaDefinition) *SagaInstance {
+	inst, _ := e.CreateSagaChecked(ctx, def)
+	return inst
+}
+
+// CreateSagaChecked applies the authenticated tenant scope before creating a
+// saga. New code should use this method so authorization failures are explicit.
+func (e *SagaEngine) CreateSagaChecked(ctx context.Context, def SagaDefinition) (*SagaInstance, error) {
+	tenant, err := resolveTenant(ctx, def.TenantID)
+	if err != nil {
+		return nil, err
+	}
+	def.TenantID = tenant
 	id := def.ID
 	if id == "" {
 		id = e.b.nextID("saga")
@@ -123,6 +136,7 @@ func (e *SagaEngine) CreateSaga(ctx context.Context, def SagaDefinition) *SagaIn
 		Status:         SagaCreated,
 		CreatedAt:      now,
 		UpdatedAt:      now,
+		mu:             &sync.Mutex{},
 	}
 	e.mu.Lock()
 	e.sagas[id] = inst
@@ -132,25 +146,40 @@ func (e *SagaEngine) CreateSaga(ctx context.Context, def SagaDefinition) *SagaIn
 		TaskID: id, TenantID: def.TenantID, Timestamp: now,
 		Data: map[string]any{"name": def.Name, "steps": len(def.Steps)},
 	})
-	return inst
+	return inst, nil
 }
 
 func (e *SagaEngine) GetSaga(id string) (SagaInstance, bool) {
+	return e.GetSagaContext(context.Background(), id)
+}
+
+func (e *SagaEngine) GetSagaContext(ctx context.Context, id string) (SagaInstance, bool) {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 	s, ok := e.sagas[id]
 	if !ok {
 		return SagaInstance{}, false
 	}
-	return s.clone(), true
+	out := s.clone()
+	if !tenantAllowed(ctx, out.TenantID) {
+		return SagaInstance{}, false
+	}
+	return out, true
 }
 
 func (e *SagaEngine) ListSagas() []SagaInstance {
+	return e.ListSagasContext(context.Background())
+}
+
+func (e *SagaEngine) ListSagasContext(ctx context.Context) []SagaInstance {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 	out := make([]SagaInstance, 0, len(e.sagas))
 	for _, s := range e.sagas {
-		out = append(out, s.clone())
+		item := s.clone()
+		if tenantAllowed(ctx, item.TenantID) {
+			out = append(out, item)
+		}
 	}
 	return out
 }
@@ -160,8 +189,9 @@ func (e *SagaEngine) ListSagasByStatus(st SagaStatus) []SagaInstance {
 	defer e.mu.RUnlock()
 	out := make([]SagaInstance, 0)
 	for _, s := range e.sagas {
-		if s.Status == st {
-			out = append(out, s.clone())
+		item := s.clone()
+		if item.Status == st {
+			out = append(out, item)
 		}
 	}
 	return out
@@ -175,6 +205,10 @@ func (e *SagaEngine) ExecuteSaga(ctx context.Context, sagaID string) error {
 		return ErrMessageNotFound
 	}
 	s.mu.Lock()
+	if !tenantAllowed(ctx, s.TenantID) {
+		s.mu.Unlock()
+		return ErrUnauthorized
+	}
 	if s.Status != SagaCreated {
 		s.mu.Unlock()
 		return errf(ErrInvalidMessage, "saga %s already started", sagaID)

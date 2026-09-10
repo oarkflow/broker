@@ -528,12 +528,12 @@ func (w *RaftWAL) Stats() map[string]any {
 	defer w.mu.RUnlock()
 
 	return map[string]any{
-		"path":           w.path,
-		"entries":        len(w.entries),
-		"first_index":    w.firstIndex,
-		"last_index":     w.lastIndex,
-		"bytes_written":  w.bytesWritten.Load(),
-		"sync_count":     w.syncCount.Load(),
+		"path":          w.path,
+		"entries":       len(w.entries),
+		"first_index":   w.firstIndex,
+		"last_index":    w.lastIndex,
+		"bytes_written": w.bytesWritten.Load(),
+		"sync_count":    w.syncCount.Load(),
 	}
 }
 

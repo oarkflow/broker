@@ -12,7 +12,7 @@ import (
 type WALReplicator struct {
 	mu sync.RWMutex
 
-	cluster    *Cluster
+	cluster      *Cluster
 	fencingToken *FencingToken
 
 	// State
@@ -239,9 +239,9 @@ func (r *WALReplicator) Stats() map[string]any {
 	defer r.mu.RUnlock()
 
 	return map[string]any{
-		"last_replicated": r.lastReplicated,
+		"last_replicated":  r.lastReplicated,
 		"replicated_count": len(r.replicated),
-		"pending_count":   len(r.pending),
+		"pending_count":    len(r.pending),
 	}
 }
 
@@ -263,9 +263,9 @@ const (
 
 // ClusterStateMachine implements StateMachine for the cluster.
 type ClusterStateMachine struct {
-	mu       sync.RWMutex
-	data     map[string][]byte
-	cluster  *Cluster
+	mu      sync.RWMutex
+	data    map[string][]byte
+	cluster *Cluster
 }
 
 // NewClusterStateMachine creates a new cluster state machine.

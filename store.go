@@ -298,7 +298,7 @@ func (s *MemoryStore) SetHistoryLimit(limit int) {
 }
 
 func (s *MemoryStore) DeclareQueue(ctx context.Context, cfg QueueConfig) error {
-	if _, scoped := restrictedTenant(ctx); scoped {
+	if hasRestrictedTenantScope(ctx) {
 		return errf(ErrUnauthorized, "tenant-scoped credentials cannot alter shared queue configuration")
 	}
 	if cfg.Name == "" {
@@ -324,7 +324,7 @@ func (s *MemoryStore) DeclareQueue(ctx context.Context, cfg QueueConfig) error {
 }
 
 func (s *MemoryStore) DeclareTopic(ctx context.Context, cfg TopicConfig) error {
-	if _, scoped := restrictedTenant(ctx); scoped {
+	if hasRestrictedTenantScope(ctx) {
 		return errf(ErrUnauthorized, "tenant-scoped credentials cannot alter shared topic configuration")
 	}
 	if cfg.Name == "" {
@@ -341,7 +341,7 @@ func (s *MemoryStore) DeclareTopic(ctx context.Context, cfg TopicConfig) error {
 }
 
 func (s *MemoryStore) DeclareStream(ctx context.Context, cfg StreamConfig) error {
-	if _, scoped := restrictedTenant(ctx); scoped {
+	if hasRestrictedTenantScope(ctx) {
 		return errf(ErrUnauthorized, "tenant-scoped credentials cannot alter shared stream configuration")
 	}
 	if cfg.Name == "" {
@@ -550,6 +550,11 @@ func (s *MemoryStore) AppendAtomicOwned(ctx context.Context, entries []AppendEnt
 func storedAppendEntries(messages []Message) []AppendEntry {
 	entries := make([]AppendEntry, 0, len(messages))
 	for _, message := range messages {
+		// Drop-newest is intentionally not durable state: the incoming record was
+		// rejected by the queue's capacity policy and is never deliverable.
+		if message.Status == MessagePurged && message.Queue != "" {
+			continue
+		}
 		var destination Destination
 		switch {
 		case message.Queue != "":
@@ -567,6 +572,114 @@ func storedAppendEntries(messages []Message) []AppendEntry {
 		entries = append(entries, AppendEntry{Message: message, Destinations: []Destination{destination}})
 	}
 	return entries
+}
+
+// prepareAppendAtomic validates an append and assigns its exact stored IDs,
+// timestamps, destinations and stream offsets without changing visible state.
+// Durable stores persist this prepared form before installing it in memory, so
+// a failed fsync cannot expose an unacknowledged record.
+func (s *MemoryStore) prepareAppendAtomic(ctx context.Context, entries []AppendEntry) ([]Message, error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
+	entries = append([]AppendEntry(nil), entries...)
+	for i := range entries {
+		tenant, err := resolveTenant(ctx, entries[i].Message.TenantID)
+		if err != nil {
+			return nil, err
+		}
+		entries[i].Message.TenantID = tenant
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if err := s.validateAtomicLocked(entries); err != nil {
+		return nil, err
+	}
+	now := time.Now()
+	streamOffsets := make(map[string]uint64)
+	queueDepths := make(map[string]int)
+	out := make([]Message, 0, len(entries))
+	for _, entry := range entries {
+		msg := cloneMessage(entry.Message)
+		if msg.CreatedAt.IsZero() {
+			msg.CreatedAt = now
+		}
+		if msg.AvailableAt.IsZero() {
+			msg.AvailableAt = msg.CreatedAt
+		}
+		if msg.Status == "" {
+			msg.Status = MessageAccepted
+		}
+		dests := entry.Destinations
+		if len(dests) == 0 {
+			dests = []Destination{{Kind: DestinationTopic, Name: msg.Topic}}
+		}
+		copyNo := 0
+		for _, dest := range dests {
+			if dest.Name == "" {
+				continue
+			}
+			m := cloneMessage(msg)
+			if copyNo > 0 {
+				m.ParentID = msg.ID
+				m.ID = msg.ID + ":copy:" + itoa(copyNo)
+			}
+			copyNo++
+			switch dest.Kind {
+			case DestinationTopic:
+				m.Topic = dest.Name
+				m.Status = MessagePersisted
+			case DestinationQueue, DestinationDLQ:
+				m.Queue = dest.Name
+				m.LeaseToken = ""
+				m.LeaseUntil = time.Time{}
+				if dest.Kind == DestinationDLQ {
+					m.Status = MessageDeadLettered
+				} else if m.AvailableAt.After(now) {
+					m.Status = MessageScheduled
+				} else {
+					m.Status = MessageQueued
+				}
+				q := s.queues[dest.Name]
+				depth, seen := queueDepths[dest.Name]
+				if !seen && q != nil {
+					depth = q.depth
+				}
+				if q != nil && q.cfg.MaxDepth > 0 && depth >= q.cfg.MaxDepth {
+					switch q.cfg.Backpressure {
+					case BackpressureDropNewest:
+						m.Status = MessagePurged
+					case BackpressureDLQ:
+						m.OriginalQueue = firstNonEmpty(m.OriginalQueue, dest.Name)
+						m.Queue = firstNonEmpty(q.cfg.DLQ, dest.Name+".dlq")
+						m.Status = MessageDeadLettered
+						m.DeadLetterReason = "backpressure"
+					default:
+						// Drop-oldest keeps the queue at the configured depth;
+						// rejecting/blocking policies were rejected by validation.
+					}
+				} else {
+					queueDepths[dest.Name] = depth + 1
+				}
+			case DestinationStream, DestinationArchive:
+				offset, seen := streamOffsets[dest.Name]
+				if !seen {
+					if stream := s.streams[dest.Name]; stream != nil {
+						offset = stream.offset
+					}
+				}
+				offset++
+				streamOffsets[dest.Name] = offset
+				m.Stream = dest.Name
+				m.Offset = offset
+				m.Status = MessagePersisted
+			}
+			out = append(out, m)
+		}
+	}
+	return out, nil
 }
 
 func (s *MemoryStore) appendAtomic(ctx context.Context, entries []AppendEntry, collect, owned bool) ([]Message, error) {
@@ -887,9 +1000,6 @@ func (s *MemoryStore) validateNackLease(ctx context.Context, req NackRequest) er
 	m, ok := s.messages[req.MessageID]
 	if !ok {
 		return ErrMessageNotFound
-	}
-	if !tenantAllowed(ctx, m.TenantID) {
-		return ErrUnauthorized
 	}
 	if !tenantAllowed(ctx, m.TenantID) {
 		return ErrUnauthorized
@@ -1243,7 +1353,7 @@ func (s *MemoryStore) appendCloneLocked(m Message, d Destination, req MoveReques
 }
 
 func (s *MemoryStore) PauseQueue(ctx context.Context, name string) error {
-	if _, scoped := restrictedTenant(ctx); scoped {
+	if hasRestrictedTenantScope(ctx) {
 		return errf(ErrUnauthorized, "tenant-scoped credentials cannot pause a shared queue")
 	}
 	s.mu.Lock()
@@ -1257,7 +1367,7 @@ func (s *MemoryStore) PauseQueue(ctx context.Context, name string) error {
 }
 
 func (s *MemoryStore) ResumeQueue(ctx context.Context, name string) error {
-	if _, scoped := restrictedTenant(ctx); scoped {
+	if hasRestrictedTenantScope(ctx) {
 		return errf(ErrUnauthorized, "tenant-scoped credentials cannot resume a shared queue")
 	}
 	s.mu.Lock()
@@ -1294,7 +1404,7 @@ func (s *MemoryStore) PurgeQueue(ctx context.Context, name string) (int, error) 
 			n++
 		}
 	}
-	if _, scoped := restrictedTenant(ctx); !scoped {
+	if !hasRestrictedTenantScope(ctx) {
 		q.head = len(q.ids)
 		q.depth = 0
 		q.hasPriority = false
@@ -1423,33 +1533,55 @@ func durableOffsetCommit(ctx context.Context, commit OffsetCommit) (OffsetCommit
 func (s *MemoryStore) Stats(ctx context.Context) (StoreStats, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	st := StoreStats{Queues: map[string]int{}, Topics: map[string]int{}, Streams: map[string]int{}, Offsets: map[string]map[string]uint64{}, DLQ: map[string]int{}, Messages: len(s.messages)}
-	for name, q := range s.queues {
-		st.Queues[name] = q.depth
-		if strings.Contains(name, ".dlq") || strings.HasSuffix(name, "dlq") {
-			st.DLQ[name] = q.depth
+	st := StoreStats{Queues: map[string]int{}, Topics: map[string]int{}, Streams: map[string]int{}, Offsets: map[string]map[string]uint64{}, DLQ: map[string]int{}}
+	for _, m := range s.messages {
+		if !tenantAllowed(ctx, m.TenantID) {
+			continue
 		}
+		st.Messages++
+		if m.Status == MessageLeased {
+			st.Leased++
+		}
+		if m.Status == MessageDeadLettered {
+			st.DeadLetter++
+		}
+	}
+	for name, q := range s.queues {
+		count := 0
 		for _, id := range q.ids[q.head:] {
-			if m := s.messages[id]; m != nil {
-				if m.Status == MessageLeased {
-					st.Leased++
-				}
-				if m.Status == MessageDeadLettered {
-					st.DeadLetter++
-				}
+			if m := s.messages[id]; m != nil && tenantAllowed(ctx, m.TenantID) {
+				count++
+			}
+		}
+		if count > 0 || !hasRestrictedTenantScope(ctx) {
+			st.Queues[name] = count
+			if strings.Contains(name, ".dlq") || strings.HasSuffix(name, "dlq") {
+				st.DLQ[name] = count
 			}
 		}
 	}
 	for name, t := range s.topics {
-		st.Topics[name] = len(t.ids)
+		count := s.visibleMessageCountLocked(ctx, t.ids, 0, "")
+		if count > 0 || !hasRestrictedTenantScope(ctx) {
+			st.Topics[name] = count
+		}
 	}
 	for name, sm := range s.streams {
-		st.Streams[name] = len(sm.ids)
+		count := s.visibleMessageCountLocked(ctx, sm.ids, 0, "")
+		if count > 0 || !hasRestrictedTenantScope(ctx) {
+			st.Streams[name] = count
+		}
 	}
 	for stream, groups := range s.offsets {
-		st.Offsets[stream] = map[string]uint64{}
 		for group, offset := range groups {
-			st.Offsets[stream][group] = offset
+			visible, ok := visibleOffsetGroup(ctx, group)
+			if !ok {
+				continue
+			}
+			if st.Offsets[stream] == nil {
+				st.Offsets[stream] = map[string]uint64{}
+			}
+			st.Offsets[stream][visible] = offset
 		}
 	}
 	return st, nil
@@ -1505,6 +1637,17 @@ func (s *MemoryStore) Cleanup(maxHistoryPerMessage int) {
 
 // StreamLag returns the consumer lag (messages behind) for a given stream and consumer group.
 func (s *MemoryStore) StreamLag(stream, consumerGroup string) (uint64, error) {
+	return s.StreamLagContext(context.Background(), stream, consumerGroup, "")
+}
+
+// StreamLagContext returns the number of messages visible to the caller after
+// its committed offset. Counting visible records avoids including traffic from
+// another tenant in the reported lag.
+func (s *MemoryStore) StreamLagContext(ctx context.Context, stream, consumerGroup, tenantID string) (uint64, error) {
+	tenant, err := resolveTenant(ctx, tenantID)
+	if err != nil {
+		return 0, err
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	st, ok := s.streams[stream]
@@ -1513,13 +1656,21 @@ func (s *MemoryStore) StreamLag(stream, consumerGroup string) (uint64, error) {
 	}
 	committed := uint64(0)
 	if groups := s.offsets[stream]; groups != nil {
-		committed = groups[consumerGroup]
+		committed = groups[offsetGroupKey(tenant, consumerGroup)]
 	}
-	return st.offset - committed, nil
+	return uint64(s.visibleMessageCountLocked(ctx, st.ids, committed, tenant)), nil
 }
 
 // StreamLagAll returns the consumer lag for all consumer groups on a stream.
 func (s *MemoryStore) StreamLagAll(stream string) (map[string]uint64, error) {
+	return s.StreamLagAllContext(context.Background(), stream, "")
+}
+
+func (s *MemoryStore) StreamLagAllContext(ctx context.Context, stream, tenantID string) (map[string]uint64, error) {
+	tenant, err := resolveTenant(ctx, tenantID)
+	if err != nil {
+		return nil, err
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	st, ok := s.streams[stream]
@@ -1528,8 +1679,15 @@ func (s *MemoryStore) StreamLagAll(stream string) (map[string]uint64, error) {
 	}
 	result := make(map[string]uint64)
 	if groups := s.offsets[stream]; groups != nil {
-		for group, committed := range groups {
-			result[group] = st.offset - committed
+		for stored, committed := range groups {
+			group, visible := visibleOffsetGroup(ctx, stored)
+			if !visible {
+				continue
+			}
+			if tenant != "" && stored != offsetGroupKey(tenant, group) {
+				continue
+			}
+			result[group] = uint64(s.visibleMessageCountLocked(ctx, st.ids, committed, tenant))
 		}
 	}
 	return result, nil
@@ -1537,13 +1695,42 @@ func (s *MemoryStore) StreamLagAll(stream string) (map[string]uint64, error) {
 
 // StreamHeadOffset returns the latest offset for a stream.
 func (s *MemoryStore) StreamHeadOffset(stream string) (uint64, error) {
+	return s.StreamHeadOffsetContext(context.Background(), stream, "")
+}
+
+func (s *MemoryStore) StreamHeadOffsetContext(ctx context.Context, stream, tenantID string) (uint64, error) {
+	tenant, err := resolveTenant(ctx, tenantID)
+	if err != nil {
+		return 0, err
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	st, ok := s.streams[stream]
 	if !ok {
 		return 0, ErrStreamNotFound
 	}
-	return st.offset, nil
+	if tenant == "" && !hasRestrictedTenantScope(ctx) {
+		return st.offset, nil
+	}
+	var head uint64
+	for _, id := range st.ids {
+		m := s.messages[id]
+		if m != nil && tenantAllowed(ctx, m.TenantID) && (tenant == "" || m.TenantID == tenant) && m.Offset > head {
+			head = m.Offset
+		}
+	}
+	return head, nil
+}
+
+func (s *MemoryStore) visibleMessageCountLocked(ctx context.Context, ids []string, after uint64, tenant string) int {
+	count := 0
+	for _, id := range ids {
+		m := s.messages[id]
+		if m != nil && m.Offset > after && tenantAllowed(ctx, m.TenantID) && (tenant == "" || m.TenantID == tenant) {
+			count++
+		}
+	}
+	return count
 }
 
 func (s *MemoryStore) listIDsLocked(ids []string, limit int, dlqOnly bool) []Message {
@@ -1741,9 +1928,17 @@ type FileWALStore struct {
 	gcm     cipher.AEAD
 	keyName string
 	gc      *groupCommitWriter
+	writeMu sync.Mutex
 }
 
 func (*FileWALStore) ConfirmationLevel() ConfirmLevel { return ConfirmPersisted }
+
+func (s *FileWALStore) StoreHealth() error {
+	if s == nil || s.gc == nil {
+		return ErrClosed
+	}
+	return s.gc.healthError()
+}
 
 // FileWALStoreConfig configures the FileWALStore.
 type FileWALStoreConfig struct {
@@ -2042,7 +2237,7 @@ func (s *FileWALStore) DeclareStream(ctx context.Context, cfg StreamConfig) erro
 }
 
 func validateSharedDeclaration(ctx context.Context, name, kind string) error {
-	if _, scoped := restrictedTenant(ctx); scoped {
+	if hasRestrictedTenantScope(ctx) {
 		return errf(ErrUnauthorized, "tenant-scoped credentials cannot alter shared %s configuration", kind)
 	}
 	if name == "" {
@@ -2051,38 +2246,34 @@ func validateSharedDeclaration(ctx context.Context, name, kind string) error {
 	return nil
 }
 func (s *FileWALStore) Append(ctx context.Context, msg Message, dests []Destination) ([]Message, error) {
-	out, err := s.MemoryStore.Append(ctx, msg, dests)
-	if err != nil {
-		return nil, err
-	}
-	if err := s.write(walRecord{Op: "append_atomic", Entries: storedAppendEntries(out)}); err != nil {
-		return out, err
-	}
-	return out, nil
+	return s.durableAppend(ctx, []AppendEntry{{Message: msg, Destinations: dests}})
 }
 func (s *FileWALStore) AppendAtomic(ctx context.Context, entries []AppendEntry) ([]Message, error) {
-	out, err := s.MemoryStore.AppendAtomic(ctx, entries)
+	return s.durableAppend(ctx, entries)
+}
+func (s *FileWALStore) AppendAtomicMinimal(ctx context.Context, entries []AppendEntry) error {
+	_, err := s.durableAppend(ctx, entries)
+	return err
+}
+func (s *FileWALStore) AppendAtomicOwned(ctx context.Context, entries []AppendEntry) error {
+	_, err := s.durableAppend(ctx, entries)
+	return err
+}
+func (s *FileWALStore) durableAppend(ctx context.Context, entries []AppendEntry) ([]Message, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	out, err := s.MemoryStore.prepareAppendAtomic(ctx, entries)
 	if err != nil {
 		return nil, err
 	}
-	if err := s.write(walRecord{Op: "append_atomic", Entries: storedAppendEntries(out)}); err != nil {
-		return out, err
+	persisted := storedAppendEntries(out)
+	if err := s.write(walRecord{Op: "append_atomic", Entries: persisted}); err != nil {
+		return nil, err
+	}
+	if err := s.MemoryStore.appendRecoveredAtomic(persisted); err != nil {
+		return nil, fmt.Errorf("apply durable append: %w", err)
 	}
 	return out, nil
-}
-func (s *FileWALStore) AppendAtomicMinimal(ctx context.Context, entries []AppendEntry) error {
-	out, err := s.MemoryStore.AppendAtomic(ctx, entries)
-	if err != nil {
-		return err
-	}
-	return s.write(walRecord{Op: "append_atomic", Entries: storedAppendEntries(out)})
-}
-func (s *FileWALStore) AppendAtomicOwned(ctx context.Context, entries []AppendEntry) error {
-	out, err := s.MemoryStore.AppendAtomic(ctx, entries)
-	if err != nil {
-		return err
-	}
-	return s.write(walRecord{Op: "append_atomic", Entries: storedAppendEntries(out)})
 }
 func (s *FileWALStore) Lease(ctx context.Context, req LeaseRequest) ([]Message, error) {
 	msgs, err := s.MemoryStore.Lease(ctx, req)

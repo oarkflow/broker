@@ -19,13 +19,13 @@ type QuorumQueue struct {
 	quorumSize int
 
 	// State
-	messages   []ReplicatedMessage
-	committed  uint64
-	leader     string
+	messages  []ReplicatedMessage
+	committed uint64
+	leader    string
 
 	// Replication
-	pending    map[uint64]*pendingReplication
-	pendingMu  sync.RWMutex
+	pending   map[uint64]*pendingReplication
+	pendingMu sync.RWMutex
 
 	// Callbacks
 	onReplicated func(msg *ReplicatedMessage)
@@ -37,15 +37,15 @@ type QuorumQueue struct {
 
 // ReplicatedMessage represents a message with replication metadata.
 type ReplicatedMessage struct {
-	ID        string    `json:"id"`
-	Index     uint64    `json:"index"`
-	Term      uint64    `json:"term"`
-	Data      []byte    `json:"data"`
+	ID        string            `json:"id"`
+	Index     uint64            `json:"index"`
+	Term      uint64            `json:"term"`
+	Data      []byte            `json:"data"`
 	Headers   map[string]string `json:"headers,omitempty"`
-	Replicas  []string  `json:"replicas"`
-	Acks      int       `json:"acks"`
-	Committed bool      `json:"committed"`
-	CreatedAt time.Time `json:"created_at"`
+	Replicas  []string          `json:"replicas"`
+	Acks      int               `json:"acks"`
+	Committed bool              `json:"committed"`
+	CreatedAt time.Time         `json:"created_at"`
 }
 
 type pendingReplication struct {

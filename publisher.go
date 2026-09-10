@@ -393,6 +393,11 @@ func (p *Publisher) publish(ctx context.Context, topic string, payload any, opts
 	if err := p.checkBackpressure(ctx, prep); err != nil {
 		return PublishResult{}, err
 	}
+	if p.b.tenantMgr != nil {
+		if err := p.b.tenantMgr.CheckPublishQuota(ctx, prep.msg.TenantID, prep.dests); err != nil {
+			return PublishResult{}, err
+		}
+	}
 	if err := validateConfirmation(prep.opts.ConfirmLevel, p.b.store); err != nil {
 		return PublishResult{}, err
 	}

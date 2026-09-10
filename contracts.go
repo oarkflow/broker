@@ -121,6 +121,12 @@ type ConfirmationStore interface {
 	ConfirmationLevel() ConfirmLevel
 }
 
+// StoreHealthProvider exposes persistent write-path failures to readiness
+// checks. A store that has fenced itself must return that error until reopened.
+type StoreHealthProvider interface {
+	StoreHealth() error
+}
+
 func confirmationLevel(store Store) ConfirmLevel {
 	if s, ok := store.(ConfirmationStore); ok {
 		return s.ConfirmationLevel()

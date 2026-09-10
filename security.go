@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
+	"crypto/x509"
 	"net/http"
 	"strings"
 	"sync"
@@ -40,20 +41,28 @@ const (
 // emitted through JSON. Use Permissions with exact strings or the admin:*
 // wildcard for full access.
 type AdminToken struct {
-	Name        string    `json:"name,omitempty"`
-	Token       string    `json:"-"`
-	Permissions []string  `json:"permissions,omitempty"`
-	Tenants     []string  `json:"tenants,omitempty"`
-	ExpiresAt   time.Time `json:"expires_at,omitempty"`
-	Revoked     bool      `json:"revoked,omitempty"`
-	tokenHash   [sha256.Size]byte
+	Name                  string    `json:"name,omitempty"`
+	Token                 string    `json:"-"`
+	Permissions           []string  `json:"permissions,omitempty"`
+	Tenants               []string  `json:"tenants,omitempty"`
+	CertificateIdentities []string  `json:"certificate_identities,omitempty"`
+	RequestsPerSecond     int       `json:"requests_per_second,omitempty"`
+	Burst                 int       `json:"burst,omitempty"`
+	MaxConcurrent         int       `json:"max_concurrent,omitempty"`
+	ExpiresAt             time.Time `json:"expires_at,omitempty"`
+	Revoked               bool      `json:"revoked,omitempty"`
+	tokenHash             [sha256.Size]byte
+	tokenSet              bool
 }
 
 type AdminPrincipal struct {
-	Name        string
-	Token       string
-	Permissions []string
-	Tenants     []string
+	Name              string
+	Token             string
+	Permissions       []string
+	Tenants           []string
+	RequestsPerSecond int
+	Burst             int
+	MaxConcurrent     int
 }
 
 type adminPrincipalKey struct{}
@@ -99,8 +108,19 @@ func resolveTenant(ctx context.Context, requested string) (string, error) {
 }
 
 func tenantAllowed(ctx context.Context, tenant string) bool {
-	_, err := resolveTenant(ctx, tenant)
-	return err == nil
+	p, scoped := scopedPrincipalFromContext(ctx)
+	if !scoped || len(p.Tenants) == 0 {
+		return true
+	}
+	for _, allowed := range p.Tenants {
+		if allowed == "*" {
+			return true
+		}
+		if tenant != "" && allowed == tenant {
+			return true
+		}
+	}
+	return false
 }
 
 func restrictedTenant(ctx context.Context) (string, bool) {
@@ -111,13 +131,62 @@ func restrictedTenant(ctx context.Context) (string, bool) {
 	return p.Tenants[0], true
 }
 
+// hasRestrictedTenantScope reports whether the authenticated credential is
+// limited to any explicit set of tenants. Global control-plane resources must
+// reject such credentials until those resources have native tenant ownership.
+func hasRestrictedTenantScope(ctx context.Context) bool {
+	p, scoped := scopedPrincipalFromContext(ctx)
+	if !scoped || len(p.Tenants) == 0 {
+		return false
+	}
+	for _, tenant := range p.Tenants {
+		if tenant == "*" {
+			return false
+		}
+	}
+	return true
+}
+
+func visibleOffsetGroup(ctx context.Context, stored string) (string, bool) {
+	p, scoped := scopedPrincipalFromContext(ctx)
+	if !scoped || len(p.Tenants) == 0 {
+		return stored, true
+	}
+	for _, tenant := range p.Tenants {
+		if tenant == "*" {
+			return stored, true
+		}
+	}
+	tenant, group, ok := strings.Cut(stored, "\x00")
+	if !ok || tenant == "" || group == "" {
+		return "", false
+	}
+	for _, allowed := range p.Tenants {
+		if tenant == allowed {
+			if len(p.Tenants) == 1 {
+				return group, true
+			}
+			return stored, true
+		}
+	}
+	return "", false
+}
+
 type ACL struct {
-	mu     sync.RWMutex
-	Tokens []AdminToken
+	mu      sync.RWMutex
+	Tokens  []AdminToken
+	quotaMu sync.Mutex
+	quotas  map[string]*principalQuota
+}
+
+type principalQuota struct {
+	tokens     float64
+	last       time.Time
+	concurrent int
 }
 
 func NewACL(tokens ...AdminToken) *ACL {
-	a := &ACL{}
+	a := &ACL{quotas: make(map[string]*principalQuota)}
 	for _, token := range tokens {
 		a.addTokenLocked(token)
 	}
@@ -134,10 +203,14 @@ func (a *ACL) AddToken(token AdminToken) {
 }
 
 func (a *ACL) addTokenLocked(token AdminToken) {
-	token.tokenHash = sha256.Sum256([]byte(token.Token))
+	token.tokenSet = token.Token != ""
+	if token.tokenSet {
+		token.tokenHash = sha256.Sum256([]byte(token.Token))
+	}
 	token.Token = ""
 	token.Permissions = append([]string(nil), token.Permissions...)
 	token.Tenants = append([]string(nil), token.Tenants...)
+	token.CertificateIdentities = append([]string(nil), token.CertificateIdentities...)
 	a.Tokens = append(a.Tokens, token)
 }
 
@@ -167,6 +240,9 @@ func (a *ACL) Authenticate(raw string) (AdminPrincipal, bool) {
 	candidate := sha256.Sum256([]byte(raw))
 	now := time.Now()
 	for _, tok := range a.Tokens {
+		if !tok.tokenSet && tok.Token == "" {
+			continue
+		}
 		stored := tok.tokenHash
 		if stored == ([sha256.Size]byte{}) && tok.Token != "" {
 			stored = sha256.Sum256([]byte(tok.Token))
@@ -176,10 +252,119 @@ func (a *ACL) Authenticate(raw string) (AdminPrincipal, bool) {
 			if name == "" {
 				name = "token"
 			}
-			return AdminPrincipal{Name: name, Permissions: append([]string(nil), tok.Permissions...), Tenants: append([]string(nil), tok.Tenants...)}, true
+			return principalForToken(name, tok), true
 		}
 	}
 	return AdminPrincipal{}, false
+}
+
+// AuthenticateCertificate maps a verified TLS client certificate to a named
+// ACL principal. Identity entries use cn:, dns:, uri:, email:, or ip: prefixes.
+func (a *ACL) AuthenticateCertificate(cert *x509.Certificate) (AdminPrincipal, bool) {
+	if a == nil || cert == nil {
+		return AdminPrincipal{}, false
+	}
+	identities := certificateIdentities(cert)
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	now := time.Now()
+	for _, token := range a.Tokens {
+		if token.Revoked || (!token.ExpiresAt.IsZero() && !now.Before(token.ExpiresAt)) {
+			continue
+		}
+		for _, allowed := range token.CertificateIdentities {
+			for _, presented := range identities {
+				if constantTimeEqual(allowed, presented) {
+					name := token.Name
+					if name == "" {
+						name = presented
+					}
+					return principalForToken(name, token), true
+				}
+			}
+		}
+	}
+	return AdminPrincipal{}, false
+}
+
+func principalForToken(name string, token AdminToken) AdminPrincipal {
+	return AdminPrincipal{Name: name, Permissions: append([]string(nil), token.Permissions...), Tenants: append([]string(nil), token.Tenants...), RequestsPerSecond: token.RequestsPerSecond, Burst: token.Burst, MaxConcurrent: token.MaxConcurrent}
+}
+
+// Admit applies the authenticated principal's shared request-rate and
+// concurrency limits. The returned release function must be called exactly
+// once after the request or connection finishes.
+func (a *ACL) Admit(principal AdminPrincipal) (func(), error) {
+	if a == nil || (principal.RequestsPerSecond <= 0 && principal.MaxConcurrent <= 0) {
+		return func() {}, nil
+	}
+	a.quotaMu.Lock()
+	if a.quotas == nil {
+		a.quotas = make(map[string]*principalQuota)
+	}
+	quota := a.quotas[principal.Name]
+	if quota == nil {
+		burst := principal.Burst
+		if burst <= 0 {
+			burst = principal.RequestsPerSecond
+		}
+		quota = &principalQuota{tokens: float64(burst), last: time.Now()}
+		a.quotas[principal.Name] = quota
+	}
+	if principal.MaxConcurrent > 0 && quota.concurrent >= principal.MaxConcurrent {
+		a.quotaMu.Unlock()
+		return nil, &RetryError{Class: RetryThrottled, Message: "principal concurrency limit reached", RetryAfter: time.Second, Cause: ErrThrottled}
+	}
+	if principal.RequestsPerSecond > 0 {
+		now := time.Now()
+		burst := principal.Burst
+		if burst <= 0 {
+			burst = principal.RequestsPerSecond
+		}
+		quota.tokens += now.Sub(quota.last).Seconds() * float64(principal.RequestsPerSecond)
+		if quota.tokens > float64(burst) {
+			quota.tokens = float64(burst)
+		}
+		quota.last = now
+		if quota.tokens < 1 {
+			retry := time.Duration((1-quota.tokens)/float64(principal.RequestsPerSecond)*float64(time.Second)) + time.Millisecond
+			a.quotaMu.Unlock()
+			return nil, &RetryError{Class: RetryThrottled, Message: "principal request rate exceeded", RetryAfter: retry, Cause: ErrThrottled}
+		}
+		quota.tokens--
+	}
+	quota.concurrent++
+	a.quotaMu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			a.quotaMu.Lock()
+			if quota.concurrent > 0 {
+				quota.concurrent--
+			}
+			a.quotaMu.Unlock()
+		})
+	}, nil
+}
+
+func certificateIdentities(cert *x509.Certificate) []string {
+	identities := make([]string, 0, 1+len(cert.DNSNames)+len(cert.EmailAddresses)+len(cert.IPAddresses)+len(cert.URIs))
+	if cert.Subject.CommonName != "" {
+		identities = append(identities, "cn:"+cert.Subject.CommonName)
+	}
+	for _, value := range cert.DNSNames {
+		identities = append(identities, "dns:"+value)
+	}
+	for _, value := range cert.EmailAddresses {
+		identities = append(identities, "email:"+value)
+	}
+	for _, value := range cert.IPAddresses {
+		identities = append(identities, "ip:"+value.String())
+	}
+	for _, value := range cert.URIs {
+		identities = append(identities, "uri:"+value.String())
+	}
+	return identities
 }
 
 func (a *ACL) Authorize(p AdminPrincipal, permission string) bool {

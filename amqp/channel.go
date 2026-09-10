@@ -158,8 +158,8 @@ func (ch *Channel) handleExchangeDeclare(args []byte) error {
 
 func (ch *Channel) handleExchangeDelete(args []byte) error {
 	r := &argsReader{data: args}
-	_, _ = r.ReadUint16()  // reserved
-	_, _ = r.ReadString()  // exchange
+	_, _ = r.ReadUint16() // reserved
+	_, _ = r.ReadString() // exchange
 	ifUnused, _ := r.ReadBool()
 	noWait, _ := r.ReadBool()
 
@@ -245,7 +245,7 @@ func (ch *Channel) handleQueueBind(args []byte) error {
 	// Bind queue to exchange (topic) by adding a route
 	if exchange != "" {
 		ch.conn.server.cfg.Broker.AddRoute(broker.Route{
-			Mode: broker.RouteTopic,
+			Mode:  broker.RouteTopic,
 			Match: routingKey,
 			To: []broker.Destination{
 				{Kind: broker.DestinationQueue, Name: queue},
@@ -443,11 +443,11 @@ func (ch *Channel) sendDelivery(delivery Delivery) {
 
 	// Send Basic.Deliver
 	deliverArgs := EncodeMethodArgs(
-		string(""),                // consumer-tag (empty for pushed deliveries)
-		delivery.DeliveryTag,      // delivery-tag
-		delivery.Redeliver,        // redeliver
-		delivery.Exchange,         // exchange
-		delivery.RoutingKey,       // routing-key
+		string(""),           // consumer-tag (empty for pushed deliveries)
+		delivery.DeliveryTag, // delivery-tag
+		delivery.Redeliver,   // redeliver
+		delivery.Exchange,    // exchange
+		delivery.RoutingKey,  // routing-key
 	)
 
 	if err := ch.codec().WriteMethodFrame(ch.id, ClassBasic, MethodBasicDeliver, deliverArgs); err != nil {

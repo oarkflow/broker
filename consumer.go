@@ -92,7 +92,7 @@ func (a *ackHandle) Ack(ctx context.Context) error {
 		if a.b.cfg.Hooks.OnAck != nil {
 			a.b.cfg.Hooks.OnAck(ctx, MessageEvent{Message: a.msg, Consumer: a.consumer, Queue: a.queue, Time: time.Now()})
 		}
-		a.b.notify.Publish(Notification{Type: "message.acked", Source: a.consumer, Severity: SeverityInfo, MessageID: a.msg.ID, Queue: a.queue, Timestamp: time.Now()})
+		a.b.notify.Publish(Notification{Type: "message.acked", Source: a.consumer, Severity: SeverityInfo, MessageID: a.msg.ID, Queue: a.queue, TenantID: a.msg.TenantID, Timestamp: time.Now()})
 		a.b.completeTask(ctx, a.msg, nil, nil)
 	}
 	return err
@@ -134,7 +134,7 @@ func (a *ackHandle) Progress(ctx context.Context, p Progress) error {
 	}
 	m.Status = MessageProgressing
 	_ = a.b.store.Update(ctx, m)
-	a.b.notify.Publish(Notification{Type: "message.progress", Source: a.consumer, Severity: SeverityInfo, MessageID: m.ID, TaskID: m.TaskID, Queue: a.queue, Timestamp: time.Now(), Data: map[string]any{"progress": p}})
+	a.b.notify.Publish(Notification{Type: "message.progress", Source: a.consumer, Severity: SeverityInfo, MessageID: m.ID, TaskID: m.TaskID, Queue: a.queue, TenantID: m.TenantID, Timestamp: time.Now(), Data: map[string]any{"progress": p}})
 	if m.TaskID != "" {
 		a.b.updateTaskProgress(ctx, m.TaskID, p)
 	}
@@ -579,6 +579,7 @@ func (s *Subscription) fail(ctx context.Context, h *ackHandle, m Message, err er
 			Severity:  SeverityWarn,
 			MessageID: m.ID,
 			Queue:     m.Queue,
+			TenantID:  m.TenantID,
 			Timestamp: time.Now(),
 			Data:      map[string]any{"attempts": m.Attempts, "max_attempts": maxAttempts, "error": err.Error()},
 		})

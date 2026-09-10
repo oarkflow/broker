@@ -31,34 +31,34 @@ const (
 )
 
 type Route struct {
-	Name        string            `json:"name"`
-	Mode        RouteMode         `json:"mode"`
-	Match       string            `json:"match"`
-	Headers     map[string]string `json:"headers,omitempty"`
-	PriorityMin int               `json:"priority_min,omitempty"`
-	TenantID    string            `json:"tenant_id,omitempty"`
-	To          []Destination     `json:"to,omitempty"`
-	CopyTo      []Destination     `json:"copy_to,omitempty"`
-	Enabled     bool              `json:"enabled"`
-	Disabled    bool              `json:"disabled,omitempty"`
+	Name        string             `json:"name"`
+	Mode        RouteMode          `json:"mode"`
+	Match       string             `json:"match"`
+	Headers     map[string]string  `json:"headers,omitempty"`
+	PriorityMin int                `json:"priority_min,omitempty"`
+	TenantID    string             `json:"tenant_id,omitempty"`
+	To          []Destination      `json:"to,omitempty"`
+	CopyTo      []Destination      `json:"copy_to,omitempty"`
+	Enabled     bool               `json:"enabled"`
+	Disabled    bool               `json:"disabled,omitempty"`
 	Condition   func(Message) bool `json:"-"`
 
 	// Strategy-based routing fields
-	Strategy       StrategyType     `json:"strategy,omitempty"`
-	Fallback       StrategyType     `json:"fallback,omitempty"`
-	Weight         int              `json:"weight,omitempty"`
-	HashKey        string           `json:"hash_key,omitempty"`
-	StickyKey      string           `json:"sticky_key,omitempty"`
-	Capabilities   []string         `json:"capabilities,omitempty"`
-	PriorityThreshold int            `json:"priority_threshold,omitempty"`
-	Rules          []RoutingRule    `json:"rules,omitempty"`
-	StrategyConfig *StrategyConfig  `json:"-"`
+	Strategy          StrategyType    `json:"strategy,omitempty"`
+	Fallback          StrategyType    `json:"fallback,omitempty"`
+	Weight            int             `json:"weight,omitempty"`
+	HashKey           string          `json:"hash_key,omitempty"`
+	StickyKey         string          `json:"sticky_key,omitempty"`
+	Capabilities      []string        `json:"capabilities,omitempty"`
+	PriorityThreshold int             `json:"priority_threshold,omitempty"`
+	Rules             []RoutingRule   `json:"rules,omitempty"`
+	StrategyConfig    *StrategyConfig `json:"-"`
 }
 
 type Router struct {
-	mu          sync.RWMutex
-	routes      []Route
-	taskRouter  *TaskRouter
+	mu           sync.RWMutex
+	routes       []Route
+	taskRouter   *TaskRouter
 	configLoader *RoutingConfigLoader
 }
 

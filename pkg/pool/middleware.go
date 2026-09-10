@@ -29,12 +29,12 @@ func Logger(prefix string) Middleware {
 		return JobFunc(func(ctx context.Context) error {
 			start := time.Now()
 			err := next.Run(ctx)
-		attrs := []zlog.Attr{zlog.String("prefix", prefix), zlog.Duration("duration", time.Since(start))}
-		if err != nil {
-			logger.Log.Error("job_error", append(attrs, zlog.Err(err))...)
-		} else {
-			logger.Log.Info("job_success", attrs...)
-		}
+			attrs := []zlog.Attr{zlog.String("prefix", prefix), zlog.Duration("duration", time.Since(start))}
+			if err != nil {
+				logger.Log.Error("job_error", append(attrs, zlog.Err(err))...)
+			} else {
+				logger.Log.Info("job_success", attrs...)
+			}
 			return err
 		})
 	}

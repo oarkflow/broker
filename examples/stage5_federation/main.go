@@ -55,9 +55,9 @@ func main() {
 	// Start federation manager (in a real setup, this connects to an upstream broker)
 	fedMgr := b.FederationManager()
 	link := fedMgr.AddLink(broker.FederationConfig{
-		Queues:      []string{"source-queue"},
+		Queues:       []string{"source-queue"},
 		PollInterval: 500 * time.Millisecond,
-		BatchSize:   10,
+		BatchSize:    10,
 	})
 	log.Printf("[federation] added link %s", link.ID)
 
