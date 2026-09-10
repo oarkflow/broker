@@ -3,6 +3,8 @@ package broker
 import (
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 )
@@ -145,3 +147,58 @@ func TestTaskSubmitAndResult(t *testing.T) {
 		t.Fatalf("unexpected result %+v", out)
 	}
 }
+
+func TestStoreHealthFencingDegradedMode(t *testing.T) {
+	dir := t.TempDir()
+	st, err := NewBinaryFileWALStore(dir)
+	if err != nil {
+		t.Fatalf("create store: %v", err)
+	}
+	defer st.Close()
+
+	b, err := New(Config{
+		Store:             st,
+		DefaultQueue:      "events",
+		DefaultVisibility: time.Second,
+	})
+	if err != nil {
+		t.Fatalf("new broker: %v", err)
+	}
+	ctx := context.Background()
+	if err := b.Start(ctx); err != nil {
+		t.Fatalf("start broker: %v", err)
+	}
+	defer b.Stop(ctx)
+
+	if b.IsStoreFenced() {
+		t.Fatalf("broker store should not be fenced initially")
+	}
+
+	// Trigger a store fault
+	fault := errors.New("simulated unrecoverable I/O disk failure")
+	b.HealthMonitor().Fence(fault)
+
+	// Verify broker detected fence
+	if !b.IsStoreFenced() {
+		t.Fatalf("expected broker to be fenced after fault")
+	}
+	if b.State() != BrokerDegraded {
+		t.Fatalf("expected broker state BrokerDegraded, got %v", b.State())
+	}
+
+	// Publishing should fail fast with ErrStorageUnavailable
+	_, err = b.Publisher().Publish(ctx, "events", []byte("data"))
+	if !errors.Is(err, ErrStorageUnavailable) {
+		t.Fatalf("expected ErrStorageUnavailable when publishing while fenced, got: %v", err)
+	}
+
+	// Check /readyz via AdminServer returns 503
+	admin := AdminServer{Broker: b, InsecureDev: true}
+	req := httptest.NewRequest("GET", "/readyz", nil)
+	rec := httptest.NewRecorder()
+	admin.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 Service Unavailable from /readyz when fenced, got %d", rec.Code)
+	}
+}
+

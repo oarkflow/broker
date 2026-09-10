@@ -187,6 +187,19 @@ func (r *Router) RouteWithStrategy(ctx context.Context, msg Message, candidates 
 	if len(matched) == 0 {
 		return candidates, nil, nil
 	}
+	if len(candidates) > 0 && (msg.TenantID != "" || hasRestrictedTenantScope(ctx)) {
+		filtered := make([]ConsumerCandidate, 0, len(candidates))
+		for _, c := range candidates {
+			if c.TenantID != "" && msg.TenantID != "" && c.TenantID != msg.TenantID {
+				continue
+			}
+			if !tenantAllowed(ctx, c.TenantID) {
+				continue
+			}
+			filtered = append(filtered, c)
+		}
+		candidates = filtered
+	}
 	for _, route := range matched {
 		if route.Strategy != "" {
 			strategy := r.buildStrategyForRoute(route)

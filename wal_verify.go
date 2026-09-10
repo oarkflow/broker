@@ -314,3 +314,154 @@ func knownWALOperation(op string) bool {
 		return false
 	}
 }
+
+type SegmentedWALVerificationReport struct {
+	Dir             string                   `json:"dir"`
+	ManifestVersion int                      `json:"manifest_version"`
+	ActiveSegment   uint64                   `json:"active_segment"`
+	TotalSegments   int                      `json:"total_segments"`
+	TotalRecords    uint64                   `json:"total_records"`
+	TotalBytes      int64                    `json:"total_bytes"`
+	SegmentReports  []WALVerificationReport  `json:"segment_reports"`
+	Problems        []WALVerificationProblem `json:"problems,omitempty"`
+	VerifiedAt      time.Time                `json:"verified_at"`
+}
+
+func (r SegmentedWALVerificationReport) Valid() bool {
+	if len(r.Problems) > 0 {
+		return false
+	}
+	for _, sr := range r.SegmentReports {
+		if !sr.Valid() {
+			return false
+		}
+	}
+	return true
+}
+
+// VerifySegmentedWAL verifies all segments and manifest in a BWL2 segmented WAL directory.
+func VerifySegmentedWAL(dir string, walCodec *WALRecordCodec, legacyCodec FrameCodec) (SegmentedWALVerificationReport, error) {
+	report := SegmentedWALVerificationReport{
+		Dir:        dir,
+		VerifiedAt: time.Now().UTC(),
+	}
+
+	manifestPath := filepath.Join(dir, "manifest.json")
+	data, err := os.ReadFile(manifestPath)
+	if err != nil {
+		return report, fmt.Errorf("read manifest: %w", err)
+	}
+
+	var manifest SegmentedWALManifest
+	if err := json.Unmarshal(data, &manifest); err != nil {
+		report.Problems = append(report.Problems, WALVerificationProblem{Error: "invalid manifest.json: " + err.Error()})
+		return report, nil
+	}
+
+	report.ManifestVersion = manifest.Version
+	report.ActiveSegment = manifest.ActiveSegment
+	report.TotalSegments = len(manifest.Segments)
+
+	for _, seg := range manifest.Segments {
+		segPath := filepath.Join(dir, seg.Filename)
+		info, err := os.Stat(segPath)
+		if err != nil {
+			report.Problems = append(report.Problems, WALVerificationProblem{Error: fmt.Sprintf("segment file %s missing: %v", seg.Filename, err)})
+			continue
+		}
+		report.TotalBytes += info.Size()
+
+		// Verify segment file (skip 22 byte BWL2 header for standard record verification)
+		segFile, err := os.Open(segPath)
+		if err != nil {
+			report.Problems = append(report.Problems, WALVerificationProblem{Error: fmt.Sprintf("open segment %s: %v", seg.Filename, err)})
+			continue
+		}
+
+		var h [22]byte
+		if _, err := io.ReadFull(segFile, h[:]); err != nil {
+			segFile.Close()
+			report.Problems = append(report.Problems, WALVerificationProblem{Error: fmt.Sprintf("read segment header %s: %v", seg.Filename, err)})
+			continue
+		}
+		segFile.Close()
+
+		if binary.BigEndian.Uint32(h[0:4]) != SegmentMagic {
+			report.Problems = append(report.Problems, WALVerificationProblem{Error: fmt.Sprintf("invalid magic in %s", seg.Filename)})
+			continue
+		}
+
+		// Verify records in segment
+		segRep, err := verifySegmentFileRecords(segPath, 22, walCodec, legacyCodec)
+		if err != nil {
+			report.Problems = append(report.Problems, WALVerificationProblem{Error: fmt.Sprintf("verify segment %s: %v", seg.Filename, err)})
+			continue
+		}
+		report.TotalRecords += segRep.Records
+		report.SegmentReports = append(report.SegmentReports, segRep)
+	}
+
+	return report, nil
+}
+
+func verifySegmentFileRecords(path string, offset int64, walCodec *WALRecordCodec, legacyCodec FrameCodec) (WALVerificationReport, error) {
+	report := WALVerificationReport{Path: path, VerifiedAt: time.Now().UTC()}
+	info, err := os.Stat(path)
+	if err != nil {
+		return report, err
+	}
+	report.SizeBytes = info.Size()
+	if walCodec == nil {
+		walCodec, err = NewWALRecordCodec(WALCodecConfig{})
+		if err != nil {
+			return report, err
+		}
+	}
+	if legacyCodec == nil {
+		legacyCodec = NewBinaryMessageCodec()
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return report, err
+	}
+	defer file.Close()
+
+	if _, err := file.Seek(offset, io.SeekStart); err != nil {
+		return report, err
+	}
+
+	reader := bufio.NewReaderSize(file, 1<<20)
+	for {
+		start := offset
+		length, readErr := binary.ReadUvarint(reader)
+		if errors.Is(readErr, io.EOF) {
+			report.GoodPrefixBytes = offset
+			return report, nil
+		}
+		if readErr != nil {
+			report.Problems = append(report.Problems, WALVerificationProblem{Offset: start, Tail: true, Error: "incomplete or invalid record length: " + readErr.Error()})
+			report.GoodPrefixBytes = start
+			return report, nil
+		}
+		offset += int64(uvarintLen(length))
+		if length == 0 || length > uint64(walCodec.maxRecordSize) {
+			report.Problems = append(report.Problems, WALVerificationProblem{Offset: start, Error: fmt.Sprintf("invalid record length %d", length)})
+			report.GoodPrefixBytes = start
+			return report, nil
+		}
+		payload := make([]byte, int(length))
+		if _, readErr := io.ReadFull(reader, payload); readErr != nil {
+			report.Problems = append(report.Problems, WALVerificationProblem{Offset: start, Tail: true, Error: "incomplete record payload: " + readErr.Error()})
+			report.GoodPrefixBytes = start
+			return report, nil
+		}
+		offset += int64(length)
+		report.Records++
+		if isNativeBinaryWALRecord(payload) {
+			report.NativeRecords++
+		} else {
+			report.LegacyRecords++
+		}
+	}
+}
+

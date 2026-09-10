@@ -9,6 +9,8 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strconv"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -227,3 +229,122 @@ func TestNativeFrameBatchPublishPollAndAck(t *testing.T) {
 		t.Fatalf("expected queue fully drained and payloads evicted, got %+v", stats)
 	}
 }
+
+func TestWALFirstUnderConcurrentWriters(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+
+	store, err := NewBinaryFileWALStore(dir)
+	if err != nil {
+		t.Fatalf("create store: %v", err)
+	}
+
+	queue := "concurrent-test"
+	if err := store.DeclareQueue(ctx, QueueConfig{Name: queue}); err != nil {
+		t.Fatalf("declare queue: %v", err)
+	}
+
+	const numProducers = 6
+	const msgsPerProducer = 100
+	const numConsumers = 4
+
+	var wg sync.WaitGroup
+	var appendErrCount atomic.Int64
+
+	// Concurrent producers
+	for p := 0; p < numProducers; p++ {
+		wg.Add(1)
+		go func(prodID int) {
+			defer wg.Done()
+			for i := 0; i < msgsPerProducer; i++ {
+				msg := Message{
+					ID:        fmt.Sprintf("p%d-m%d", prodID, i),
+					Queue:     queue,
+					Payload:   []byte(fmt.Sprintf("data-%d-%d", prodID, i)),
+					CreatedAt: time.Now(),
+				}
+				_, err := store.Append(ctx, msg, []Destination{{Kind: DestinationQueue, Name: queue}})
+				if err != nil {
+					appendErrCount.Add(1)
+				}
+			}
+		}(p)
+	}
+
+	// Concurrent consumers leasing and acking
+	var ackedCount atomic.Int64
+	stopConsumers := make(chan struct{})
+	var consumerWg sync.WaitGroup
+
+	for c := 0; c < numConsumers; c++ {
+		consumerWg.Add(1)
+		go func(consID int) {
+			defer consumerWg.Done()
+			for {
+				select {
+				case <-stopConsumers:
+					return
+				default:
+				}
+				leased, err := store.Lease(ctx, LeaseRequest{
+					Queue:             queue,
+					ConsumerID:        fmt.Sprintf("consumer-%d", consID),
+					Limit:             10,
+					VisibilityTimeout: 5 * time.Second,
+				})
+				if err != nil || len(leased) == 0 {
+					time.Sleep(2 * time.Millisecond)
+					continue
+				}
+				for _, m := range leased {
+					if err := store.Ack(ctx, AckRequest{Queue: queue, MessageID: m.ID, LeaseToken: m.LeaseToken}); err == nil {
+						ackedCount.Add(1)
+					}
+				}
+			}
+		}(c)
+	}
+
+	wg.Wait()
+	time.Sleep(50 * time.Millisecond)
+	close(stopConsumers)
+	consumerWg.Wait()
+
+	// Drain any remaining messages cleanly
+	for {
+		leased, err := store.Lease(ctx, LeaseRequest{Queue: queue, ConsumerID: "drainer", Limit: 50, VisibilityTimeout: time.Second})
+		if err != nil || len(leased) == 0 {
+			break
+		}
+		for _, m := range leased {
+			if err := store.Ack(ctx, AckRequest{Queue: queue, MessageID: m.ID, LeaseToken: m.LeaseToken}); err == nil {
+				ackedCount.Add(1)
+			}
+		}
+	}
+
+	totalProduced := int64(numProducers*msgsPerProducer) - appendErrCount.Load()
+	if ackedCount.Load() != totalProduced {
+		t.Fatalf("expected ackedCount (%d) == totalProduced (%d)", ackedCount.Load(), totalProduced)
+	}
+
+	if err := store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	// Reopen store to verify WAL recovery consistency under concurrent load
+	store2, err := NewBinaryFileWALStore(dir)
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	defer store2.Close()
+
+	remMsgs, err := store2.ListQueue(ctx, queue, 100)
+	if err != nil {
+		t.Fatalf("list queue: %v", err)
+	}
+	if len(remMsgs) != 0 {
+		t.Fatalf("expected 0 remaining messages in queue after recovery, got %d", len(remMsgs))
+	}
+}
+

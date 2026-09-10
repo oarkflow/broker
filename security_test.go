@@ -390,3 +390,49 @@ func TestFileWALPermissionsChecksumAndTailRecovery(t *testing.T) {
 		t.Fatalf("expected recovered intact record, got %+v", msgs)
 	}
 }
+
+func TestCrossProtocolQuotaAdmissionEnforcement(t *testing.T) {
+	acl := NewACL(
+		AdminToken{
+			Name:          "shared-client",
+			Token:         "quota-token",
+			Permissions:   []string{PermissionAdminAll},
+			MaxConcurrent: 2,
+		},
+	)
+
+	principal, ok := acl.Authenticate("quota-token")
+	if !ok {
+		t.Fatalf("failed to authenticate token")
+	}
+
+	// 1. Connection 1 admitted
+	release1, err := acl.AdmitConnection(principal)
+	if err != nil {
+		t.Fatalf("first connection admission failed: %v", err)
+	}
+
+	// 2. Connection 2 admitted
+	release2, err := acl.AdmitConnection(principal)
+	if err != nil {
+		t.Fatalf("second connection admission failed: %v", err)
+	}
+
+	// 3. Connection 3 exceeds MaxConcurrent: 2 -> ErrThrottled
+	_, err = acl.AdmitConnection(principal)
+	if !errors.Is(err, ErrThrottled) {
+		t.Fatalf("expected ErrThrottled on exceeding quota, got: %v", err)
+	}
+
+	// 4. Release connection 1
+	release1()
+
+	// 5. Connection 4 now succeeds
+	release3, err := acl.AdmitConnection(principal)
+	if err != nil {
+		t.Fatalf("connection admission after release failed: %v", err)
+	}
+	defer release2()
+	defer release3()
+}
+

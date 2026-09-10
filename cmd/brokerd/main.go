@@ -48,6 +48,8 @@ func main() {
 	wal := flag.String("wal", env("BROKER_WAL", ""), "WAL directory; empty uses in-memory store")
 	walFormat := flag.String("wal-format", env("BROKER_WAL_FORMAT", "binary"), "WAL format: binary or json")
 	walShards := flag.Int("wal-shards", int(envInt64("BROKER_WAL_SHARDS", 1)), "independent binary WAL shards; use separate volumes for best scaling")
+	walSegmentSize := flag.Int64("wal-segment-size", envInt64("BROKER_WAL_SEGMENT_SIZE", 64<<20), "maximum BWL2 segment size in bytes before rotating")
+	walMaxSegments := flag.Int("wal-max-segments", int(envInt64("BROKER_WAL_MAX_SEGMENTS", 10)), "maximum active BWL2 segments before compaction")
 	frameSigningKey := flag.String("frame-signing-key", env("BROKER_FRAME_SIGNING_KEY", ""), "optional FWB frame and BWL1 WAL HMAC signing key")
 	frameEncryptionKey := flag.String("frame-encryption-key", env("BROKER_FRAME_ENCRYPTION_KEY", ""), "optional FWB frame and BWL1 WAL AES-GCM encryption key")
 	frameCompress := flag.Int("frame-compress-threshold", int(envInt64("BROKER_FRAME_COMPRESS_THRESHOLD", 0)), "gzip FWB payloads and BWL1 records at or above this size; 0 disables")
@@ -151,6 +153,20 @@ func main() {
 				store = st
 			}
 		}
+	case "wal2", "segmented", "segmented-wal":
+		if *wal == "" {
+			logger.Log.Fatal("-wal is required when -store=wal2")
+		}
+		st, err := broker.NewSegmentedWALStore(broker.SegmentedWALConfig{
+			Dir:            *wal,
+			MaxSegmentSize: *walSegmentSize,
+			MaxSegments:    *walMaxSegments,
+			Codec:          frameCodec,
+		})
+		if err != nil {
+			logger.Log.Fatal("open segmented WAL store", zlog.Err(err))
+		}
+		store = st
 	default:
 		logger.Log.Fatal("unsupported store", zlog.String("store", *storeKind))
 	}

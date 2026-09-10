@@ -971,3 +971,69 @@ func TestStickySessionConcurrency(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+func TestAll14StrategiesWithTenantFiltering(t *testing.T) {
+	strategies := []StrategyType{
+		StrategyRoundRobin,
+		StrategyWeightedRoundRobin,
+		StrategyLeastLoaded,
+		StrategyRandom,
+		StrategyConsistentHash,
+		StrategyCapabilityBased,
+		StrategyPriorityAware,
+		StrategyAdaptiveLoadBalance,
+		StrategyStickySession,
+		StrategyFanOut,
+		StrategyRuleBased,
+		StrategyPowerOfTwoChoices,
+		StrategySharded,
+		StrategyHealthBased,
+	}
+
+	for _, st := range strategies {
+		t.Run(string(st), func(t *testing.T) {
+			router := NewRouter()
+			router.Add(Route{
+				Name:     "test-route-" + string(st),
+				Match:    "orders.*",
+				Strategy: st,
+				Enabled:  true,
+			})
+
+			candidates := []ConsumerCandidate{
+				{ConsumerID: "c-tenant-a-1", TenantID: "tenant-a", Weight: 10, MaxInFlight: 10, Healthy: true, Capabilities: []string{"cap1"}},
+				{ConsumerID: "c-tenant-a-2", TenantID: "tenant-a", Weight: 20, MaxInFlight: 10, Healthy: true, Capabilities: []string{"cap1"}},
+				{ConsumerID: "c-tenant-b-1", TenantID: "tenant-b", Weight: 100, MaxInFlight: 10, Healthy: true, Capabilities: []string{"cap1"}},
+				{ConsumerID: "c-tenant-b-2", TenantID: "tenant-b", Weight: 200, MaxInFlight: 10, Healthy: true, Capabilities: []string{"cap1"}},
+			}
+
+			principal := AdminPrincipal{Name: "user-a", Tenants: []string{"tenant-a"}}
+			ctx := context.WithValue(context.Background(), adminPrincipalKey{}, principal)
+
+			msg := Message{
+				ID:       "msg-a-1",
+				Topic:    "orders.created",
+				TenantID: "tenant-a",
+				Key:      "order-123",
+			}
+
+			selected, _, err := router.RouteWithStrategy(ctx, msg, candidates)
+			if err != nil {
+				t.Fatalf("strategy %s error: %v", st, err)
+			}
+			if len(selected) == 0 {
+				t.Fatalf("strategy %s returned no candidates", st)
+			}
+
+			for _, c := range selected {
+				if c.TenantID == "tenant-b" {
+					t.Fatalf("strategy %s leaked candidate from tenant-b: %s", st, c.ConsumerID)
+				}
+				if c.TenantID != "tenant-a" {
+					t.Fatalf("strategy %s selected invalid tenant candidate: %+v", st, c)
+				}
+			}
+		})
+	}
+}
+

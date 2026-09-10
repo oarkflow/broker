@@ -34,6 +34,7 @@ const (
 type ConsumerCandidate struct {
 	ConsumerID   string            `json:"consumer_id"`
 	Group        string            `json:"group"`
+	TenantID     string            `json:"tenant_id,omitempty"`
 	Weight       int               `json:"weight"`
 	Capabilities []string          `json:"capabilities,omitempty"`
 	Metadata     map[string]string `json:"metadata,omitempty"`
