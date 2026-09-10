@@ -85,6 +85,8 @@ func main() {
 		} else {
 			err = request(client, *addr, *token, http.MethodGet, "/v1/sagas/"+flag.Arg(1), nil)
 		}
+	case "cluster":
+		err = request(client, *addr, *token, http.MethodGet, "/cluster/status", nil)
 	default:
 		usage()
 		os.Exit(2)
@@ -226,7 +228,8 @@ func usage() {
   publish -topic <topic> -queue <queue> -stream <stream> -type <type> -payload '<json>'
   move -from-type queue -from <name> -to-type queue -to <name> [-mode move] [-ids id1,id2]
   consumers [id|ban <id> [reason]|unban <id>]
-  sagas [id]`)
+  sagas [id]
+  cluster`)
 }
 
 func die(msg string) {

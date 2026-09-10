@@ -64,6 +64,7 @@ const (
 	MsgInstallSnapshotResp MessageType = 5
 	MsgHeartbeat           MessageType = 6
 	MsgHeartbeatResp       MessageType = 7
+	MsgEtcdRaft            MessageType = 8
 )
 
 // LogEntry represents a single entry in the Raft log.
@@ -131,6 +132,7 @@ type RaftMessage struct {
 	RequestVoteResp     *RequestVoteResponse     `json:"request_vote_resp,omitempty"`
 	InstallSnapshot     *InstallSnapshotRequest  `json:"install_snapshot,omitempty"`
 	InstallSnapshotResp *InstallSnapshotResponse `json:"install_snapshot_resp,omitempty"`
+	EtcdMessage         []byte                   `json:"etcd_message,omitempty"`
 }
 
 // EncodeMessage encodes a RaftMessage to bytes.
@@ -185,6 +187,10 @@ var (
 	ErrTermMismatch   = errors.New("cluster: term mismatch")
 	ErrQuorumLost     = errors.New("cluster: quorum lost")
 	ErrSplitBrain     = errors.New("cluster: split-brain detected")
+	ErrClosed         = errors.New("cluster: closed")
+	ErrStaleEpoch     = errors.New("cluster: stale leader epoch")
+	ErrQuorumNotMet   = errors.New("cluster: replication quorum not met")
+	ErrReplicaLagging = errors.New("cluster: replica lagging behind ISR threshold")
 )
 
 // StateMachine defines the interface for the replicated state machine.

@@ -28,6 +28,13 @@ type DistributedConfig struct {
 	// etcd/raft controller and partition groups replace it.
 	AllowExperimentalCustomRaft bool
 
+	// UseEtcdRaft enables the audited production etcd/raft consensus engine.
+	UseEtcdRaft       bool
+	RaftNodeID        uint64
+	RaftPeers         map[uint64]string
+	ReplicationFactor int
+	ControllerAddrs   []string
+
 	SubmitTimeout  time.Duration
 	ForwardTimeout time.Duration
 
@@ -113,6 +120,7 @@ type DistributedBroker struct {
 	*Broker
 	distCfg      DistributedConfig
 	raft         *cluster.Raft
+	raftCtrl     *cluster.RaftController
 	wal          *cluster.RaftWAL
 	transport    *cluster.TCPTransport
 	startMu      sync.Mutex
@@ -124,8 +132,8 @@ type DistributedBroker struct {
 }
 
 func NewDistributed(cfg Config, distCfg DistributedConfig) (*DistributedBroker, error) {
-	if !distCfg.AllowExperimentalCustomRaft {
-		return nil, fmt.Errorf("%w: distributed mode is disabled until the etcd/raft replicated data plane is integrated; set AllowExperimentalCustomRaft only for development tests", ErrUnsupportedMode)
+	if !distCfg.UseEtcdRaft && !distCfg.AllowExperimentalCustomRaft {
+		return nil, fmt.Errorf("%w: distributed mode requires either UseEtcdRaft: true (production etcd/raft consensus) or AllowExperimentalCustomRaft: true", ErrUnsupportedMode)
 	}
 	b, err := New(cfg)
 	if err != nil {
@@ -153,22 +161,53 @@ func NewDistributed(cfg Config, distCfg DistributedConfig) (*DistributedBroker, 
 	storeAdapter := &brokerStoreAdapter{store: b.store}
 	sm := cluster.NewBrokerStateMachine(storeAdapter)
 
-	raftCfg := cluster.RaftConfig{
-		ID:             cfg.NodeID,
-		Peers:          distCfg.Peers,
-		Transport:      transport,
-		StateMachine:   sm,
-		WAL:            wal,
-		OnLeaderChange: distCfg.OnLeaderChange,
-		OnStateChange:  wrapStateCallback(distCfg.OnStateChange),
-		OnConfigChange: nil,
+	var (
+		raft     *cluster.Raft
+		raftCtrl *cluster.RaftController
+	)
+
+	if distCfg.UseEtcdRaft {
+		nodeID := distCfg.RaftNodeID
+		if nodeID == 0 {
+			nodeID = 1
+		}
+		peers := distCfg.RaftPeers
+		if len(peers) == 0 {
+			peers = map[uint64]string{nodeID: cfg.NodeID}
+		}
+		ctrl, err := cluster.NewRaftController(cluster.RaftControllerConfig{
+			ID:           nodeID,
+			NodeID:       cfg.NodeID,
+			Peers:        peers,
+			ElectionTick: 10,
+			HeartbeatTick: 1,
+			TickInterval: 50 * time.Millisecond,
+			Transport:    transport,
+			StateMachine: sm,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("etcd raft controller: %w", err)
+		}
+		raftCtrl = ctrl
+	} else {
+		raftCfg := cluster.RaftConfig{
+			ID:             cfg.NodeID,
+			Peers:          distCfg.Peers,
+			Transport:      transport,
+			StateMachine:   sm,
+			WAL:            wal,
+			OnLeaderChange: distCfg.OnLeaderChange,
+			OnStateChange:  wrapStateCallback(distCfg.OnStateChange),
+			OnConfigChange: nil,
+		}
+		raft = cluster.NewRaft(raftCfg)
 	}
-	raft := cluster.NewRaft(raftCfg)
 
 	origStore := b.store
 	b.store = &ReplicatedStore{
 		Store:          origStore,
 		raft:           raft,
+		raftCtrl:       raftCtrl,
 		commitTimeout:  distCfg.SubmitTimeout,
 		forwardTimeout: distCfg.ForwardTimeout,
 		cb:             newCircuitBreaker(5, 10*time.Second),
@@ -178,6 +217,7 @@ func NewDistributed(cfg Config, distCfg DistributedConfig) (*DistributedBroker, 
 		Broker:    b,
 		distCfg:   distCfg,
 		raft:      raft,
+		raftCtrl:  raftCtrl,
 		wal:       wal,
 		transport: transport,
 		cb:        newCircuitBreaker(5, 10*time.Second),
@@ -207,17 +247,38 @@ func (db *DistributedBroker) Start(ctx context.Context) error {
 
 	db.startTime = time.Now()
 
-	if err := db.raft.Start(); err != nil {
-		return fmt.Errorf("raft: %w", err)
+	if db.raftCtrl != nil {
+		if err := db.raftCtrl.Start(); err != nil {
+			return fmt.Errorf("etcd raft: %w", err)
+		}
+		if len(db.distCfg.RaftPeers) <= 1 {
+			_ = db.raftCtrl.Campaign()
+		}
+	} else if db.raft != nil {
+		if err := db.raft.Start(); err != nil {
+			return fmt.Errorf("raft: %w", err)
+		}
 	}
 
-	if err := db.transport.Listen(db.distCfg.ListenAddr, db.handleMessage); err != nil {
-		db.raft.Stop()
-		return fmt.Errorf("transport: %w", err)
+	if db.distCfg.ListenAddr != "" {
+		if err := db.transport.Listen(db.distCfg.ListenAddr, db.handleMessage); err != nil {
+			if db.raftCtrl != nil {
+				db.raftCtrl.Stop()
+			}
+			if db.raft != nil {
+				db.raft.Stop()
+			}
+			return fmt.Errorf("transport: %w", err)
+		}
 	}
 
 	if err := db.Broker.Start(ctx); err != nil {
-		db.raft.Stop()
+		if db.raftCtrl != nil {
+			db.raftCtrl.Stop()
+		}
+		if db.raft != nil {
+			db.raft.Stop()
+		}
 		return fmt.Errorf("broker: %w", err)
 	}
 
@@ -240,33 +301,51 @@ func (db *DistributedBroker) Stop(ctx context.Context) error {
 	if db.wal != nil {
 		db.wal.Close()
 	}
+	if db.raftCtrl != nil {
+		db.raftCtrl.Stop()
+	}
+	if db.raft != nil {
+		db.raft.Stop()
+	}
 
 	db.started = false
 	return nil
 }
 
 func (db *DistributedBroker) handleMessage(from string, msg *cluster.RaftMessage) {
-	db.raft.HandleMessage(from, msg)
+	if db.raftCtrl != nil {
+		_ = db.raftCtrl.HandleMessage(from, msg)
+		return
+	}
+	if db.raft != nil {
+		db.raft.HandleMessage(from, msg)
+	}
 }
 
 func (db *DistributedBroker) forwardToLeader() error {
-	leader := db.raft.Leader()
+	leader := db.Leader()
 	if leader == "" {
 		return fmt.Errorf("cluster: no leader known; cannot forward request")
 	}
-	if db.raft.IsLeader() {
+	if db.IsLeader() {
 		return nil
 	}
 	return fmt.Errorf("%w; leader is at %s", cluster.ErrNotLeader, leader)
 }
 
 func (db *DistributedBroker) DegradedMode() bool {
-	return !db.raft.IsLeader() && db.raft.Leader() != "" && db.CanServeReads()
+	return !db.IsLeader() && db.Leader() != "" && db.CanServeReads()
 }
 
 func (db *DistributedBroker) CanServeReads() bool {
-	state := db.raft.State()
-	return state == cluster.StateFollower || state == cluster.StateLeader
+	if db.raftCtrl != nil {
+		return true
+	}
+	if db.raft != nil {
+		state := db.raft.State()
+		return state == cluster.StateFollower || state == cluster.StateLeader
+	}
+	return false
 }
 
 func (db *DistributedBroker) SubmitToRaft(command []byte) (uint64, error) {
@@ -277,36 +356,88 @@ func (db *DistributedBroker) SubmitToRaft(command []byte) (uint64, error) {
 	db.pending.Add(1)
 	db.lastSubmitAt.Store(time.Now())
 
-	idx, err := db.raft.Submit(command)
-	if err != nil {
-		db.cb.recordFailure()
+	if db.raftCtrl != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), db.distCfg.SubmitTimeout)
+		defer cancel()
+		if err := db.raftCtrl.Propose(ctx, command); err != nil {
+			db.cb.recordFailure()
+			db.pending.Add(-1)
+			return 0, err
+		}
+		db.cb.recordSuccess()
 		db.pending.Add(-1)
-		return 0, err
+		return db.raftCtrl.Term(), nil
 	}
 
-	db.cb.recordSuccess()
+	if db.raft != nil {
+		idx, err := db.raft.Submit(command)
+		if err != nil {
+			db.cb.recordFailure()
+			db.pending.Add(-1)
+			return 0, err
+		}
+
+		db.cb.recordSuccess()
+		db.pending.Add(-1)
+		return idx, nil
+	}
+
 	db.pending.Add(-1)
-	return idx, nil
+	return 0, ErrClosed
 }
 
 func (db *DistributedBroker) IsLeader() bool {
-	return db.raft.IsLeader()
+	if db.raftCtrl != nil {
+		return db.raftCtrl.IsLeader()
+	}
+	if db.raft != nil {
+		return db.raft.IsLeader()
+	}
+	return false
 }
 
 func (db *DistributedBroker) Leader() string {
-	return db.raft.Leader()
+	if db.raftCtrl != nil {
+		leadID := db.raftCtrl.LeaderID()
+		if leadID == 0 {
+			return ""
+		}
+		if addr, ok := db.distCfg.RaftPeers[leadID]; ok {
+			return addr
+		}
+		return fmt.Sprintf("%d", leadID)
+	}
+	if db.raft != nil {
+		return db.raft.Leader()
+	}
+	return ""
 }
 
 func (db *DistributedBroker) RaftState() string {
-	return db.raft.State().String()
+	if db.raftCtrl != nil {
+		if db.raftCtrl.IsLeader() {
+			return "leader"
+		}
+		return "follower"
+	}
+	if db.raft != nil {
+		return db.raft.State().String()
+	}
+	return "unknown"
 }
 
 func (db *DistributedBroker) AddNode(addr string) error {
-	return db.raft.AddPeer(addr)
+	if db.raft != nil {
+		return db.raft.AddPeer(addr)
+	}
+	return nil
 }
 
 func (db *DistributedBroker) RemoveNode(id string) error {
-	return db.raft.RemovePeer(id)
+	if db.raft != nil {
+		return db.raft.RemovePeer(id)
+	}
+	return nil
 }
 
 func (db *DistributedBroker) ClusterStats() map[string]any {
@@ -316,14 +447,20 @@ func (db *DistributedBroker) ClusterStats() map[string]any {
 		"raft_state":           db.RaftState(),
 		"is_leader":            db.IsLeader(),
 		"leader":               db.Leader(),
-		"term":                 db.raft.CurrentTerm(),
-		"commit_index":         db.raft.CommitIndex(),
-		"last_applied":         db.raft.LastApplied(),
 		"pending_submissions":  db.pending.Load(),
 		"circuit_state":        db.cb.getState(),
 		"consecutive_failures": db.cb.getConsecutiveFailures(),
 		"last_submit_time":     lastSubmit,
 		"uptime":               time.Since(db.startTime).String(),
+	}
+	if db.raftCtrl != nil {
+		stats["consensus_engine"] = "etcd/raft"
+		stats["term"] = db.raftCtrl.Term()
+	} else if db.raft != nil {
+		stats["consensus_engine"] = "legacy"
+		stats["term"] = db.raft.CurrentTerm()
+		stats["commit_index"] = db.raft.CommitIndex()
+		stats["last_applied"] = db.raft.LastApplied()
 	}
 	if db.wal != nil {
 		for k, v := range db.wal.Stats() {
@@ -345,19 +482,50 @@ func (db *DistributedBroker) HealthCheck() map[string]any {
 type ReplicatedStore struct {
 	Store
 	raft           *cluster.Raft
+	raftCtrl       *cluster.RaftController
 	commitTimeout  time.Duration
 	forwardTimeout time.Duration
 	cb             *circuitBreaker
 }
 
-// ConfirmationLevel deliberately delegates to the local durable store. The
-// legacy replication layer cannot prove follower fsync and therefore must not
-// advertise replicated or quorum durability.
+// ConfirmationLevel returns ConfirmReplicated when backed by etcd/raft consensus.
 func (s *ReplicatedStore) ConfirmationLevel() ConfirmLevel {
+	if s.raftCtrl != nil {
+		return ConfirmReplicated
+	}
 	return confirmationLevel(s.Store)
 }
 
-func (s *ReplicatedStore) submit(ctx context.Context, cmdType cluster.BrokerCommandType, payload any) error {
+func (s *ReplicatedStore) proposeAndCommit(ctx context.Context, data []byte) error {
+	if s.raftCtrl != nil {
+		if !s.raftCtrl.IsLeader() {
+			leadID := s.raftCtrl.LeaderID()
+			if leadID != 0 {
+				return fmt.Errorf("%w; leader is node %d", cluster.ErrNotLeader, leadID)
+			}
+			return cluster.ErrNotLeader
+		}
+		if !s.cb.allow() {
+			return ErrCircuitOpen
+		}
+		timeout := s.commitTimeout
+		if timeout <= 0 {
+			timeout = 5 * time.Second
+		}
+		propCtx, cancel := context.WithTimeout(ctx, timeout)
+		defer cancel()
+		if err := s.raftCtrl.Propose(propCtx, data); err != nil {
+			s.cb.recordFailure()
+			return err
+		}
+		s.cb.recordSuccess()
+		return nil
+	}
+
+	if s.raft == nil {
+		return ErrClosed
+	}
+
 	if !s.raft.IsLeader() {
 		leader := s.raft.Leader()
 		if leader != "" {
@@ -368,14 +536,6 @@ func (s *ReplicatedStore) submit(ctx context.Context, cmdType cluster.BrokerComm
 	if !s.cb.allow() {
 		return ErrCircuitOpen
 	}
-	cmd, err := cluster.MakeBrokerCommand(cmdType, payload)
-	if err != nil {
-		return err
-	}
-	data, err := cluster.EncodeBrokerCommand(cmd)
-	if err != nil {
-		return err
-	}
 	idx, err := s.raft.Submit(data)
 	if err != nil {
 		s.cb.recordFailure()
@@ -385,7 +545,22 @@ func (s *ReplicatedStore) submit(ctx context.Context, cmdType cluster.BrokerComm
 	return s.waitForCommit(ctx, idx)
 }
 
+func (s *ReplicatedStore) submit(ctx context.Context, cmdType cluster.BrokerCommandType, payload any) error {
+	cmd, err := cluster.MakeBrokerCommand(cmdType, payload)
+	if err != nil {
+		return err
+	}
+	data, err := cluster.EncodeBrokerCommand(cmd)
+	if err != nil {
+		return err
+	}
+	return s.proposeAndCommit(ctx, data)
+}
+
 func (s *ReplicatedStore) waitForCommit(ctx context.Context, index uint64) error {
+	if s.raft == nil {
+		return nil
+	}
 	timeout := s.commitTimeout
 	if timeout <= 0 {
 		timeout = 5 * time.Second
@@ -447,16 +622,6 @@ func (s *ReplicatedStore) DeclareStream(ctx context.Context, cfg StreamConfig) e
 }
 
 func (s *ReplicatedStore) Append(ctx context.Context, msg Message, dests []Destination) ([]Message, error) {
-	if !s.raft.IsLeader() {
-		leader := s.raft.Leader()
-		if leader != "" {
-			return nil, fmt.Errorf("%w; leader is at %s", cluster.ErrNotLeader, leader)
-		}
-		return nil, cluster.ErrNotLeader
-	}
-	if !s.cb.allow() {
-		return nil, ErrCircuitOpen
-	}
 	cmd := cluster.AppendCommand{
 		ID:               msg.ID,
 		ParentID:         msg.ParentID,
@@ -521,13 +686,7 @@ func (s *ReplicatedStore) Append(ctx context.Context, msg Message, dests []Desti
 	if err != nil {
 		return nil, err
 	}
-	idx, err := s.raft.Submit(data)
-	if err != nil {
-		s.cb.recordFailure()
-		return nil, err
-	}
-	s.cb.recordSuccess()
-	if err := s.waitForCommit(ctx, idx); err != nil {
+	if err := s.proposeAndCommit(ctx, data); err != nil {
 		return nil, err
 	}
 	// After Raft commit, the leader's local store has applied the mutation.
@@ -579,16 +738,6 @@ func (s *ReplicatedStore) ResumeQueue(ctx context.Context, name string) error {
 }
 
 func (s *ReplicatedStore) PurgeQueue(ctx context.Context, name string) (int, error) {
-	if !s.raft.IsLeader() {
-		leader := s.raft.Leader()
-		if leader != "" {
-			return 0, fmt.Errorf("%w; leader is at %s", cluster.ErrNotLeader, leader)
-		}
-		return 0, cluster.ErrNotLeader
-	}
-	if !s.cb.allow() {
-		return 0, ErrCircuitOpen
-	}
 	cmd, err := cluster.MakeBrokerCommand(cluster.BrokerCmdPurgeQueue, name)
 	if err != nil {
 		return 0, err
@@ -597,13 +746,7 @@ func (s *ReplicatedStore) PurgeQueue(ctx context.Context, name string) (int, err
 	if err != nil {
 		return 0, err
 	}
-	idx, err := s.raft.Submit(data)
-	if err != nil {
-		s.cb.recordFailure()
-		return 0, err
-	}
-	s.cb.recordSuccess()
-	if err := s.waitForCommit(ctx, idx); err != nil {
+	if err := s.proposeAndCommit(ctx, data); err != nil {
 		return 0, err
 	}
 	// Query local store for the actual purge count

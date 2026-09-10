@@ -70,6 +70,7 @@ func (a AdminServer) Handler() http.Handler {
 	mux.HandleFunc("/notifications", a.wrap(a.notifications))
 	mux.HandleFunc("/events", a.wrap(a.events))
 	mux.HandleFunc("/routes", a.wrap(a.routes))
+	mux.HandleFunc("/cluster/status", a.wrap(a.clusterStatus))
 	return mux
 }
 func (a AdminServer) ListenAndServe(addr string) *http.Server {
@@ -1022,3 +1023,20 @@ func adminAction(r *http.Request) string {
 		return PermissionBrokerRead
 	}
 }
+
+func (a AdminServer) clusterStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	resp := map[string]any{
+		"mode":    string(a.Broker.cfg.Mode),
+		"node_id": a.Broker.cfg.NodeID,
+	}
+	if a.Broker.Cluster() != nil {
+		resp["nodes"] = a.Broker.Cluster().Nodes()
+		resp["assignments"] = a.Broker.Cluster().Assignments()
+	}
+	writeBrokerJSON(w, resp)
+}
+
