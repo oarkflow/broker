@@ -67,15 +67,23 @@ const (
 )
 
 // MQTTServer is a lightweight MQTT 3.1.1 server backed by the broker.
+type MQTTSession struct {
+	ClientID      string
+	Subscriptions map[string]uint8
+	UpdatedAt     time.Time
+}
+
 type MQTTServer struct {
-	broker *Broker
-	cfg    MQTTConfig
-	ln     net.Listener
-	conns  map[string]*mqttConn
-	mu     sync.RWMutex
-	wg     sync.WaitGroup
-	ctx    context.Context
-	cancel context.CancelFunc
+	broker     *Broker
+	cfg        MQTTConfig
+	ln         net.Listener
+	conns      map[string]*mqttConn
+	mu         sync.RWMutex
+	sessions   map[string]*MQTTSession
+	sessionsMu sync.Mutex
+	wg         sync.WaitGroup
+	ctx        context.Context
+	cancel     context.CancelFunc
 }
 
 type mqttConn struct {
@@ -83,6 +91,7 @@ type mqttConn struct {
 	conn         net.Conn
 	clientID     string
 	username     string
+	cleanSession bool
 	keepAlive    uint16
 	subs         map[string]uint8 // topic -> qos
 	incomingQoS2 map[uint16]mqttPendingPublish
@@ -115,11 +124,12 @@ func NewMQTTServer(b *Broker, cfg MQTTConfig) *MQTTServer {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	return &MQTTServer{
-		broker: b,
-		cfg:    cfg,
-		conns:  make(map[string]*mqttConn),
-		ctx:    ctx,
-		cancel: cancel,
+		broker:   b,
+		cfg:      cfg,
+		conns:    make(map[string]*mqttConn),
+		sessions: make(map[string]*MQTTSession),
+		ctx:      ctx,
+		cancel:   cancel,
 	}
 }
 
@@ -329,6 +339,8 @@ func (ms *MQTTServer) handleConnect(mc *mqttConn, payload []byte) bool {
 	_ = payload[offset] // protocol level
 	offset++
 	connectFlags := payload[offset]
+	cleanSession := (connectFlags & 0x02) != 0
+	mc.cleanSession = cleanSession
 	offset++
 	keepAlive := binary.BigEndian.Uint16(payload[offset:])
 	mc.keepAlive = keepAlive
@@ -408,26 +420,49 @@ func (ms *MQTTServer) handleConnect(mc *mqttConn, payload []byte) bool {
 		if authenticated {
 			release, err := ms.cfg.ACL.AdmitConnection(principal)
 			if err != nil {
-				ms.sendConnack(mc.conn, 0x03) // Server unavailable
+				ms.sendConnack(mc.conn, 0x03, false) // Server unavailable
 				return false
 			}
 			mc.release = release
 		} else if ms.cfg.RequireAuth {
-			ms.sendConnack(mc.conn, 0x05) // Connection Refused: not authorized
+			ms.sendConnack(mc.conn, 0x05, false) // Connection Refused: not authorized
 			return false
 		}
 	} else if ms.cfg.BrokerToken != "" {
 		// Use broker token for authentication
 		if !constantTimeEqual(password, ms.cfg.BrokerToken) {
-			ms.sendConnack(mc.conn, 0x05) // Connection Refused: not authorized
+			ms.sendConnack(mc.conn, 0x05, false) // Connection Refused: not authorized
 			return false
 		}
 	} else if ms.cfg.RequireAuth && (!constantTimeEqual(mc.username, ms.cfg.Username) || !constantTimeEqual(password, ms.cfg.Password)) {
-		ms.sendConnack(mc.conn, 0x05) // Connection Refused: not authorized
+		ms.sendConnack(mc.conn, 0x05, false) // Connection Refused: not authorized
 		return false
 	}
 
-	ms.sendConnack(mc.conn, 0x00) // Connection Accepted
+	sessionPresent := false
+	if cleanSession {
+		ms.sessionsMu.Lock()
+		delete(ms.sessions, mc.clientID)
+		ms.sessionsMu.Unlock()
+	} else {
+		ms.sessionsMu.Lock()
+		sess, exists := ms.sessions[mc.clientID]
+		if !exists {
+			ms.sessions[mc.clientID] = &MQTTSession{
+				ClientID:      mc.clientID,
+				Subscriptions: make(map[string]uint8),
+				UpdatedAt:     time.Now(),
+			}
+		} else {
+			sessionPresent = true
+			for topicFilter, qos := range sess.Subscriptions {
+				ms.attachSubscription(mc, topicFilter, qos)
+			}
+		}
+		ms.sessionsMu.Unlock()
+	}
+
+	ms.sendConnack(mc.conn, 0x00, sessionPresent) // Connection Accepted
 	return true
 }
 
@@ -502,6 +537,36 @@ func (ms *MQTTServer) completeIncomingQoS2(mc *mqttConn, packetID uint16) error 
 	return nil
 }
 
+func (ms *MQTTServer) attachSubscription(mc *mqttConn, topicFilter string, qos uint8) {
+	if mc.subs == nil {
+		mc.subs = make(map[string]uint8)
+	}
+	mc.subs[topicFilter] = qos
+
+	// Create broker subscription
+	brokerTopic := strings.ReplaceAll(topicFilter, "/", ".")
+	queue := "mqtt.sub." + mc.clientID + "." + strings.ReplaceAll(topicFilter, "*", "star")
+	_ = ms.broker.DeclareQueue(ms.ctx, QueueConfig{Name: queue, VisibilityTimeout: 30 * time.Second})
+	ms.broker.AddRoute(Route{
+		Name:  "mqtt." + mc.clientID + "." + topicFilter,
+		Mode:  RouteTopic,
+		Match: brokerTopic,
+		To:    []Destination{{Kind: DestinationQueue, Name: queue}},
+	})
+	ms.broker.Subscribe(ms.ctx, ConsumerConfig{
+		Name:    "mqtt-" + mc.clientID + "-" + queue,
+		Queue:   queue,
+		AckMode: AckAuto,
+	}, func(ctx context.Context, d Delivery) error {
+		mqttTopic := topicFilter
+		if v, ok := d.Message.Headers["mqtt_topic"]; ok {
+			mqttTopic = v
+		}
+		ms.sendMqttPublish(mc.conn, mqttTopic, d.Message.Payload, 0)
+		return nil
+	})
+}
+
 func (ms *MQTTServer) handleSubscribe(mc *mqttConn, payload []byte) {
 	if len(payload) < 5 {
 		return
@@ -520,30 +585,16 @@ func (ms *MQTTServer) handleSubscribe(mc *mqttConn, payload []byte) {
 		qos := payload[offset]
 		offset++
 		grantedQoS = append(grantedQoS, qos)
-		mc.subs[topicFilter] = qos
 
-		// Create broker subscription
-		brokerTopic := strings.ReplaceAll(topicFilter, "/", ".")
-		queue := "mqtt.sub." + mc.clientID + "." + strings.ReplaceAll(topicFilter, "*", "star")
-		_ = ms.broker.DeclareQueue(ms.ctx, QueueConfig{Name: queue, VisibilityTimeout: 30 * time.Second})
-		ms.broker.AddRoute(Route{
-			Name:  "mqtt." + mc.clientID + "." + topicFilter,
-			Mode:  RouteTopic,
-			Match: brokerTopic,
-			To:    []Destination{{Kind: DestinationQueue, Name: queue}},
-		})
-		ms.broker.Subscribe(ms.ctx, ConsumerConfig{
-			Name:    "mqtt-" + mc.clientID + "-" + queue,
-			Queue:   queue,
-			AckMode: AckAuto,
-		}, func(ctx context.Context, d Delivery) error {
-			mqttTopic := topicFilter
-			if v, ok := d.Message.Headers["mqtt_topic"]; ok {
-				mqttTopic = v
+		ms.attachSubscription(mc, topicFilter, qos)
+		if !mc.cleanSession {
+			ms.sessionsMu.Lock()
+			if sess, ok := ms.sessions[mc.clientID]; ok {
+				sess.Subscriptions[topicFilter] = qos
+				sess.UpdatedAt = time.Now()
 			}
-			ms.sendMqttPublish(mc.conn, mqttTopic, d.Message.Payload, 0)
-			return nil
-		})
+			ms.sessionsMu.Unlock()
+		}
 	}
 	// Send SUBACK
 	data := make([]byte, 2+len(grantedQoS))
@@ -561,15 +612,28 @@ func (ms *MQTTServer) handleUnsubscribe(mc *mqttConn, payload []byte) {
 	for offset+2 < len(payload) {
 		topicLen := int(binary.BigEndian.Uint16(payload[offset : offset+2]))
 		offset += 2 + topicLen
-		delete(mc.subs, string(payload[offset-topicLen:offset]))
+		topic := string(payload[offset-topicLen : offset])
+		delete(mc.subs, topic)
+		if !mc.cleanSession {
+			ms.sessionsMu.Lock()
+			if sess, ok := ms.sessions[mc.clientID]; ok {
+				delete(sess.Subscriptions, topic)
+				sess.UpdatedAt = time.Now()
+			}
+			ms.sessionsMu.Unlock()
+		}
 	}
 	data := make([]byte, 2)
 	binary.BigEndian.PutUint16(data, pktID)
 	ms.sendPacket(mc.conn, MQTTUnsuback, data)
 }
 
-func (ms *MQTTServer) sendConnack(conn net.Conn, returnCode byte) {
-	ms.sendPacket(conn, MQTTConnack, []byte{0x00, returnCode})
+func (ms *MQTTServer) sendConnack(conn net.Conn, returnCode byte, sessionPresent bool) {
+	var flags byte
+	if sessionPresent && returnCode == 0 {
+		flags = 0x01
+	}
+	ms.sendPacket(conn, MQTTConnack, []byte{flags, returnCode})
 }
 
 func (ms *MQTTServer) sendPuback(conn net.Conn, pktID uint16) {

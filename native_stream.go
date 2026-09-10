@@ -619,7 +619,7 @@ func (s *NativeStreamServer) serveConn(c net.Conn) {
 	}
 
 	for {
-		op, corr, body, err := readNativeFrame(r, s.cfg.MaxFrameBytes)
+		op, chanID, corr, body, err := readNativeFrameWithChannel(r, s.cfg.MaxFrameBytes)
 		if err != nil {
 			return
 		}
@@ -656,7 +656,7 @@ func (s *NativeStreamServer) serveConn(c net.Conn) {
 		default:
 			resp = appendNativeError(nil, "unsupported operation")
 		}
-		if err := writeNativeFrame(w, respOp, corr, resp); err != nil {
+		if err := writeNativeFrameWithChannel(w, respOp, chanID, corr, resp); err != nil {
 			return
 		}
 		if err := w.Flush(); err != nil {
@@ -893,27 +893,30 @@ func appendNativeError(dst []byte, msg string) []byte {
 	dst = append(dst, 1)
 	return appendNativeString(dst, msg)
 }
-func readNativeFrame(r io.Reader, max int) (byte, uint64, []byte, error) {
+func readNativeFrameWithChannel(r io.Reader, max int) (byte, uint16, uint64, []byte, error) {
 	var h [nativeHeaderSize]byte
 	if _, err := io.ReadFull(r, h[:]); err != nil {
-		return 0, 0, nil, err
+		return 0, 0, 0, nil, err
 	}
 	if binary.BigEndian.Uint32(h[:4]) != NativeStreamMagic || h[4] != nativeVersion {
-		return 0, 0, nil, errors.New("invalid native stream frame")
+		return 0, 0, 0, nil, errors.New("invalid native stream frame")
 	}
+	chanID := binary.BigEndian.Uint16(h[6:8])
 	n := int(binary.BigEndian.Uint32(h[16:20]))
 	if n < 0 || n > max {
-		return 0, 0, nil, errors.New("native frame too large")
+		return 0, 0, 0, nil, errors.New("native frame too large")
 	}
 	b := make([]byte, n)
 	_, err := io.ReadFull(r, b)
-	return h[5], binary.BigEndian.Uint64(h[8:16]), b, err
+	return h[5], chanID, binary.BigEndian.Uint64(h[8:16]), b, err
 }
-func writeNativeFrame(w io.Writer, op byte, corr uint64, body []byte) error {
+
+func writeNativeFrameWithChannel(w io.Writer, op byte, channelID uint16, corr uint64, body []byte) error {
 	var h [nativeHeaderSize]byte
 	binary.BigEndian.PutUint32(h[:4], NativeStreamMagic)
 	h[4] = nativeVersion
 	h[5] = op
+	binary.BigEndian.PutUint16(h[6:8], channelID)
 	binary.BigEndian.PutUint64(h[8:16], corr)
 	binary.BigEndian.PutUint32(h[16:20], uint32(len(body)))
 	if _, err := w.Write(h[:]); err != nil {
@@ -921,6 +924,15 @@ func writeNativeFrame(w io.Writer, op byte, corr uint64, body []byte) error {
 	}
 	_, err := w.Write(body)
 	return err
+}
+
+func readNativeFrame(r io.Reader, max int) (byte, uint64, []byte, error) {
+	op, _, corr, b, err := readNativeFrameWithChannel(r, max)
+	return op, corr, b, err
+}
+
+func writeNativeFrame(w io.Writer, op byte, corr uint64, body []byte) error {
+	return writeNativeFrameWithChannel(w, op, 0, corr, body)
 }
 
 // NativeStreamClient is a persistent, correlation-safe client. One client may
@@ -1045,21 +1057,21 @@ func (c *NativeStreamClient) Principal() string {
 	}
 	return c.principal
 }
-func (c *NativeStreamClient) call(op byte, body []byte) ([]byte, error) {
+func (c *NativeStreamClient) callOnChannel(chanID uint16, op byte, body []byte) ([]byte, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.corr++
-	if err := writeNativeFrame(c.w, op, c.corr, body); err != nil {
+	if err := writeNativeFrameWithChannel(c.w, op, chanID, c.corr, body); err != nil {
 		return nil, err
 	}
 	if err := c.w.Flush(); err != nil {
 		return nil, err
 	}
-	rop, corr, resp, err := readNativeFrame(c.r, c.max)
+	rop, rChan, corr, resp, err := readNativeFrameWithChannel(c.r, c.max)
 	if err != nil {
 		return nil, err
 	}
-	if rop != op|nativeResponseFlag || corr != c.corr {
+	if rop != op|nativeResponseFlag || corr != c.corr || rChan != chanID {
 		return nil, errors.New("native response mismatch")
 	}
 	if len(resp) == 0 {
@@ -1070,6 +1082,10 @@ func (c *NativeStreamClient) call(op byte, body []byte) ([]byte, error) {
 		return nil, errors.New(d.str())
 	}
 	return resp[1:], nil
+}
+
+func (c *NativeStreamClient) call(op byte, body []byte) ([]byte, error) {
+	return c.callOnChannel(0, op, body)
 }
 func (c *NativeStreamClient) Produce(stream string, partition int, payloads [][]byte) (uint64, error) {
 	b := appendNativeString(nil, stream)
@@ -1191,3 +1207,65 @@ func (c *NativeStreamClient) Close() error {
 	}
 	return c.conn.Close()
 }
+
+// NativeChannel provides a logical multiplexed channel over a shared client connection.
+type NativeChannel struct {
+	ID     uint16
+	client *NativeStreamClient
+}
+
+// Channel returns a multiplexed channel handle for logical channel id.
+func (c *NativeStreamClient) Channel(id uint16) *NativeChannel {
+	return &NativeChannel{ID: id, client: c}
+}
+
+// Produce sends records over this multiplexed channel.
+func (ch *NativeChannel) Produce(stream string, partition int, payloads [][]byte) (uint64, error) {
+	b := appendNativeString(nil, stream)
+	b = binary.AppendUvarint(b, uint64(partition))
+	b = binary.AppendUvarint(b, uint64(len(payloads)))
+	for _, v := range payloads {
+		b = binary.AppendUvarint(b, uint64(len(v)))
+		b = append(b, v...)
+	}
+	r, err := ch.client.callOnChannel(ch.ID, nativeOpProduce, b)
+	if err != nil {
+		return 0, err
+	}
+	d := nativeDecoder{b: r}
+	base := d.uvar()
+	_ = d.uvar()
+	return base, d.err
+}
+
+// Fetch retrieves records over this multiplexed channel.
+func (ch *NativeChannel) Fetch(stream string, partition int, offset uint64, maxRecords, maxBytes int) ([][]byte, uint64, error) {
+	b := appendNativeString(nil, stream)
+	b = binary.AppendUvarint(b, uint64(partition))
+	b = binary.AppendUvarint(b, offset)
+	b = binary.AppendUvarint(b, uint64(maxRecords))
+	b = binary.AppendUvarint(b, uint64(maxBytes))
+	r, err := ch.client.callOnChannel(ch.ID, nativeOpFetch, b)
+	if err != nil {
+		return nil, offset, err
+	}
+	d := nativeDecoder{b: r}
+	next := d.uvar()
+	n := int(d.uvar())
+	out := make([][]byte, n)
+	for i := range out {
+		out[i] = append([]byte(nil), d.bytes(int(d.uvar()))...)
+	}
+	return out, next, d.err
+}
+
+// Commit records consumer offset over this multiplexed channel.
+func (ch *NativeChannel) Commit(stream, group string, partition int, offset uint64) error {
+	b := appendNativeString(nil, stream)
+	b = appendNativeString(b, group)
+	b = binary.AppendUvarint(b, uint64(partition))
+	b = binary.AppendUvarint(b, offset)
+	_, err := ch.client.callOnChannel(ch.ID, nativeOpCommit, b)
+	return err
+}
+
