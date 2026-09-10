@@ -333,6 +333,7 @@ type Config struct {
 	AuditEnabled                bool               `json:"audit_enabled,omitempty"`
 	RateLimit                   *RateLimitConfig   `json:"rate_limit,omitempty"`
 	Tenancy                     *TenancyConfig     `json:"tenancy,omitempty"`
+	ACL                         *ACL               `json:"-"`
 	Partition                   *PartitionConfig   `json:"partition,omitempty"`
 	WebSocket                   *WebSocketConfig   `json:"websocket,omitempty"`
 	ExactlyOnce                 *ExactlyOnceConfig `json:"exactly_once,omitempty"`

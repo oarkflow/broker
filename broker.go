@@ -58,6 +58,7 @@ type Broker struct {
 	grpcServer            *GRPCServer
 	healthMonitor         *StoreHealthMonitor
 	producerRegistry      *ProducerRegistry
+	acl                   *ACL
 }
 
 func New(cfg Config) (*Broker, error) {
@@ -179,6 +180,7 @@ func New(cfg Config) (*Broker, error) {
 	b.partitionReassignment = NewPartitionReassignment(b)
 	b.healthMonitor = NewStoreHealthMonitor(b, b.store, 250*time.Millisecond)
 	b.producerRegistry = NewProducerRegistry()
+	b.acl = cfg.ACL
 	b.cfg = cfg
 	b.state.Store(BrokerConfigured)
 	if err := b.store.DeclareQueue(context.Background(), QueueConfig{Name: cfg.DefaultQueue, VisibilityTimeout: cfg.DefaultVisibility, RetryPolicy: cfg.DefaultRetry, DLQ: cfg.DefaultDLQ}); err != nil {
@@ -791,4 +793,14 @@ func mergeHooks(base, override Hooks) Hooks {
 		merged.OnCircuitClosed = override.OnCircuitClosed
 	}
 	return merged
+}
+
+// ACL returns the configured ACL manager for the broker.
+func (b *Broker) ACL() *ACL {
+	return b.acl
+}
+
+// SetACL sets or updates the ACL manager for the broker.
+func (b *Broker) SetACL(a *ACL) {
+	b.acl = a
 }

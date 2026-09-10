@@ -65,6 +65,16 @@ type AdminPrincipal struct {
 	MaxConcurrent     int
 }
 
+// HasPermission reports whether the principal has the specified permission.
+func (p AdminPrincipal) HasPermission(perm string) bool {
+	for _, cp := range p.Permissions {
+		if cp == perm || cp == PermissionAdminAll || cp == "*" {
+			return true
+		}
+	}
+	return false
+}
+
 type adminPrincipalKey struct{}
 
 func principalFromContext(ctx context.Context) AdminPrincipal {
