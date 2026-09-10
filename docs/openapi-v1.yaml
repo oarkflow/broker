@@ -1,27 +1,30 @@
 openapi: 3.1.0
 info:
-  title: Fastworker Broker HTTP API
-  version: 0.1.0-dev
-  description: Pre-v1 contract. Stable compatibility is not yet guaranteed.
+  title: High-Performance Message Broker HTTP & Admin API
+  version: 1.0.0
+  description: Multi-protocol durable message broker REST and Admin OpenAPI 3.1 contract.
 servers:
-  - url: https://localhost:8090
+  - url: http://localhost:8090
 security:
   - bearerAuth: []
 paths:
   /healthz:
     get:
       operationId: health
+      summary: Liveness probe
       responses:
         "200": {description: Broker health}
   /readyz:
     get:
       operationId: readiness
+      summary: Readiness probe
       responses:
-        "200": {description: Broker is ready}
-        "503": {description: Broker is not ready}
+        "200": {description: Broker is ready to accept traffic}
+        "503": {description: Broker is degraded or starting}
   /publish:
     post:
       operationId: publish
+      summary: Publish message with durable confirmation
       requestBody:
         required: true
         content:
@@ -36,10 +39,11 @@ paths:
         "400": {description: Invalid request}
         "401": {description: Missing or invalid credential}
         "403": {description: Permission or tenant denied}
-        "409": {description: Broker semantic conflict}
+        "409": {description: Broker semantic conflict or producer fenced}
   /v1/queues/{queue}/poll:
     post:
       operationId: pollQueue
+      summary: Lease messages from queue
       parameters:
         - {name: queue, in: path, required: true, schema: {type: string}}
       requestBody:
@@ -54,6 +58,7 @@ paths:
   /streams/{stream}/messages:
     get:
       operationId: readStream
+      summary: Read ordered messages from stream
       parameters:
         - {name: stream, in: path, required: true, schema: {type: string}}
         - {name: consumer_group, in: query, schema: {type: string}}
@@ -63,6 +68,7 @@ paths:
   /streams/{stream}/commit:
     post:
       operationId: commitOffset
+      summary: Monotonically commit consumer offset
       parameters:
         - {name: stream, in: path, required: true, schema: {type: string}}
       requestBody:
@@ -72,6 +78,122 @@ paths:
             schema: {$ref: "#/components/schemas/OffsetCommit"}
       responses:
         "200": {description: Offset committed monotonically}
+  /dlq/dashboard:
+    get:
+      operationId: dlqDashboard
+      summary: Aggregated dead-letter queue dashboard metrics
+      responses:
+        "200":
+          description: DLQ metrics summary
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/DLQDashboardResponse"}
+  /dlq/{queue}/errors:
+    get:
+      operationId: dlqErrors
+      summary: Paginated error pattern breakdown for a dead-letter queue
+      parameters:
+        - {name: queue, in: path, required: true, schema: {type: string}}
+        - {name: page, in: query, schema: {type: integer, default: 1}}
+        - {name: limit, in: query, schema: {type: integer, default: 20}}
+        - {name: sample, in: query, schema: {type: integer, default: 1000}}
+      responses:
+        "200":
+          description: Error frequency breakdown
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/DLQErrorsResponse"}
+  /dlq/{queue}/replay-all:
+    post:
+      operationId: dlqReplayAll
+      summary: Replay messages from DLQ to destination in batches
+      parameters:
+        - {name: queue, in: path, required: true, schema: {type: string}}
+      requestBody:
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/DLQReplayAllRequest"}
+      responses:
+        "200":
+          description: Replay result summary
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/DLQReplayAllResponse"}
+  /dlq/{queue}/archive:
+    post:
+      operationId: dlqArchive
+      summary: Move DLQ messages to archive destination
+      parameters:
+        - {name: queue, in: path, required: true, schema: {type: string}}
+      requestBody:
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/DLQArchiveRequest"}
+      responses:
+        "200":
+          description: Archive result summary
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/DLQArchiveResponse"}
+  /dlq/{queue}/export:
+    get:
+      operationId: dlqExport
+      summary: Stream dead-letter queue contents as Newline-Delimited JSON (NDJSON)
+      parameters:
+        - {name: queue, in: path, required: true, schema: {type: string}}
+        - {name: limit, in: query, schema: {type: integer, default: 1000}}
+      responses:
+        "200":
+          description: Streamed NDJSON messages
+          content:
+            application/x-ndjson:
+              schema: {type: string}
+  /config/reload:
+    post:
+      operationId: reloadConfig
+      summary: Trigger atomic runtime config hot-reload
+      responses:
+        "200": {description: Config reloaded successfully}
+        "400": {description: Invalid configuration, rollback performed}
+  /v1/producers:
+    post:
+      operationId: registerProducer
+      summary: Register idempotent producer ID and allocate new epoch
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [producer_id]
+              properties:
+                producer_id: {type: string}
+      responses:
+        "200":
+          description: Registered producer epoch
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  producer_id: {type: string}
+                  epoch: {type: integer}
+  /v1/producers/{producer_id}:
+    delete:
+      operationId: closeProducer
+      summary: Close producer registration and fence old epochs
+      parameters:
+        - {name: producer_id, in: path, required: true, schema: {type: string}}
+      responses:
+        "200": {description: Producer epoch closed}
+  /webhooks/deliveries:
+    get:
+      operationId: webhookDeliveries
+      summary: List persistent webhook delivery attempts and circuit states
+      parameters:
+        - {name: limit, in: query, schema: {type: integer, default: 50}}
+      responses:
+        "200": {description: Webhook delivery attempt logs}
 components:
   securitySchemes:
     bearerAuth: {type: http, scheme: bearer}
@@ -87,6 +209,9 @@ components:
         payload: {}
         headers: {type: object, additionalProperties: {type: string}}
         idempotency_key: {type: string}
+        producer_id: {type: string}
+        producer_epoch: {type: integer}
+        producer_sequence: {type: integer}
     PublishResult:
       type: object
       required: [message_id, confirmed, durability]
@@ -105,6 +230,7 @@ components:
         consumer_id: {type: string}
         consumer_group: {type: string}
         tenant_id: {type: string}
+        filter_expression: {type: string, description: "Server-side filter expression e.g. headers['region'] == 'us-east'"}
         limit: {type: integer, minimum: 1}
         visibility_timeout: {type: integer, description: Nanoseconds}
     OffsetCommit:
@@ -114,3 +240,68 @@ components:
         consumer_group: {type: string}
         offset: {type: integer, minimum: 0}
         tenant_id: {type: string}
+    DLQDashboardResponse:
+      type: object
+      properties:
+        total_depth: {type: integer}
+        queue_count: {type: integer}
+        queues:
+          type: array
+          items:
+            type: object
+            properties:
+              name: {type: string}
+              depth: {type: integer}
+              last_error: {type: string}
+              top_errors:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    error: {type: string}
+                    count: {type: integer}
+    DLQErrorsResponse:
+      type: object
+      properties:
+        queue: {type: string}
+        total_errors: {type: integer}
+        total_messages: {type: integer}
+        page: {type: integer}
+        limit: {type: integer}
+        total_pages: {type: integer}
+        errors:
+          type: array
+          items:
+            type: object
+            properties:
+              error: {type: string}
+              count: {type: integer}
+              sample_message_ids: {type: array, items: {type: string}}
+    DLQReplayAllRequest:
+      type: object
+      properties:
+        batch_size: {type: integer, default: 100}
+        destination: {type: string}
+        dry_run: {type: boolean}
+    DLQReplayAllResponse:
+      type: object
+      properties:
+        source: {type: string}
+        destination: {type: string}
+        replayed: {type: integer}
+        batches: {type: integer}
+        dry_run: {type: boolean}
+        message_ids: {type: array, items: {type: string}}
+    DLQArchiveRequest:
+      type: object
+      properties:
+        destination: {type: string}
+        limit: {type: integer}
+        dry_run: {type: boolean}
+    DLQArchiveResponse:
+      type: object
+      properties:
+        source: {type: string}
+        destination: {type: string}
+        archived: {type: integer}
+        dry_run: {type: boolean}

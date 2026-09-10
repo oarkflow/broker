@@ -1,0 +1,96 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+  id-token: write
+  packages: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache-dependency-path: |
+            go.sum
+            cmd/go.sum
+            contrib/go.sum
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3.5.0
+
+      - name: Build release binaries (reproducible)
+        env:
+          CGO_ENABLED: 0
+          SOURCE_DATE_EPOCH: 1700000000
+        run: |
+          mkdir -p dist
+          TAG="${GITHUB_REF_NAME}"
+          TARGETS=(
+            "linux/amd64"
+            "linux/arm64"
+            "darwin/amd64"
+            "darwin/arm64"
+            "windows/amd64"
+            "windows/arm64"
+          )
+
+          for target in "${TARGETS[@]}"; do
+            GOOS="${target%/*}"
+            GOARCH="${target#*/}"
+            EXT=""
+            if [ "$GOOS" = "windows" ]; then
+              EXT=".exe"
+            fi
+
+            echo "Building brokerd for $GOOS/$GOARCH..."
+            (cd cmd && GOOS="$GOOS" GOARCH="$GOARCH" go build -trimpath -ldflags "-s -w -X main.version=$TAG" -o "../dist/brokerd_${TAG}_${GOOS}_${GOARCH}${EXT}" ./brokerd)
+
+            echo "Building brokerctl for $GOOS/$GOARCH..."
+            (cd cmd && GOOS="$GOOS" GOARCH="$GOARCH" go build -trimpath -ldflags "-s -w -X main.version=$TAG" -o "../dist/brokerctl_${TAG}_${GOOS}_${GOARCH}${EXT}" ./brokerctl)
+          done
+
+      - name: Package archives
+        run: |
+          cd dist
+          TAG="${GITHUB_REF_NAME}"
+          for f in *; do
+            if [[ "$f" == *.exe ]]; then
+              zip "${f%.exe}.zip" "$f"
+              rm "$f"
+            elif [ -f "$f" ]; then
+              tar -czf "${f}.tar.gz" "$f"
+              rm "$f"
+            fi
+          done
+
+      - name: Generate Checksums
+        run: |
+          cd dist
+          sha256sum * > checksums.txt
+
+      - name: Sign Checksums with Cosign
+        run: |
+          cd dist
+          cosign sign-blob --yes --bundle cosign.bundle checksums.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*
+          generate_release_notes: true
+          draft: false
+          prerelease: false
