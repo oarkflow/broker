@@ -86,6 +86,10 @@ type LeaseRequest struct {
 	LeaseToken        string
 	MessageID         string
 	TenantID          string `json:"tenant_id,omitempty"`
+	// Accept is evaluated before a message is leased. It is process-local and
+	// intentionally excluded from wire/WAL encoding; embedded dispatch uses it
+	// to ensure a consumer never leases work assigned to another consumer.
+	Accept func(Message) bool `json:"-"`
 }
 
 type AckRequest struct {
@@ -221,6 +225,8 @@ type MemoryStore struct {
 	offsets         map[string]map[string]uint64
 	dedup           map[string]time.Time
 	idemp           map[string]string
+	producerSeq     map[string]ProducerState
+	moveOps         map[string]MoveResult
 	rand            *mathrand.Rand
 	historyLimit    int
 	retainCompleted bool
@@ -232,7 +238,7 @@ type MemoryStore struct {
 }
 
 func NewMemoryStore() *MemoryStore {
-	return &MemoryStore{queues: map[string]*memoryQueue{}, topics: map[string]*memoryTopic{}, streams: map[string]*memoryStream{}, messages: map[string]*Message{}, history: map[string][]MessageHistory{}, offsets: map[string]map[string]uint64{}, dedup: map[string]time.Time{}, idemp: map[string]string{}, rand: mathrand.New(mathrand.NewSource(time.Now().UnixNano())), historyLimit: 32, retainCompleted: true, completed: map[string]struct{}{}, completedLimit: 65536}
+	return &MemoryStore{queues: map[string]*memoryQueue{}, topics: map[string]*memoryTopic{}, streams: map[string]*memoryStream{}, messages: map[string]*Message{}, history: map[string][]MessageHistory{}, offsets: map[string]map[string]uint64{}, dedup: map[string]time.Time{}, idemp: map[string]string{}, producerSeq: map[string]ProducerState{}, moveOps: map[string]MoveResult{}, rand: mathrand.New(mathrand.NewSource(time.Now().UnixNano())), historyLimit: 32, retainCompleted: true, completed: map[string]struct{}{}, completedLimit: 65536}
 }
 
 func (*MemoryStore) ConfirmationLevel() ConfirmLevel { return ConfirmEnqueued }
@@ -330,13 +336,25 @@ func (s *MemoryStore) DeclareTopic(ctx context.Context, cfg TopicConfig) error {
 	if cfg.Name == "" {
 		return errf(ErrInvalidMessage, "topic name required")
 	}
+	if cfg.Partitions <= 0 {
+		cfg.Partitions = 1
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if t, ok := s.topics[cfg.Name]; ok {
 		t.cfg = cfg
+		if cfg.Paused {
+			t.state = QueuePaused
+		} else {
+			t.state = QueueActive
+		}
 		return nil
 	}
-	s.topics[cfg.Name] = &memoryTopic{cfg: cfg, state: QueueActive}
+	state := QueueActive
+	if cfg.Paused {
+		state = QueuePaused
+	}
+	s.topics[cfg.Name] = &memoryTopic{cfg: cfg, state: state}
 	return nil
 }
 
@@ -346,6 +364,9 @@ func (s *MemoryStore) DeclareStream(ctx context.Context, cfg StreamConfig) error
 	}
 	if cfg.Name == "" {
 		return errf(ErrInvalidMessage, "stream name required")
+	}
+	if cfg.Partitions <= 0 {
+		cfg.Partitions = 1
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -418,6 +439,14 @@ func (s *MemoryStore) appendLockedCollect(msg Message, dests []Destination, coll
 	if msg.ID == "" {
 		return nil, errf(ErrInvalidMessage, "message id required")
 	}
+	if replay {
+		if existing := s.messages[msg.ID]; existing != nil {
+			if collect {
+				return []Message{cloneMessage(*existing)}, nil
+			}
+			return nil, nil
+		}
+	}
 	if msg.CreatedAt.IsZero() {
 		msg.CreatedAt = time.Now()
 	}
@@ -437,8 +466,16 @@ func (s *MemoryStore) appendLockedCollect(msg Message, dests []Destination, coll
 			return nil, ErrDuplicateMessage
 		}
 	}
+	if !replay && msg.ProducerID != "" && msg.ProducerSequence != nil {
+		if err := validateProducerSequence(s.producerSeq[msg.ProducerID], msg); err != nil {
+			return nil, err
+		}
+	}
 	if len(dests) == 0 {
 		dests = []Destination{{Kind: DestinationTopic, Name: msg.Topic}}
+	}
+	if err := s.validateDestinationsLocked(msg, dests); err != nil {
+		return nil, err
 	}
 	var out []Message
 	if collect {
@@ -464,7 +501,7 @@ func (s *MemoryStore) appendLockedCollect(msg Message, dests []Destination, coll
 		switch d.Kind {
 		case DestinationTopic:
 			if _, ok := s.topics[d.Name]; !ok {
-				s.topics[d.Name] = &memoryTopic{cfg: TopicConfig{Name: d.Name}, state: QueueActive}
+				s.topics[d.Name] = &memoryTopic{cfg: TopicConfig{Name: d.Name, Partitions: 1}, state: QueueActive}
 			}
 			m.Topic = d.Name
 			m.Status = MessagePersisted
@@ -506,7 +543,7 @@ func (s *MemoryStore) appendLockedCollect(msg Message, dests []Destination, coll
 			s.addHistoryLocked(m.ID, m.Status, "queue_append", "", d.Name, "", "", "")
 		case DestinationStream, DestinationArchive:
 			if _, ok := s.streams[d.Name]; !ok {
-				s.streams[d.Name] = &memoryStream{cfg: StreamConfig{Name: d.Name}}
+				s.streams[d.Name] = &memoryStream{cfg: StreamConfig{Name: d.Name, Partitions: 1}}
 			}
 			st := s.streams[d.Name]
 			st.offset++
@@ -526,6 +563,9 @@ func (s *MemoryStore) appendLockedCollect(msg Message, dests []Destination, coll
 	}
 	if msg.IdempotencyKey != "" {
 		s.idemp[msg.IdempotencyKey] = msg.ID
+	}
+	if msg.ProducerID != "" && msg.ProducerSequence != nil {
+		s.producerSeq[msg.ProducerID] = advanceProducerState(s.producerSeq[msg.ProducerID], msg)
 	}
 	return out, nil
 }
@@ -733,6 +773,7 @@ func (s *MemoryStore) validateAtomicLocked(entries []AppendEntry) error {
 		return ErrClosed
 	}
 	var seenDedup, seenIdemp map[string]struct{}
+	pendingProducers := make(map[string]ProducerState)
 	var pendingDepth map[string]int
 	now := time.Now()
 	for _, entry := range entries {
@@ -763,7 +804,24 @@ func (s *MemoryStore) validateAtomicLocked(entries []AppendEntry) error {
 				return ErrDuplicateMessage
 			}
 		}
-		for _, d := range entry.Destinations {
+		if producerID := entry.Message.ProducerID; producerID != "" && entry.Message.ProducerSequence != nil {
+			state, ok := pendingProducers[producerID]
+			if !ok {
+				state = s.producerSeq[producerID]
+			}
+			if err := validateProducerSequence(state, entry.Message); err != nil {
+				return err
+			}
+			pendingProducers[producerID] = advanceProducerState(state, entry.Message)
+		}
+		destinations := entry.Destinations
+		if len(destinations) == 0 {
+			destinations = []Destination{{Kind: DestinationTopic, Name: entry.Message.Topic}}
+		}
+		if err := s.validateDestinationsLocked(entry.Message, destinations); err != nil {
+			return err
+		}
+		for _, d := range destinations {
 			if d.Kind != DestinationQueue && d.Kind != DestinationDLQ {
 				continue
 			}
@@ -778,6 +836,29 @@ func (s *MemoryStore) validateAtomicLocked(entries []AppendEntry) error {
 			if q.depth+pendingDepth[d.Name] > q.cfg.MaxDepth && q.cfg.Backpressure != BackpressureDropOldest && q.cfg.Backpressure != BackpressureDLQ && q.cfg.Backpressure != BackpressureDropNewest {
 				return ErrBackpressure
 			}
+		}
+	}
+	return nil
+}
+
+func (s *MemoryStore) validateDestinationsLocked(message Message, destinations []Destination) error {
+	for _, destination := range destinations {
+		if destination.Name == "" {
+			return errf(ErrInvalidMessage, "destination name required")
+		}
+		switch destination.Kind {
+		case DestinationQueue, DestinationDLQ, DestinationStream, DestinationArchive:
+		case DestinationTopic:
+			if topic := s.topics[destination.Name]; topic != nil {
+				if topic.cfg.Paused || topic.state == QueuePaused {
+					return ErrPaused
+				}
+				if message.Partition < 0 || message.Partition >= topic.cfg.Partitions {
+					return errf(ErrInvalidMessage, "partition %d outside topic %q range [0,%d)", message.Partition, destination.Name, topic.cfg.Partitions)
+				}
+			}
+		default:
+			return errf(ErrInvalidMessage, "unsupported destination kind %q", destination.Kind)
 		}
 	}
 	return nil
@@ -829,6 +910,9 @@ func (s *MemoryStore) Lease(ctx context.Context, req LeaseRequest) ([]Message, e
 			if !isLeaseableQueueStatus(m.Status) || (!m.AvailableAt.IsZero() && m.AvailableAt.After(now)) {
 				continue
 			}
+			if req.Accept != nil && !req.Accept(cloneMessage(*m)) {
+				continue
+			}
 			s.leaseMessageLocked(m, req, now)
 			out = append(out, cloneMessage(*m))
 		}
@@ -857,6 +941,9 @@ func (s *MemoryStore) Lease(ctx context.Context, req LeaseRequest) ([]Message, e
 			continue
 		}
 		if !isLeaseableQueueStatus(m.Status) || (!m.AvailableAt.IsZero() && m.AvailableAt.After(now)) {
+			continue
+		}
+		if req.Accept != nil && !req.Accept(cloneMessage(*m)) {
 			continue
 		}
 		if len(candidates) < req.Limit {
@@ -954,6 +1041,9 @@ func (s *MemoryStore) prepareLease(ctx context.Context, req LeaseRequest) ([]Mes
 		if !isLeaseableQueueStatus(m.Status) || (!m.AvailableAt.IsZero() && m.AvailableAt.After(now)) {
 			continue
 		}
+		if req.Accept != nil && !req.Accept(cloneMessage(*m)) {
+			continue
+		}
 		// Clone the message and assign the lease fields without touching the live record.
 		clone := cloneMessage(*m)
 		clone.Status = MessageLeased
@@ -1002,7 +1092,6 @@ func newPreparedLeaseToken() string {
 	_, _ = cryptorand.Read(buf)
 	return "lease-" + hex.EncodeToString(buf)
 }
-
 
 func (s *MemoryStore) Ack(ctx context.Context, req AckRequest) error {
 	select {
@@ -1309,6 +1398,10 @@ func (s *MemoryStore) ListDLQ(ctx context.Context, name string, limit int) ([]Me
 func (s *MemoryStore) Move(ctx context.Context, req MoveRequest) (MoveResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.moveLocked(ctx, req, nil, false)
+}
+
+func (s *MemoryStore) moveLocked(ctx context.Context, req MoveRequest, plannedIDs map[string]string, requirePlan bool) (MoveResult, error) {
 	res := MoveResult{Destination: req.Destination, DryRun: req.DryRun}
 	ids := s.resolveMoveIDsLocked(req)
 	for _, id := range ids {
@@ -1332,7 +1425,13 @@ func (s *MemoryStore) Move(ctx context.Context, req MoveRequest) (MoveResult, er
 		}
 		newID := id
 		if req.Mode == MoveCopy || req.Mode == MoveReplay || !req.PreserveID {
-			newID = id + ":" + string(req.Mode) + ":" + newIDFromTime()
+			newID = plannedIDs[id]
+			if newID == "" {
+				if requirePlan {
+					return res, fmt.Errorf("replicated move: missing planned ID for %s", id)
+				}
+				newID = s.nextMoveIDLocked(id, req.Mode)
+			}
 		}
 		clone := cloneMessage(*m)
 		clone.ParentID = firstNonEmpty(clone.ParentID, m.ID)
@@ -1359,6 +1458,67 @@ func (s *MemoryStore) Move(ctx context.Context, req MoveRequest) (MoveResult, er
 		}
 	}
 	return res, nil
+}
+
+func (s *MemoryStore) prepareMove(ctx context.Context, req MoveRequest) (map[string]string, MoveResult, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	res := MoveResult{Destination: req.Destination, DryRun: req.DryRun}
+	planned := make(map[string]string)
+	for _, id := range s.resolveMoveIDsLocked(req) {
+		message, ok := s.messages[id]
+		if !ok || !tenantAllowed(ctx, message.TenantID) || !filterMessage(*message, req.Filter) {
+			res.Skipped++
+			continue
+		}
+		res.MessageIDs = append(res.MessageIDs, id)
+		if req.DryRun {
+			res.Moved++
+			continue
+		}
+		if req.Mode == MoveCopy || req.Mode == MoveReplay || !req.PreserveID {
+			planned[id] = s.nextMoveIDLocked(id, req.Mode)
+		}
+		if req.Mode == MoveCopy || req.Mode == MoveReplay {
+			res.Copied++
+		} else {
+			res.Moved++
+		}
+	}
+	return planned, res, nil
+}
+
+// nextMoveIDLocked derives IDs from replicated state rather than wall-clock
+// time. Replaying the same WAL/Raft command at the same log position therefore
+// produces the same ID on every node and after restart.
+func (s *MemoryStore) nextMoveIDLocked(sourceID string, mode MoveMode) string {
+	prefix := sourceID + ":" + string(mode) + ":"
+	sequence := 0
+	for id := range s.messages {
+		if strings.HasPrefix(id, prefix) {
+			sequence++
+		}
+	}
+	for {
+		candidate := prefix + itoa(sequence)
+		if _, exists := s.messages[candidate]; !exists {
+			return candidate
+		}
+		sequence++
+	}
+}
+
+func (s *MemoryStore) applyMovePlan(ctx context.Context, operationID string, req MoveRequest, plannedIDs map[string]string) (MoveResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if result, ok := s.moveOps[operationID]; ok {
+		return result, nil
+	}
+	result, err := s.moveLocked(ctx, req, plannedIDs, true)
+	if err == nil {
+		s.moveOps[operationID] = result
+	}
+	return result, err
 }
 
 func (s *MemoryStore) applyBackpressureLocked(q *memoryQueue, queue string, incoming *Message) (bool, error) {
@@ -1439,7 +1599,7 @@ func (s *MemoryStore) appendCloneLocked(m Message, d Destination, req MoveReques
 		}
 	case DestinationTopic:
 		if _, ok := s.topics[d.Name]; !ok {
-			s.topics[d.Name] = &memoryTopic{cfg: TopicConfig{Name: d.Name}, state: QueueActive}
+			s.topics[d.Name] = &memoryTopic{cfg: TopicConfig{Name: d.Name, Partitions: 1}, state: QueueActive}
 		}
 		m.Topic = d.Name
 		m.Status = MessagePersisted
@@ -1447,7 +1607,7 @@ func (s *MemoryStore) appendCloneLocked(m Message, d Destination, req MoveReques
 		s.topics[d.Name].ids = append(s.topics[d.Name].ids, m.ID)
 	case DestinationStream, DestinationArchive:
 		if _, ok := s.streams[d.Name]; !ok {
-			s.streams[d.Name] = &memoryStream{cfg: StreamConfig{Name: d.Name}}
+			s.streams[d.Name] = &memoryStream{cfg: StreamConfig{Name: d.Name, Partitions: 1}}
 		}
 		st := s.streams[d.Name]
 		st.offset++
@@ -1715,6 +1875,35 @@ func (s *MemoryStore) SweepLeases(ctx context.Context, now time.Time) (int, erro
 		}
 	}
 	return n, nil
+}
+
+// prepareSweepLeases returns the exact post-expiry records without mutating
+// the store. Replicated stores commit this deterministic set before applying it
+// on every node, avoiding independent wall-clock sweeps that can diverge.
+func (s *MemoryStore) prepareSweepLeases(ctx context.Context, now time.Time) ([]Message, error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.closed {
+		return nil, ErrClosed
+	}
+	var expired []Message
+	for _, current := range s.messages {
+		if current.Status != MessageLeased || current.LeaseUntil.IsZero() || !now.After(current.LeaseUntil) {
+			continue
+		}
+		message := cloneMessage(*current)
+		message.Status = MessageQueued
+		message.LeaseToken = ""
+		message.LeaseUntil = time.Time{}
+		message.Redeliveries++
+		expired = append(expired, message)
+	}
+	return expired, nil
 }
 
 func (s *MemoryStore) Close() error { s.mu.Lock(); s.closed = true; s.mu.Unlock(); return nil }
@@ -2325,6 +2514,8 @@ func (s *FileWALStore) DeclareQueue(ctx context.Context, cfg QueueConfig) error 
 	if err := validateSharedDeclaration(ctx, cfg.Name, "queue"); err != nil {
 		return err
 	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	if err := s.write(walRecord{Op: "declare_queue", Queue: cfg}); err != nil {
 		return err
 	}
@@ -2334,6 +2525,8 @@ func (s *FileWALStore) DeclareTopic(ctx context.Context, cfg TopicConfig) error 
 	if err := validateSharedDeclaration(ctx, cfg.Name, "topic"); err != nil {
 		return err
 	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	if err := s.write(walRecord{Op: "declare_topic", Topic: cfg}); err != nil {
 		return err
 	}
@@ -2343,6 +2536,8 @@ func (s *FileWALStore) DeclareStream(ctx context.Context, cfg StreamConfig) erro
 	if err := validateSharedDeclaration(ctx, cfg.Name, "stream"); err != nil {
 		return err
 	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	if err := s.write(walRecord{Op: "declare_stream", Stream: cfg}); err != nil {
 		return err
 	}
@@ -2389,78 +2584,118 @@ func (s *FileWALStore) durableAppend(ctx context.Context, entries []AppendEntry)
 	return out, nil
 }
 func (s *FileWALStore) Lease(ctx context.Context, req LeaseRequest) ([]Message, error) {
-	msgs, err := s.MemoryStore.Lease(ctx, req)
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	msgs, err := s.MemoryStore.prepareLease(ctx, req)
 	if err != nil || len(msgs) == 0 {
 		return msgs, err
 	}
 	if err := s.write(walRecord{Op: "lease_batch", Messages: msgs, Lease: req}); err != nil {
-		return msgs, err
+		return nil, err
+	}
+	if err := s.MemoryStore.applyLease(ctx, msgs, req); err != nil {
+		return nil, err
 	}
 	return msgs, nil
 }
 func (s *FileWALStore) Ack(ctx context.Context, req AckRequest) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	if err := s.MemoryStore.validateAckLease(ctx, req); err != nil {
 		return err
 	}
-	if err := s.MemoryStore.Ack(ctx, req); err != nil {
+	if err := s.write(walRecord{Op: "ack", Ack: req}); err != nil {
 		return err
 	}
-	return s.write(walRecord{Op: "ack", Ack: req})
+	return s.MemoryStore.Ack(ctx, req)
 }
 func (s *FileWALStore) AckBatch(ctx context.Context, reqs []AckRequest) []error {
-	errs := s.MemoryStore.AckBatch(ctx, reqs)
-	successful := make([]AckRequest, 0, len(reqs))
-	indices := make([]int, 0, len(reqs))
-	for i, err := range errs {
-		if err == nil {
-			successful = append(successful, reqs[i])
-			indices = append(indices, i)
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	errs := make([]error, len(reqs))
+	valid := make([]AckRequest, 0, len(reqs))
+	for i, req := range reqs {
+		if err := s.MemoryStore.validateAckLease(ctx, req); err != nil {
+			errs[i] = err
+		} else {
+			valid = append(valid, req)
 		}
 	}
-	if len(successful) == 0 {
+	if len(valid) == 0 {
 		return errs
 	}
-	if err := s.write(walRecord{Op: "ack_batch", Acks: successful}); err != nil {
-		for _, i := range indices {
-			errs[i] = err
+	if err := s.write(walRecord{Op: "ack_batch", Acks: valid}); err != nil {
+		for i := range errs {
+			if errs[i] == nil {
+				errs[i] = err
+			}
+		}
+		return errs
+	}
+	applied := s.MemoryStore.AckBatch(ctx, valid)
+	validIndex := 0
+	for i := range errs {
+		if errs[i] == nil {
+			errs[i] = applied[validIndex]
+			validIndex++
 		}
 	}
 	return errs
 }
 func (s *FileWALStore) Nack(ctx context.Context, req NackRequest) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	if err := s.MemoryStore.validateNackLease(ctx, req); err != nil {
 		return err
 	}
-	if err := s.MemoryStore.Nack(ctx, req); err != nil {
+	if err := s.write(walRecord{Op: "nack", Nack: req}); err != nil {
 		return err
 	}
-	return s.write(walRecord{Op: "nack", Nack: req})
+	return s.MemoryStore.Nack(ctx, req)
 }
 func (s *FileWALStore) ExtendLease(ctx context.Context, req LeaseRequest) error {
-	if err := s.MemoryStore.ExtendLease(ctx, req); err != nil {
-		return err
-	}
-	m, ok, err := s.MemoryStore.Get(ctx, req.MessageID)
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	m, err := s.MemoryStore.validateExtendLease(ctx, req)
 	if err != nil {
 		return err
 	}
-	if !ok {
-		return ErrMessageNotFound
+	if req.VisibilityTimeout <= 0 {
+		req.VisibilityTimeout = 30 * time.Second
 	}
-	return s.write(walRecord{Op: "lease", Message: m, Lease: req})
-}
-func (s *FileWALStore) Update(ctx context.Context, msg Message) error {
-	if err := s.MemoryStore.Update(ctx, msg); err != nil {
+	m.LeaseUntil = time.Now().Add(req.VisibilityTimeout)
+	if err := s.write(walRecord{Op: "lease", Message: m, Lease: req}); err != nil {
 		return err
 	}
-	return s.write(walRecord{Op: "update", Message: msg})
+	return s.MemoryStore.ExtendLease(ctx, req)
+}
+func (s *FileWALStore) Update(ctx context.Context, msg Message) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if _, ok, err := s.MemoryStore.Get(ctx, msg.ID); err != nil || !ok {
+		if err != nil {
+			return err
+		}
+		return ErrMessageNotFound
+	}
+	if err := s.write(walRecord{Op: "update", Message: msg}); err != nil {
+		return err
+	}
+	return s.MemoryStore.Update(ctx, msg)
 }
 func (s *FileWALStore) UpdateBatch(ctx context.Context, messages []Message) []error {
-	errs := s.MemoryStore.UpdateBatch(ctx, messages)
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	errs := make([]error, len(messages))
 	successful := make([]Message, 0, len(messages))
 	indices := make([]int, 0, len(messages))
-	for i, err := range errs {
-		if err == nil {
+	for i, msg := range messages {
+		_, ok, err := s.MemoryStore.Get(ctx, msg.ID)
+		if err != nil {
+			errs[i] = err
+		} else if !ok {
+			errs[i] = ErrMessageNotFound
+		} else {
 			successful = append(successful, messages[i])
 			indices = append(indices, i)
 		}
@@ -2472,53 +2707,62 @@ func (s *FileWALStore) UpdateBatch(ctx context.Context, messages []Message) []er
 		for _, i := range indices {
 			errs[i] = err
 		}
+		return errs
+	}
+	applied := s.MemoryStore.UpdateBatch(ctx, successful)
+	for i, index := range indices {
+		errs[index] = applied[i]
 	}
 	return errs
 }
 func (s *FileWALStore) Move(ctx context.Context, req MoveRequest) (MoveResult, error) {
-	res, err := s.MemoryStore.Move(ctx, req)
-	if err != nil {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if err := s.write(walRecord{Op: "move", Move: req}); err != nil {
 		return MoveResult{}, err
 	}
-	if err := s.write(walRecord{Op: "move", Move: req}); err != nil {
-		return res, err
-	}
-	return res, nil
+	return s.MemoryStore.Move(ctx, req)
 }
 func (s *FileWALStore) PauseQueue(ctx context.Context, name string) error {
-	if err := s.MemoryStore.PauseQueue(ctx, name); err != nil {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if err := s.write(walRecord{Op: "pause_queue", QueueName: name}); err != nil {
 		return err
 	}
-	return s.write(walRecord{Op: "pause_queue", QueueName: name})
+	return s.MemoryStore.PauseQueue(ctx, name)
 }
 func (s *FileWALStore) ResumeQueue(ctx context.Context, name string) error {
-	if err := s.MemoryStore.ResumeQueue(ctx, name); err != nil {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if err := s.write(walRecord{Op: "resume_queue", QueueName: name}); err != nil {
 		return err
 	}
-	return s.write(walRecord{Op: "resume_queue", QueueName: name})
+	return s.MemoryStore.ResumeQueue(ctx, name)
 }
 func (s *FileWALStore) PurgeQueue(ctx context.Context, name string) (int, error) {
-	n, err := s.MemoryStore.PurgeQueue(ctx, name)
-	if err != nil {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if err := s.write(walRecord{Op: "purge_queue", QueueName: name}); err != nil {
 		return 0, err
 	}
-	if err := s.write(walRecord{Op: "purge_queue", QueueName: name}); err != nil {
-		return n, err
-	}
-	return n, nil
+	return s.MemoryStore.PurgeQueue(ctx, name)
 }
 func (s *FileWALStore) CommitOffset(ctx context.Context, commit OffsetCommit) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	persisted, err := durableOffsetCommit(ctx, commit)
 	if err != nil {
 		return err
 	}
-	if err := s.MemoryStore.CommitOffset(context.Background(), persisted); err != nil {
+	if err := s.write(walRecord{Op: "commit_offset", Offset: persisted}); err != nil {
 		return err
 	}
-	return s.write(walRecord{Op: "commit_offset", Offset: persisted})
+	return s.MemoryStore.CommitOffset(context.Background(), persisted)
 }
 
 func (s *FileWALStore) Close() error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	var joined error
 	if s.gc != nil {
 		joined = errors.Join(joined, s.gc.close())

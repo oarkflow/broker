@@ -13,6 +13,12 @@ import (
 	"github.com/oarkflow/broker/pkg/pool"
 )
 
+type consumerStrategyKey struct {
+	queue string
+	group string
+	type_ StrategyType
+}
+
 type Delivery struct {
 	Message Message
 	ack     *ackHandle
@@ -89,6 +95,7 @@ func (a *ackHandle) Ack(ctx context.Context) error {
 	}
 	err := a.b.store.Ack(ctx, AckRequest{MessageID: a.msg.ID, Queue: a.queue, LeaseToken: a.msg.LeaseToken, ConsumerID: a.consumer})
 	if err == nil {
+		a.b.releaseDispatchAssignment(a.msg.ID)
 		if a.b.cfg.Hooks.OnAck != nil {
 			a.b.cfg.Hooks.OnAck(ctx, MessageEvent{Message: a.msg, Consumer: a.consumer, Queue: a.queue, Time: time.Now()})
 		}
@@ -108,7 +115,11 @@ func (a *ackHandle) Nack(ctx context.Context, opts ...NackOption) error {
 	if !a.once.CompareAndSwap(false, true) {
 		return nil
 	}
-	return a.b.store.Nack(ctx, NackRequest{MessageID: a.msg.ID, Queue: a.queue, LeaseToken: a.msg.LeaseToken, ConsumerID: a.consumer, Action: o.Action, Delay: o.Delay, DLQ: o.DLQ, Reason: o.Reason, Error: o.Error, IncrementAttempt: true})
+	err := a.b.store.Nack(ctx, NackRequest{MessageID: a.msg.ID, Queue: a.queue, LeaseToken: a.msg.LeaseToken, ConsumerID: a.consumer, Action: o.Action, Delay: o.Delay, DLQ: o.DLQ, Reason: o.Reason, Error: o.Error, IncrementAttempt: true})
+	if err == nil {
+		a.b.releaseDispatchAssignment(a.msg.ID)
+	}
+	return err
 }
 func (a *ackHandle) Reject(ctx context.Context, reason string) error {
 	return a.Nack(ctx, NackToDLQ(""), NackReason(reason))
@@ -334,11 +345,7 @@ func (b *Broker) subscribe(ctx context.Context, cfg ConsumerConfig, handler Hand
 	cctx, cancel := context.WithCancel(b.ctx)
 	var strategy ConsumerStrategy
 	if cfg.Strategy != "" {
-		if cfg.StrategyConfig != nil {
-			strategy = NewStrategy(*cfg.StrategyConfig)
-		} else {
-			strategy = NewStrategy(StrategyConfig{Type: cfg.Strategy})
-		}
+		strategy = b.sharedConsumerStrategy(cfg)
 	}
 	s := &Subscription{id: b.nextID("sub"), b: b, cfg: cfg, handler: handler, batchHandler: batchHandler, ctx: cctx, cancel: cancel, stopped: make(chan struct{}), strategy: strategy}
 	if f, err := NewConsumerFilter(cfg); err == nil && f != nil {
@@ -363,6 +370,7 @@ func (s *Subscription) loop() {
 		s.b.subsMu.Lock()
 		delete(s.b.subs, s.id)
 		s.b.subsMu.Unlock()
+		s.b.releaseConsumerAssignments(s.cfg.Name)
 		if s.b.cfg.Hooks.OnConsumerStopped != nil {
 			s.b.cfg.Hooks.OnConsumerStopped(context.Background(), ConsumerEvent{Consumer: s.cfg.Name, Group: s.cfg.Group, Queue: s.cfg.Queue, State: ConsumerStopped, Time: time.Now()})
 		}
@@ -398,15 +406,16 @@ func (s *Subscription) loop() {
 			if n <= 0 {
 				n = 1
 			}
-			msgs, err := s.b.store.Lease(s.ctx, LeaseRequest{Queue: s.cfg.Queue, ConsumerID: s.cfg.Name, ConsumerGroup: s.cfg.Group, Limit: n, VisibilityTimeout: s.cfg.VisibilityTimeout})
+			req := LeaseRequest{Queue: s.cfg.Queue, ConsumerID: s.cfg.Name, ConsumerGroup: s.cfg.Group, Limit: n, VisibilityTimeout: s.cfg.VisibilityTimeout}
+			if s.strategy != nil {
+				candidates := s.b.QueueCandidates(s.cfg.Queue, s.cfg.Group)
+				req.Accept = func(msg Message) bool {
+					return s.b.assignConsumer(s.strategy, msg, candidates) == s.cfg.Name
+				}
+			}
+			msgs, err := s.b.store.Lease(s.ctx, req)
 			if err != nil || len(msgs) == 0 {
 				continue
-			}
-			if s.strategy != nil && len(msgs) > 0 {
-				msgs = s.filterByStrategy(msgs)
-				if len(msgs) == 0 {
-					continue
-				}
 			}
 			if s.filter != nil && len(msgs) > 0 {
 				msgs = s.filterMessages(msgs)
@@ -522,7 +531,9 @@ func (s *Subscription) handleBatch(ctx context.Context, msgs []Message) (err err
 
 func (s *Subscription) handle(ctx context.Context, m Message) (err error) {
 	if s.dedup != nil && s.dedup.IsDuplicate(m) {
-		_ = s.b.store.Ack(ctx, AckRequest{MessageID: m.ID, Queue: s.cfg.Queue, LeaseToken: m.LeaseToken, ConsumerID: s.cfg.Name})
+		if err := s.b.store.Ack(ctx, AckRequest{MessageID: m.ID, Queue: s.cfg.Queue, LeaseToken: m.LeaseToken, ConsumerID: s.cfg.Name}); err == nil {
+			s.b.releaseDispatchAssignment(m.ID)
+		}
 		return nil
 	}
 	m.Status = MessageProcessing
@@ -661,6 +672,67 @@ func (s *Subscription) buildCandidate() ConsumerCandidate {
 	}
 }
 
+func (b *Broker) sharedConsumerStrategy(cfg ConsumerConfig) ConsumerStrategy {
+	key := consumerStrategyKey{queue: cfg.Queue, group: cfg.Group, type_: cfg.Strategy}
+	b.dispatchMu.Lock()
+	defer b.dispatchMu.Unlock()
+	if strategy := b.consumerStrategies[key]; strategy != nil {
+		return strategy
+	}
+	strategyCfg := StrategyConfig{Type: cfg.Strategy}
+	if cfg.StrategyConfig != nil {
+		strategyCfg = *cfg.StrategyConfig
+		if strategyCfg.Type == "" {
+			strategyCfg.Type = cfg.Strategy
+		}
+	}
+	strategy := NewStrategy(strategyCfg)
+	b.consumerStrategies[key] = strategy
+	return strategy
+}
+
+// assignConsumer makes strategy selection a broker-level decision and caches
+// it by message ID. Every competing subscription therefore observes the same
+// owner before any of them mutates the message lease.
+func (b *Broker) assignConsumer(strategy ConsumerStrategy, msg Message, candidates []ConsumerCandidate) string {
+	b.dispatchMu.Lock()
+	defer b.dispatchMu.Unlock()
+	if assigned := b.dispatchAssignments[msg.ID]; assigned != "" {
+		for _, candidate := range candidates {
+			if candidate.ConsumerID == assigned {
+				return assigned
+			}
+		}
+		delete(b.dispatchAssignments, msg.ID)
+	}
+	if len(candidates) == 0 {
+		return ""
+	}
+	selected, err := strategy.Select(b.ctx, msg, candidates)
+	if err != nil || len(selected) == 0 {
+		selected = candidates[:1]
+	}
+	owner := selected[0].ConsumerID
+	b.dispatchAssignments[msg.ID] = owner
+	return owner
+}
+
+func (b *Broker) releaseDispatchAssignment(messageID string) {
+	b.dispatchMu.Lock()
+	delete(b.dispatchAssignments, messageID)
+	b.dispatchMu.Unlock()
+}
+
+func (b *Broker) releaseConsumerAssignments(consumerID string) {
+	b.dispatchMu.Lock()
+	for messageID, assigned := range b.dispatchAssignments {
+		if assigned == consumerID {
+			delete(b.dispatchAssignments, messageID)
+		}
+	}
+	b.dispatchMu.Unlock()
+}
+
 func (s *Subscription) filterByStrategy(msgs []Message) []Message {
 	if s.strategy == nil || len(msgs) == 0 {
 		return msgs
@@ -695,7 +767,9 @@ func (s *Subscription) filterMessages(msgs []Message) []Message {
 		if s.filter.Match(m) {
 			matched = append(matched, m)
 		} else {
-			_ = s.b.store.Ack(s.ctx, AckRequest{Queue: s.cfg.Queue, MessageID: m.ID, ConsumerID: s.cfg.Name, LeaseToken: m.LeaseToken})
+			if err := s.b.store.Ack(s.ctx, AckRequest{Queue: s.cfg.Queue, MessageID: m.ID, ConsumerID: s.cfg.Name, LeaseToken: m.LeaseToken}); err == nil {
+				s.b.releaseDispatchAssignment(m.ID)
+			}
 		}
 	}
 	return matched

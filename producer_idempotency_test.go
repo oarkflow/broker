@@ -2,8 +2,22 @@ package broker
 
 import (
 	"context"
+	"errors"
 	"testing"
 )
+
+type failOnceProducerStore struct {
+	*MemoryStore
+	fail bool
+}
+
+func (s *failOnceProducerStore) Append(ctx context.Context, msg Message, dests []Destination) ([]Message, error) {
+	if s.fail {
+		s.fail = false
+		return nil, ErrStorageUnavailable
+	}
+	return s.MemoryStore.Append(ctx, msg, dests)
+}
 
 func TestProducerRegistryEpochFencingAndSequencing(t *testing.T) {
 	reg := NewProducerRegistry()
@@ -117,5 +131,61 @@ func TestBrokerPublishIdempotentProducer(t *testing.T) {
 	)
 	if err != ErrProducerFenced {
 		t.Fatalf("expected ErrProducerFenced, got %v", err)
+	}
+}
+
+func TestProducerSequenceIsNotConsumedByFailedAppend(t *testing.T) {
+	store := &failOnceProducerStore{MemoryStore: NewMemoryStore(), fail: true}
+	b := MustNew(Config{Store: store})
+	if err := b.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer b.Stop(context.Background())
+
+	if _, err := b.Publisher().Publish(context.Background(), "events", "payload", WithQueue("orders"), WithProducer("producer", 1, 0)); !errors.Is(err, ErrStorageUnavailable) {
+		t.Fatalf("expected first append to fail, got %v", err)
+	}
+	result, err := b.Publisher().Publish(context.Background(), "events", "payload", WithQueue("orders"), WithProducer("producer", 1, 0))
+	if err != nil {
+		t.Fatalf("retry after failed append: %v", err)
+	}
+	if result.Duplicate {
+		t.Fatal("failed append consumed the producer sequence")
+	}
+}
+
+func TestProducerSequenceSurvivesWALRestart(t *testing.T) {
+	dir := t.TempDir()
+	store, err := NewSegmentedWALStore(SegmentedWALConfig{Dir: dir, DisableCompactor: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := MustNew(Config{Store: store})
+	if err := b.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	first, err := b.Publisher().Publish(context.Background(), "events", "payload", WithQueue("orders"), WithProducer("producer", 1, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Stop(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := NewSegmentedWALStore(SegmentedWALConfig{Dir: dir, DisableCompactor: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b2 := MustNew(Config{Store: reopened})
+	if err := b2.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer b2.Stop(context.Background())
+	retry, err := b2.Publisher().Publish(context.Background(), "events", "payload", WithQueue("orders"), WithProducer("producer", 1, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !retry.Duplicate || retry.MessageID != first.MessageID {
+		t.Fatalf("restart retry=%+v, want duplicate message %q", retry, first.MessageID)
 	}
 }

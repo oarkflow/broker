@@ -2,6 +2,7 @@ package broker
 
 import (
 	"errors"
+	"fmt"
 	"sync"
 	"time"
 )
@@ -12,6 +13,53 @@ var (
 	// ErrOutOfOrderSequence is returned when a sequence gap is detected.
 	ErrOutOfOrderSequence = errors.New("out of order sequence: sequence number gap detected")
 )
+
+// DuplicateProducerSequenceError identifies the message already committed for
+// the producer's current sequence. Stores return this typed error so publisher
+// retries can be acknowledged without performing a second append.
+type DuplicateProducerSequenceError struct {
+	ProducerID string
+	Epoch      int32
+	Sequence   uint64
+	MessageID  string
+}
+
+func (e *DuplicateProducerSequenceError) Error() string {
+	return fmt.Sprintf("%v: producer %q epoch %d sequence %d already committed as %q", ErrDuplicateMessage, e.ProducerID, e.Epoch, e.Sequence, e.MessageID)
+}
+
+func (e *DuplicateProducerSequenceError) Unwrap() error { return ErrDuplicateMessage }
+
+func validateProducerSequence(state ProducerState, msg Message) error {
+	if msg.ProducerID == "" || msg.ProducerSequence == nil {
+		return nil
+	}
+	seq := *msg.ProducerSequence
+	if state.ProducerID == "" || msg.ProducerEpoch > state.Epoch || !state.Initialized {
+		return nil
+	}
+	if msg.ProducerEpoch < state.Epoch {
+		return ErrProducerFenced
+	}
+	if seq == state.LastSequence {
+		return &DuplicateProducerSequenceError{ProducerID: msg.ProducerID, Epoch: msg.ProducerEpoch, Sequence: seq, MessageID: state.LastMessageID}
+	}
+	if seq < state.LastSequence || seq > state.LastSequence+1 {
+		return ErrOutOfOrderSequence
+	}
+	return nil
+}
+
+func advanceProducerState(state ProducerState, msg Message) ProducerState {
+	if msg.ProducerID == "" || msg.ProducerSequence == nil {
+		return state
+	}
+	seq := *msg.ProducerSequence
+	if state.ProducerID == "" || msg.ProducerEpoch > state.Epoch || !state.Initialized || (msg.ProducerEpoch == state.Epoch && seq > state.LastSequence) {
+		return ProducerState{ProducerID: msg.ProducerID, Epoch: msg.ProducerEpoch, LastSequence: seq, LastMessageID: msg.ID, Initialized: true, UpdatedAt: time.Now()}
+	}
+	return state
+}
 
 // ProducerState tracks the current epoch and sequence for a specific producer ID.
 type ProducerState struct {

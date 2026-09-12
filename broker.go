@@ -27,6 +27,9 @@ type Broker struct {
 	seq                   atomic.Uint64
 	subsMu                sync.RWMutex
 	subs                  map[string]*Subscription
+	dispatchMu            sync.Mutex
+	consumerStrategies    map[consumerStrategyKey]ConsumerStrategy
+	dispatchAssignments   map[string]string
 	waitMu                sync.Mutex
 	waiters               map[string]chan Response
 	taskMu                sync.RWMutex
@@ -73,6 +76,13 @@ func New(cfg Config) (*Broker, error) {
 	}
 	if cfg.Mode == "" {
 		cfg.Mode = ModeEmbedded
+	}
+	switch cfg.Mode {
+	case ModeEmbedded, ModeStandalone:
+	case ModeDistributed:
+		return nil, fmt.Errorf("%w: use NewDistributed for distributed mode", ErrUnsupportedMode)
+	default:
+		return nil, fmt.Errorf("%w: unknown broker mode %q", ErrUnsupportedMode, cfg.Mode)
 	}
 	if cfg.DefaultQueue == "" {
 		cfg.DefaultQueue = "default"
@@ -128,7 +138,7 @@ func New(cfg Config) (*Broker, error) {
 		own = true
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	b := &Broker{cfg: cfg, store: cfg.Store, stateStore: cfg.StateStore, router: NewRouter(), codec: cfg.Codec, frameCodec: cfg.FrameCodec, pool: pool, ownPool: own, ctx: ctx, cancel: cancel, subs: map[string]*Subscription{}, waiters: map[string]chan Response{}, tasks: map[string]*TaskInfo{}, taskWait: map[string][]chan TaskResult{}, notify: NewNotificationBus(cfg.NotificationHistoryCapacity), consumers: NewConsumerRegistry(512), cluster: NewCluster(firstNonEmpty(cfg.NodeID, "node-1"))}
+	b := &Broker{cfg: cfg, store: cfg.Store, stateStore: cfg.StateStore, router: NewRouter(), codec: cfg.Codec, frameCodec: cfg.FrameCodec, pool: pool, ownPool: own, ctx: ctx, cancel: cancel, subs: map[string]*Subscription{}, consumerStrategies: map[consumerStrategyKey]ConsumerStrategy{}, dispatchAssignments: map[string]string{}, waiters: map[string]chan Response{}, tasks: map[string]*TaskInfo{}, taskWait: map[string][]chan TaskResult{}, notify: NewNotificationBus(cfg.NotificationHistoryCapacity), consumers: NewConsumerRegistry(512), cluster: NewCluster(firstNonEmpty(cfg.NodeID, "node-1"))}
 	if cfg.EnablePrometheus {
 		b.promMetrics = GlobalPrometheusMetrics()
 		if cfg.Hooks.OnStarted == nil {

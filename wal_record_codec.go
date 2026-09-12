@@ -831,6 +831,8 @@ const (
 	msgFieldDeadLetterReason
 	msgFieldTaskID
 	msgFieldTaskName
+	msgFieldProducerEpoch
+	msgFieldProducerSequence
 )
 
 const msgBatchCommonCandidates = msgFieldTopic | msgFieldQueue | msgFieldStream |
@@ -838,7 +840,7 @@ const msgBatchCommonCandidates = msgFieldTopic | msgFieldQueue | msgFieldStream 
 	msgFieldTenantID | msgFieldProducerID | msgFieldConsumerID | msgFieldConsumerGroup |
 	msgFieldOriginalTopic | msgFieldOriginalQueue | msgFieldOriginalStream | msgFieldStatus
 
-const msgKnownFields uint64 = (msgFieldTaskName << 1) - 1
+const msgKnownFields uint64 = (msgFieldProducerSequence << 1) - 1
 
 func messageFieldMask(m Message) uint64 {
 	var mask uint64
@@ -946,6 +948,9 @@ func messageFieldMask(m Message) uint64 {
 	}
 	if m.ProducerID != "" {
 		mask |= msgFieldProducerID
+	}
+	if m.ProducerSequence != nil {
+		mask |= msgFieldProducerEpoch | msgFieldProducerSequence
 	}
 	if m.ConsumerID != "" {
 		mask |= msgFieldConsumerID
@@ -1140,6 +1145,12 @@ func (w *walBinaryWriter) messageFields(m Message, mask uint64) {
 	if mask&msgFieldTaskName != 0 {
 		w.string(m.TaskName)
 	}
+	if mask&msgFieldProducerEpoch != 0 {
+		w.int(int(m.ProducerEpoch))
+	}
+	if mask&msgFieldProducerSequence != 0 {
+		w.uvarint(*m.ProducerSequence)
+	}
 }
 
 func (r *walBinaryReader) message(base Message) Message {
@@ -1295,6 +1306,13 @@ func (r *walBinaryReader) messageFields(m Message, mask uint64) Message {
 	}
 	if mask&msgFieldTaskName != 0 {
 		m.TaskName = r.string()
+	}
+	if mask&msgFieldProducerEpoch != 0 {
+		m.ProducerEpoch = int32(r.int())
+	}
+	if mask&msgFieldProducerSequence != 0 {
+		sequence := r.uvarint()
+		m.ProducerSequence = &sequence
 	}
 	return m
 }

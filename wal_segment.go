@@ -2,6 +2,7 @@ package broker
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/binary"
 	"encoding/json"
@@ -16,12 +17,12 @@ import (
 )
 
 const (
-	SegmentMagic        uint32 = 0x42574C32 // "BWL2"
-	SegmentVersion      byte   = 2
-	SegmentTrailerMagic uint32 = 0x434C4F53 // "CLOS"
-	DefaultMaxSegmentSize      = 64 << 20  // 64 MiB
-	DefaultMaxSegments         = 10
-	DefaultCompactionInt       = 5 * time.Minute
+	SegmentMagic          uint32 = 0x42574C32 // "BWL2"
+	SegmentVersion        byte   = 2
+	SegmentTrailerMagic   uint32 = 0x434C4F53 // "CLOS"
+	DefaultMaxSegmentSize        = 64 << 20   // 64 MiB
+	DefaultMaxSegments           = 10
+	DefaultCompactionInt         = 5 * time.Minute
 )
 
 // SegmentMeta tracks metadata about a single WAL segment.
@@ -422,43 +423,135 @@ func (s *SegmentedWALStore) migrateLegacyFile(legacyPath string, isFWB bool) err
 		return err
 	}
 
-	// Read and migrate records
+	// Read and migrate records. Migration is deliberately fail-closed: the
+	// legacy file is not renamed unless every record has been decoded, verified,
+	// applied, and synced into BWL2.
 	f, err := os.Open(legacyPath)
 	if err != nil {
+		s.abortLegacyMigration()
 		return err
 	}
 	defer f.Close()
 
+	var migrateErr error
 	if isFWB {
 		r := bufio.NewReaderSize(f, 1<<20)
 		for {
 			l, err := binary.ReadUvarint(r)
 			if err != nil {
+				if errors.Is(err, io.EOF) {
+					break
+				}
+				migrateErr = fmt.Errorf("read legacy BWL1 record length: %w", err)
+				break
+			}
+			if l == 0 || l > uint64(s.walCodec.maxRecordSize) {
+				migrateErr = fmt.Errorf("legacy BWL1 record length %d is invalid", l)
 				break
 			}
 			buf := make([]byte, int(l))
 			if _, err := io.ReadFull(r, buf); err != nil {
+				migrateErr = fmt.Errorf("read legacy BWL1 record: %w", err)
 				break
 			}
 			var rec walRecord
 			if isNativeBinaryWALRecord(buf) {
 				if err := s.walCodec.decode(buf, &rec); err != nil {
-					continue
+					migrateErr = fmt.Errorf("decode legacy BWL1 record: %w", err)
+					break
 				}
 			} else {
 				var msg Message
-				if err := s.legacyCodec.DecodeMessage(buf, &msg); err == nil {
-					_ = json.Unmarshal(msg.Payload, &rec)
+				if err := s.legacyCodec.DecodeMessage(buf, &msg); err != nil {
+					migrateErr = fmt.Errorf("decode legacy framed WAL record: %w", err)
+					break
+				}
+				if err := json.Unmarshal(msg.Payload, &rec); err != nil {
+					migrateErr = fmt.Errorf("decode legacy framed WAL payload: %w", err)
+					break
 				}
 			}
 			s.applyRecovered(rec)
-			_ = s.writeRecordLocked(rec)
+			if err := s.writeRecordLocked(rec); err != nil {
+				migrateErr = fmt.Errorf("write migrated BWL1 record: %w", err)
+				break
+			}
+		}
+	} else {
+		r := bufio.NewReaderSize(f, 1<<20)
+		lineNo := 0
+		for {
+			line, readErr := r.ReadBytes('\n')
+			lineNo++
+			trimmed := bytes.TrimSpace(line)
+			if len(trimmed) > 0 {
+				if bytes.HasPrefix(trimmed, []byte("ENC:")) {
+					migrateErr = fmt.Errorf("legacy JSON WAL line %d is encrypted; migrate it with the key-aware broker-wal tool", lineNo)
+					break
+				}
+				var rec walRecord
+				if err := json.Unmarshal(trimmed, &rec); err != nil {
+					migrateErr = fmt.Errorf("decode legacy JSON WAL line %d: %w", lineNo, err)
+					break
+				}
+				if err := verifyWALRecord(rec); err != nil {
+					migrateErr = fmt.Errorf("verify legacy JSON WAL line %d: %w", lineNo, err)
+					break
+				}
+				s.applyRecovered(rec)
+				if err := s.writeRecordLocked(rec); err != nil {
+					migrateErr = fmt.Errorf("write migrated JSON WAL line %d: %w", lineNo, err)
+					break
+				}
+			}
+			if errors.Is(readErr, io.EOF) {
+				break
+			}
+			if readErr != nil {
+				migrateErr = fmt.Errorf("read legacy JSON WAL line %d: %w", lineNo, readErr)
+				break
+			}
 		}
 	}
 
-	// Rename legacy file to .migrated
-	_ = os.Rename(legacyPath, legacyPath+".migrated")
+	if migrateErr != nil {
+		s.abortLegacyMigration()
+		return migrateErr
+	}
+
+	backupPath := legacyPath + ".migrated"
+	if _, err := os.Stat(backupPath); err == nil {
+		s.abortLegacyMigration()
+		return fmt.Errorf("legacy WAL backup already exists: %s", backupPath)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		s.abortLegacyMigration()
+		return fmt.Errorf("check legacy WAL backup: %w", err)
+	}
+	if err := os.Rename(legacyPath, backupPath); err != nil {
+		s.abortLegacyMigration()
+		return fmt.Errorf("preserve migrated legacy WAL: %w", err)
+	}
 	return nil
+}
+
+// abortLegacyMigration removes only the newly-created BWL2 files. The source
+// legacy WAL remains untouched so a failed migration is always retryable.
+func (s *SegmentedWALStore) abortLegacyMigration() {
+	if s.gc != nil {
+		_ = s.gc.close()
+		s.gc = nil
+	}
+	if s.activeFile != nil {
+		_ = s.activeFile.Close()
+		s.activeFile = nil
+	}
+	for _, segment := range s.manifest.Segments {
+		_ = os.Remove(filepath.Join(s.dir, segment.Filename))
+		if segment.IndexFile != "" {
+			_ = os.Remove(filepath.Join(s.dir, segment.IndexFile))
+		}
+	}
+	_ = os.Remove(s.manifestPath)
 }
 
 func (s *SegmentedWALStore) normalizeRecoveredInflight() {
@@ -587,21 +680,27 @@ func (s *SegmentedWALStore) write(r walRecord) error {
 // ---------------- Store Interface Implementation (WAL-First) ----------------
 
 func (s *SegmentedWALStore) DeclareQueue(ctx context.Context, cfg QueueConfig) error {
-	if err := s.write(walRecord{Op: "declare_queue", Queue: cfg}); err != nil {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if err := s.writeRecordLocked(walRecord{Op: "declare_queue", Queue: cfg}); err != nil {
 		return err
 	}
 	return s.MemoryStore.DeclareQueue(ctx, cfg)
 }
 
 func (s *SegmentedWALStore) DeclareTopic(ctx context.Context, cfg TopicConfig) error {
-	if err := s.write(walRecord{Op: "declare_topic", Topic: cfg}); err != nil {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if err := s.writeRecordLocked(walRecord{Op: "declare_topic", Topic: cfg}); err != nil {
 		return err
 	}
 	return s.MemoryStore.DeclareTopic(ctx, cfg)
 }
 
 func (s *SegmentedWALStore) DeclareStream(ctx context.Context, cfg StreamConfig) error {
-	if err := s.write(walRecord{Op: "declare_stream", Stream: cfg}); err != nil {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if err := s.writeRecordLocked(walRecord{Op: "declare_stream", Stream: cfg}); err != nil {
 		return err
 	}
 	return s.MemoryStore.DeclareStream(ctx, cfg)

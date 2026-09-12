@@ -235,6 +235,8 @@ func (s *BinaryFileWALStore) DeclareQueue(ctx context.Context, cfg QueueConfig) 
 	if err := validateSharedDeclaration(ctx, cfg.Name, "queue"); err != nil {
 		return err
 	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	if err := s.write(walRecord{Op: "declare_queue", Queue: cfg}); err != nil {
 		return err
 	}
@@ -244,6 +246,8 @@ func (s *BinaryFileWALStore) DeclareTopic(ctx context.Context, cfg TopicConfig) 
 	if err := validateSharedDeclaration(ctx, cfg.Name, "topic"); err != nil {
 		return err
 	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	if err := s.write(walRecord{Op: "declare_topic", Topic: cfg}); err != nil {
 		return err
 	}
@@ -253,6 +257,8 @@ func (s *BinaryFileWALStore) DeclareStream(ctx context.Context, cfg StreamConfig
 	if err := validateSharedDeclaration(ctx, cfg.Name, "stream"); err != nil {
 		return err
 	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	if err := s.write(walRecord{Op: "declare_stream", Stream: cfg}); err != nil {
 		return err
 	}
@@ -370,6 +376,7 @@ func (s *BinaryFileWALStore) Nack(ctx context.Context, req NackRequest) error {
 	}
 	return s.MemoryStore.Nack(ctx, req)
 }
+
 // ExtendLease implements WAL-first ordering: validate, snapshot the updated
 // lease-until timestamp, WAL, then apply.
 func (s *BinaryFileWALStore) ExtendLease(ctx context.Context, req LeaseRequest) error {
@@ -390,6 +397,7 @@ func (s *BinaryFileWALStore) ExtendLease(ctx context.Context, req LeaseRequest) 
 	}
 	return s.MemoryStore.ExtendLease(ctx, req)
 }
+
 // Update implements WAL-first ordering.
 func (s *BinaryFileWALStore) Update(ctx context.Context, msg Message) error {
 	s.writeMu.Lock()
@@ -413,6 +421,7 @@ func (s *BinaryFileWALStore) UpdateBatch(ctx context.Context, messages []Message
 	}
 	return s.MemoryStore.UpdateBatch(ctx, messages)
 }
+
 // Move implements WAL-first ordering.
 func (s *BinaryFileWALStore) Move(ctx context.Context, req MoveRequest) (MoveResult, error) {
 	s.writeMu.Lock()
@@ -469,6 +478,8 @@ func (s *BinaryFileWALStore) CommitOffset(ctx context.Context, commit OffsetComm
 }
 
 func (s *BinaryFileWALStore) Close() error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	var joined error
 	if s.gc != nil {
 		joined = errors.Join(joined, s.gc.close())

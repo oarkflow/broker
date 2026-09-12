@@ -8,7 +8,7 @@ An experimental message broker for Go with embedded, single-node, and distribute
 |------------|--------|
 | Embedded broker (in-process) | Pre-v1; functional, hardening in progress |
 | Standalone broker (HTTP/native server) | Pre-v1; functional, hardening in progress |
-| Distributed broker (multi-node) | Experimental; not production-safe |
+| Distributed broker (multi-node) | Pre-v1 etcd/raft implementation; release gates remain |
 | Encryption at rest (AES-GCM) | Optional, configurable |
 | Encryption in transit (TLS/mTLS) | Listener-dependent; conformance in progress |
 
@@ -19,6 +19,7 @@ An experimental message broker for Go with embedded, single-node, and distribute
 ## Table of Contents
 
 - [Quick Start](#quick-start)
+- [Complete Examples](#complete-examples)
 - [Installation](#installation)
 - [Broker Modes](#broker-modes)
 - [Features](#features)
@@ -136,7 +137,20 @@ go build -o broker-worker ./cmd/broker-worker/
 |------|-------------|----------|
 | **Embedded** | Runs in your Go process as a library | High-performance in-process messaging |
 | **Standalone** | HTTP server with auth/TLS/ACL | Microservices, API gateway |
-| **Distributed** | Extension points only | Not production-ready for multi-node |
+| **Distributed** | Durable etcd/raft replication, snapshots, membership, and leader-gated reads | Pre-v1 clustered evaluation |
+
+## Complete Examples
+
+Runnable, fail-fast examples for embedded workflows, durable WAL restart, and
+a real three-node etcd/Raft cluster are in
+[`examples/complete`](examples/complete/README.md). From the `examples` module:
+
+```bash
+go run ./complete embedded
+go run ./complete durable
+go run ./complete distributed
+./complete/check.sh
+```
 
 ---
 
@@ -722,7 +736,12 @@ curl -H "Authorization: Bearer $TOKEN" http://localhost:8090/audit
 - [ ] Use idempotency keys for unsafe operations
 - [ ] Use manual ack for operations requiring confirmation
 - [ ] Keep visibility timeout longer than handler time or extend leases
-- [ ] Run `go test ./...`, `go test -race`, `go vet ./...` in CI
+- [ ] Run `scripts/release_gate.sh` and archive its artifacts for the exact commit
+- [ ] Complete `DURATION=72h scripts/soak.sh` on production-like hardware
+- [ ] Perform the backup, restore, upgrade, rollback, and alert drills in [Operations](docs/OPERATIONS.md)
+- [ ] Review the [threat model](docs/THREAT_MODEL.md) and close deployment-specific risks
+- [ ] Verify required third-party clients against the [protocol compatibility scope](docs/PROTOCOL_COMPATIBILITY.md)
+- [ ] Obtain independent security review and explicit release sign-off
 
 ---
 
@@ -745,7 +764,7 @@ broker/
   admin.go               HTTP admin/API server
   dataplane.go           /v1/* data-plane endpoints
   remote.go              Remote consumer registry
-  distributed.go         Distributed broker (extension points)
+  distributed.go         Distributed broker and replicated store adapter
   rebalance.go           Consumer group rebalancing
   strategy.go            14 routing strategies
   schema.go              Schema registry
@@ -769,7 +788,7 @@ broker/
   binary_wal_store.go    Native BWL1 WAL store
 
   amqp/                  AMQP 0-9-1 protocol server
-  cluster/               Raft consensus (extension points)
+  cluster/               Durable etcd/raft consensus and transports
   contrib/sqlitestore/   SQLite state + message stores
   cmd/brokerd/           Standalone broker server
   cmd/brokerctl/         CLI client

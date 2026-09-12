@@ -86,6 +86,8 @@ type AppendCommand struct {
 	Redeliveries     int                  `json:"redeliveries,omitempty"`
 	TenantID         string               `json:"tenant_id,omitempty"`
 	ProducerID       string               `json:"producer_id,omitempty"`
+	ProducerEpoch    int32                `json:"producer_epoch,omitempty"`
+	ProducerSequence *uint64              `json:"producer_sequence,omitempty"`
 	ConsumerID       string               `json:"consumer_id,omitempty"`
 	ConsumerGroup    string               `json:"consumer_group,omitempty"`
 	LeaseToken       string               `json:"lease_token,omitempty"`
@@ -140,6 +142,20 @@ type BrokerStore interface {
 	ReplicatePurgeQueue(ctx context.Context, name string) (int, error)
 }
 
+type extendedBrokerStore interface {
+	ReplicateAppendAtomic(ctx context.Context, payload json.RawMessage) error
+	ReplicateLease(ctx context.Context, payload json.RawMessage) error
+	ReplicateUpdate(ctx context.Context, payload json.RawMessage) error
+	ReplicateUpdateBatch(ctx context.Context, payload json.RawMessage) error
+	ReplicateMove(ctx context.Context, payload json.RawMessage) error
+	ReplicateCommitOffset(ctx context.Context, payload json.RawMessage) error
+}
+
+type snapshotBrokerStore interface {
+	ReplicateSnapshot() ([]byte, error)
+	ReplicateRestore([]byte) error
+}
+
 // BrokerCommandType identifies the broker operation to replicate.
 type BrokerCommandType string
 
@@ -148,8 +164,14 @@ const (
 	BrokerCmdDeclareTopic  BrokerCommandType = "declare_topic"
 	BrokerCmdDeclareStream BrokerCommandType = "declare_stream"
 	BrokerCmdAppend        BrokerCommandType = "append"
+	BrokerCmdAppendAtomic  BrokerCommandType = "append_atomic"
 	BrokerCmdAck           BrokerCommandType = "ack"
 	BrokerCmdNack          BrokerCommandType = "nack"
+	BrokerCmdLease         BrokerCommandType = "lease"
+	BrokerCmdUpdate        BrokerCommandType = "update"
+	BrokerCmdUpdateBatch   BrokerCommandType = "update_batch"
+	BrokerCmdMove          BrokerCommandType = "move"
+	BrokerCmdCommitOffset  BrokerCommandType = "commit_offset"
 	BrokerCmdPauseQueue    BrokerCommandType = "pause_queue"
 	BrokerCmdResumeQueue   BrokerCommandType = "resume_queue"
 	BrokerCmdPurgeQueue    BrokerCommandType = "purge_queue"
@@ -182,6 +204,9 @@ func (sm *BrokerStateMachine) Apply(entry *LogEntry) error {
 		return nil
 	}
 
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
 	var cmd BrokerCommand
 	if err := json.Unmarshal(entry.Data, &cmd); err != nil {
 		return fmt.Errorf("broker sm: unmarshal command: %w", err)
@@ -199,10 +224,22 @@ func (sm *BrokerStateMachine) Apply(entry *LogEntry) error {
 		return sm.applyDeclareStream(ctx, cmd.Payload)
 	case BrokerCmdAppend:
 		return sm.applyAppend(ctx, cmd.Payload)
+	case BrokerCmdAppendAtomic:
+		return sm.applyExtended(ctx, func(store extendedBrokerStore) error { return store.ReplicateAppendAtomic(ctx, cmd.Payload) })
 	case BrokerCmdAck:
 		return sm.applyAck(ctx, cmd.Payload)
 	case BrokerCmdNack:
 		return sm.applyNack(ctx, cmd.Payload)
+	case BrokerCmdLease:
+		return sm.applyExtended(ctx, func(store extendedBrokerStore) error { return store.ReplicateLease(ctx, cmd.Payload) })
+	case BrokerCmdUpdate:
+		return sm.applyExtended(ctx, func(store extendedBrokerStore) error { return store.ReplicateUpdate(ctx, cmd.Payload) })
+	case BrokerCmdUpdateBatch:
+		return sm.applyExtended(ctx, func(store extendedBrokerStore) error { return store.ReplicateUpdateBatch(ctx, cmd.Payload) })
+	case BrokerCmdMove:
+		return sm.applyExtended(ctx, func(store extendedBrokerStore) error { return store.ReplicateMove(ctx, cmd.Payload) })
+	case BrokerCmdCommitOffset:
+		return sm.applyExtended(ctx, func(store extendedBrokerStore) error { return store.ReplicateCommitOffset(ctx, cmd.Payload) })
 	case BrokerCmdPauseQueue:
 		return sm.applyPauseQueue(ctx, cmd.Payload)
 	case BrokerCmdResumeQueue:
@@ -212,6 +249,14 @@ func (sm *BrokerStateMachine) Apply(entry *LogEntry) error {
 	default:
 		return fmt.Errorf("broker sm: unknown command type: %s", cmd.Type)
 	}
+}
+
+func (sm *BrokerStateMachine) applyExtended(ctx context.Context, apply func(extendedBrokerStore) error) error {
+	store, ok := sm.store.(extendedBrokerStore)
+	if !ok {
+		return fmt.Errorf("broker sm: backing store does not support extended replicated mutations")
+	}
+	return apply(store)
 }
 
 func (sm *BrokerStateMachine) applyDeclareQueue(ctx context.Context, payload json.RawMessage) error {
@@ -287,17 +332,32 @@ func (sm *BrokerStateMachine) applyPurgeQueue(ctx context.Context, payload json.
 	return err
 }
 
-// Snapshot returns a snapshot of the state machine.
-// For the broker state machine, snapshots are managed by the store itself;
-// this is a placeholder that signals "no extra state to snapshot".
 func (sm *BrokerStateMachine) Snapshot() ([]byte, error) {
-	return json.Marshal(map[string]string{"type": "broker_state_machine"})
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	store, ok := sm.store.(snapshotBrokerStore)
+	if !ok {
+		// Lightweight test/custom stores retain the pre-v1 marker behavior. The
+		// production broker adapter implements snapshotBrokerStore and therefore
+		// always captures the complete broker state.
+		return json.Marshal(map[string]string{"type": "broker_state_machine"})
+	}
+	return store.ReplicateSnapshot()
 }
 
 // Restore restores the state machine from a snapshot.
 func (sm *BrokerStateMachine) Restore(snapshot []byte) error {
-	// The broker store handles its own restore; this is a no-op.
-	return nil
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	store, ok := sm.store.(snapshotBrokerStore)
+	if !ok {
+		var marker map[string]string
+		if err := json.Unmarshal(snapshot, &marker); err == nil && marker["type"] == "broker_state_machine" {
+			return nil
+		}
+		return fmt.Errorf("broker sm: backing store does not support snapshot restore")
+	}
+	return store.ReplicateRestore(snapshot)
 }
 
 // EncodeBrokerCommand serializes a BrokerCommand for embedding in a LogEntry.

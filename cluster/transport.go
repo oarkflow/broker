@@ -37,6 +37,7 @@ type TCPTransport struct {
 	dialMu          sync.Mutex
 	pendingMu       sync.Mutex
 	pendingRequests map[uint64]chan *RaftMessage
+	closed          atomic.Bool
 
 	HandshakeTimeout time.Duration
 	ReadTimeout      time.Duration
@@ -72,6 +73,9 @@ func NewTCPTransport() *TCPTransport {
 
 // Listen starts listening for incoming connections.
 func (t *TCPTransport) Listen(addr string, handler func(from string, msg *RaftMessage)) error {
+	if t.closed.Load() {
+		return ErrClosed
+	}
 	var ln net.Listener
 	var err error
 
@@ -149,6 +153,10 @@ func (t *TCPTransport) handleConn(conn net.Conn) {
 	}
 
 	t.connsMu.Lock()
+	if t.closed.Load() {
+		t.connsMu.Unlock()
+		return
+	}
 	// Close existing connection to this node
 	if old, ok := t.conns[nodeID]; ok {
 		close(old.stopCh)
@@ -453,6 +461,9 @@ func (t *TCPTransport) SendInstallSnapshot(nodeID string, req *InstallSnapshotRe
 
 // getConn returns a connection to a node, creating one if necessary.
 func (t *TCPTransport) getConn(nodeID string) (*nodeConn, error) {
+	if t.closed.Load() {
+		return nil, ErrClosed
+	}
 	t.connsMu.RLock()
 	nc, ok := t.conns[nodeID]
 	t.connsMu.RUnlock()
@@ -528,18 +539,23 @@ func (t *TCPTransport) dial(nodeID string) (*nodeConn, error) {
 	}
 
 	t.connsMu.Lock()
+	if t.closed.Load() {
+		t.connsMu.Unlock()
+		_ = conn.Close()
+		return nil, ErrClosed
+	}
 	// Close existing connection to this node if any
 	if old, ok := t.conns[nodeID]; ok {
 		close(old.stopCh)
 		old.conn.Close()
 	}
 	t.conns[nodeID] = nc
+	t.wg.Add(1)
 	t.connsMu.Unlock()
 
 	log.Printf("[transport] dialed node %s", nodeID)
 
 	// Start read loop (handshake already done in dial)
-	t.wg.Add(1)
 	go func() {
 		defer t.wg.Done()
 		t.readLoop(nc, nodeID)
@@ -550,7 +566,16 @@ func (t *TCPTransport) dial(nodeID string) (*nodeConn, error) {
 
 // Close stops the transport.
 func (t *TCPTransport) Close() error {
+	if !t.closed.CompareAndSwap(false, true) {
+		return nil
+	}
 	close(t.stopCh)
+	// Stop accepting before draining connections. A connection accepted during
+	// the drain could otherwise be added after the map snapshot and keep its
+	// read loop alive forever.
+	if t.listener != nil {
+		_ = t.listener.Close()
+	}
 
 	// Drain pending requests before closing connections
 	t.pendingMu.Lock()
@@ -567,10 +592,6 @@ func (t *TCPTransport) Close() error {
 	}
 	t.conns = make(map[string]*nodeConn)
 	t.connsMu.Unlock()
-
-	if t.listener != nil {
-		t.listener.Close()
-	}
 
 	t.wg.Wait()
 	return nil
@@ -623,6 +644,7 @@ func (t *TCPTransport) Stats() map[string]any {
 type MemoryTransport struct {
 	mu      sync.RWMutex
 	nodes   map[string]*MemoryTransport
+	blocked map[string]bool
 	handler func(from string, msg *RaftMessage)
 	id      string
 	stopCh  chan struct{}
@@ -637,6 +659,7 @@ type MemoryTransport struct {
 func NewMemoryTransport(id string) *MemoryTransport {
 	return &MemoryTransport{
 		nodes:    make(map[string]*MemoryTransport),
+		blocked:  make(map[string]bool),
 		id:       id,
 		stopCh:   make(chan struct{}),
 		aeRespCh: make(chan *AppendEntriesResponse, 100),
@@ -667,7 +690,9 @@ func (t *MemoryTransport) Register(registry map[string]*MemoryTransport) {
 
 // Listen starts handling incoming messages.
 func (t *MemoryTransport) Listen(addr string, handler func(from string, msg *RaftMessage)) error {
+	t.mu.Lock()
 	t.handler = handler
+	t.mu.Unlock()
 	return nil
 }
 
@@ -675,10 +700,18 @@ func (t *MemoryTransport) Listen(addr string, handler func(from string, msg *Raf
 func (t *MemoryTransport) Send(nodeID string, msg *RaftMessage) error {
 	t.mu.RLock()
 	target, ok := t.nodes[nodeID]
+	blocked := t.blocked[nodeID]
 	t.mu.RUnlock()
 
 	if !ok {
 		return fmt.Errorf("node %s not found", nodeID)
+	}
+	target.mu.RLock()
+	blocked = blocked || target.blocked[t.id]
+	handler := target.handler
+	target.mu.RUnlock()
+	if blocked {
+		return ErrPartitioned
 	}
 
 	// Route responses to dedicated channels instead of handler
@@ -704,11 +737,24 @@ func (t *MemoryTransport) Send(nodeID string, msg *RaftMessage) error {
 	}
 
 	// Non-response messages go to handler
-	if target.handler != nil {
-		go target.handler(t.id, msg)
+	if handler != nil {
+		go handler(t.id, msg)
 	}
 
 	return nil
+}
+
+// SetPartition toggles a bidirectional test-network partition between this
+// transport and nodeID. Send checks both endpoints, so changing either side is
+// sufficient to isolate the link.
+func (t *MemoryTransport) SetPartition(nodeID string, partitioned bool) {
+	t.mu.Lock()
+	if partitioned {
+		t.blocked[nodeID] = true
+	} else {
+		delete(t.blocked, nodeID)
+	}
+	t.mu.Unlock()
 }
 
 // SendAppendEntries sends AppendEntries to a node.
@@ -771,7 +817,24 @@ func (t *MemoryTransport) SendRequestVote(nodeID string, req *RequestVoteRequest
 
 // SendInstallSnapshot sends a snapshot to a node.
 func (t *MemoryTransport) SendInstallSnapshot(nodeID string, req *InstallSnapshotRequest) (*InstallSnapshotResponse, error) {
-	return nil, fmt.Errorf("not implemented")
+	msg := &RaftMessage{Type: MsgInstallSnapshot, InstallSnapshot: req}
+	t.mu.RLock()
+	_, ok := t.nodes[nodeID]
+	t.mu.RUnlock()
+	if !ok {
+		return nil, fmt.Errorf("node %s not found", nodeID)
+	}
+	if err := t.Send(nodeID, msg); err != nil {
+		return nil, err
+	}
+	select {
+	case resp := <-t.isRespCh:
+		return resp, nil
+	case <-t.stopCh:
+		return nil, ErrClosed
+	case <-time.After(500 * time.Millisecond):
+		return nil, ErrSnapshotFailed
+	}
 }
 
 // Close stops the transport.

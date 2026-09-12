@@ -1,41 +1,41 @@
-# Release Gates and Production Readiness Sign-off
+# Release Gates and Production Readiness
 
-The repository enforces strict release gates to ensure zero data loss, rock-solid security, cross-protocol conformance, and industry-leading performance before any public or production release.
+This project is pre-v1. A green unit-test run is necessary, but it is not a
+production-readiness sign-off. Release claims must be backed by reproducible
+artifacts from the exact commit being released.
 
----
+## Current gate status
 
-## Release Gates Status Table
+| Gate | Status | Required evidence |
+| :--- | :---: | :--- |
+| All-module tests | Automated | `bash scripts/ci_all_modules.sh test` |
+| Race detector | Automated | `bash scripts/ci_all_modules.sh race` |
+| Static analysis | Automated | `bash scripts/ci_all_modules.sh vet` |
+| Dependency vulnerabilities | Automated | `bash scripts/ci_all_modules.sh vuln`; triage every reachable finding |
+| WAL crash recovery and migrations | Covered, expanding | WAL-first fault tests, stable move replay, corrupt/torn recovery, and backup-preserving migration tests |
+| Distributed consensus | Covered, expanding | Durable restart, real state snapshots/log compaction, quorum loss, leader replacement, healing, and membership tests |
+| Protocol conformance | Incomplete | Compatibility scope is documented in `PROTOCOL_COMPATIBILITY.md`; named third-party client evidence is still required |
+| Security | Incomplete | Threat model, fuzzing, dependency scan, and secure defaults exist; independent assessment remains required |
+| Performance | Incomplete | Reproducible native benchmark output on named hardware; no synthetic comparison values |
+| Operations | Implemented, unverified | `OPERATIONS.md` covers backup/restore, alerts, rolling upgrade and rollback; a release drill is still required |
+| Reliability | Harness available | `DURATION=72h scripts/soak.sh`; generated evidence must complete successfully |
 
-| Gate Category | Gate Description | Status | Evidence / Implementation |
-| :--- | :--- | :---: | :--- |
-| **Correctness & Durability** | WAL-first mutation ordering (fsync before in-memory state apply) | **PASSED** | Group commit fsync ordering across `Append`, `Lease`, `Ack`, `Nack`, `Move`, `ExtendLease` (`wal_ordering_test.go`) |
-| **Correctness & Durability** | Storage health fencing & broker degradation on I/O stall/failure | **PASSED** | `StoreHealthMonitor` active heartbeat fencing, auto-recovery on disk restore (`wal_store_fencing.go`) |
-| **Correctness & Durability** | BWL2 Segmented WAL with active compaction and torn-write recovery | **PASSED** | Rotating segments, `sparseIndex`, active background tombstone merger (`wal_segment.go`, `wal_compaction_active.go`) |
-| **Consensus & Clustering** | Distributed etcd-raft multi-node replication & partition quorum | **PASSED** | Full `go.etcd.io/raft/v3` integration, ISR tracking, leader lease, RF=3 group consensus (`cluster/etcd_raft.go`) |
-| **Security & Isolation** | Cross-protocol centralized admission and principal quota tracking | **PASSED** | `ACL.AdmitConnection` wired to MQTT, AMQP, gRPC, WebSocket, BST1 (`security.go`) |
-| **Security & Isolation** | Strict multi-tenant isolation across control plane and data plane | **PASSED** | Tenant scoping enforced in `admin.go`, `dataplane.go`, sagas, tasks, and queues (`tenant_enforcement_test.go`) |
-| **Security & Isolation** | BST1 authenticated handshake and frame signing/encryption | **PASSED** | Handshake frame, ACL token verification, TLS listener support (`native_stream.go`, `auth_bst1_test.go`) |
-| **Protocols & Conformance** | AMQP 0-9-1 publisher confirms (`confirm.select`) & flow control | **PASSED** | `channel.flow`/`basic.ack`/`basic.nack` with thread-safe frame codec (`amqp/conn.go`, `amqp/amqp_test.go`) |
-| **Protocols & Conformance** | MQTT 3.1.1 persistent sessions (`cleanSession: false`) | **PASSED** | `MQTTSessionStore`, session restoration, `sessionPresent` CONNACK flag (`mqtt.go`) |
-| **Protocols & Conformance** | Zero-copy kernel sendfile streaming | **PASSED** | Kernel splice/sendfile native stream chunk transmission (`native_stream_zerocopy.go`) |
-| **Protocols & Conformance** | BST1 logical channel multiplexing | **PASSED** | Multiplexed logical sub-channels over single TCP connection (`native_stream.go`) |
-| **Features & Reliability** | Persistent idempotent producer sequence & epoch fencing | **PASSED** | `ProducerRegistry`, monotonic sequence checking, epoch fencing (`producer_idempotency.go`) |
-| **Features & Reliability** | Server-side consumer message filtering expressions | **PASSED** | Header/attribute evaluation with auto-ack on skipped messages (`message_filter.go`, `consumer.go`) |
-| **Features & Reliability** | Consumer lag alerting engine (warning/critical thresholds) | **PASSED** | `LagMonitor` checking queue/stream lag, emitting notifications (`lag_alerts.go`) |
-| **Features & Reliability** | Message TTL background sweeper with DLQ expiry routing | **PASSED** | `TTLSweeper` scanning queues, moving expired messages to `.dlq` (`ttl_sweep.go`) |
-| **Features & Reliability** | Persistent webhook retry dispatcher with per-URL circuit breaker | **PASSED** | Exponential backoff, jitter, attempt history, circuit breaker integration (`webhook_persistent.go`) |
-| **Features & Reliability** | Dynamic config hot-reload with atomic swap & rollback | **PASSED** | `ConfigWatcher` file polling, validation, atomic rollback on error (`config_reload.go`) |
-| **Features & Reliability** | DLQ admin dashboard, error frequency analytics, bulk replay | **PASSED** | `/dlq/dashboard`, `/dlq/:queue/errors`, `/dlq/:queue/replay-all`, NDJSON export (`dlq_dashboard.go`) |
-| **Observability** | OpenTelemetry Protocol (OTLP) metrics exporter | **PASSED** | Direct Prometheus-to-OTLP JSON export for sum, gauge, histogram (`metrics_otlp.go`) |
-| **Tooling & Operations** | Interactive full-screen terminal console (`brokerctl tui`) | **PASSED** | ANSI terminal dashboard, queue inspector, stream tail, consumer view (`cmd/brokerctl/tui.go`) |
-| **Supply Chain & Release** | Reproducible signed release builds with SBOM & checksums | **PASSED** | GitHub Actions release workflow with Cosign signature generation (`.github/workflows/release.yml`) |
+## Supported deployment statement
 
----
+There is currently no generally supported production release. Embedded and
+standalone modes are suitable for evaluation with the documented security and
+durability settings. Distributed mode uses durable etcd/raft state,
+deterministic mutations, and complete broker-state snapshots, but remains
+pre-v1 until the external and elapsed-time gates above are demonstrated and a
+release candidate is signed off.
 
-## Production Readiness Sign-off
+Do not label a build production-ready solely because the automated test, race,
+and vet gates pass. Record the commit, environment, commands, logs, benchmark
+hardware, and reviewer for every manual gate.
 
-### Summary
-All functional, correctness, security, architectural, and performance requirements spanning Milestones M0 through M4 have been completed and verified with 100% test pass rate across all modules.
+## Release sign-off
 
-### Licensing Notice
-The repository includes an Apache License 2.0 (`LICENSE`). Modify or confirm the license per the organization's open-source or commercial governance policy.
+A stable release requires all rows above to be complete, no unresolved critical
+or high-severity security findings, documented upgrade and rollback procedures,
+and explicit maintainer approval. The repository includes the Apache License
+2.0; confirm its use under the deploying organization's governance policy.

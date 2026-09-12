@@ -14,6 +14,7 @@ import (
 
 func testWALMessage(id string) Message {
 	now := time.Unix(1773748800, 123456789).UTC()
+	producerSequence := uint64(42)
 	return Message{
 		ID: id, ParentID: "parent", Topic: "orders.created", Queue: "orders", Stream: "audit",
 		Partition: 3, Offset: 99, Key: "customer-42", RoutingKey: "orders.eu.created",
@@ -23,7 +24,7 @@ func testWALMessage(id string) Message {
 		CausationID: "cause", RequestID: "request", ReplyTo: "reply", ReplyGroup: "reply-group",
 		IdempotencyKey: "idempotent", DeduplicationID: "dedup", Checksum: "checksum", Priority: 7,
 		CreatedAt: now, AvailableAt: now.Add(time.Second), ExpiresAt: now.Add(time.Hour), Attempts: 2,
-		MaxAttempts: 9, Redeliveries: 1, TenantID: "tenant", ProducerID: "producer", ConsumerID: "consumer",
+		MaxAttempts: 9, Redeliveries: 1, TenantID: "tenant", ProducerID: "producer", ProducerEpoch: 3, ProducerSequence: &producerSequence, ConsumerID: "consumer",
 		ConsumerGroup: "group", LeaseToken: "lease", LeaseUntil: now.Add(time.Minute), OriginalTopic: "original.topic",
 		OriginalQueue: "original.queue", OriginalStream: "original.stream", OriginalOffset: 10,
 		Status: MessageLeased, LastError: "last error", DeadLetterReason: "reason", TaskID: "task", TaskName: "task-name",

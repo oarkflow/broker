@@ -29,11 +29,19 @@ type DistributedConfig struct {
 	AllowExperimentalCustomRaft bool
 
 	// UseEtcdRaft enables the audited production etcd/raft consensus engine.
-	UseEtcdRaft       bool
-	RaftNodeID        uint64
-	RaftPeers         map[uint64]string
-	ReplicationFactor int
-	ControllerAddrs   []string
+	UseEtcdRaft            bool
+	RaftNodeID             uint64
+	RaftPeers              map[uint64]string
+	ReplicationFactor      int
+	ControllerAddrs        []string
+	SnapshotEntries        uint64
+	SnapshotCatchUpEntries uint64
+	// AllowStaleReads permits follower-local reads. It is false by default;
+	// callers requiring linearizable reads must use the leader.
+	AllowStaleReads bool
+	// JoinExisting starts a fresh node without bootstrapping a separate Raft
+	// cluster. Add the node through AddRaftNode first and use its returned ID.
+	JoinExisting bool
 
 	SubmitTimeout  time.Duration
 	ForwardTimeout time.Duration
@@ -42,6 +50,20 @@ type DistributedConfig struct {
 	OnStateChange  func(state string)
 	OnNodeJoin     func(nodeID string)
 	OnNodeLeave    func(nodeID string)
+}
+
+type distributedStateStore interface {
+	Store
+	prepareAppendAtomic(context.Context, []AppendEntry) ([]Message, error)
+	prepareLease(context.Context, LeaseRequest) ([]Message, error)
+	applyLease(context.Context, []Message, LeaseRequest) error
+	validateExtendLease(context.Context, LeaseRequest) (Message, error)
+	prepareSweepLeases(context.Context, time.Time) ([]Message, error)
+	prepareMove(context.Context, MoveRequest) (map[string]string, MoveResult, error)
+	applyMovePlan(context.Context, string, MoveRequest, map[string]string) (MoveResult, error)
+	appendRecoveredAtomic([]AppendEntry) error
+	Snapshot() MemoryStoreSnapshot
+	RestoreExact(MemoryStoreSnapshot)
 }
 
 type circuitBreaker struct {
@@ -135,9 +157,29 @@ func NewDistributed(cfg Config, distCfg DistributedConfig) (*DistributedBroker, 
 	if !distCfg.UseEtcdRaft && !distCfg.AllowExperimentalCustomRaft {
 		return nil, fmt.Errorf("%w: distributed mode requires either UseEtcdRaft: true (production etcd/raft consensus) or AllowExperimentalCustomRaft: true", ErrUnsupportedMode)
 	}
+	if distCfg.UseEtcdRaft && distCfg.WALDir == "" {
+		return nil, fmt.Errorf("%w: etcd/raft distributed mode requires WALDir for durable consensus state", ErrUnsupportedMode)
+	}
+	if distCfg.JoinExisting {
+		if !distCfg.UseEtcdRaft || distCfg.RaftNodeID == 0 || len(distCfg.RaftPeers) < 2 {
+			return nil, fmt.Errorf("%w: joining requires etcd/raft, a non-zero RaftNodeID, and the current peer map", ErrUnsupportedMode)
+		}
+		if _, ok := distCfg.RaftPeers[distCfg.RaftNodeID]; !ok {
+			return nil, fmt.Errorf("%w: joining peer map does not contain RaftNodeID %d", ErrUnsupportedMode, distCfg.RaftNodeID)
+		}
+	}
+	// Distributed construction is intentionally explicit; Config.Mode alone
+	// must never make a local broker appear clustered.
+	cfg.Mode = ModeEmbedded
 	b, err := New(cfg)
 	if err != nil {
 		return nil, err
+	}
+	b.cfg.Mode = ModeDistributed
+	if distCfg.UseEtcdRaft {
+		if _, ok := b.store.(distributedStateStore); !ok {
+			return nil, fmt.Errorf("%w: distributed etcd/raft requires a snapshot-capable deterministic state store", ErrUnsupportedMode)
+		}
 	}
 
 	if distCfg.SubmitTimeout <= 0 {
@@ -151,7 +193,7 @@ func NewDistributed(cfg Config, distCfg DistributedConfig) (*DistributedBroker, 
 	transport.TLSConfig = distCfg.TLSConfig
 
 	var wal *cluster.RaftWAL
-	if distCfg.WALDir != "" {
+	if !distCfg.UseEtcdRaft && distCfg.WALDir != "" {
 		wal, err = cluster.NewRaftWAL(cluster.WALConfig{Directory: distCfg.WALDir})
 		if err != nil {
 			return nil, fmt.Errorf("raft wal: %w", err)
@@ -176,14 +218,18 @@ func NewDistributed(cfg Config, distCfg DistributedConfig) (*DistributedBroker, 
 			peers = map[uint64]string{nodeID: cfg.NodeID}
 		}
 		ctrl, err := cluster.NewRaftController(cluster.RaftControllerConfig{
-			ID:           nodeID,
-			NodeID:       cfg.NodeID,
-			Peers:        peers,
-			ElectionTick: 10,
-			HeartbeatTick: 1,
-			TickInterval: 50 * time.Millisecond,
-			Transport:    transport,
-			StateMachine: sm,
+			ID:                     nodeID,
+			NodeID:                 cfg.NodeID,
+			Peers:                  peers,
+			ElectionTick:           10,
+			HeartbeatTick:          1,
+			TickInterval:           50 * time.Millisecond,
+			Transport:              transport,
+			StateMachine:           sm,
+			StorageDir:             distCfg.WALDir,
+			SkipBootstrap:          distCfg.JoinExisting,
+			SnapshotEntries:        distCfg.SnapshotEntries,
+			SnapshotCatchUpEntries: distCfg.SnapshotCatchUpEntries,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("etcd raft controller: %w", err)
@@ -205,12 +251,13 @@ func NewDistributed(cfg Config, distCfg DistributedConfig) (*DistributedBroker, 
 
 	origStore := b.store
 	b.store = &ReplicatedStore{
-		Store:          origStore,
-		raft:           raft,
-		raftCtrl:       raftCtrl,
-		commitTimeout:  distCfg.SubmitTimeout,
-		forwardTimeout: distCfg.ForwardTimeout,
-		cb:             newCircuitBreaker(5, 10*time.Second),
+		Store:           origStore,
+		raft:            raft,
+		raftCtrl:        raftCtrl,
+		commitTimeout:   distCfg.SubmitTimeout,
+		forwardTimeout:  distCfg.ForwardTimeout,
+		cb:              newCircuitBreaker(5, 10*time.Second),
+		allowStaleReads: distCfg.AllowStaleReads,
 	}
 
 	db := &DistributedBroker{
@@ -247,8 +294,17 @@ func (db *DistributedBroker) Start(ctx context.Context) error {
 
 	db.startTime = time.Now()
 
+	// Accept peer traffic before starting elections so a node cannot campaign
+	// while its transport is still unreachable.
+	if db.distCfg.ListenAddr != "" {
+		if err := db.transport.Listen(db.distCfg.ListenAddr, db.handleMessage); err != nil {
+			return fmt.Errorf("transport: %w", err)
+		}
+	}
+
 	if db.raftCtrl != nil {
 		if err := db.raftCtrl.Start(); err != nil {
+			_ = db.transport.Close()
 			return fmt.Errorf("etcd raft: %w", err)
 		}
 		if len(db.distCfg.RaftPeers) <= 1 {
@@ -256,19 +312,8 @@ func (db *DistributedBroker) Start(ctx context.Context) error {
 		}
 	} else if db.raft != nil {
 		if err := db.raft.Start(); err != nil {
+			_ = db.transport.Close()
 			return fmt.Errorf("raft: %w", err)
-		}
-	}
-
-	if db.distCfg.ListenAddr != "" {
-		if err := db.transport.Listen(db.distCfg.ListenAddr, db.handleMessage); err != nil {
-			if db.raftCtrl != nil {
-				db.raftCtrl.Stop()
-			}
-			if db.raft != nil {
-				db.raft.Stop()
-			}
-			return fmt.Errorf("transport: %w", err)
 		}
 	}
 
@@ -293,23 +338,26 @@ func (db *DistributedBroker) Stop(ctx context.Context) error {
 		return nil
 	}
 
-	db.Broker.Stop(ctx)
-
-	if db.transport != nil {
-		db.transport.Close()
-	}
-	if db.wal != nil {
-		db.wal.Close()
-	}
+	var stopErr error
+	// Stop consensus before closing its transport. Otherwise the active Raft
+	// loop can race transport shutdown by dialing a peer while Close is waiting
+	// for connection goroutines to exit.
 	if db.raftCtrl != nil {
-		db.raftCtrl.Stop()
+		stopErr = errors.Join(stopErr, db.raftCtrl.Stop())
 	}
 	if db.raft != nil {
 		db.raft.Stop()
 	}
+	if db.transport != nil {
+		stopErr = errors.Join(stopErr, db.transport.Close())
+	}
+	stopErr = errors.Join(stopErr, db.Broker.Stop(ctx))
+	if db.wal != nil {
+		stopErr = errors.Join(stopErr, db.wal.Close())
+	}
 
 	db.started = false
-	return nil
+	return stopErr
 }
 
 func (db *DistributedBroker) handleMessage(from string, msg *cluster.RaftMessage) {
@@ -339,7 +387,7 @@ func (db *DistributedBroker) DegradedMode() bool {
 
 func (db *DistributedBroker) CanServeReads() bool {
 	if db.raftCtrl != nil {
-		return true
+		return db.raftCtrl.IsLeader() || db.distCfg.AllowStaleReads
 	}
 	if db.raft != nil {
 		state := db.raft.State()
@@ -402,7 +450,7 @@ func (db *DistributedBroker) Leader() string {
 		if leadID == 0 {
 			return ""
 		}
-		if addr, ok := db.distCfg.RaftPeers[leadID]; ok {
+		if addr, ok := db.raftCtrl.PeerAddress(leadID); ok {
 			return addr
 		}
 		return fmt.Sprintf("%d", leadID)
@@ -427,17 +475,41 @@ func (db *DistributedBroker) RaftState() string {
 }
 
 func (db *DistributedBroker) AddNode(addr string) error {
+	if db.raftCtrl != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), db.distCfg.SubmitTimeout)
+		defer cancel()
+		_, err := db.AddRaftNode(ctx, addr)
+		return err
+	}
 	if db.raft != nil {
 		return db.raft.AddPeer(addr)
 	}
-	return nil
+	return fmt.Errorf("%w: no Raft engine is running", ErrClosed)
+}
+
+// AddRaftNode commits a voting-member addition and returns the ID that the
+// joining process must use with JoinExisting enabled.
+func (db *DistributedBroker) AddRaftNode(ctx context.Context, addr string) (uint64, error) {
+	if db.raftCtrl == nil {
+		return 0, fmt.Errorf("%w: etcd/raft controller is not enabled", ErrUnsupportedMode)
+	}
+	return db.raftCtrl.AddPeer(ctx, addr)
 }
 
 func (db *DistributedBroker) RemoveNode(id string) error {
+	if db.raftCtrl != nil {
+		peerID, ok := db.raftCtrl.PeerID(id)
+		if !ok {
+			return cluster.ErrNodeNotFound
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), db.distCfg.SubmitTimeout)
+		defer cancel()
+		return db.raftCtrl.RemovePeer(ctx, peerID)
+	}
 	if db.raft != nil {
 		return db.raft.RemovePeer(id)
 	}
-	return nil
+	return fmt.Errorf("%w: no Raft engine is running", ErrClosed)
 }
 
 func (db *DistributedBroker) ClusterStats() map[string]any {
@@ -456,6 +528,8 @@ func (db *DistributedBroker) ClusterStats() map[string]any {
 	if db.raftCtrl != nil {
 		stats["consensus_engine"] = "etcd/raft"
 		stats["term"] = db.raftCtrl.Term()
+		stats["applied_index"] = db.raftCtrl.AppliedIndex()
+		stats["snapshot_index"] = db.raftCtrl.SnapshotIndex()
 	} else if db.raft != nil {
 		stats["consensus_engine"] = "legacy"
 		stats["term"] = db.raft.CurrentTerm()
@@ -471,21 +545,102 @@ func (db *DistributedBroker) ClusterStats() map[string]any {
 }
 
 func (db *DistributedBroker) HealthCheck() map[string]any {
-	return map[string]any{
+	db.startMu.Lock()
+	started := db.started
+	db.startMu.Unlock()
+	health := map[string]any{
 		"leader":    db.Leader(),
 		"state":     db.RaftState(),
 		"is_leader": db.IsLeader(),
-		"started":   db.started,
+		"started":   started,
 	}
+	if db.raftCtrl != nil {
+		if err := db.raftCtrl.FatalError(); err != nil {
+			health["healthy"] = false
+			health["error"] = err.Error()
+			return health
+		}
+	}
+	health["healthy"] = started && db.CanServeReads()
+	return health
 }
 
 type ReplicatedStore struct {
 	Store
-	raft           *cluster.Raft
-	raftCtrl       *cluster.RaftController
-	commitTimeout  time.Duration
-	forwardTimeout time.Duration
-	cb             *circuitBreaker
+	raft            *cluster.Raft
+	raftCtrl        *cluster.RaftController
+	commitTimeout   time.Duration
+	forwardTimeout  time.Duration
+	cb              *circuitBreaker
+	mutationMu      sync.Mutex
+	allowStaleReads bool
+}
+
+func (s *ReplicatedStore) checkReadable() error {
+	if s.raftCtrl != nil && !s.raftCtrl.IsLeader() && !s.allowStaleReads {
+		return cluster.ErrNotLeader
+	}
+	return nil
+}
+
+func (s *ReplicatedStore) Get(ctx context.Context, id string) (Message, bool, error) {
+	if err := s.checkReadable(); err != nil {
+		return Message{}, false, err
+	}
+	return s.Store.Get(ctx, id)
+}
+
+func (s *ReplicatedStore) History(ctx context.Context, id string) ([]MessageHistory, error) {
+	if err := s.checkReadable(); err != nil {
+		return nil, err
+	}
+	return s.Store.History(ctx, id)
+}
+
+func (s *ReplicatedStore) ListQueue(ctx context.Context, name string, limit int) ([]Message, error) {
+	if err := s.checkReadable(); err != nil {
+		return nil, err
+	}
+	return s.Store.ListQueue(ctx, name, limit)
+}
+
+func (s *ReplicatedStore) ListDLQ(ctx context.Context, name string, limit int) ([]Message, error) {
+	if err := s.checkReadable(); err != nil {
+		return nil, err
+	}
+	return s.Store.ListDLQ(ctx, name, limit)
+}
+
+func (s *ReplicatedStore) ReadStream(ctx context.Context, req StreamReadRequest) ([]Message, error) {
+	if err := s.checkReadable(); err != nil {
+		return nil, err
+	}
+	return s.Store.ReadStream(ctx, req)
+}
+
+func (s *ReplicatedStore) ConsumerOffset(ctx context.Context, commit OffsetCommit) (uint64, error) {
+	if err := s.checkReadable(); err != nil {
+		return 0, err
+	}
+	return s.Store.ConsumerOffset(ctx, commit)
+}
+
+func (s *ReplicatedStore) Stats(ctx context.Context) (StoreStats, error) {
+	if err := s.checkReadable(); err != nil {
+		return StoreStats{}, err
+	}
+	return s.Store.Stats(ctx)
+}
+
+type replicatedLease struct {
+	Request  LeaseRequest `json:"request"`
+	Messages []Message    `json:"messages"`
+}
+
+type replicatedMove struct {
+	OperationID string            `json:"operation_id"`
+	Request     MoveRequest       `json:"request"`
+	PlannedIDs  map[string]string `json:"planned_ids,omitempty"`
 }
 
 // ConfirmationLevel returns ConfirmReplicated when backed by etcd/raft consensus.
@@ -546,6 +701,12 @@ func (s *ReplicatedStore) proposeAndCommit(ctx context.Context, data []byte) err
 }
 
 func (s *ReplicatedStore) submit(ctx context.Context, cmdType cluster.BrokerCommandType, payload any) error {
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
+	return s.submitUnlocked(ctx, cmdType, payload)
+}
+
+func (s *ReplicatedStore) submitUnlocked(ctx context.Context, cmdType cluster.BrokerCommandType, payload any) error {
 	cmd, err := cluster.MakeBrokerCommand(cmdType, payload)
 	if err != nil {
 		return err
@@ -622,6 +783,8 @@ func (s *ReplicatedStore) DeclareStream(ctx context.Context, cfg StreamConfig) e
 }
 
 func (s *ReplicatedStore) Append(ctx context.Context, msg Message, dests []Destination) ([]Message, error) {
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
 	cmd := cluster.AppendCommand{
 		ID:               msg.ID,
 		ParentID:         msg.ParentID,
@@ -658,6 +821,8 @@ func (s *ReplicatedStore) Append(ctx context.Context, msg Message, dests []Desti
 		Redeliveries:     msg.Redeliveries,
 		TenantID:         msg.TenantID,
 		ProducerID:       msg.ProducerID,
+		ProducerEpoch:    msg.ProducerEpoch,
+		ProducerSequence: msg.ProducerSequence,
 		ConsumerID:       msg.ConsumerID,
 		ConsumerGroup:    msg.ConsumerGroup,
 		LeaseToken:       msg.LeaseToken,
@@ -702,6 +867,143 @@ func (s *ReplicatedStore) Append(ctx context.Context, msg Message, dests []Desti
 	return []Message{msg}, nil
 }
 
+func (s *ReplicatedStore) AppendAtomic(ctx context.Context, entries []AppendEntry) ([]Message, error) {
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
+	if s.raftCtrl == nil || !s.raftCtrl.IsLeader() {
+		return nil, cluster.ErrNotLeader
+	}
+	preparer, ok := s.Store.(interface {
+		prepareAppendAtomic(context.Context, []AppendEntry) ([]Message, error)
+	})
+	if !ok {
+		return nil, fmt.Errorf("%w: backing store cannot prepare a replicated atomic append", ErrUnsupportedMode)
+	}
+	prepared, err := preparer.prepareAppendAtomic(ctx, entries)
+	if err != nil {
+		return nil, err
+	}
+	persisted := storedAppendEntries(prepared)
+	if err := s.submitUnlocked(ctx, cluster.BrokerCmdAppendAtomic, persisted); err != nil {
+		return nil, err
+	}
+	return prepared, nil
+}
+
+func (s *ReplicatedStore) Lease(ctx context.Context, req LeaseRequest) ([]Message, error) {
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
+	if s.raftCtrl == nil || !s.raftCtrl.IsLeader() {
+		return nil, cluster.ErrNotLeader
+	}
+	preparer, ok := s.Store.(interface {
+		prepareLease(context.Context, LeaseRequest) ([]Message, error)
+	})
+	if !ok {
+		return nil, fmt.Errorf("%w: backing store cannot prepare a replicated lease", ErrUnsupportedMode)
+	}
+	messages, err := preparer.prepareLease(ctx, req)
+	if err != nil || len(messages) == 0 {
+		return messages, err
+	}
+	if err := s.submitUnlocked(ctx, cluster.BrokerCmdLease, replicatedLease{Request: req, Messages: messages}); err != nil {
+		return nil, err
+	}
+	return messages, nil
+}
+
+func (s *ReplicatedStore) ExtendLease(ctx context.Context, req LeaseRequest) error {
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
+	if s.raftCtrl == nil || !s.raftCtrl.IsLeader() {
+		return cluster.ErrNotLeader
+	}
+	validator, ok := s.Store.(interface {
+		validateExtendLease(context.Context, LeaseRequest) (Message, error)
+	})
+	if !ok {
+		return fmt.Errorf("%w: backing store cannot prepare a replicated lease extension", ErrUnsupportedMode)
+	}
+	message, err := validator.validateExtendLease(ctx, req)
+	if err != nil {
+		return err
+	}
+	if req.VisibilityTimeout <= 0 {
+		req.VisibilityTimeout = 30 * time.Second
+	}
+	message.LeaseUntil = time.Now().Add(req.VisibilityTimeout)
+	return s.submitUnlocked(ctx, cluster.BrokerCmdUpdate, message)
+}
+
+func (s *ReplicatedStore) Update(ctx context.Context, message Message) error {
+	return s.submit(ctx, cluster.BrokerCmdUpdate, message)
+}
+
+func (s *ReplicatedStore) UpdateBatch(ctx context.Context, messages []Message) []error {
+	errs := make([]error, len(messages))
+	if len(messages) == 0 {
+		return errs
+	}
+	if err := s.submit(ctx, cluster.BrokerCmdUpdateBatch, messages); err != nil {
+		for i := range errs {
+			errs[i] = err
+		}
+	}
+	return errs
+}
+
+func (s *ReplicatedStore) SweepLeases(ctx context.Context, now time.Time) (int, error) {
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
+	if s.raftCtrl == nil || !s.raftCtrl.IsLeader() {
+		return 0, nil
+	}
+	preparer, ok := s.Store.(interface {
+		prepareSweepLeases(context.Context, time.Time) ([]Message, error)
+	})
+	if !ok {
+		return 0, fmt.Errorf("%w: backing store cannot prepare replicated lease expiry", ErrUnsupportedMode)
+	}
+	messages, err := preparer.prepareSweepLeases(ctx, now)
+	if err != nil || len(messages) == 0 {
+		return 0, err
+	}
+	if err := s.submitUnlocked(ctx, cluster.BrokerCmdUpdateBatch, messages); err != nil {
+		return 0, err
+	}
+	return len(messages), nil
+}
+
+func (s *ReplicatedStore) Move(ctx context.Context, req MoveRequest) (MoveResult, error) {
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
+	if s.raftCtrl == nil || !s.raftCtrl.IsLeader() {
+		return MoveResult{}, cluster.ErrNotLeader
+	}
+	preparer, ok := s.Store.(interface {
+		prepareMove(context.Context, MoveRequest) (map[string]string, MoveResult, error)
+	})
+	if !ok {
+		return MoveResult{}, fmt.Errorf("%w: backing store cannot prepare a deterministic replicated move", ErrUnsupportedMode)
+	}
+	planned, result, err := preparer.prepareMove(ctx, req)
+	if err != nil || req.DryRun || len(result.MessageIDs) == 0 {
+		return result, err
+	}
+	if err := s.submitUnlocked(ctx, cluster.BrokerCmdMove, replicatedMove{OperationID: newIDFromTime(), Request: req, PlannedIDs: planned}); err != nil {
+		return MoveResult{}, err
+	}
+	return result, nil
+}
+
+func (s *ReplicatedStore) CommitOffset(ctx context.Context, commit OffsetCommit) error {
+	persisted, err := durableOffsetCommit(ctx, commit)
+	if err != nil {
+		return err
+	}
+	return s.submit(ctx, cluster.BrokerCmdCommitOffset, persisted)
+}
+
 func (s *ReplicatedStore) Ack(ctx context.Context, req AckRequest) error {
 	cmd := cluster.AckCommand{
 		MessageID:  req.MessageID,
@@ -738,6 +1040,12 @@ func (s *ReplicatedStore) ResumeQueue(ctx context.Context, name string) error {
 }
 
 func (s *ReplicatedStore) PurgeQueue(ctx context.Context, name string) (int, error) {
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
+	before, listErr := s.Store.ListQueue(ctx, name, 0)
+	if listErr != nil {
+		return 0, listErr
+	}
 	cmd, err := cluster.MakeBrokerCommand(cluster.BrokerCmdPurgeQueue, name)
 	if err != nil {
 		return 0, err
@@ -749,13 +1057,7 @@ func (s *ReplicatedStore) PurgeQueue(ctx context.Context, name string) (int, err
 	if err := s.proposeAndCommit(ctx, data); err != nil {
 		return 0, err
 	}
-	// Query local store for the actual purge count
-	n, err := s.Store.PurgeQueue(ctx, name)
-	if err != nil {
-		// If local purge fails (already purged by Raft), return 0
-		return 0, nil
-	}
-	return n, nil
+	return len(before), nil
 }
 
 type brokerStoreAdapter struct {
@@ -801,6 +1103,14 @@ func (a *brokerStoreAdapter) ReplicateDeclareStream(ctx context.Context, cmd clu
 }
 
 func (a *brokerStoreAdapter) ReplicateAppend(ctx context.Context, cmd cluster.AppendCommand) error {
+	// Committed entries are replayed after a controller restart. If the backing
+	// store recovered the same command from its own WAL, applying it again must
+	// be a no-op rather than a duplicate-producer failure or duplicate queue ID.
+	if _, exists, err := a.store.Get(ctx, cmd.ID); err != nil {
+		return err
+	} else if exists {
+		return nil
+	}
 	dests := make([]Destination, len(cmd.Destinations))
 	for i, d := range cmd.Destinations {
 		dests[i] = Destination{
@@ -844,6 +1154,8 @@ func (a *brokerStoreAdapter) ReplicateAppend(ctx context.Context, cmd cluster.Ap
 		Redeliveries:     cmd.Redeliveries,
 		TenantID:         cmd.TenantID,
 		ProducerID:       cmd.ProducerID,
+		ProducerEpoch:    cmd.ProducerEpoch,
+		ProducerSequence: cmd.ProducerSequence,
 		ConsumerID:       cmd.ConsumerID,
 		ConsumerGroup:    cmd.ConsumerGroup,
 		LeaseToken:       cmd.LeaseToken,
@@ -859,6 +1171,20 @@ func (a *brokerStoreAdapter) ReplicateAppend(ctx context.Context, cmd cluster.Ap
 		TaskName:         cmd.TaskName,
 	}, dests)
 	return err
+}
+
+func (a *brokerStoreAdapter) ReplicateAppendAtomic(ctx context.Context, payload json.RawMessage) error {
+	var entries []AppendEntry
+	if err := json.Unmarshal(payload, &entries); err != nil {
+		return err
+	}
+	store, ok := a.store.(interface {
+		appendRecoveredAtomic([]AppendEntry) error
+	})
+	if !ok {
+		return fmt.Errorf("%w: backing store cannot apply atomic append", ErrUnsupportedMode)
+	}
+	return store.appendRecoveredAtomic(entries)
 }
 
 func (a *brokerStoreAdapter) ReplicateAck(ctx context.Context, cmd cluster.AckCommand) error {
@@ -884,6 +1210,99 @@ func (a *brokerStoreAdapter) ReplicateNack(ctx context.Context, cmd cluster.Nack
 		ResetLease:       cmd.ResetLease,
 		IncrementAttempt: cmd.IncrementAttempt,
 	})
+}
+
+func (a *brokerStoreAdapter) ReplicateLease(ctx context.Context, payload json.RawMessage) error {
+	var lease replicatedLease
+	if err := json.Unmarshal(payload, &lease); err != nil {
+		return err
+	}
+	applier, ok := a.store.(interface {
+		applyLease(context.Context, []Message, LeaseRequest) error
+	})
+	if !ok {
+		return fmt.Errorf("%w: backing store cannot apply replicated leases", ErrUnsupportedMode)
+	}
+	return applier.applyLease(ctx, lease.Messages, lease.Request)
+}
+
+func (a *brokerStoreAdapter) ReplicateUpdate(ctx context.Context, payload json.RawMessage) error {
+	var message Message
+	if err := json.Unmarshal(payload, &message); err != nil {
+		return err
+	}
+	return a.store.Update(ctx, message)
+}
+
+func (a *brokerStoreAdapter) ReplicateUpdateBatch(ctx context.Context, payload json.RawMessage) error {
+	var messages []Message
+	if err := json.Unmarshal(payload, &messages); err != nil {
+		return err
+	}
+	batch, ok := a.store.(BatchUpdateStore)
+	if !ok {
+		for i := range messages {
+			if err := a.store.Update(ctx, messages[i]); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	errs := batch.UpdateBatch(ctx, messages)
+	for _, err := range errs {
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (a *brokerStoreAdapter) ReplicateMove(ctx context.Context, payload json.RawMessage) error {
+	var move replicatedMove
+	if err := json.Unmarshal(payload, &move); err != nil {
+		return err
+	}
+	applier, ok := a.store.(interface {
+		applyMovePlan(context.Context, string, MoveRequest, map[string]string) (MoveResult, error)
+	})
+	if !ok {
+		return fmt.Errorf("%w: backing store cannot apply a deterministic replicated move", ErrUnsupportedMode)
+	}
+	_, err := applier.applyMovePlan(ctx, move.OperationID, move.Request, move.PlannedIDs)
+	return err
+}
+
+func (a *brokerStoreAdapter) ReplicateCommitOffset(ctx context.Context, payload json.RawMessage) error {
+	var commit OffsetCommit
+	if err := json.Unmarshal(payload, &commit); err != nil {
+		return err
+	}
+	return a.store.CommitOffset(ctx, commit)
+}
+
+func (a *brokerStoreAdapter) ReplicateSnapshot() ([]byte, error) {
+	store, ok := a.store.(interface {
+		Snapshot() MemoryStoreSnapshot
+	})
+	if !ok {
+		return nil, fmt.Errorf("%w: backing store cannot create a consensus snapshot", ErrUnsupportedMode)
+	}
+	return json.Marshal(store.Snapshot())
+}
+
+func (a *brokerStoreAdapter) ReplicateRestore(data []byte) error {
+	var snapshot MemoryStoreSnapshot
+	if err := json.Unmarshal(data, &snapshot); err != nil {
+		return fmt.Errorf("decode broker consensus snapshot: %w", err)
+	}
+	store, ok := a.store.(interface {
+		RestoreExact(MemoryStoreSnapshot)
+	})
+	if !ok {
+		return fmt.Errorf("%w: backing store cannot restore a consensus snapshot", ErrUnsupportedMode)
+	}
+	store.RestoreExact(snapshot)
+	return nil
 }
 
 func (a *brokerStoreAdapter) ReplicatePauseQueue(ctx context.Context, name string) error {

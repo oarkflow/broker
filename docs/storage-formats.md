@@ -28,10 +28,18 @@ go run ./broker-wal -path ../data/broker.wal.fwb -export-json ../backup.jsonl
 go run ./broker-wal -path ../restored/broker.wal.fwb -import-json ../backup.jsonl
 ```
 
-## BWL2 and BST2
+## BWL2
 
-BWL2/BST2 are reserved for the segmented production formats. No implementation
-may emit either magic/version until manifests, checksummed segment headers,
-indexes, checkpoints, clean-shutdown markers, and migration tests are complete.
-Existing BWL1 data must only be migrated by an explicit backup-preserving tool;
-it must never be silently rewritten.
+BWL2 is the active segmented WAL implementation. It provides manifests,
+checksummed bounded records, sparse indexes, clean-shutdown trailers, rotation,
+compaction, torn-tail handling, and tested BWL1/JSON migration. Migration is
+fail-closed: the original is renamed to `.migrated` only after every record is
+verified and the BWL2 destination is synced. A failed migration removes partial
+BWL2 output and leaves the source untouched.
+
+## BST2
+
+BST2 remains reserved for a future authenticated, version-negotiated native
+stream protocol. No implementation may advertise or emit BST2 until its format
+and conformance tests are committed. BST1 remains the implemented native stream
+format described in `native-protocols.md`.

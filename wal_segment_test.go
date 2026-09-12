@@ -359,3 +359,95 @@ func TestSegmentedWALBWL1Migration(t *testing.T) {
 		}
 	}
 }
+
+func TestSegmentedWALJSONMigration(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	legacyStore, err := NewFileWALStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := legacyStore.DeclareQueue(ctx, QueueConfig{Name: "json-migrated"}); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		msg := Message{ID: fmt.Sprintf("json-mig-%d", i), Payload: []byte("payload")}
+		if _, err := legacyStore.Append(ctx, msg, []Destination{{Kind: DestinationQueue, Name: "json-migrated"}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := legacyStore.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	segStore, err := NewSegmentedWALStore(SegmentedWALConfig{Dir: dir, DisableCompactor: true})
+	if err != nil {
+		t.Fatalf("migrate JSON WAL: %v", err)
+	}
+	defer segStore.Close()
+	for i := 0; i < 3; i++ {
+		id := fmt.Sprintf("json-mig-%d", i)
+		msg, ok, err := segStore.Get(ctx, id)
+		if err != nil || !ok || msg.Queue != "json-migrated" {
+			t.Fatalf("migrated message %q missing: ok=%v message=%+v err=%v", id, ok, msg, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(dir, "broker.wal.jsonl.migrated")); err != nil {
+		t.Fatalf("legacy JSON WAL was not preserved: %v", err)
+	}
+}
+
+func TestSegmentedWALJSONMigrationFailurePreservesSource(t *testing.T) {
+	dir := t.TempDir()
+	legacyPath := filepath.Join(dir, "broker.wal.jsonl")
+	if err := os.WriteFile(legacyPath, []byte("{not-json}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := NewSegmentedWALStore(SegmentedWALConfig{Dir: dir, DisableCompactor: true}); err == nil {
+		t.Fatal("expected corrupt legacy WAL migration to fail")
+	}
+	if got, err := os.ReadFile(legacyPath); err != nil || string(got) != "{not-json}\n" {
+		t.Fatalf("legacy source was not preserved: data=%q err=%v", got, err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "manifest.json")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("partial BWL2 manifest survived failed migration: %v", err)
+	}
+}
+
+func TestSegmentedWALMoveIDsAreStableAcrossRestart(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	store, err := NewSegmentedWALStore(SegmentedWALConfig{Dir: dir, DisableCompactor: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, queue := range []string{"source", "copies"} {
+		if err := store.DeclareQueue(ctx, QueueConfig{Name: queue}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := store.Append(ctx, Message{ID: "move-me"}, []Destination{{Kind: DestinationQueue, Name: "source"}}); err != nil {
+		t.Fatal(err)
+	}
+	result, err := store.Move(ctx, MoveRequest{SourceType: DestinationQueue, Source: "source", DestinationType: DestinationQueue, Destination: "copies", MessageIDs: []string{"move-me"}, Mode: MoveCopy})
+	if err != nil || result.Copied != 1 {
+		t.Fatalf("move result=%+v err=%v", result, err)
+	}
+	before, err := store.ListQueue(ctx, "copies", 10)
+	if err != nil || len(before) != 1 {
+		t.Fatalf("before restart: messages=%+v err=%v", before, err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := NewSegmentedWALStore(SegmentedWALConfig{Dir: dir, DisableCompactor: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	after, err := reopened.ListQueue(ctx, "copies", 10)
+	if err != nil || len(after) != 1 || after[0].ID != before[0].ID {
+		t.Fatalf("after restart: messages=%+v want ID=%q err=%v", after, before[0].ID, err)
+	}
+}

@@ -7,9 +7,12 @@ import "time"
 // persist/recover the default in-memory data-plane without reaching into
 // MemoryStore internals.
 type MemoryQueueSnapshot struct {
-	Config QueueConfig `json:"config"`
-	IDs    []string    `json:"ids"`
-	State  QueueState  `json:"state"`
+	Config      QueueConfig `json:"config"`
+	IDs         []string    `json:"ids"`
+	State       QueueState  `json:"state"`
+	Head        int         `json:"head,omitempty"`
+	Depth       int         `json:"depth,omitempty"`
+	HasPriority bool        `json:"has_priority,omitempty"`
 }
 
 type MemoryTopicSnapshot struct {
@@ -39,6 +42,8 @@ type MemoryStoreSnapshot struct {
 	Offsets   map[string]map[string]uint64    `json:"offsets"`
 	Dedup     map[string]time.Time            `json:"dedup"`
 	Idemp     map[string]string               `json:"idemp"`
+	Producers map[string]ProducerState        `json:"producers,omitempty"`
+	MoveOps   map[string]MoveResult           `json:"move_ops,omitempty"`
 }
 
 // Snapshot returns a consistent deep-copy image of the store.
@@ -56,9 +61,11 @@ func (s *MemoryStore) Snapshot() MemoryStoreSnapshot {
 		Offsets:   make(map[string]map[string]uint64, len(s.offsets)),
 		Dedup:     make(map[string]time.Time, len(s.dedup)),
 		Idemp:     make(map[string]string, len(s.idemp)),
+		Producers: make(map[string]ProducerState, len(s.producerSeq)),
+		MoveOps:   make(map[string]MoveResult, len(s.moveOps)),
 	}
 	for name, q := range s.queues {
-		snap.Queues[name] = MemoryQueueSnapshot{Config: q.cfg, IDs: append([]string(nil), q.ids...), State: q.state}
+		snap.Queues[name] = MemoryQueueSnapshot{Config: q.cfg, IDs: append([]string(nil), q.ids...), State: q.state, Head: q.head, Depth: q.depth, HasPriority: q.hasPriority}
 	}
 	for name, t := range s.topics {
 		snap.Topics[name] = MemoryTopicSnapshot{Config: t.cfg, IDs: append([]string(nil), t.ids...), State: t.state}
@@ -84,6 +91,12 @@ func (s *MemoryStore) Snapshot() MemoryStoreSnapshot {
 	for k, v := range s.idemp {
 		snap.Idemp[k] = v
 	}
+	for k, v := range s.producerSeq {
+		snap.Producers[k] = v
+	}
+	for k, v := range s.moveOps {
+		snap.MoveOps[k] = v
+	}
 	return snap
 }
 
@@ -91,6 +104,17 @@ func (s *MemoryStore) Snapshot() MemoryStoreSnapshot {
 // are converted back to queued during restore so a crashed consumer cannot keep
 // work invisible forever after process recovery.
 func (s *MemoryStore) Restore(snap MemoryStoreSnapshot) {
+	s.restoreSnapshot(snap, true)
+}
+
+// RestoreExact replaces the store with a consensus snapshot without changing
+// lease state. Lease expiry is itself a replicated mutation and must not be
+// decided independently by a recovering follower.
+func (s *MemoryStore) RestoreExact(snap MemoryStoreSnapshot) {
+	s.restoreSnapshot(snap, false)
+}
+
+func (s *MemoryStore) restoreSnapshot(snap MemoryStoreSnapshot, recoverInflight bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.queues = map[string]*memoryQueue{}
@@ -101,12 +125,18 @@ func (s *MemoryStore) Restore(snap MemoryStoreSnapshot) {
 	s.offsets = map[string]map[string]uint64{}
 	s.dedup = map[string]time.Time{}
 	s.idemp = map[string]string{}
+	s.producerSeq = map[string]ProducerState{}
+	s.moveOps = map[string]MoveResult{}
 	for name, q := range snap.Queues {
 		state := q.State
 		if state == "" {
 			state = QueueActive
 		}
-		s.queues[name] = &memoryQueue{cfg: q.Config, ids: append([]string(nil), q.IDs...), state: state}
+		head := q.Head
+		if head < 0 || head > len(q.IDs) {
+			head = 0
+		}
+		s.queues[name] = &memoryQueue{cfg: q.Config, ids: append([]string(nil), q.IDs...), state: state, head: head, depth: q.Depth, hasPriority: q.HasPriority}
 	}
 	for name, t := range snap.Topics {
 		state := t.State
@@ -120,7 +150,7 @@ func (s *MemoryStore) Restore(snap MemoryStoreSnapshot) {
 	}
 	for id, msg := range snap.Messages {
 		m := cloneMessage(msg)
-		if m.Status == MessageLeased || m.Status == MessageProcessing || m.Status == MessageProgressing || m.Status == MessageDelivered {
+		if recoverInflight && (m.Status == MessageLeased || m.Status == MessageProcessing || m.Status == MessageProgressing || m.Status == MessageDelivered) {
 			m.Status = MessageQueued
 			m.LeaseToken = ""
 			m.LeaseUntil = time.Time{}
@@ -128,6 +158,23 @@ func (s *MemoryStore) Restore(snap MemoryStoreSnapshot) {
 			m.Redeliveries++
 		}
 		s.messages[id] = &m
+	}
+	// Version-1 snapshots did not persist queue counters. Reconstruct them when
+	// absent so old backups remain readable and messages do not become invisible.
+	for _, queue := range s.queues {
+		if queue.depth != 0 || len(queue.ids) == 0 {
+			continue
+		}
+		for _, id := range queue.ids[queue.head:] {
+			message := s.messages[id]
+			if message == nil || message.Queue != queue.cfg.Name || isTerminalQueueStatus(message.Status) {
+				continue
+			}
+			queue.depth++
+			if message.Priority != 0 {
+				queue.hasPriority = true
+			}
+		}
 	}
 	for id, h := range snap.History {
 		s.history[id] = append([]MessageHistory(nil), h...)
@@ -146,6 +193,12 @@ func (s *MemoryStore) Restore(snap MemoryStoreSnapshot) {
 	}
 	for k, v := range snap.Idemp {
 		s.idemp[k] = v
+	}
+	for k, v := range snap.Producers {
+		s.producerSeq[k] = v
+	}
+	for k, v := range snap.MoveOps {
+		s.moveOps[k] = v
 	}
 	s.closed = false
 }

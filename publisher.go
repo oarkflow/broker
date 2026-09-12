@@ -2,6 +2,7 @@ package broker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 )
@@ -396,18 +397,6 @@ func (p *Publisher) publish(ctx context.Context, topic string, payload any, opts
 	if err := p.checkBackpressure(ctx, prep); err != nil {
 		return PublishResult{}, err
 	}
-	if prep.opts.ProducerID != "" && prep.opts.ProducerSequence != nil {
-		isDup, existingID, err := p.b.ProducerRegistry().CheckAndRecord(prep.opts.ProducerID, prep.opts.ProducerEpoch, *prep.opts.ProducerSequence, prep.msg.ID)
-		if err != nil {
-			return PublishResult{}, err
-		}
-		if isDup {
-			return PublishResult{
-				MessageID: existingID,
-				Duplicate: true,
-			}, nil
-		}
-	}
 	if p.b.tenantMgr != nil {
 		if err := p.b.tenantMgr.CheckPublishQuota(ctx, prep.msg.TenantID, prep.dests); err != nil {
 			return PublishResult{}, err
@@ -418,6 +407,10 @@ func (p *Publisher) publish(ctx context.Context, topic string, payload any, opts
 	}
 	stored, err := p.b.store.Append(ctx, prep.msg, prep.dests)
 	if err != nil {
+		var duplicate *DuplicateProducerSequenceError
+		if errors.As(err, &duplicate) {
+			return PublishResult{MessageID: duplicate.MessageID, Duplicate: true}, nil
+		}
 		if p.b.cfg.Hooks.OnPublishFailed != nil {
 			prep.event.Error = err
 			p.b.cfg.Hooks.OnPublishFailed(ctx, prep.event)
