@@ -1,0 +1,50 @@
+fastworker Broker ({{ include "broker.fullname" . }}) has been installed into
+namespace {{ include "broker.namespace" . }}.
+
+*** THIS CHART IS NEW AND HAS NOT BEEN VALIDATED AGAINST A REAL CLUSTER. ***
+Read deploy/README.md in the broker repository before relying on it.
+
+IMPORTANT CAVEATS
+------------------
+1. Distributed/clustered mode in brokerd itself is EXPERIMENTAL and, per the
+   project's own Tasks.md, NOT PRODUCTION-SAFE. Running replicaCount > 1
+   gives you {{ .Values.replicaCount }} independent standalone brokers, each
+   with its own WAL volume and identity -- brokerd has no peer/Raft flags
+   wired up yet, so this is NOT a coordinated cluster today.
+2. The native BST1 TCP stream (port 8091) is disabled by default
+   (broker.listeners.native.enabled=false) and MUST stay disabled in any
+   shared environment: it has no authentication and brokerd will not even
+   start that listener unless insecure-dev mode is on.
+3. If you installed with default values and did not override `secrets.*` /
+   `tls.*`, the admin token and TLS certificate are PLACEHOLDERS and the
+   broker will not pass a real TLS handshake or be meaningfully secured.
+
+NEXT STEPS
+----------
+1. Replace placeholder secrets before using this anywhere but a scratch
+   cluster:
+
+     helm upgrade {{ .Release.Name }} deploy/helm/broker -n {{ include "broker.namespace" . }} \
+       --set-string secrets.adminToken="$(openssl rand -hex 32)" \
+       --set-file tls.crt=/path/to/server.crt \
+       --set-file tls.key=/path/to/server.key
+
+   or set `secrets.existingSecret` / `tls.existingSecret` to a Secret you
+   manage with sealed-secrets / external-secrets / SOPS.
+
+2. Check rollout status:
+
+     kubectl -n {{ include "broker.namespace" . }} rollout status statefulset/{{ include "broker.fullname" . }}
+
+3. Verify health once pods are Ready:
+
+     kubectl -n {{ include "broker.namespace" . }} exec {{ include "broker.fullname" . }}-0 -- \
+       wget -qO- --no-check-certificate https://127.0.0.1:8090/healthz
+
+4. Port-forward for local testing:
+
+     kubectl -n {{ include "broker.namespace" . }} port-forward svc/{{ include "broker.fullname" . }} 8090:8090
+
+5. Read docs/OPERATIONS.md in the broker repository for backup/restore and
+   rolling-upgrade procedures before operating this in anything that
+   matters.

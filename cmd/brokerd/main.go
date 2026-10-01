@@ -25,7 +25,7 @@ import (
 func main() {
 	addr := flag.String("addr", env("BROKER_ADDR", ":8090"), "HTTP listen address")
 	profileName := flag.String("profile", env("BROKER_PROFILE", string(broker.ProfileDurable)), "performance profile: durable, latency, throughput, lightweight")
-	nativeAddr := flag.String("native-addr", env("BROKER_NATIVE_ADDR", ""), "unauthenticated native BST1 stream listen address; empty disables; development only")
+	nativeAddr := flag.String("native-addr", env("BROKER_NATIVE_ADDR", ""), "native BST1 stream listen address; empty disables; requires -token or -require-client-cert unless --insecure-dev")
 	nativeRPCAddr := flag.String("native-rpc-addr", env("BROKER_NATIVE_RPC_ADDR", ""), "native JSON/TCP RPC listen address; empty disables")
 	grpcAddr := flag.String("grpc-addr", env("BROKER_GRPC_ADDR", ""), "protobuf/HTTP2 gRPC listen address; empty disables")
 	mqttAddr := flag.String("mqtt-addr", env("BROKER_MQTT_ADDR", ""), "MQTT 3.1.1 listen address; empty disables")
@@ -50,6 +50,8 @@ func main() {
 	walShards := flag.Int("wal-shards", int(envInt64("BROKER_WAL_SHARDS", 1)), "independent binary WAL shards; use separate volumes for best scaling")
 	walSegmentSize := flag.Int64("wal-segment-size", envInt64("BROKER_WAL_SEGMENT_SIZE", 64<<20), "maximum BWL2 segment size in bytes before rotating")
 	walMaxSegments := flag.Int("wal-max-segments", int(envInt64("BROKER_WAL_MAX_SEGMENTS", 10)), "maximum active BWL2 segments before compaction")
+	walRetention := flag.Duration("wal-retention", time.Duration(envInt64("BROKER_WAL_RETENTION_SEC", 0))*time.Second, "BWL2: age after which a closed, checkpointed segment is eligible for deletion; 0 disables age-based retention")
+	walCompactionInterval := flag.Duration("wal-compaction-interval", time.Duration(envInt64("BROKER_WAL_COMPACTION_INTERVAL_SEC", 0))*time.Second, "BWL2: how often the background compactor runs; 0 uses the default (5m)")
 	frameSigningKey := flag.String("frame-signing-key", env("BROKER_FRAME_SIGNING_KEY", ""), "optional FWB frame and BWL1 WAL HMAC signing key")
 	frameEncryptionKey := flag.String("frame-encryption-key", env("BROKER_FRAME_ENCRYPTION_KEY", ""), "optional FWB frame and BWL1 WAL AES-GCM encryption key")
 	frameCompress := flag.Int("frame-compress-threshold", int(envInt64("BROKER_FRAME_COMPRESS_THRESHOLD", 0)), "gzip FWB payloads and BWL1 records at or above this size; 0 disables")
@@ -85,8 +87,8 @@ func main() {
 	if !*insecureDev && *tlsCert == "" {
 		logger.Log.Fatal("production mode requires TLS. Configure -tls-cert and -tls-key, or use --insecure-dev only for local development.")
 	}
-	if !*insecureDev && *nativeAddr != "" {
-		logger.Log.Fatal("native BST1 has no authentication layer and may only be enabled with --insecure-dev")
+	if *nativeAddr != "" && !*insecureDev && *token == "" && !*requireClientCert {
+		logger.Log.Fatal("native BST1 requires a bearer token (-token) or mTLS (-require-client-cert) in production mode, or --insecure-dev for local development")
 	}
 	if *amqpAddr != "" && !*insecureDev && *amqpUsername == "" && *amqpPassword == "" && !*requireClientCert {
 		logger.Log.Fatal("AMQP requires PLAIN credentials or mTLS in production mode")
@@ -160,10 +162,12 @@ func main() {
 			logger.Log.Fatal("-wal is required when -store=wal2")
 		}
 		st, err := broker.NewSegmentedWALStore(broker.SegmentedWALConfig{
-			Dir:            *wal,
-			MaxSegmentSize: *walSegmentSize,
-			MaxSegments:    *walMaxSegments,
-			Codec:          frameCodec,
+			Dir:                *wal,
+			MaxSegmentSize:     *walSegmentSize,
+			MaxSegments:        *walMaxSegments,
+			Retention:          *walRetention,
+			CompactionInterval: *walCompactionInterval,
+			Codec:              frameCodec,
 		})
 		if err != nil {
 			logger.Log.Fatal("open segmented WAL store", zlog.Err(err))

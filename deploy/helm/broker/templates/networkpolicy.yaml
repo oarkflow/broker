@@ -1,0 +1,50 @@
+{{- if .Values.networkPolicy.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "broker.fullname" . }}
+  namespace: {{ include "broker.namespace" . }}
+  labels:
+    {{- include "broker.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "broker.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from: []
+      ports:
+        - protocol: TCP
+          port: {{ .Values.service.ports.httpAdmin }}
+        {{- if .Values.broker.listeners.grpc.enabled }}
+        - protocol: TCP
+          port: {{ .Values.service.ports.grpc }}
+        {{- end }}
+        {{- if .Values.broker.listeners.mqtt.enabled }}
+        - protocol: TCP
+          port: {{ .Values.service.ports.mqtt }}
+        {{- end }}
+        {{- if .Values.broker.listeners.amqp.enabled }}
+        - protocol: TCP
+          port: {{ .Values.service.ports.amqp }}
+        {{- end }}
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "broker.selectorLabels" . | nindent 14 }}
+  egress:
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "broker.selectorLabels" . | nindent 14 }}
+    - to: []
+{{- end }}

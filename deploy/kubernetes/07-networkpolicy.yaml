@@ -1,0 +1,58 @@
+# Default-deny ingress for the broker pods except on the ports brokerd
+# actually exposes (Dockerfile EXPOSE 8090 8091 1883 5672 50051). Port 8091
+# (native BST1) is deliberately NOT opened here: it is unauthenticated and
+# brokerd refuses to even start that listener unless --insecure-dev is set,
+# which this deployment does not set.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: broker
+  namespace: broker
+  labels:
+    app.kubernetes.io/name: broker
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: broker
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Client traffic from anywhere in the cluster on the supported protocol
+    # ports. Narrow `from:` to specific namespaceSelector/podSelector values
+    # for your environment before relying on this in production.
+    - from: []
+      ports:
+        - protocol: TCP
+          port: 8090
+        - protocol: TCP
+          port: 50051
+        - protocol: TCP
+          port: 1883
+        - protocol: TCP
+          port: 5672
+    # Pod-to-pod traffic between broker replicas on all ports, for future
+    # Raft/gossip peer communication once distributed mode is wired up.
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: broker
+  egress:
+    # DNS
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Pod-to-pod traffic between broker replicas (future peer comms).
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: broker
+    # Everything else outbound (e.g. an OTLP collector, external AMQP/MQTT
+    # clients reached via egress gateways). Tighten this for your
+    # environment; it is deliberately permissive here to avoid silently
+    # breaking BROKER_OTLP_ENDPOINT or other operator-configured egress.
+    - to: []

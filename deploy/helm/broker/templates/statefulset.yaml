@@ -1,0 +1,189 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "broker.fullname" . }}
+  namespace: {{ include "broker.namespace" . }}
+  labels:
+    {{- include "broker.labels" . | nindent 4 }}
+spec:
+  serviceName: {{ include "broker.fullname" . }}-headless
+  replicas: {{ .Values.replicaCount }}
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      {{- include "broker.selectorLabels" . | nindent 6 }}
+  updateStrategy:
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        {{- include "broker.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "broker.serviceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.serviceAccount.automount }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- if .Values.topologySpreadConstraints.enabled }}
+      topologySpreadConstraints:
+        - maxSkew: {{ .Values.topologySpreadConstraints.maxSkew }}
+          topologyKey: {{ .Values.topologySpreadConstraints.topologyKey }}
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              {{- include "broker.selectorLabels" . | nindent 14 }}
+      {{- end }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: brokerd
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/brokerd"]
+          args:
+            {{- if .Values.tls.enabled }}
+            - -tls-cert=/etc/broker/tls/tls.crt
+            - -tls-key=/etc/broker/tls/tls.key
+            {{- end }}
+            {{- if .Values.tls.requireClientCert }}
+            - -client-ca=/etc/broker/tls/ca.crt
+            - -require-client-cert
+            {{- end }}
+          ports:
+            - name: http-admin
+              containerPort: 8090
+            {{- if .Values.broker.listeners.grpc.enabled }}
+            - name: grpc
+              containerPort: 50051
+            {{- end }}
+            {{- if .Values.broker.listeners.mqtt.enabled }}
+            - name: mqtt
+              containerPort: 1883
+            {{- end }}
+            {{- if .Values.broker.listeners.amqp.enabled }}
+            - name: amqp
+              containerPort: 5672
+            {{- end }}
+            {{- if .Values.broker.listeners.native.enabled }}
+            - name: native-bst1
+              containerPort: 8091
+            {{- end }}
+          envFrom:
+            - configMapRef:
+                name: {{ include "broker.fullname" . }}-config
+            - secretRef:
+                name: {{ include "broker.secretName" . }}
+            {{- range .Values.broker.extraEnvFrom }}
+            - {{ toYaml . | nindent 14 }}
+            {{- end }}
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            {{- with .Values.broker.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          livenessProbe:
+            httpGet:
+              path: {{ .Values.probes.liveness.path }}
+              port: http-admin
+              scheme: {{ if .Values.tls.enabled }}HTTPS{{ else }}HTTP{{ end }}
+            initialDelaySeconds: {{ .Values.probes.liveness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.liveness.failureThreshold }}
+          readinessProbe:
+            httpGet:
+              path: {{ .Values.probes.readiness.path }}
+              port: http-admin
+              scheme: {{ if .Values.tls.enabled }}HTTPS{{ else }}HTTP{{ end }}
+            initialDelaySeconds: {{ .Values.probes.readiness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.readiness.failureThreshold }}
+          startupProbe:
+            httpGet:
+              path: {{ .Values.probes.startup.path }}
+              port: http-admin
+              scheme: {{ if .Values.tls.enabled }}HTTPS{{ else }}HTTP{{ end }}
+            periodSeconds: {{ .Values.probes.startup.periodSeconds }}
+            failureThreshold: {{ .Values.probes.startup.failureThreshold }}
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh", "-c", "sleep 5"]
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            {{- if .Values.persistence.enabled }}
+            - name: data
+              mountPath: /data
+            {{- end }}
+            {{- if .Values.tls.enabled }}
+            - name: tls
+              mountPath: /etc/broker/tls
+              readOnly: true
+            {{- end }}
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        {{- if .Values.tls.enabled }}
+        - name: tls
+          secret:
+            secretName: {{ include "broker.tlsSecretName" . }}
+            items:
+              - key: tls.crt
+                path: tls.crt
+              - key: tls.key
+                path: tls.key
+              {{- if .Values.tls.requireClientCert }}
+              - key: ca.crt
+                path: ca.crt
+              {{- end }}
+        {{- end }}
+        - name: tmp
+          emptyDir: {}
+        {{- if not .Values.persistence.enabled }}
+        - name: data
+          emptyDir: {}
+        {{- end }}
+  {{- if .Values.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          {{- include "broker.selectorLabels" . | nindent 10 }}
+      spec:
+        accessModes:
+          {{- toYaml .Values.persistence.accessModes | nindent 10 }}
+        {{- if .Values.persistence.storageClassName }}
+        storageClassName: {{ .Values.persistence.storageClassName }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.persistence.size }}
+  {{- end }}

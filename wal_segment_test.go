@@ -2,6 +2,7 @@ package broker
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -412,6 +413,285 @@ func TestSegmentedWALJSONMigrationFailurePreservesSource(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, "manifest.json")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("partial BWL2 manifest survived failed migration: %v", err)
+	}
+}
+
+// TestSegmentedWALManifestMetadataAccuracy guards against a regression where
+// activeMeta's size/record/closed-state mutations were never synced back into
+// manifest.Segments, so the persisted manifest.json silently diverged from
+// reality (frozen at whatever it was when the segment was created).
+func TestSegmentedWALManifestMetadataAccuracy(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+
+	cfg := SegmentedWALConfig{
+		Dir:              dir,
+		MaxSegmentSize:   512,
+		MaxSegments:      10,
+		DisableCompactor: true,
+	}
+	st, err := NewSegmentedWALStore(cfg)
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	_ = st.DeclareQueue(ctx, QueueConfig{Name: "q"})
+	for i := 1; i <= 20; i++ {
+		msg := Message{ID: fmt.Sprintf("m-%d", i), Queue: "q", Payload: []byte("large-enough-payload-to-force-rotation")}
+		if _, err := st.Append(ctx, msg, []Destination{{Kind: DestinationQueue, Name: "q"}}); err != nil {
+			t.Fatalf("append %d: %v", i, err)
+		}
+	}
+	if len(st.manifest.Segments) < 2 {
+		t.Fatalf("expected rotation to have produced multiple segments, got %d", len(st.manifest.Segments))
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(dir, "manifest.json"))
+	if err != nil {
+		t.Fatalf("read manifest: %v", err)
+	}
+	var manifest SegmentedWALManifest
+	if err := json.Unmarshal(data, &manifest); err != nil {
+		t.Fatalf("unmarshal manifest: %v", err)
+	}
+
+	var sawClosedSegment bool
+	for _, seg := range manifest.Segments {
+		if seg.ID == manifest.ActiveSegment {
+			continue
+		}
+		sawClosedSegment = true
+		if !seg.CleanClose {
+			t.Errorf("segment %d: expected CleanClose=true after rotation, got false", seg.ID)
+		}
+		if seg.ClosedAt.IsZero() {
+			t.Errorf("segment %d: expected non-zero ClosedAt after rotation", seg.ID)
+		}
+		if seg.SizeBytes <= 22 {
+			t.Errorf("segment %d: expected SizeBytes to reflect written records, got %d (header-only)", seg.ID, seg.SizeBytes)
+		}
+		if seg.Records == 0 {
+			t.Errorf("segment %d: expected Records > 0, got 0", seg.ID)
+		}
+	}
+	if !sawClosedSegment {
+		t.Fatal("expected at least one non-active (rotated-out) segment in manifest")
+	}
+}
+
+// TestSegmentedWALRetentionPruning verifies age-based retention actually
+// removes old, checkpointed segments (this previously could never fire
+// because ClosedAt was never persisted into manifest.Segments).
+func TestSegmentedWALRetentionPruning(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+
+	cfg := SegmentedWALConfig{
+		Dir:              dir,
+		MaxSegmentSize:   256,
+		MaxSegments:      100, // large enough that count-based pruning doesn't trigger
+		Retention:        1 * time.Millisecond,
+		DisableCompactor: true,
+	}
+	st, err := NewSegmentedWALStore(cfg)
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	defer st.Close()
+	_ = st.DeclareQueue(ctx, QueueConfig{Name: "q"})
+	for i := 1; i <= 15; i++ {
+		msg := Message{ID: fmt.Sprintf("m-%d", i), Queue: "q", Payload: []byte("payload-large-enough-to-rotate-segments")}
+		if _, err := st.Append(ctx, msg, []Destination{{Kind: DestinationQueue, Name: "q"}}); err != nil {
+			t.Fatalf("append %d: %v", i, err)
+		}
+	}
+	segmentsBefore := len(st.manifest.Segments)
+	if segmentsBefore < 3 {
+		t.Fatalf("expected several rotated segments, got %d", segmentsBefore)
+	}
+
+	time.Sleep(5 * time.Millisecond)
+
+	compactor := newSegmentCompactor(st)
+	if err := compactor.Compact(ctx); err != nil {
+		t.Fatalf("compact: %v", err)
+	}
+	if len(st.manifest.Segments) >= segmentsBefore {
+		t.Fatalf("expected retention-based pruning to reduce segment count below %d, got %d", segmentsBefore, len(st.manifest.Segments))
+	}
+
+	// All messages must still be recoverable from the checkpoint + remaining segments.
+	st2, err := NewSegmentedWALStore(SegmentedWALConfig{Dir: dir, DisableCompactor: true})
+	if err != nil {
+		t.Fatalf("reopen after retention pruning: %v", err)
+	}
+	defer st2.Close()
+	for i := 1; i <= 15; i++ {
+		id := fmt.Sprintf("m-%d", i)
+		if _, ok, err := st2.Get(ctx, id); err != nil || !ok {
+			t.Errorf("message %s missing after retention pruning: ok=%v err=%v", id, ok, err)
+		}
+	}
+}
+
+// TestSegmentedWALCompactionSurvivesInterruptedDeletion simulates a crash
+// between the manifest being saved after compaction and the pruned segment
+// files actually being removed from disk: the orphaned files must not be
+// re-read as if they still held live data, and must be cleaned up on the next
+// open.
+func TestSegmentedWALCompactionSurvivesInterruptedDeletion(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+
+	cfg := SegmentedWALConfig{
+		Dir:              dir,
+		MaxSegmentSize:   256,
+		MaxSegments:      2,
+		DisableCompactor: true,
+	}
+	st, err := NewSegmentedWALStore(cfg)
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	_ = st.DeclareQueue(ctx, QueueConfig{Name: "q"})
+	for i := 1; i <= 20; i++ {
+		msg := Message{ID: fmt.Sprintf("m-%d", i), Queue: "q", Payload: []byte("payload-large-enough-to-force-several-rotations")}
+		if _, err := st.Append(ctx, msg, []Destination{{Kind: DestinationQueue, Name: "q"}}); err != nil {
+			t.Fatalf("append %d: %v", i, err)
+		}
+	}
+	if len(st.manifest.Segments) < 3 {
+		t.Fatalf("expected several segments before compaction, got %d", len(st.manifest.Segments))
+	}
+
+	manifestBefore, err := os.ReadFile(filepath.Join(dir, "manifest.json"))
+	if err != nil {
+		t.Fatalf("read manifest before compaction: %v", err)
+	}
+	var before SegmentedWALManifest
+	if err := json.Unmarshal(manifestBefore, &before); err != nil {
+		t.Fatal(err)
+	}
+	prunedFilenames := map[string]bool{}
+	keep := map[uint64]bool{}
+	for _, seg := range before.Segments {
+		keep[seg.ID] = seg.ID == before.ActiveSegment
+	}
+
+	compactor := newSegmentCompactor(st)
+	if err := compactor.Compact(ctx); err != nil {
+		t.Fatalf("compact: %v", err)
+	}
+
+	manifestAfter, err := os.ReadFile(filepath.Join(dir, "manifest.json"))
+	if err != nil {
+		t.Fatalf("read manifest after compaction: %v", err)
+	}
+	var after SegmentedWALManifest
+	if err := json.Unmarshal(manifestAfter, &after); err != nil {
+		t.Fatal(err)
+	}
+	afterIDs := map[uint64]bool{}
+	for _, seg := range after.Segments {
+		afterIDs[seg.ID] = true
+	}
+	for _, seg := range before.Segments {
+		if !afterIDs[seg.ID] {
+			prunedFilenames[seg.Filename] = true
+			prunedFilenames[seg.IndexFile] = true
+		}
+	}
+	if len(prunedFilenames) == 0 {
+		t.Fatal("expected compaction to prune at least one segment")
+	}
+
+	if err := st.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	// Simulate a crash that saved the pruned manifest but never got around to
+	// deleting the files it pruned: recreate them with plausible-looking
+	// (but stale/garbage) content and confirm reopening still works and the
+	// orphans get swept up.
+	for name := range prunedFilenames {
+		if name == "" {
+			continue
+		}
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("stale orphan data from a pre-crash segment"), 0o600); err != nil {
+			t.Fatalf("recreate orphan %s: %v", name, err)
+		}
+	}
+
+	st2, err := NewSegmentedWALStore(SegmentedWALConfig{Dir: dir, DisableCompactor: true})
+	if err != nil {
+		t.Fatalf("reopen with simulated orphan files: %v", err)
+	}
+	defer st2.Close()
+
+	for i := 1; i <= 20; i++ {
+		id := fmt.Sprintf("m-%d", i)
+		if _, ok, err := st2.Get(ctx, id); err != nil || !ok {
+			t.Errorf("message %s missing after reopen with orphans present: ok=%v err=%v", id, ok, err)
+		}
+	}
+	for name := range prunedFilenames {
+		if name == "" {
+			continue
+		}
+		if _, err := os.Stat(filepath.Join(dir, name)); !os.IsNotExist(err) {
+			t.Errorf("expected orphan file %s to be cleaned up on open, stat err=%v", name, err)
+		}
+	}
+}
+
+// TestSegmentedWALMissingReferencedSegmentFailsClosed verifies that a
+// manifest referencing a segment file that no longer exists on disk is
+// treated as a hard failure (likely data loss / external deletion), not
+// silently skipped as if it held zero records.
+func TestSegmentedWALMissingReferencedSegmentFailsClosed(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+
+	cfg := SegmentedWALConfig{Dir: dir, MaxSegmentSize: 256, DisableCompactor: true}
+	st, err := NewSegmentedWALStore(cfg)
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	_ = st.DeclareQueue(ctx, QueueConfig{Name: "q"})
+	for i := 1; i <= 10; i++ {
+		msg := Message{ID: fmt.Sprintf("m-%d", i), Queue: "q", Payload: []byte("payload-large-enough-to-rotate")}
+		if _, err := st.Append(ctx, msg, []Destination{{Kind: DestinationQueue, Name: "q"}}); err != nil {
+			t.Fatalf("append %d: %v", i, err)
+		}
+	}
+	if len(st.manifest.Segments) < 2 {
+		t.Fatalf("expected rotation, got %d segments", len(st.manifest.Segments))
+	}
+	var victim SegmentMeta
+	for _, seg := range st.manifest.Segments {
+		if seg.ID != st.manifest.ActiveSegment {
+			victim = seg
+			break
+		}
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	// Externally delete a non-active segment file while the manifest still
+	// references it, simulating accidental deletion / filesystem corruption.
+	if err := os.Remove(filepath.Join(dir, victim.Filename)); err != nil {
+		t.Fatalf("remove victim segment: %v", err)
+	}
+
+	_, err = NewSegmentedWALStore(cfg)
+	if err == nil {
+		t.Fatal("expected opening a store with a missing referenced segment to fail closed")
+	}
+	if !errors.Is(err, ErrStorageUnavailable) {
+		t.Fatalf("expected error to wrap ErrStorageUnavailable, got: %v", err)
 	}
 }
 

@@ -1,0 +1,21 @@
+# With the default replicaCount of 3, maxUnavailable: 1 keeps 2 of 3 pods
+# available during voluntary disruptions (node drains, cluster upgrades),
+# which is what a 3-node Raft-style quorum needs to keep making progress.
+# If you change replica count, recompute this: it must stay below
+# ceil(replicas/2) so quorum (a majority) can never be voluntarily evicted.
+# NOTE: brokerd does not currently implement the distributed/quorum logic
+# itself (see deploy/README.md) -- this PDB protects against losing a
+# majority of *replicas* in the StatefulSet sense, which is still the right
+# posture to adopt now and will matter once distributed mode ships.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: broker
+  namespace: broker
+  labels:
+    app.kubernetes.io/name: broker
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: broker

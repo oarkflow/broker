@@ -1,0 +1,30 @@
+# Headless service providing stable per-pod DNS names
+# (broker-0.broker-headless.broker.svc.cluster.local, ...). This is what
+# gives the StatefulSet stable network identity for peer addressing if/when
+# the binary's distributed/Raft mode is wired up (see deploy/README.md for
+# the current status: brokerd has no exposed cluster/peer flags today).
+apiVersion: v1
+kind: Service
+metadata:
+  name: broker-headless
+  namespace: broker
+  labels:
+    app.kubernetes.io/name: broker
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: broker
+  ports:
+    - name: http-admin
+      port: 8090
+      targetPort: http-admin
+    - name: grpc
+      port: 50051
+      targetPort: grpc
+    - name: mqtt
+      port: 1883
+      targetPort: mqtt
+    - name: amqp
+      port: 5672
+      targetPort: amqp

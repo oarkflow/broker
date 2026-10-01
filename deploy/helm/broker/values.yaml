@@ -1,0 +1,177 @@
+# Default values for the broker chart.
+# This chart is new/unvalidated tooling — read deploy/README.md before using
+# it anywhere that matters. In particular: distributed/clustered mode in the
+# underlying brokerd binary is experimental and not production-safe
+# (project Tasks.md), and replicaCount > 1 today just runs N independent
+# standalone brokers (no peer/Raft wiring exists in cmd/brokerd/main.go yet)
+# -- it does NOT give you a coordinated cluster.
+
+replicaCount: 3
+
+image:
+  repository: ghcr.io/oarkflow/broker
+  tag: "latest" # TODO: pin to a real, signed tag or digest before using this
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+nameOverride: ""
+fullnameOverride: ""
+
+namespace:
+  # Set to false if the namespace is managed outside this chart.
+  create: true
+  name: broker
+
+serviceAccount:
+  create: true
+  name: ""
+  automount: false
+
+podAnnotations: {}
+podLabels: {}
+
+# Pod-level security context. The brokerd image runs as a fixed non-root
+# UID/GID (65532) baked into the distroless image (see root Dockerfile).
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+# -- brokerd configuration --
+broker:
+  profile: durable # durable | latency | throughput | lightweight
+  defaultQueue: default
+  maxBodyBytes: 1048576
+  insecureDev: false # NEVER set true outside isolated dev; main.go disables auth entirely
+  quiet: false
+
+  store:
+    kind: wal # memory | wal | sqlite
+    walFormat: binary
+    walShards: 1
+    walSegmentSize: 67108864
+    walMaxSegments: 10
+
+  listeners:
+    httpAddr: ":8090"
+    grpc:
+      enabled: true
+      addr: ":50051"
+    mqtt:
+      enabled: true
+      addr: ":1883"
+    amqp:
+      enabled: true
+      addr: ":5672"
+    # Native BST1 is unauthenticated and brokerd refuses to start it unless
+    # insecureDev is true. Do not enable in any shared/production chart use.
+    native:
+      enabled: false
+      addr: ":8091"
+
+  # Extra environment variables/passthrough, e.g. BROKER_OTLP_ENDPOINT.
+  extraEnv: []
+  # - name: BROKER_OTLP_ENDPOINT
+  #   value: "http://otel-collector.observability:4318"
+  extraEnvFrom: []
+
+# -- secrets --
+# By default the chart creates a placeholder Secret you MUST overwrite
+# (values below are rejected as obviously-fake unless you override them).
+# Prefer `secrets.create: false` plus an externally managed Secret named
+# `secrets.existingSecret` (sealed-secrets, external-secrets, SOPS, etc).
+secrets:
+  create: true
+  existingSecret: ""
+  adminToken: "REPLACE_ME_ADMIN_TOKEN"
+  readToken: ""
+  workerToken: ""
+  publisherToken: ""
+  frameSigningKey: ""
+  frameEncryptionKey: ""
+  amqpUsername: ""
+  amqpPassword: ""
+
+# -- TLS --
+# docs/OPERATIONS.md requires TLS or mTLS in any non-isolated-dev
+# environment; main.go also refuses to start in production mode (insecureDev
+# false) without -tls-cert/-tls-key.
+tls:
+  enabled: true
+  # Existing secret containing tls.crt / tls.key / (optional) ca.crt.
+  # If empty and tls.enabled is true, the chart creates `secrets.create`'s
+  # secret with placeholder PEM content that WILL fail TLS handshake and
+  # must be replaced before real use.
+  existingSecret: ""
+  requireClientCert: false
+
+persistence:
+  enabled: true
+  size: 20Gi
+  storageClassName: "" # empty = cluster default StorageClass
+  accessModes:
+    - ReadWriteOnce
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 256Mi
+  limits:
+    cpu: "1"
+    memory: 1Gi
+
+service:
+  type: ClusterIP
+  ports:
+    httpAdmin: 8090
+    grpc: 50051
+    mqtt: 1883
+    amqp: 5672
+
+terminationGracePeriodSeconds: 30
+
+probes:
+  liveness:
+    path: /healthz
+    initialDelaySeconds: 10
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 3
+  readiness:
+    path: /readyz
+    initialDelaySeconds: 5
+    periodSeconds: 5
+    timeoutSeconds: 5
+    failureThreshold: 3
+  startup:
+    path: /healthz
+    periodSeconds: 5
+    failureThreshold: 30
+
+podDisruptionBudget:
+  enabled: true
+  # Must stay below ceil(replicaCount/2) so a voluntary disruption can never
+  # remove a quorum majority. The default (1) is sized for replicaCount: 3.
+  maxUnavailable: 1
+
+networkPolicy:
+  enabled: true
+
+topologySpreadConstraints:
+  enabled: true
+  maxSkew: 1
+  topologyKey: kubernetes.io/hostname
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

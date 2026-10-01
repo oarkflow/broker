@@ -82,7 +82,11 @@ func (a AdminServer) dataPlane(w http.ResponseWriter, r *http.Request) {
 	case path == "/dlq":
 		a.dlq(w, r)
 	case strings.HasPrefix(path, "/dlq/"):
-		a.dlqQueue(w, r)
+		r2 := new(http.Request)
+		*r2 = *r
+		r2.URL = cloneURL(r.URL)
+		r2.URL.Path = strings.TrimPrefix(r.URL.Path, "/v1")
+		a.dlqQueue(w, r2)
 	case path == "/events":
 		a.events(w, r)
 	case path == "/sagas":

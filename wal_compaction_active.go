@@ -121,13 +121,25 @@ func (c *SegmentCompactor) Compact(ctx context.Context) error {
 		return nil
 	}
 
-	// Write checkpoint of live store before pruning old segments
+	// Write checkpoint of live store before pruning old segments.
 	checkpointPath := filepath.Join(c.store.dir, "checkpoint.bwl2")
 	if err := c.writeCheckpointLocked(checkpointPath); err != nil {
 		return fmt.Errorf("write compaction checkpoint: %w", err)
 	}
 
-	// Delete pruned segment files and index files
+	manifest.Segments = remaining
+	manifest.LastCompactionAt = time.Now().UTC()
+	manifest.CheckpointFile = "checkpoint.bwl2"
+
+	// Persist the manifest BEFORE deleting any segment file. If the process
+	// crashes between these two steps, the pruned segment files become
+	// harmless orphans on disk (no longer referenced by the manifest); if we
+	// deleted first and crashed before saving, the manifest would still
+	// reference now-missing files and recovery would treat that as data loss.
+	if err := c.store.saveManifestLocked(); err != nil {
+		return fmt.Errorf("persist manifest before segment deletion: %w", err)
+	}
+
 	for _, seg := range toDelete {
 		segPath := filepath.Join(c.store.dir, seg.Filename)
 		idxPath := filepath.Join(c.store.dir, seg.IndexFile)
@@ -135,11 +147,7 @@ func (c *SegmentCompactor) Compact(ctx context.Context) error {
 		_ = os.Remove(idxPath)
 	}
 
-	manifest.Segments = remaining
-	manifest.LastCompactionAt = time.Now().UTC()
-	manifest.CheckpointFile = "checkpoint.bwl2"
-
-	return c.store.saveManifestLocked()
+	return nil
 }
 
 func (c *SegmentCompactor) writeCheckpointLocked(path string) error {

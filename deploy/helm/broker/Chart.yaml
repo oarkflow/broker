@@ -1,0 +1,19 @@
+apiVersion: v2
+name: broker
+description: >-
+  Helm chart for fastworker Broker (brokerd) — a message broker exposing
+  HTTP admin/API, gRPC, MQTT, and AMQP. This chart is new and has not been
+  validated against a real Kubernetes cluster; see deploy/README.md.
+type: application
+version: 0.1.0
+appVersion: "0.1.0-dev"
+home: https://github.com/oarkflow/broker
+sources:
+  - https://github.com/oarkflow/broker
+keywords:
+  - message-broker
+  - mqtt
+  - amqp
+  - grpc
+maintainers:
+  - name: oarkflow

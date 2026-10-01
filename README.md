@@ -209,7 +209,7 @@ go run ./complete distributed
 | Protocol | Transport | Port | Status |
 |----------|-----------|------|--------|
 | HTTP/JSON | TCP | 8090 | Pre-v1; daemon-integrated |
-| Native stream | TCP | configurable | Pre-v1; unauthenticated development listener |
+| Native stream | TCP/TLS | configurable | Pre-v1; authenticated (token/mTLS) handshake, see below |
 | AMQP 0-9-1 | TCP/TLS | configurable | Experimental; conformance not established |
 | MQTT 3.1.1 | TCP/TLS | configurable | Experimental; persistent sessions remain incomplete |
 | Native RPC | TCP/TLS | configurable | Experimental JSON/TCP; not gRPC |
@@ -218,8 +218,9 @@ go run ./complete distributed
 | gRPC | protobuf/HTTP2 | configurable | Pre-v1 versioned `broker.v1` API |
 
 `brokerd` supervises every enabled listener. Protocol listeners are opt-in by
-address; production mode requires TLS and authentication, while the native BST1
-stream remains development-only until it has its own authenticated handshake.
+address; production mode requires TLS and authentication on every listener,
+including the native BST1 stream, which enforces a token or mTLS handshake
+unless `--insecure-dev` is set.
 
 ---
 
@@ -802,7 +803,7 @@ broker/
 
 ## License
 
-No license has been selected. Source visibility does not grant public-use rights; this blocks a stable public release until the project owner adds a license.
+Apache License 2.0. See [LICENSE](LICENSE) for the full text.
 
 ## High-throughput BST1 stream mode
 
@@ -813,5 +814,12 @@ brokerd -wal .broker-data/queue -native-addr :8091 \
   -native-dir .broker-data/native-stream -native-partitions 8 \
   -native-sync=true -insecure-dev
 ```
+
+The native stream listener supports an authenticated handshake (bearer token or
+mTLS, enforced via the same ACL used by the HTTP admin API). Outside
+`--insecure-dev`, `brokerd` requires `-token` or `-require-client-cert` to be
+set before it will start the listener. `--insecure-dev` disables that
+enforcement (anonymous/auto-admin access) and must only be used for local
+development.
 
 The `native-bench` command uses persistent TCP clients, compact record batches, partition offsets and restart-safe segmented logs. See `NATIVE_STREAM_PERFORMANCE.md` and `scripts/benchmark_native_vs_kafka.sh`.

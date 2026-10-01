@@ -1,0 +1,35 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "broker.fullname" . }}-config
+  namespace: {{ include "broker.namespace" . }}
+  labels:
+    {{- include "broker.labels" . | nindent 4 }}
+data:
+  BROKER_ADDR: {{ .Values.broker.listeners.httpAddr | quote }}
+  BROKER_PROFILE: {{ .Values.broker.profile | quote }}
+  BROKER_STORE: {{ .Values.broker.store.kind | quote }}
+  BROKER_WAL: "/data/wal"
+  BROKER_WAL_FORMAT: {{ .Values.broker.store.walFormat | quote }}
+  BROKER_WAL_SHARDS: {{ .Values.broker.store.walShards | quote }}
+  BROKER_WAL_SEGMENT_SIZE: {{ .Values.broker.store.walSegmentSize | quote }}
+  BROKER_WAL_MAX_SEGMENTS: {{ .Values.broker.store.walMaxSegments | quote }}
+  {{- if .Values.broker.listeners.mqtt.enabled }}
+  BROKER_MQTT_ADDR: {{ .Values.broker.listeners.mqtt.addr | quote }}
+  {{- end }}
+  {{- if .Values.broker.listeners.amqp.enabled }}
+  BROKER_AMQP_ADDR: {{ .Values.broker.listeners.amqp.addr | quote }}
+  {{- end }}
+  {{- if .Values.broker.listeners.grpc.enabled }}
+  BROKER_GRPC_ADDR: {{ .Values.broker.listeners.grpc.addr | quote }}
+  {{- end }}
+  {{- if .Values.broker.listeners.native.enabled }}
+  # WARNING: native BST1 is unauthenticated. This only takes effect if
+  # BROKER_INSECURE_DEV is also true; brokerd otherwise refuses to start.
+  BROKER_NATIVE_ADDR: {{ .Values.broker.listeners.native.addr | quote }}
+  {{- end }}
+  BROKER_DEFAULT_QUEUE: {{ .Values.broker.defaultQueue | quote }}
+  BROKER_MAX_BODY: {{ .Values.broker.maxBodyBytes | quote }}
+  BROKER_INSECURE_DEV: {{ .Values.broker.insecureDev | quote }}
+  BROKER_REQUIRE_CLIENT_CERT: {{ .Values.tls.requireClientCert | quote }}
+  BROKER_QUIET: {{ .Values.broker.quiet | quote }}

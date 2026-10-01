@@ -1,0 +1,30 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "broker.fullname" . }}
+  namespace: {{ include "broker.namespace" . }}
+  labels:
+    {{- include "broker.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "broker.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: http-admin
+      port: {{ .Values.service.ports.httpAdmin }}
+      targetPort: http-admin
+    {{- if .Values.broker.listeners.grpc.enabled }}
+    - name: grpc
+      port: {{ .Values.service.ports.grpc }}
+      targetPort: grpc
+    {{- end }}
+    {{- if .Values.broker.listeners.mqtt.enabled }}
+    - name: mqtt
+      port: {{ .Values.service.ports.mqtt }}
+      targetPort: mqtt
+    {{- end }}
+    {{- if .Values.broker.listeners.amqp.enabled }}
+    - name: amqp
+      port: {{ .Values.service.ports.amqp }}
+      targetPort: amqp
+    {{- end }}

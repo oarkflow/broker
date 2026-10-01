@@ -1,0 +1,27 @@
+# ClusterIP service for client traffic (HTTP admin/API, gRPC, MQTT, AMQP).
+# Change `type` to LoadBalancer/NodePort or front it with an Ingress/Gateway
+# as needed for your environment; this is intentionally conservative.
+apiVersion: v1
+kind: Service
+metadata:
+  name: broker
+  namespace: broker
+  labels:
+    app.kubernetes.io/name: broker
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: broker
+  ports:
+    - name: http-admin
+      port: 8090
+      targetPort: http-admin
+    - name: grpc
+      port: 50051
+      targetPort: grpc
+    - name: mqtt
+      port: 1883
+      targetPort: mqtt
+    - name: amqp
+      port: 5672
+      targetPort: amqp

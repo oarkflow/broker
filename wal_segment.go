@@ -163,7 +163,11 @@ func (s *SegmentedWALStore) recoverOrMigrate() error {
 		if err := s.loadManifest(); err != nil {
 			return err
 		}
-		return s.replaySegments()
+		if err := s.replaySegments(); err != nil {
+			return err
+		}
+		s.cleanupOrphanFilesLocked()
+		return nil
 	}
 
 	// Manifest does not exist. Check for legacy BWL1 or JSONL files to migrate
@@ -195,7 +199,27 @@ func (s *SegmentedWALStore) loadManifest() error {
 	return json.Unmarshal(data, &s.manifest)
 }
 
+// syncSegmentMetaLocked writes meta into the manifest's Segments slice,
+// replacing any existing entry with the same ID or appending a new one.
+// Without this, in-memory mutations to activeMeta (size/record counts on
+// every write, ClosedAt/CleanClose on rotation) would never reach the
+// persisted manifest, which silently breaks anything that reads
+// manifest.Segments: retention-based pruning (it keys off ClosedAt), and
+// external tooling inspecting manifest.json.
+func (s *SegmentedWALStore) syncSegmentMetaLocked(meta SegmentMeta) {
+	for i := range s.manifest.Segments {
+		if s.manifest.Segments[i].ID == meta.ID {
+			s.manifest.Segments[i] = meta
+			return
+		}
+	}
+	s.manifest.Segments = append(s.manifest.Segments, meta)
+}
+
 func (s *SegmentedWALStore) saveManifestLocked() error {
+	if s.activeMeta != nil {
+		s.syncSegmentMetaLocked(*s.activeMeta)
+	}
 	data, err := json.MarshalIndent(s.manifest, "", "  ")
 	if err != nil {
 		return err
@@ -261,19 +285,9 @@ func (s *SegmentedWALStore) initActiveSegment(segID uint64, startSeq uint64) err
 		s.gc.setFaultCallback(s.onFaultFn)
 	}
 
-	// Update manifest
+	// Update manifest. saveManifestLocked syncs s.activeMeta (the new
+	// segment, just assigned above) into manifest.Segments automatically.
 	s.manifest.ActiveSegment = segID
-	found := false
-	for i := range s.manifest.Segments {
-		if s.manifest.Segments[i].ID == segID {
-			s.manifest.Segments[i] = meta
-			found = true
-			break
-		}
-	}
-	if !found {
-		s.manifest.Segments = append(s.manifest.Segments, meta)
-	}
 	return s.saveManifestLocked()
 }
 
@@ -323,7 +337,13 @@ func (s *SegmentedWALStore) replaySegmentFile(ctx context.Context, path string, 
 	f, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return 0, 0, nil
+			// A segment listed in the manifest with no file on disk is data
+			// loss, not an empty segment: the manifest is only ever updated
+			// to drop a segment reference *after* that segment's file is
+			// safely superseded by a checkpoint (see SegmentCompactor.Compact).
+			// Silently treating a missing file as "0 records" would mask
+			// whatever it actually contained.
+			return 0, 0, fmt.Errorf("%w: segment file %s is missing but referenced by manifest.json; run broker-wal -dir=%s to diagnose", ErrStorageUnavailable, path, s.dir)
 		}
 		return 0, 0, err
 	}
@@ -333,7 +353,10 @@ func (s *SegmentedWALStore) replaySegmentFile(ctx context.Context, path string, 
 	var header [22]byte
 	if _, err := io.ReadFull(r, header[:]); err != nil {
 		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-			return 0, 0, nil
+			if isActive {
+				return 0, 0, nil
+			}
+			return 0, 0, fmt.Errorf("%w: segment file %s is truncated below its header but is not the active segment", ErrStorageUnavailable, path)
 		}
 		return 0, 0, err
 	}
@@ -407,6 +430,36 @@ func (s *SegmentedWALStore) replaySegmentFile(ctx context.Context, path string, 
 		if s.manifest.NextSeq <= records {
 			s.manifest.NextSeq = records + 1
 		}
+	}
+}
+
+// cleanupOrphanFilesLocked removes *.bwl2/*.idx files that are not referenced
+// by the manifest and are not the active segment. These only appear if the
+// process crashed between saving a pruned manifest and deleting the segment
+// files it just pruned (see SegmentCompactor.Compact) — they hold no data
+// reachable through the manifest, so leaving them around only wastes disk.
+func (s *SegmentedWALStore) cleanupOrphanFilesLocked() {
+	entries, err := os.ReadDir(s.dir)
+	if err != nil {
+		return
+	}
+	known := make(map[string]bool, len(s.manifest.Segments)*2)
+	for _, seg := range s.manifest.Segments {
+		known[seg.Filename] = true
+		if seg.IndexFile != "" {
+			known[seg.IndexFile] = true
+		}
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || known[name] {
+			continue
+		}
+		ext := filepath.Ext(name)
+		if ext != ".bwl2" && ext != ".idx" {
+			continue
+		}
+		_ = os.Remove(filepath.Join(s.dir, name))
 	}
 }
 
@@ -619,6 +672,10 @@ func (s *SegmentedWALStore) rotateSegmentLocked() error {
 			idxPath := filepath.Join(s.dir, s.activeMeta.IndexFile)
 			_ = s.activeIdx.SaveToFile(idxPath)
 		}
+		// Persist the closed segment's final metadata now, while s.activeMeta
+		// still refers to it — initActiveSegment below reassigns s.activeMeta
+		// to the new segment, after which this one would no longer be reachable.
+		s.syncSegmentMetaLocked(*s.activeMeta)
 	}
 	if s.activeFile != nil {
 		_ = s.activeFile.Close()

@@ -1,0 +1,39 @@
+# Non-secret brokerd configuration. See cmd/brokerd/main.go and README.md
+# ("Configuration" section) for the authoritative list of flags/env vars.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: broker-config
+  namespace: broker
+  labels:
+    app.kubernetes.io/name: broker
+data:
+  # Listen address for the HTTP admin/API server (healthz, readyz, /stats,
+  # /metrics, /publish, /consume, ...).
+  BROKER_ADDR: ":8090"
+
+  # durable | latency | throughput | lightweight. docs/OPERATIONS.md requires
+  # "durable" with a segmented WAL on a dedicated, monitored volume.
+  BROKER_PROFILE: "durable"
+
+  # Durable binary WAL on the PersistentVolumeClaim mounted at /data (see the
+  # VolumeClaimTemplate in the StatefulSet).
+  BROKER_STORE: "wal"
+  BROKER_WAL: "/data/wal"
+  BROKER_WAL_FORMAT: "binary"
+  BROKER_WAL_SHARDS: "1"
+  BROKER_WAL_SEGMENT_SIZE: "67108864"
+  BROKER_WAL_MAX_SEGMENTS: "10"
+
+  # Protocol listeners. Native BST1 (-native-addr) is intentionally left
+  # disabled: main.go refuses to start it unless --insecure-dev is set,
+  # because it has no authentication layer. Do not enable it here.
+  BROKER_MQTT_ADDR: ":1883"
+  BROKER_AMQP_ADDR: ":5672"
+  BROKER_GRPC_ADDR: ":50051"
+
+  BROKER_DEFAULT_QUEUE: "default"
+  BROKER_MAX_BODY: "1048576"
+  BROKER_INSECURE_DEV: "false"
+  BROKER_REQUIRE_CLIENT_CERT: "false"
+  BROKER_QUIET: "false"
