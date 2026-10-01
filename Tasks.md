@@ -6,8 +6,18 @@ removed because several described APIs rather than verified guarantees.
 ## Current verdict
 
 - **Version:** `0.1.0-dev`
-- **Embedded/single-node:** functional pre-v1; not yet production-supported.
-- **Distributed broker:** experimental; not production-safe.
+- **Embedded/single-node:** pre-v1, hardened. BWL2 segmented WAL is now the
+  recommended durable store (`-store wal2`); several crash-safety and
+  data-loss bugs in it were found and fixed in the 2026-10-01 pass (see P1).
+  `govulncheck` is clean across all four modules and a 45s fuzz smoke of the
+  WAL/message codecs found no crashes. Still short of the project's own
+  production bar: root/cluster/AMQP coverage remain below the stated 80/90%
+  targets (see P0), there is no AMQP/MQTT interoperability evidence against
+  real clients, no multi-hour fuzz/soak run has been published, and no
+  independent security review has occurred.
+- **Distributed broker:** experimental; not production-safe. Out of scope for
+  the current owner-directed hardening pass (single-node is the target
+  deployment); see P2.
 - **Public stable release:** blocked by the gates below. License is resolved
   (Apache License 2.0, confirmed by project owner).
 

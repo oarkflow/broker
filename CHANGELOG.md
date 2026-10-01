@@ -23,6 +23,11 @@ documented migration path.
   currently has no peer/cluster flags, so a multi-replica install is N
   independent standalone brokers rather than an actual cluster.
 - Raised test coverage: `pkg/queue` 0% -> 100%, `pkg/client` 12.4% -> 85.6%.
+- `brokerd` now exposes `-wal-retention`/`BROKER_WAL_RETENTION_SEC` and
+  `-wal-compaction-interval` for the BWL2 segmented store, and `broker-wal`
+  gained a `-dir` mode to run non-destructive verification
+  (`VerifySegmentedWAL`) against a BWL2 directory — previously the CLI tool
+  only understood single-file BWL1 WALs.
 - Reset the reported version to `0.1.0-dev` until production gates pass.
 - Publish results now report the acknowledgement actually achieved by the
   backing store and reject confirmation levels the store cannot provide.
@@ -40,6 +45,20 @@ documented migration path.
   every `/v1/dlq/*` call 404'd. `pkg/client`'s `Client.DLQ()` and
   `ReplayDLQ()` were unusable against a real broker. Fixed by stripping `/v1`
   before delegating, matching the existing `/v1/streams/` handling.
+- BWL2 segmented WAL (`wal_segment.go`): fixed three crash-safety/data-loss
+  bugs found while hardening the format. (1) A live segment's size/record
+  counters and `ClosedAt`/`CleanClose` state were mutated on an in-memory
+  struct that was never synced back into `manifest.Segments`, so
+  `manifest.json` silently diverged from reality after the first rotation —
+  this made age-based (`-wal-retention`) segment pruning a complete no-op,
+  since it keys off `ClosedAt`, which was always zero on disk. (2) Compaction
+  deleted pruned segment files *before* persisting the manifest that recorded
+  their removal; a crash between those two steps left the manifest pointing
+  at now-missing files, which recovery silently read as zero records. Fixed
+  by persisting the manifest first and sweeping any resulting orphan files on
+  the next open. (3) A manifest entry whose segment file is missing on disk
+  is now a hard open failure (`ErrStorageUnavailable`) instead of being
+  silently treated as an empty segment.
 
 ### Security
 
