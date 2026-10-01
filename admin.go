@@ -1059,4 +1059,3 @@ func (a AdminServer) clusterStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	writeBrokerJSON(w, resp)
 }
-

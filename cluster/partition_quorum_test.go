@@ -10,13 +10,13 @@ import (
 func TestPartitionGroupLifecycleAndISR(t *testing.T) {
 	sm := &testStateMachine{}
 	ctrl, err := NewRaftController(RaftControllerConfig{
-		ID:           1,
-		NodeID:       "node-1",
-		Peers:        map[uint64]string{1: "node-1"},
-		ElectionTick: 10,
+		ID:            1,
+		NodeID:        "node-1",
+		Peers:         map[uint64]string{1: "node-1"},
+		ElectionTick:  10,
 		HeartbeatTick: 1,
-		TickInterval: 10 * time.Millisecond,
-		StateMachine: sm,
+		TickInterval:  10 * time.Millisecond,
+		StateMachine:  sm,
 	})
 	if err != nil {
 		t.Fatalf("new controller: %v", err)
@@ -109,13 +109,13 @@ func TestControllerQuorumMetadataReplication(t *testing.T) {
 	sm := NewMetadataStateMachine(meta)
 
 	ctrl, err := NewRaftController(RaftControllerConfig{
-		ID:           1,
-		NodeID:       "ctrl-1",
-		Peers:        map[uint64]string{1: "ctrl-1"},
-		ElectionTick: 10,
+		ID:            1,
+		NodeID:        "ctrl-1",
+		Peers:         map[uint64]string{1: "ctrl-1"},
+		ElectionTick:  10,
 		HeartbeatTick: 1,
-		TickInterval: 10 * time.Millisecond,
-		StateMachine: sm,
+		TickInterval:  10 * time.Millisecond,
+		StateMachine:  sm,
 	})
 	if err != nil {
 		t.Fatalf("new controller: %v", err)

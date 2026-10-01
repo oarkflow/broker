@@ -271,26 +271,26 @@ type StreamConfig struct {
 }
 
 type ConsumerConfig struct {
-	Name                string          `json:"name"`
-	Group               string          `json:"group"`
-	Queue               string          `json:"queue"`
-	Topic               string          `json:"topic"`
-	Pattern             string          `json:"pattern"`
-	Concurrency         int             `json:"concurrency"`
-	MaxInFlight         int             `json:"max_inflight"`
-	BatchSize           int             `json:"batch_size"`
-	BatchWait           time.Duration   `json:"batch_wait"`
-	VisibilityTimeout   time.Duration   `json:"visibility_timeout"`
-	AckMode             AckMode         `json:"ack_mode"`
-	RetryPolicy         RetryPolicy     `json:"retry_policy"`
-	DLQ                 string          `json:"dlq"`
-	Ordered             bool            `json:"ordered"`
-	OrderBy             OrderMode       `json:"order_by"`
-	Timeout             time.Duration   `json:"timeout"`
-	HeartbeatInterval   time.Duration   `json:"heartbeat_interval"`
-	Strategy            StrategyType    `json:"strategy,omitempty"`
-	StrategyConfig      *StrategyConfig `json:"-"`
-	Priority            int             `json:"priority,omitempty"`
+	Name                string            `json:"name"`
+	Group               string            `json:"group"`
+	Queue               string            `json:"queue"`
+	Topic               string            `json:"topic"`
+	Pattern             string            `json:"pattern"`
+	Concurrency         int               `json:"concurrency"`
+	MaxInFlight         int               `json:"max_inflight"`
+	BatchSize           int               `json:"batch_size"`
+	BatchWait           time.Duration     `json:"batch_wait"`
+	VisibilityTimeout   time.Duration     `json:"visibility_timeout"`
+	AckMode             AckMode           `json:"ack_mode"`
+	RetryPolicy         RetryPolicy       `json:"retry_policy"`
+	DLQ                 string            `json:"dlq"`
+	Ordered             bool              `json:"ordered"`
+	OrderBy             OrderMode         `json:"order_by"`
+	Timeout             time.Duration     `json:"timeout"`
+	HeartbeatInterval   time.Duration     `json:"heartbeat_interval"`
+	Strategy            StrategyType      `json:"strategy,omitempty"`
+	StrategyConfig      *StrategyConfig   `json:"-"`
+	Priority            int               `json:"priority,omitempty"`
 	Idempotent          bool              `json:"idempotent,omitempty"`
 	DeduplicationWindow time.Duration     `json:"deduplication_window,omitempty"`
 	FilterExpression    string            `json:"filter_expression,omitempty"`

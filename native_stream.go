@@ -1268,4 +1268,3 @@ func (ch *NativeChannel) Commit(stream, group string, partition int, offset uint
 	_, err := ch.client.callOnChannel(ch.ID, nativeOpCommit, b)
 	return err
 }
-

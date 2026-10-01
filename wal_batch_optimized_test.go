@@ -347,4 +347,3 @@ func TestWALFirstUnderConcurrentWriters(t *testing.T) {
 		t.Fatalf("expected 0 remaining messages in queue after recovery, got %d", len(remMsgs))
 	}
 }
-

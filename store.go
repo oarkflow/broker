@@ -870,6 +870,13 @@ func (s *MemoryStore) Lease(ctx context.Context, req LeaseRequest) ([]Message, e
 		return nil, ctx.Err()
 	default:
 	}
+	// req.TenantID is caller-supplied. A tenant-scoped credential must not be
+	// able to lease another tenant's messages by naming that tenant here.
+	tenant, err := resolveTenant(ctx, req.TenantID)
+	if err != nil {
+		return nil, err
+	}
+	req.TenantID = tenant
 	if req.Limit <= 0 {
 		req.Limit = 1
 	}
@@ -894,7 +901,7 @@ func (s *MemoryStore) Lease(ctx context.Context, req LeaseRequest) ([]Message, e
 			if m == nil || m.Queue != req.Queue || isTerminalQueueStatus(m.Status) {
 				continue
 			}
-			if req.TenantID != "" && m.TenantID != req.TenantID {
+			if !tenantAllowed(ctx, m.TenantID) || (req.TenantID != "" && m.TenantID != req.TenantID) {
 				continue
 			}
 			if !m.ExpiresAt.IsZero() && now.After(m.ExpiresAt) {
@@ -1007,6 +1014,13 @@ func (s *MemoryStore) prepareLease(ctx context.Context, req LeaseRequest) ([]Mes
 		return nil, ctx.Err()
 	default:
 	}
+	// Same tenant-scope rule as Lease: req.TenantID is caller-supplied, so
+	// resolve it against the credential before filtering.
+	tenant, err := resolveTenant(ctx, req.TenantID)
+	if err != nil {
+		return nil, err
+	}
+	req.TenantID = tenant
 	if req.Limit <= 0 {
 		req.Limit = 1
 	}
@@ -1639,6 +1653,16 @@ func (s *MemoryStore) PauseQueue(ctx context.Context, name string) error {
 	return nil
 }
 
+// queueExists reports whether a queue is currently declared. Durable stores use
+// it to validate before appending a control-plane WAL record, so a typo'd queue
+// name cannot leave a record that fails on replay.
+func (s *MemoryStore) queueExists(name string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	_, ok := s.queues[name]
+	return ok
+}
+
 func (s *MemoryStore) ResumeQueue(ctx context.Context, name string) error {
 	if hasRestrictedTenantScope(ctx) {
 		return errf(ErrUnauthorized, "tenant-scoped credentials cannot resume a shared queue")
@@ -1904,6 +1928,32 @@ func (s *MemoryStore) prepareSweepLeases(ctx context.Context, now time.Time) ([]
 		expired = append(expired, message)
 	}
 	return expired, nil
+}
+
+// applySweepLeases applies a prepared lease-expiry set to the in-memory index.
+// Durable stores must persist the prepared set first (see the WAL stores'
+// SweepLeases), then call this, so a crash between the two is recovered by
+// replaying the WAL record rather than losing the un-lease.
+func (s *MemoryStore) applySweepLeases(messages []Message) int {
+	if len(messages) == 0 {
+		return 0
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := 0
+	for _, prepared := range messages {
+		m := s.messages[prepared.ID]
+		if m == nil || m.Status != MessageLeased {
+			continue
+		}
+		m.Status = prepared.Status
+		m.LeaseToken = ""
+		m.LeaseUntil = time.Time{}
+		m.Redeliveries = prepared.Redeliveries
+		s.addHistoryLocked(m.ID, MessageQueued, "lease_expired", m.Queue, "", "visibility timeout", m.ConsumerID, "")
+		n++
+	}
+	return n
 }
 
 func (s *MemoryStore) Close() error { s.mu.Lock(); s.closed = true; s.mu.Unlock(); return nil }
@@ -2416,46 +2466,62 @@ func (s *FileWALStore) normalizeRecoveredInflight() {
 	}
 }
 
+// benignReplayError reports whether a replay failure is expected after the
+// target has already disappeared (acked, purged, or renamed since the record
+// was written). These must not fail recovery: the WAL is a log of intent, and a
+// record whose subject is gone is a no-op rather than corruption.
+func benignReplayError(err error) bool {
+	return errors.Is(err, ErrMessageNotFound) ||
+		errors.Is(err, ErrQueueNotFound) ||
+		errors.Is(err, ErrStreamNotFound) ||
+		errors.Is(err, ErrTopicNotFound) ||
+		errors.Is(err, ErrClosed)
+}
+
 func (s *FileWALStore) applyRecovered(r walRecord) error {
 	ctx := context.Background()
+	var err error
 	switch r.Op {
 	case "declare_queue":
-		return s.MemoryStore.DeclareQueue(ctx, r.Queue)
+		err = s.MemoryStore.DeclareQueue(ctx, r.Queue)
 	case "declare_topic":
-		return s.MemoryStore.DeclareTopic(ctx, r.Topic)
+		err = s.MemoryStore.DeclareTopic(ctx, r.Topic)
 	case "declare_stream":
-		return s.MemoryStore.DeclareStream(ctx, r.Stream)
+		err = s.MemoryStore.DeclareStream(ctx, r.Stream)
 	case "append":
-		_, err := s.MemoryStore.Append(ctx, r.Message, r.Dests)
-		return err
+		_, err = s.MemoryStore.Append(ctx, r.Message, r.Dests)
 	case "append_atomic":
-		return s.MemoryStore.appendRecoveredAtomic(r.Entries)
+		err = s.MemoryStore.appendRecoveredAtomic(r.Entries)
 	case "lease":
-		return s.MemoryStore.Update(ctx, r.Message)
+		err = s.MemoryStore.Update(ctx, r.Message)
 	case "lease_batch", "update_batch":
-		return errors.Join(s.MemoryStore.UpdateBatch(ctx, r.Messages)...)
+		err = errors.Join(s.MemoryStore.UpdateBatch(ctx, r.Messages)...)
 	case "ack":
-		return s.MemoryStore.Ack(ctx, r.Ack)
+		err = s.MemoryStore.Ack(ctx, r.Ack)
 	case "ack_batch":
-		return errors.Join(s.MemoryStore.AckBatch(ctx, r.Acks)...)
+		err = errors.Join(s.MemoryStore.AckBatch(ctx, r.Acks)...)
 	case "nack":
-		return s.MemoryStore.Nack(ctx, r.Nack)
+		err = s.MemoryStore.Nack(ctx, r.Nack)
 	case "move":
-		_, err := s.MemoryStore.Move(ctx, r.Move)
-		return err
+		_, err = s.MemoryStore.Move(ctx, r.Move)
 	case "pause_queue":
-		return s.MemoryStore.PauseQueue(ctx, r.QueueName)
+		err = s.MemoryStore.PauseQueue(ctx, r.QueueName)
 	case "resume_queue":
-		return s.MemoryStore.ResumeQueue(ctx, r.QueueName)
+		err = s.MemoryStore.ResumeQueue(ctx, r.QueueName)
 	case "purge_queue":
-		_, err := s.MemoryStore.PurgeQueue(ctx, r.QueueName)
-		return err
+		_, err = s.MemoryStore.PurgeQueue(ctx, r.QueueName)
 	case "update":
-		return s.MemoryStore.Update(ctx, r.Message)
+		err = s.MemoryStore.Update(ctx, r.Message)
 	case "commit_offset":
-		return s.MemoryStore.CommitOffset(ctx, r.Offset)
+		err = s.MemoryStore.CommitOffset(ctx, r.Offset)
+	case "sweep_leases":
+		s.MemoryStore.applySweepLeases(r.Messages)
+		return nil
 	}
-	return nil
+	if err != nil && benignReplayError(err) {
+		return nil
+	}
+	return err
 }
 
 func (s *FileWALStore) write(r walRecord) error {
@@ -2723,9 +2789,23 @@ func (s *FileWALStore) Move(ctx context.Context, req MoveRequest) (MoveResult, e
 	}
 	return s.MemoryStore.Move(ctx, req)
 }
+
+// requireQueue validates a control-plane target before its WAL record is
+// appended. Writing the record first would leave a mutation that cannot be
+// applied on replay, and FileWALStore recovery treats apply errors as fatal.
+func (s *FileWALStore) requireQueue(name string) error {
+	if !s.MemoryStore.queueExists(name) {
+		return ErrQueueNotFound
+	}
+	return nil
+}
+
 func (s *FileWALStore) PauseQueue(ctx context.Context, name string) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+	if err := s.requireQueue(name); err != nil {
+		return err
+	}
 	if err := s.write(walRecord{Op: "pause_queue", QueueName: name}); err != nil {
 		return err
 	}
@@ -2734,6 +2814,9 @@ func (s *FileWALStore) PauseQueue(ctx context.Context, name string) error {
 func (s *FileWALStore) ResumeQueue(ctx context.Context, name string) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+	if err := s.requireQueue(name); err != nil {
+		return err
+	}
 	if err := s.write(walRecord{Op: "resume_queue", QueueName: name}); err != nil {
 		return err
 	}
@@ -2742,6 +2825,9 @@ func (s *FileWALStore) ResumeQueue(ctx context.Context, name string) error {
 func (s *FileWALStore) PurgeQueue(ctx context.Context, name string) (int, error) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+	if err := s.requireQueue(name); err != nil {
+		return 0, err
+	}
 	if err := s.write(walRecord{Op: "purge_queue", QueueName: name}); err != nil {
 		return 0, err
 	}
@@ -2758,6 +2844,23 @@ func (s *FileWALStore) CommitOffset(ctx context.Context, commit OffsetCommit) er
 		return err
 	}
 	return s.MemoryStore.CommitOffset(context.Background(), persisted)
+}
+
+// SweepLeases implements WAL-first ordering: compute the deterministic
+// expiry set without mutating, persist it, then apply it. Without this override
+// the promoted MemoryStore.SweepLeases would mutate memory only and every
+// un-lease would be lost on crash.
+func (s *FileWALStore) SweepLeases(ctx context.Context, now time.Time) (int, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	expired, err := s.MemoryStore.prepareSweepLeases(ctx, now)
+	if err != nil || len(expired) == 0 {
+		return 0, err
+	}
+	if err := s.write(walRecord{Op: "sweep_leases", Messages: expired}); err != nil {
+		return 0, err
+	}
+	return s.MemoryStore.applySweepLeases(expired), nil
 }
 
 func (s *FileWALStore) Close() error {

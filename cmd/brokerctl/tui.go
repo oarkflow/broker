@@ -44,13 +44,13 @@ const (
 )
 
 type TUIApp struct {
-	addr         string
-	token        string
-	client       *http.Client
-	currentScreen TUIScreen
-	mu           sync.Mutex
-	statusMsg    string
-	selectedQueue string
+	addr           string
+	token          string
+	client         *http.Client
+	currentScreen  TUIScreen
+	mu             sync.Mutex
+	statusMsg      string
+	selectedQueue  string
 	selectedStream string
 }
 

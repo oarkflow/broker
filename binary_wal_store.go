@@ -211,6 +211,8 @@ func (s *BinaryFileWALStore) applyRecovered(r walRecord) {
 		_ = s.MemoryStore.Update(ctx, r.Message)
 	case "commit_offset":
 		_ = s.MemoryStore.CommitOffset(ctx, r.Offset)
+	case "sweep_leases":
+		_ = s.MemoryStore.applySweepLeases(r.Messages)
 	}
 }
 func (s *BinaryFileWALStore) write(r walRecord) error {
@@ -398,28 +400,64 @@ func (s *BinaryFileWALStore) ExtendLease(ctx context.Context, req LeaseRequest) 
 	return s.MemoryStore.ExtendLease(ctx, req)
 }
 
-// Update implements WAL-first ordering.
+// Update implements WAL-first ordering. The target must already exist;
+// validating first avoids appending a WAL record that the apply step would
+// reject, which would leave a spurious record for replay to trip over.
 func (s *BinaryFileWALStore) Update(ctx context.Context, msg Message) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+	existing, ok, err := s.MemoryStore.Get(ctx, msg.ID)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return ErrMessageNotFound
+	}
+	if !tenantAllowed(ctx, existing.TenantID) {
+		return ErrUnauthorized
+	}
 	if err := s.write(walRecord{Op: "update", Message: msg}); err != nil {
 		return err
 	}
 	return s.MemoryStore.Update(ctx, msg)
 }
 
-// UpdateBatch implements WAL-first ordering: WAL the full batch then apply.
+// UpdateBatch implements WAL-first ordering: validate the batch, WAL the valid
+// subset, then apply. WALing entries whose targets are missing would append
+// records the apply step rejects.
 func (s *BinaryFileWALStore) UpdateBatch(ctx context.Context, messages []Message) []error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	if walErr := s.write(walRecord{Op: "update_batch", Messages: messages}); walErr != nil {
-		errs := make([]error, len(messages))
-		for i := range errs {
+	errs := make([]error, len(messages))
+	successful := make([]Message, 0, len(messages))
+	indices := make([]int, 0, len(messages))
+	for i, msg := range messages {
+		existing, ok, err := s.MemoryStore.Get(ctx, msg.ID)
+		if err != nil {
+			errs[i] = err
+		} else if !ok {
+			errs[i] = ErrMessageNotFound
+		} else if !tenantAllowed(ctx, existing.TenantID) {
+			errs[i] = ErrUnauthorized
+		} else {
+			successful = append(successful, messages[i])
+			indices = append(indices, i)
+		}
+	}
+	if len(successful) == 0 {
+		return errs
+	}
+	if walErr := s.write(walRecord{Op: "update_batch", Messages: successful}); walErr != nil {
+		for _, i := range indices {
 			errs[i] = walErr
 		}
 		return errs
 	}
-	return s.MemoryStore.UpdateBatch(ctx, messages)
+	applied := s.MemoryStore.UpdateBatch(ctx, successful)
+	for j, i := range indices {
+		errs[i] = applied[j]
+	}
+	return errs
 }
 
 // Move implements WAL-first ordering.
@@ -433,9 +471,21 @@ func (s *BinaryFileWALStore) Move(ctx context.Context, req MoveRequest) (MoveRes
 }
 
 // PauseQueue implements WAL-first ordering.
+// requireQueue validates a control-plane target before its WAL record is
+// appended, so a typo'd name cannot leave a record that fails to replay.
+func (s *BinaryFileWALStore) requireQueue(name string) error {
+	if !s.MemoryStore.queueExists(name) {
+		return ErrQueueNotFound
+	}
+	return nil
+}
+
 func (s *BinaryFileWALStore) PauseQueue(ctx context.Context, name string) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+	if err := s.requireQueue(name); err != nil {
+		return err
+	}
 	if err := s.write(walRecord{Op: "pause_queue", QueueName: name}); err != nil {
 		return err
 	}
@@ -446,6 +496,9 @@ func (s *BinaryFileWALStore) PauseQueue(ctx context.Context, name string) error 
 func (s *BinaryFileWALStore) ResumeQueue(ctx context.Context, name string) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+	if err := s.requireQueue(name); err != nil {
+		return err
+	}
 	if err := s.write(walRecord{Op: "resume_queue", QueueName: name}); err != nil {
 		return err
 	}
@@ -456,6 +509,9 @@ func (s *BinaryFileWALStore) ResumeQueue(ctx context.Context, name string) error
 func (s *BinaryFileWALStore) PurgeQueue(ctx context.Context, name string) (int, error) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+	if err := s.requireQueue(name); err != nil {
+		return 0, err
+	}
 	if err := s.write(walRecord{Op: "purge_queue", QueueName: name}); err != nil {
 		return 0, err
 	}
@@ -475,6 +531,22 @@ func (s *BinaryFileWALStore) CommitOffset(ctx context.Context, commit OffsetComm
 		return err
 	}
 	return s.MemoryStore.CommitOffset(context.Background(), persisted)
+}
+
+// SweepLeases implements WAL-first ordering: prepare the deterministic expiry
+// set, persist it, then apply it. The promoted MemoryStore.SweepLeases mutates
+// memory only, so without this override lease expirations are not durable.
+func (s *BinaryFileWALStore) SweepLeases(ctx context.Context, now time.Time) (int, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	expired, err := s.MemoryStore.prepareSweepLeases(ctx, now)
+	if err != nil || len(expired) == 0 {
+		return 0, err
+	}
+	if err := s.write(walRecord{Op: "sweep_leases", Messages: expired}); err != nil {
+		return 0, err
+	}
+	return s.MemoryStore.applySweepLeases(expired), nil
 }
 
 func (s *BinaryFileWALStore) Close() error {

@@ -249,9 +249,9 @@ func (a AdminServer) dlqErrors(w http.ResponseWriter, r *http.Request, queue str
 	}
 
 	type errStats struct {
-		count       int
-		firstSeen   *time.Time
-		lastSeen    *time.Time
+		count        int
+		firstSeen    *time.Time
+		lastSeen     *time.Time
 		sampleMsgIDs []string
 	}
 	grouped := make(map[string]*errStats)

@@ -15,10 +15,10 @@ type TTLSweeperConfig struct {
 
 // TTLSweepResult summarizes the results of a TTL sweep iteration.
 type TTLSweepResult struct {
-	Inspected int `json:"inspected"`
-	Expired   int `json:"expired"`
+	Inspected    int `json:"inspected"`
+	Expired      int `json:"expired"`
 	DeadLettered int `json:"dead_lettered"`
-	Purged    int `json:"purged"`
+	Purged       int `json:"purged"`
 }
 
 // TTLSweeper inspects queue messages and cleans up expired messages.

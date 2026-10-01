@@ -435,4 +435,3 @@ func TestCrossProtocolQuotaAdmissionEnforcement(t *testing.T) {
 	defer release2()
 	defer release3()
 }
-

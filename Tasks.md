@@ -51,16 +51,37 @@ removed because several described APIs rather than verified guarantees.
   verified.
 - [x] Added the etcd/raft `RawNode` foundation with safe election/quorum defaults;
   the durable controller/partition group runtime is still pending.
+- [x] Closed the remaining memory-before-WAL window: `SweepLeases` was still
+  mutating memory only. Both `FileWALStore` and `BinaryFileWALStore` now
+  prepare the deterministic expiry set, persist it (`sweep_leases`), then apply
+  it, and the BWL1 codec carries the new operation without renumbering the
+  released operation codes.
+- [x] Hardened durable control-plane ordering: `PauseQueue`, `ResumeQueue`,
+  `PurgeQueue`, `Update` and `UpdateBatch` validate their target before
+  appending a WAL record. Previously a typo'd queue name appended a record that
+  could not be applied, and `FileWALStore` recovery treats apply errors as fatal,
+  so the store failed to open on the next restart. Replay is now also tolerant
+  of records whose subject has since disappeared.
+- [x] Closed the `Lease` tenant-isolation bypass: the lease paths filtered only
+  on the caller-supplied `req.TenantID`, so a credential scoped to one tenant
+  could lease another tenant's messages by naming that tenant. `Lease` and
+  `prepareLease` now resolve the request tenant against the credential and
+  enforce `tenantAllowed` per message.
+- [x] Added `MemorySchemaRegistry.RegisterContext` with the same
+  tenant-scoped-credentials-may-not-mutate-shared-config rule used by queue,
+  topic and stream declarations.
 
 ## P0 — correctness and truthful contracts
 
 - [x] Make the complete repository race-free under the current repository-wide run.
-- [ ] Eliminate memory-before-WAL mutation windows for every durable operation.
-  Publish append is WAL-first; lease, acknowledgement, nack, movement, purge,
-  update, and offset mutation paths still require the same ordering.
+- [x] Eliminate memory-before-WAL mutation windows for every durable operation.
+  Publish append, lease, acknowledgement, nack, movement, purge, update, offset
+  and lease-sweep mutation paths all persist before applying to memory in both
+  WAL stores.
 - [x] Add persistent store health/fencing after disk and `fsync` failures.
-- [ ] Finish tenant enforcement for every admin, stream-offset, notification,
-  task, schema, route, and control-plane read/write operation.
+- [x] Finish tenant enforcement for every admin, stream-offset, notification,
+  task, schema, route, and control-plane read/write operation. Lease was the
+  last bypass; schema registration is now guarded as well.
 - [ ] The legacy outbox has been renamed/documented as an in-memory retry buffer;
   provide the real transactional integration contract.
 - [ ] Establish 80% core and 90% critical-path coverage. Current package

@@ -464,4 +464,3 @@ func verifySegmentFileRecords(path string, offset int64, walCodec *WALRecordCode
 		}
 	}
 }
-

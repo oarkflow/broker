@@ -201,4 +201,3 @@ func TestStoreHealthFencingDegradedMode(t *testing.T) {
 		t.Fatalf("expected 503 Service Unavailable from /readyz when fenced, got %d", rec.Code)
 	}
 }
-

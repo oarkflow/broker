@@ -48,7 +48,7 @@ type PartitionMetadata struct {
 // ClusterMetadata holds the in-memory replicated topology.
 type ClusterMetadata struct {
 	mu         sync.RWMutex
-	Nodes      map[string]*NodeInfo                  `json:"nodes"`
+	Nodes      map[string]*NodeInfo                    `json:"nodes"`
 	Partitions map[PartitionGroupID]*PartitionMetadata `json:"partitions"`
 }
 

@@ -57,7 +57,19 @@ func NewMemorySchemaRegistry(defs ...SchemaDefinition) *MemorySchemaRegistry {
 	return r
 }
 
+// Register adds or replaces a schema version. It is the unrestricted setup form;
+// use RegisterContext when the caller is an authenticated principal.
 func (r *MemorySchemaRegistry) Register(d SchemaDefinition) error {
+	return r.RegisterContext(context.Background(), d)
+}
+
+// RegisterContext adds or replaces a schema version. Schemas are shared
+// infrastructure, so tenant-scoped credentials may read but not mutate them,
+// matching the queue/topic/stream declaration rules.
+func (r *MemorySchemaRegistry) RegisterContext(ctx context.Context, d SchemaDefinition) error {
+	if hasRestrictedTenantScope(ctx) {
+		return errf(ErrUnauthorized, "tenant-scoped credentials cannot alter shared schema configuration")
+	}
 	if d.Name == "" {
 		return errf(ErrInvalidMessage, "schema name required")
 	}

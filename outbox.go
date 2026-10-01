@@ -36,12 +36,12 @@ type DurableOutboxEntry struct {
 
 // DurableOutboxConfig configures the background transactional outbox engine.
 type DurableOutboxConfig struct {
-	Broker           *Broker
-	PollInterval     time.Duration
-	BatchSize        int
-	MaxRetries       int
-	DeadLetterQueue  string
-	DispatchTimeout  time.Duration
+	Broker          *Broker
+	PollInterval    time.Duration
+	BatchSize       int
+	MaxRetries      int
+	DeadLetterQueue string
+	DispatchTimeout time.Duration
 }
 
 // DurableOutbox provides guaranteed, at-least-once message delivery from a durable store.

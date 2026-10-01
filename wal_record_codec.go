@@ -59,6 +59,9 @@ const (
 	walOpPurgeQueue
 	walOpUpdate
 	walOpCommitOffset
+	// walOpSweepLeases is appended after the released codes so on-disk records
+	// written by earlier builds keep their operation bytes.
+	walOpSweepLeases
 )
 
 // WALCodecConfig configures the native BWL1 WAL record codec.
@@ -441,6 +444,8 @@ func walOperationCode(op string) (byte, bool) {
 		return walOpUpdate, true
 	case "commit_offset":
 		return walOpCommitOffset, true
+	case "sweep_leases":
+		return walOpSweepLeases, true
 	default:
 		return 0, false
 	}
@@ -482,6 +487,8 @@ func walOperationName(op byte) (string, bool) {
 		return "update", true
 	case walOpCommitOffset:
 		return "commit_offset", true
+	case walOpSweepLeases:
+		return "sweep_leases", true
 	default:
 		return "", false
 	}
@@ -522,6 +529,8 @@ func encodeWALOperation(w *walBinaryWriter, op byte, r walRecord) {
 		w.message(r.Message, 0)
 	case walOpCommitOffset:
 		w.offsetCommit(r.Offset)
+	case walOpSweepLeases:
+		w.messages(r.Messages)
 	}
 }
 
@@ -560,6 +569,8 @@ func decodeWALOperation(r *walBinaryReader, op byte, out *walRecord) {
 		out.Message = r.message(Message{})
 	case walOpCommitOffset:
 		out.Offset = r.offsetCommit()
+	case walOpSweepLeases:
+		out.Messages = r.messages()
 	}
 }
 

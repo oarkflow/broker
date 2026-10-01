@@ -14,8 +14,8 @@ var (
 	SnapshotMagic = [4]byte{'B', 'S', 'N', 'P'}
 	SnapshotVer   = uint8(1)
 
-	ErrInvalidSnapshotMagic    = errors.New("snapshot: invalid magic bytes")
-	ErrUnsupportedSnapshotVer  = errors.New("snapshot: unsupported format version")
+	ErrInvalidSnapshotMagic     = errors.New("snapshot: invalid magic bytes")
+	ErrUnsupportedSnapshotVer   = errors.New("snapshot: unsupported format version")
 	ErrSnapshotChecksumMismatch = errors.New("snapshot: CRC32 checksum mismatch")
 )
 
