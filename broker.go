@@ -5,6 +5,8 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	mrand "math/rand/v2"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -631,7 +633,21 @@ func (b *Broker) SetDefaultStrategy(st StrategyType) {
 }
 
 func (b *Broker) nextID(prefix string) string {
-	return fmt.Sprintf("%s-%d-%s", prefix, b.seq.Add(1), randomHex(6))
+	// The sequence number already guarantees uniqueness; the random suffix only
+	// keeps ids unguessable across restarts. math/rand/v2's global source is
+	// lock-free, unlike a crypto/rand syscall per id.
+	var buf [64]byte
+	out := append(buf[:0], prefix...)
+	out = append(out, '-')
+	out = strconv.AppendUint(out, b.seq.Add(1), 10)
+	out = append(out, '-')
+	r := mrand.Uint64()
+	const hexdigits = "0123456789abcdef"
+	for i := 0; i < 12; i++ {
+		out = append(out, hexdigits[r&0xf])
+		r >>= 4
+	}
+	return string(out)
 }
 func randomHex(n int) string {
 	buf := make([]byte, n)

@@ -45,6 +45,18 @@ The load generator supports:
 - Separate publish, consume, and combined message-rate reporting.
 - `publish`, `pull`, and bounded `roundtrip` modes.
 
+## Compact backlog (`-compact-backlog`)
+
+A queue holding millions of undelivered messages normally keeps each one as a 752-byte `Message` struct plus strings, maps and payload, about 1.1 KB and eight pointer-bearing heap objects per message, all scanned on every GC cycle. With `-compact-backlog` (or `MemoryStore.SetCompactBacklog(true)`), a freshly queued message is kept as its lossless BWL1 encoding plus a small summary, and is decoded back into a normal message the first time anything leases or changes it.
+
+Measured on 1M retained 256-byte messages: live heap 1,167 to 610 B/message, GC cycle 106 ms to 23 ms. In the daemon, publish-only into a durable WAL went from 143k to 171k msg/s, with about 500 B/message live heap. Steady-state publisher plus consumers is unchanged within noise at about half the RSS.
+
+Notes:
+- Only queue messages that have never been leased are compacted; streams, topics, leased and dead-lettered messages stay in normal form.
+- Resident memory also depends on Go GC headroom. Set `GOMEMLIMIT` to turn the smaller live heap into a smaller RSS.
+- Decoded times come back in UTC (as they already do after WAL recovery).
+- It is off by default. `BROKER_TEST_COMPACT=1 go test ./...` runs the whole suite against it.
+
 ## Recommended single-node configuration
 
 ```bash

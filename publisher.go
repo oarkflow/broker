@@ -272,6 +272,20 @@ func (p *Publisher) publishMessagesMinimal(ctx context.Context, messages []Messa
 			}
 		}
 	}
+	if err != nil && len(entries) > 1 && isEntryScopedPublishError(err) {
+		// The atomic append rejected the batch during validation, before anything
+		// was written. One bad message must not fail its unrelated neighbours, so
+		// retry the entries individually and report errors per message.
+		err = nil
+		for k := range entries {
+			if entryErr := p.appendOneEntry(ctx, entries[k]); entryErr != nil {
+				errs[indices[k]] = entryErr
+				if first == nil {
+					first = entryErr
+				}
+			}
+		}
+	}
 	if err != nil {
 		for _, index := range indices {
 			errs[index] = err
@@ -281,6 +295,27 @@ func (p *Publisher) publishMessagesMinimal(ctx context.Context, messages []Messa
 		}
 	}
 	return errs, first
+}
+
+// isEntryScopedPublishError reports whether err came from validating a single
+// message (duplicate, invalid, backpressure...), as opposed to the store itself
+// failing, which affects every message in the batch.
+func isEntryScopedPublishError(err error) bool {
+	switch {
+	case errors.Is(err, ErrStorageUnavailable), errors.Is(err, ErrClosed),
+		errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		return false
+	}
+	return true
+}
+
+func (p *Publisher) appendOneEntry(ctx context.Context, entry AppendEntry) error {
+	if store, ok := p.b.store.(AtomicStore); ok {
+		_, err := store.AppendAtomic(ctx, []AppendEntry{entry})
+		return err
+	}
+	_, err := p.b.store.Append(ctx, entry.Message, entry.Destinations)
+	return err
 }
 
 func (p *Publisher) prepareOwnedMessage(ctx context.Context, msg Message, now time.Time) (AppendEntry, error) {

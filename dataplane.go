@@ -1,7 +1,6 @@
 package broker
 
 import (
-	"bufio"
 	"bytes"
 	"encoding/binary"
 	"encoding/json"
@@ -177,7 +176,7 @@ func (a AdminServer) v1PublishFrameBatch(w http.ResponseWriter, r *http.Request)
 		methodBroker(w)
 		return
 	}
-	messages, err := readFrameBatch(r.Body, a.Broker.FrameCodec(), 1<<20)
+	messages, err := readFrameBatch(r.Body, a.Broker.FrameCodec(), 1<<20, r.ContentLength)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -186,14 +185,14 @@ func (a AdminServer) v1PublishFrameBatch(w http.ResponseWriter, r *http.Request)
 		http.Error(w, "empty frame batch", http.StatusBadRequest)
 		return
 	}
-	items := make([]PublishBatchItem, len(messages))
-	for i := range messages {
-		items[i] = PublishBatchItem{Topic: messages[i].Topic, Payload: messages[i].Payload, Options: publishOptionsFromFrame(messages[i])}
-	}
 	if preferMinimal(r) {
 		errs, first := a.Broker.Publisher().publishMessagesMinimal(r.Context(), messages)
 		writeMinimalPublishResponse(w, errs, first)
 		return
+	}
+	items := make([]PublishBatchItem, len(messages))
+	for i := range messages {
+		items[i] = PublishBatchItem{Topic: messages[i].Topic, Payload: messages[i].Payload, Options: publishOptionsFromFrame(messages[i])}
 	}
 	results, errs, first := a.Broker.Publisher().publishItemsAligned(r.Context(), items)
 	errorsOut := make([]string, len(errs))
@@ -211,36 +210,59 @@ func (a AdminServer) v1PublishFrameBatch(w http.ResponseWriter, r *http.Request)
 	writeBrokerJSON(w, map[string]any{"results": results, "errors": errorsOut, "failed": failed, "error": errorString(first)})
 }
 
-func readFrameBatch(reader io.Reader, codec FrameCodec, maxMessages int) ([]Message, error) {
+// readFrameBatch decodes length-prefixed frames. The request body is buffered
+// once (sizeHint is its Content-Length, 0 if unknown; the HTTP layer already
+// bounds it), frames are counted with a length-only pass, and the result slice
+// is allocated exactly. DecodeMessage copies everything it keeps out of the
+// frame, so decoding straight from the buffer is safe. Sizing the slice by
+// guesswork zeroed far more Message memory than the batch needed.
+func readFrameBatch(reader io.Reader, codec FrameCodec, maxMessages int, sizeHint int64) ([]Message, error) {
 	if maxMessages <= 0 {
 		maxMessages = 1 << 20
 	}
-	buffered := bufio.NewReaderSize(reader, 64<<10)
-	messages := make([]Message, 0, 128)
-	for {
-		length, err := binary.ReadUvarint(buffered)
-		if err != nil {
-			if err == io.EOF {
-				return messages, nil
-			}
-			return nil, fmt.Errorf("read frame length: %w", err)
+	var buf bytes.Buffer
+	if sizeHint > 0 {
+		// Never trust the header for allocation size beyond a modest cap.
+		buf.Grow(int(min(sizeHint, 8<<20)) + bytes.MinRead)
+	}
+	if _, err := buf.ReadFrom(reader); err != nil {
+		return nil, fmt.Errorf("read frame payload: %w", err)
+	}
+	body := buf.Bytes()
+
+	count := 0
+	for off := 0; off < len(body); {
+		length, n := binary.Uvarint(body[off:])
+		if n <= 0 {
+			return nil, fmt.Errorf("read frame length: %w", io.ErrUnexpectedEOF)
 		}
 		if length == 0 || length > 128<<20 {
 			return nil, errf(ErrInvalidMessage, "invalid frame length %d", length)
 		}
-		if len(messages) >= maxMessages {
+		if count >= maxMessages {
 			return nil, errf(ErrBackpressure, "frame batch exceeds %d messages", maxMessages)
 		}
-		frame := make([]byte, int(length))
-		if _, err := io.ReadFull(buffered, frame); err != nil {
-			return nil, fmt.Errorf("read frame payload: %w", err)
+		off += n
+		if uint64(len(body)-off) < length {
+			return nil, fmt.Errorf("read frame payload: %w", io.ErrUnexpectedEOF)
 		}
+		off += int(length)
+		count++
+	}
+
+	messages := make([]Message, 0, count)
+	for off := 0; off < len(body); {
+		length, n := binary.Uvarint(body[off:])
+		off += n
+		frame := body[off : off+int(length)]
+		off += int(length)
 		var message Message
 		if err := codec.DecodeMessage(frame, &message); err != nil {
 			return nil, err
 		}
 		messages = append(messages, message)
 	}
+	return messages, nil
 }
 
 func EncodeMessageFrameBatch(dst []byte, codec FrameCodec, messages []Message) ([]byte, error) {
@@ -256,7 +278,7 @@ func EncodeMessageFrameBatch(dst []byte, codec FrameCodec, messages []Message) (
 }
 
 func DecodeMessageFrameBatch(data []byte, codec FrameCodec, maxMessages int) ([]Message, error) {
-	return readFrameBatch(bytes.NewReader(data), codec, maxMessages)
+	return readFrameBatch(bytes.NewReader(data), codec, maxMessages, int64(len(data)))
 }
 
 func EncodeAckFrameBatch(dst []byte, requests []AckRequest) []byte {

@@ -90,7 +90,7 @@ func New(cfg Config) *Client {
 	}
 	// Build HTTP client with TLS if configured
 	if cfg.HTTPClient == nil {
-		transport := http.DefaultTransport
+		transport := tunedTransport()
 		if cfg.TLSCertFile != "" && cfg.TLSKeyFile != "" {
 			cert, err := tls.LoadX509KeyPair(cfg.TLSCertFile, cfg.TLSKeyFile)
 			if err != nil {
@@ -112,11 +112,13 @@ func New(cfg Config) *Client {
 				}
 				tlsCfg.RootCAs = pool
 			}
-			transport = &http.Transport{TLSClientConfig: tlsCfg}
+			t := tunedTransport().(*http.Transport)
+			t.TLSClientConfig = tlsCfg
+			transport = t
 		} else if cfg.InsecureSkipVerify {
-			transport = &http.Transport{
-				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-			}
+			t := tunedTransport().(*http.Transport)
+			t.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+			transport = t
 		}
 		cfg.HTTPClient = &http.Client{Transport: transport, Timeout: 30 * time.Second}
 	}
@@ -552,6 +554,13 @@ func (c *Client) doRaw(ctx context.Context, method, path, contentType string, bo
 }
 
 func (c *Client) doRawBytes(ctx context.Context, method, path, contentType string, bodyBytes []byte) ([]byte, error) {
+	data, _, err := c.doRawStatus(ctx, method, path, contentType, bodyBytes, "")
+	return data, err
+}
+
+// doRawStatus is doRawBytes that also reports the HTTP status and can send a
+// Prefer header. 2xx responses, including 207 multi-status, return their body.
+func (c *Client) doRawStatus(ctx context.Context, method, path, contentType string, bodyBytes []byte, prefer string) ([]byte, int, error) {
 	urls := c.orderedURLs()
 	var last error
 	for i, base := range urls {
@@ -565,6 +574,9 @@ func (c *Client) doRawBytes(ctx context.Context, method, path, contentType strin
 		}
 		if c.cfg.Token != "" {
 			req.Header.Set("Authorization", "Bearer "+c.cfg.Token)
+		}
+		if prefer != "" {
+			req.Header.Set("Prefer", prefer)
 		}
 		resp, err := c.http.Do(req)
 		if err != nil {
@@ -582,14 +594,14 @@ func (c *Client) doRawBytes(ctx context.Context, method, path, contentType strin
 		}
 		c.markActive(base)
 		if resp.StatusCode >= 300 {
-			return nil, fmt.Errorf("broker %s: %s", resp.Status, strings.TrimSpace(string(data)))
+			return nil, resp.StatusCode, fmt.Errorf("broker %s: %s", resp.Status, strings.TrimSpace(string(data)))
 		}
-		return data, nil
+		return data, resp.StatusCode, nil
 	}
 	if last == nil {
 		last = errors.New("broker unavailable")
 	}
-	return nil, last
+	return nil, 0, last
 }
 func (c *Client) doJSON(ctx context.Context, method, path string, in, out any) error {
 	var bodyBytes []byte
@@ -748,3 +760,15 @@ func NackDLQ(v string) NackOption {
 }
 func NackReason(v string) NackOption { return func(o *NackOptions) { o.Reason = v } }
 func NackError(v string) NackOption  { return func(o *NackOptions) { o.Error = v } }
+
+// tunedTransport is http.DefaultTransport with an idle pool sized for many
+// concurrent publishers. The default keeps only 2 idle connections per host, so
+// hundreds of concurrent requests constantly close and reopen sockets.
+func tunedTransport() http.RoundTripper {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.MaxIdleConns = 1024
+	t.MaxIdleConnsPerHost = 512
+	t.MaxConnsPerHost = 0
+	t.IdleConnTimeout = 90 * time.Second
+	return t
+}

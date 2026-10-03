@@ -11,6 +11,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -202,13 +203,28 @@ func (a AdminServer) wrap(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+var insecureDevWarnedAt atomic.Int64
+
+// warnInsecureDevOnce logs the dev-mode warning at most once a minute. Logging it
+// on every request cost a write syscall per call and flooded the log.
+func warnInsecureDevOnce() {
+	now := time.Now().UnixNano()
+	last := insecureDevWarnedAt.Load()
+	if last != 0 && now-last < int64(time.Minute) {
+		return
+	}
+	if insecureDevWarnedAt.CompareAndSwap(last, now) {
+		log.Printf("[SECURITY WARNING] InsecureDev mode is active - all requests authenticated as admin. Do NOT use in production!")
+	}
+}
+
 func (a AdminServer) authenticate(r *http.Request) (AdminPrincipal, bool) {
 	// Health probes can be unauthenticated. readyz reveals only binary readiness.
 	if r.URL.Path == "/healthz" || r.URL.Path == "/readyz" {
 		return AdminPrincipal{Name: "probe", Permissions: []string{PermissionBrokerRead}}, true
 	}
 	if a.InsecureDev {
-		log.Printf("[SECURITY WARNING] InsecureDev mode is active - all requests authenticated as admin. Do NOT use in production!")
+		warnInsecureDevOnce()
 		return AdminPrincipal{Name: "insecure-dev", Permissions: []string{PermissionAdminAll}}, true
 	}
 	acl := a.effectiveACL()

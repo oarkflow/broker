@@ -240,10 +240,84 @@ type MemoryStore struct {
 	// store is faulted and they stay hidden forever, so a failed append is never
 	// observable.
 	pending map[string]struct{}
+
+	// leased indexes messages that entered MessageLeased so lease sweeps cost
+	// O(leased) instead of O(all retained messages). Entries may be stale (the
+	// message was acked or moved); sweeps prune them. leasedMu is always taken
+	// after mu. Every fullSweepEvery-th sweep still scans all messages to catch
+	// any status transition that bypassed noteLeasedLocked.
+	leasedMu   sync.Mutex
+	leased     map[string]struct{}
+	sweepCount int
+
+	// Compact backlog (see store_cold.go).
+	compact     bool
+	cold        map[string]coldSlot
+	coldScratch []byte
+	tenants     map[string]string
+}
+
+const fullSweepEvery = 30
+
+// noteLeasedLocked records m in the lease index when it is leased. Callers hold
+// s.mu for writing.
+func (s *MemoryStore) noteLeasedLocked(m *Message) {
+	if m == nil || m.Status != MessageLeased {
+		return
+	}
+	s.leasedMu.Lock()
+	if s.leased == nil {
+		s.leased = make(map[string]struct{})
+	}
+	s.leased[m.ID] = struct{}{}
+	s.leasedMu.Unlock()
+}
+
+// leasedCandidatesLocked returns the messages to inspect for lease expiry and
+// prunes index entries that are no longer leased. Callers hold s.mu (read or
+// write); it takes leasedMu itself. full forces a scan of every message and
+// rebuilds the index.
+func (s *MemoryStore) leasedCandidatesLocked(full bool) []*Message {
+	s.leasedMu.Lock()
+	defer s.leasedMu.Unlock()
+	if full {
+		s.leased = make(map[string]struct{})
+		out := make([]*Message, 0)
+		for id, m := range s.messages {
+			if m.Status == MessageLeased {
+				s.leased[id] = struct{}{}
+				out = append(out, m)
+			}
+		}
+		return out
+	}
+	out := make([]*Message, 0, len(s.leased))
+	for id := range s.leased {
+		m := s.messages[id]
+		if m == nil || m.Status != MessageLeased {
+			delete(s.leased, id)
+			continue
+		}
+		out = append(out, m)
+	}
+	return out
+}
+
+func (s *MemoryStore) dropLeased(id string) {
+	s.leasedMu.Lock()
+	delete(s.leased, id)
+	s.leasedMu.Unlock()
+}
+
+func (s *MemoryStore) nextSweepFull() bool {
+	s.leasedMu.Lock()
+	defer s.leasedMu.Unlock()
+	s.sweepCount++
+	return s.sweepCount%fullSweepEvery == 0
 }
 
 func NewMemoryStore() *MemoryStore {
-	return &MemoryStore{queues: map[string]*memoryQueue{}, topics: map[string]*memoryTopic{}, streams: map[string]*memoryStream{}, messages: map[string]*Message{}, history: map[string][]MessageHistory{}, offsets: map[string]map[string]uint64{}, dedup: map[string]time.Time{}, idemp: map[string]string{}, producerSeq: map[string]ProducerState{}, moveOps: map[string]MoveResult{}, rand: mathrand.New(mathrand.NewSource(time.Now().UnixNano())), historyLimit: 32, retainCompleted: true, completed: map[string]struct{}{}, completedLimit: 65536}
+	return &MemoryStore{queues: map[string]*memoryQueue{}, topics: map[string]*memoryTopic{}, streams: map[string]*memoryStream{}, messages: map[string]*Message{}, history: map[string][]MessageHistory{}, offsets: map[string]map[string]uint64{}, dedup: map[string]time.Time{}, idemp: map[string]string{}, producerSeq: map[string]ProducerState{}, moveOps: map[string]MoveResult{}, rand: mathrand.New(mathrand.NewSource(time.Now().UnixNano())), historyLimit: 32, retainCompleted: true, completed: map[string]struct{}{}, completedLimit: 65536, compact: compactBacklogDefault}
 }
 
 func (*MemoryStore) ConfirmationLevel() ConfirmLevel { return ConfirmEnqueued }
@@ -445,7 +519,7 @@ func (s *MemoryStore) appendLockedCollect(msg Message, dests []Destination, coll
 		return nil, errf(ErrInvalidMessage, "message id required")
 	}
 	if replay {
-		if existing := s.messages[msg.ID]; existing != nil {
+		if existing := s.peekMsg(msg.ID); existing != nil {
 			if collect {
 				return []Message{cloneMessage(*existing)}, nil
 			}
@@ -511,6 +585,7 @@ func (s *MemoryStore) appendLockedCollect(msg Message, dests []Destination, coll
 			m.Topic = d.Name
 			m.Status = MessagePersisted
 			s.messages[m.ID] = &m
+			s.noteLeasedLocked(s.messages[m.ID])
 			s.topics[d.Name].ids = append(s.topics[d.Name].ids, m.ID)
 			s.addHistoryLocked(m.ID, MessagePersisted, "topic_append", "", d.Name, "", "", "")
 		case DestinationQueue, DestinationDLQ:
@@ -539,7 +614,12 @@ func (s *MemoryStore) appendLockedCollect(msg Message, dests []Destination, coll
 			}
 			m.LeaseToken = ""
 			m.LeaseUntil = time.Time{}
-			s.messages[m.ID] = &m
+			if s.compactableLocked(&m) {
+				s.demoteLocked(&m, q)
+			} else {
+				s.messages[m.ID] = &m
+				s.noteLeasedLocked(s.messages[m.ID])
+			}
 			q.ids = append(q.ids, m.ID)
 			q.depth++
 			if m.Priority != 0 {
@@ -556,6 +636,7 @@ func (s *MemoryStore) appendLockedCollect(msg Message, dests []Destination, coll
 			m.Offset = st.offset
 			m.Status = MessagePersisted
 			s.messages[m.ID] = &m
+			s.noteLeasedLocked(s.messages[m.ID])
 			st.ids = append(st.ids, m.ID)
 			s.addHistoryLocked(m.ID, MessagePersisted, "stream_append", "", d.Name, "", "", "")
 		}
@@ -940,11 +1021,18 @@ func (s *MemoryStore) Lease(ctx context.Context, req LeaseRequest) ([]Message, e
 
 	if !q.hasPriority {
 		for i := q.head; i < len(q.ids) && len(out) < req.Limit; i++ {
-			m := s.messages[q.ids[i]]
-			if m == nil || m.Queue != req.Queue || isTerminalQueueStatus(m.Status) {
+			v := s.scanViewLocked(q.ids[i])
+			if !v.exists || v.queue != req.Queue || isTerminalQueueStatus(v.status) {
 				continue
 			}
-			if !tenantAllowed(ctx, m.TenantID) || (req.TenantID != "" && m.TenantID != req.TenantID) {
+			if !tenantAllowed(ctx, v.tenant) || (req.TenantID != "" && v.tenant != req.TenantID) {
+				continue
+			}
+			if v.cold && v.expiresAt.IsZero() && !v.availableAt.IsZero() && v.availableAt.After(now) {
+				continue // scheduled for later; no need to decode
+			}
+			m := s.msgLocked(q.ids[i]) // promotes a cold message we are about to inspect or lease
+			if m == nil {
 				continue
 			}
 			if !m.ExpiresAt.IsZero() && now.After(m.ExpiresAt) {
@@ -973,11 +1061,34 @@ func (s *MemoryStore) Lease(ctx context.Context, req LeaseRequest) ([]Message, e
 	type candidate struct{ idx, priority int }
 	candidates := make([]candidate, 0, minInt(req.Limit, q.depth))
 	for i := q.head; i < len(q.ids); i++ {
-		m := s.messages[q.ids[i]]
-		if m == nil || m.Queue != req.Queue || isTerminalQueueStatus(m.Status) {
+		v := s.scanViewLocked(q.ids[i])
+		if !v.exists || v.queue != req.Queue || isTerminalQueueStatus(v.status) {
 			continue
 		}
-		if req.TenantID != "" && m.TenantID != req.TenantID {
+		if req.TenantID != "" && v.tenant != req.TenantID {
+			continue
+		}
+		if v.cold && v.expiresAt.IsZero() && req.Accept == nil {
+			// Rank by the summary and promote only messages that win a slot, so
+			// scanning a large priority backlog does not decode all of it.
+			if !v.availableAt.IsZero() && v.availableAt.After(now) {
+				continue
+			}
+			if len(candidates) < req.Limit {
+				candidates = append(candidates, candidate{i, v.priority})
+				for k := len(candidates) - 1; k > 0 && candidates[k].priority > candidates[k-1].priority; k-- {
+					candidates[k], candidates[k-1] = candidates[k-1], candidates[k]
+				}
+			} else if v.priority > candidates[len(candidates)-1].priority {
+				candidates[len(candidates)-1] = candidate{i, v.priority}
+				for k := len(candidates) - 1; k > 0 && candidates[k].priority > candidates[k-1].priority; k-- {
+					candidates[k], candidates[k-1] = candidates[k-1], candidates[k]
+				}
+			}
+			continue
+		}
+		m := s.msgLocked(q.ids[i])
+		if m == nil {
 			continue
 		}
 		if !m.ExpiresAt.IsZero() && now.After(m.ExpiresAt) {
@@ -1009,7 +1120,7 @@ func (s *MemoryStore) Lease(ctx context.Context, req LeaseRequest) ([]Message, e
 		}
 	}
 	for _, c := range candidates {
-		m := s.messages[q.ids[c.idx]]
+		m := s.msgLocked(q.ids[c.idx])
 		if m == nil {
 			continue
 		}
@@ -1045,6 +1156,7 @@ func (s *MemoryStore) leaseMessageLocked(m *Message, req LeaseRequest, now time.
 	m.LeaseToken = newIDLocked(s, "lease")
 	m.LeaseUntil = now.Add(req.VisibilityTimeout)
 	s.addHistoryLocked(m.ID, MessageLeased, "leased", req.Queue, req.ConsumerID, "", req.ConsumerID, "")
+	s.noteLeasedLocked(m)
 }
 
 // prepareLease computes the set of messages that would be leased for the given
@@ -1085,14 +1197,21 @@ func (s *MemoryStore) prepareLease(ctx context.Context, req LeaseRequest) ([]Mes
 	}
 	out := make([]Message, 0, minInt(req.Limit, q.depth))
 	for i := q.head; i < len(q.ids) && len(out) < req.Limit; i++ {
-		m := s.messages[q.ids[i]]
-		if m == nil || m.Queue != req.Queue || isTerminalQueueStatus(m.Status) {
+		v := s.scanViewLocked(q.ids[i])
+		if !v.exists || v.queue != req.Queue || isTerminalQueueStatus(v.status) {
 			continue
 		}
-		if req.TenantID != "" && m.TenantID != req.TenantID {
+		if req.TenantID != "" && v.tenant != req.TenantID {
 			continue
 		}
-		if !m.ExpiresAt.IsZero() && now.After(m.ExpiresAt) {
+		if !v.expiresAt.IsZero() && now.After(v.expiresAt) {
+			continue
+		}
+		if v.cold && !v.availableAt.IsZero() && v.availableAt.After(now) {
+			continue
+		}
+		m := s.peekMsg(q.ids[i]) // read-only: a cold message is decoded to a temporary copy
+		if m == nil {
 			continue
 		}
 		if !isLeaseableQueueStatus(m.Status) || (!m.AvailableAt.IsZero() && m.AvailableAt.After(now)) {
@@ -1123,7 +1242,7 @@ func (s *MemoryStore) applyLease(ctx context.Context, prepared []Message, req Le
 		return ErrQueueNotFound
 	}
 	for _, prep := range prepared {
-		m, ok := s.messages[prep.ID]
+		m, ok := s.msgLockedOK(prep.ID)
 		if !ok {
 			continue // message was concurrently removed; skip
 		}
@@ -1136,6 +1255,7 @@ func (s *MemoryStore) applyLease(ctx context.Context, prepared []Message, req Le
 		m.ConsumerGroup = prep.ConsumerGroup
 		m.LeaseToken = prep.LeaseToken
 		m.LeaseUntil = prep.LeaseUntil
+		s.noteLeasedLocked(m)
 		s.addHistoryLocked(m.ID, MessageLeased, "leased", req.Queue, req.ConsumerID, "", req.ConsumerID, "")
 	}
 	s.advanceQueueHeadLocked(q)
@@ -1158,14 +1278,14 @@ func (s *MemoryStore) Ack(ctx context.Context, req AckRequest) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if m := s.messages[req.MessageID]; m != nil && !tenantAllowed(ctx, m.TenantID) {
+	if m := s.msgLocked(req.MessageID); m != nil && !tenantAllowed(ctx, m.TenantID) {
 		return ErrUnauthorized
 	}
 	return s.ackLocked(req)
 }
 
 func (s *MemoryStore) ackLocked(req AckRequest) error {
-	m, ok := s.messages[req.MessageID]
+	m, ok := s.msgLockedOK(req.MessageID)
 	if !ok {
 		if _, completed := s.completed[req.MessageID]; completed {
 			return nil
@@ -1204,7 +1324,7 @@ func (s *MemoryStore) AckBatch(ctx context.Context, reqs []AckRequest) []error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for i := range reqs {
-		if m := s.messages[reqs[i].MessageID]; m != nil && !tenantAllowed(ctx, m.TenantID) {
+		if m := s.msgLocked(reqs[i].MessageID); m != nil && !tenantAllowed(ctx, m.TenantID) {
 			errs[i] = ErrUnauthorized
 		} else {
 			errs[i] = s.ackLocked(reqs[i])
@@ -1216,7 +1336,7 @@ func (s *MemoryStore) AckBatch(ctx context.Context, reqs []AckRequest) []error {
 func (s *MemoryStore) validateAckLease(ctx context.Context, req AckRequest) error {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	m, ok := s.messages[req.MessageID]
+	m, ok := s.peekMsgOK(req.MessageID)
 	if !ok {
 		if _, completed := s.completed[req.MessageID]; completed {
 			return nil
@@ -1237,7 +1357,7 @@ func (s *MemoryStore) validateAckLease(ctx context.Context, req AckRequest) erro
 func (s *MemoryStore) validateNackLease(ctx context.Context, req NackRequest) error {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	m, ok := s.messages[req.MessageID]
+	m, ok := s.peekMsgOK(req.MessageID)
 	if !ok {
 		return ErrMessageNotFound
 	}
@@ -1258,7 +1378,7 @@ func (s *MemoryStore) validateNackLease(ctx context.Context, req NackRequest) er
 func (s *MemoryStore) validateExtendLease(ctx context.Context, req LeaseRequest) (Message, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	m, ok := s.messages[req.MessageID]
+	m, ok := s.peekMsgOK(req.MessageID)
 	if !ok {
 		return Message{}, ErrMessageNotFound
 	}
@@ -1274,7 +1394,7 @@ func (s *MemoryStore) validateExtendLease(ctx context.Context, req LeaseRequest)
 func (s *MemoryStore) Nack(ctx context.Context, req NackRequest) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	m, ok := s.messages[req.MessageID]
+	m, ok := s.msgLockedOK(req.MessageID)
 	if !ok {
 		return ErrMessageNotFound
 	}
@@ -1329,7 +1449,7 @@ func (s *MemoryStore) Nack(ctx context.Context, req NackRequest) error {
 func (s *MemoryStore) ExtendLease(ctx context.Context, req LeaseRequest) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	m, ok := s.messages[req.MessageID]
+	m, ok := s.msgLockedOK(req.MessageID)
 	if !ok {
 		return ErrMessageNotFound
 	}
@@ -1350,7 +1470,7 @@ func (s *MemoryStore) ExtendLease(ctx context.Context, req LeaseRequest) error {
 func (s *MemoryStore) Update(ctx context.Context, msg Message) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	existing, ok := s.messages[msg.ID]
+	existing, ok := s.msgLockedOK(msg.ID)
 	if !ok {
 		return ErrMessageNotFound
 	}
@@ -1364,6 +1484,7 @@ func (s *MemoryStore) Update(ctx context.Context, msg Message) error {
 	msg.TenantID = tenant
 	m := cloneMessage(msg)
 	s.messages[msg.ID] = &m
+	s.noteLeasedLocked(s.messages[msg.ID])
 	s.addHistoryLocked(m.ID, m.Status, "updated", m.Queue, "", "", m.ConsumerID, m.LastError)
 	return nil
 }
@@ -1382,7 +1503,7 @@ func (s *MemoryStore) UpdateBatch(ctx context.Context, messages []Message) []err
 	defer s.mu.Unlock()
 	for i := range messages {
 		msg := messages[i]
-		existing, ok := s.messages[msg.ID]
+		existing, ok := s.msgLockedOK(msg.ID)
 		if !ok {
 			errs[i] = ErrMessageNotFound
 			continue
@@ -1399,6 +1520,7 @@ func (s *MemoryStore) UpdateBatch(ctx context.Context, messages []Message) []err
 		msg.TenantID = tenant
 		m := cloneMessage(msg)
 		s.messages[msg.ID] = &m
+		s.noteLeasedLocked(s.messages[msg.ID])
 		s.addHistoryLocked(m.ID, m.Status, "updated", m.Queue, "", "", m.ConsumerID, m.LastError)
 	}
 	return errs
@@ -1407,7 +1529,7 @@ func (s *MemoryStore) UpdateBatch(ctx context.Context, messages []Message) []err
 func (s *MemoryStore) Get(ctx context.Context, id string) (Message, bool, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	m, ok := s.messages[id]
+	m, ok := s.peekMsgOK(id)
 	if !ok || s.isPendingLocked(id) {
 		return Message{}, false, nil
 	}
@@ -1420,7 +1542,7 @@ func (s *MemoryStore) Get(ctx context.Context, id string) (Message, bool, error)
 func (s *MemoryStore) History(ctx context.Context, id string) ([]MessageHistory, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	if m := s.messages[id]; m != nil && !tenantAllowed(ctx, m.TenantID) {
+	if m := s.peekMsg(id); m != nil && !tenantAllowed(ctx, m.TenantID) {
 		return nil, ErrUnauthorized
 	}
 	h := s.history[id]
@@ -1462,7 +1584,7 @@ func (s *MemoryStore) moveLocked(ctx context.Context, req MoveRequest, plannedID
 	res := MoveResult{Destination: req.Destination, DryRun: req.DryRun}
 	ids := s.resolveMoveIDsLocked(req)
 	for _, id := range ids {
-		m, ok := s.messages[id]
+		m, ok := s.msgLockedOK(id)
 		if !ok {
 			res.Skipped++
 			continue
@@ -1523,7 +1645,7 @@ func (s *MemoryStore) prepareMove(ctx context.Context, req MoveRequest) (map[str
 	res := MoveResult{Destination: req.Destination, DryRun: req.DryRun}
 	planned := make(map[string]string)
 	for _, id := range s.resolveMoveIDsLocked(req) {
-		message, ok := s.messages[id]
+		message, ok := s.peekMsgOK(id)
 		if !ok || !tenantAllowed(ctx, message.TenantID) || !filterMessage(*message, req.Filter) {
 			res.Skipped++
 			continue
@@ -1556,9 +1678,14 @@ func (s *MemoryStore) nextMoveIDLocked(sourceID string, mode MoveMode) string {
 			sequence++
 		}
 	}
+	for id := range s.cold {
+		if strings.HasPrefix(id, prefix) {
+			sequence++
+		}
+	}
 	for {
 		candidate := prefix + itoa(sequence)
-		if _, exists := s.messages[candidate]; !exists {
+		if !s.hasMsgLocked(candidate) {
 			return candidate
 		}
 		sequence++
@@ -1587,7 +1714,7 @@ func (s *MemoryStore) applyBackpressureLocked(q *memoryQueue, queue string, inco
 	case BackpressureDropOldest:
 		for i := q.head; i < len(q.ids); i++ {
 			id := q.ids[i]
-			old := s.messages[id]
+			old := s.msgLocked(id)
 			if old == nil || isTerminalQueueStatus(old.Status) {
 				continue
 			}
@@ -1609,6 +1736,7 @@ func (s *MemoryStore) applyBackpressureLocked(q *memoryQueue, queue string, inco
 		incoming.Queue = queue
 		incoming.Status = MessagePurged
 		s.messages[incoming.ID] = incoming
+		s.noteLeasedLocked(s.messages[incoming.ID])
 		s.addHistoryLocked(incoming.ID, MessagePurged, "backpressure_drop_newest", queue, "", "queue full", "", "")
 		return true, nil
 	case BackpressureDLQ:
@@ -1624,6 +1752,7 @@ func (s *MemoryStore) applyBackpressureLocked(q *memoryQueue, queue string, inco
 		incoming.Status = MessageDeadLettered
 		incoming.DeadLetterReason = "backpressure"
 		s.messages[incoming.ID] = incoming
+		s.noteLeasedLocked(s.messages[incoming.ID])
 		dlqQueue := s.queues[dlq]
 		dlqQueue.ids = append(dlqQueue.ids, incoming.ID)
 		dlqQueue.depth++
@@ -1648,6 +1777,7 @@ func (s *MemoryStore) appendCloneLocked(m Message, d Destination, req MoveReques
 			m.Status = MessageDeadLettered
 		}
 		s.messages[m.ID] = &m
+		s.noteLeasedLocked(s.messages[m.ID])
 		q := s.queues[d.Name]
 		q.ids = append(q.ids, m.ID)
 		q.depth++
@@ -1661,6 +1791,7 @@ func (s *MemoryStore) appendCloneLocked(m Message, d Destination, req MoveReques
 		m.Topic = d.Name
 		m.Status = MessagePersisted
 		s.messages[m.ID] = &m
+		s.noteLeasedLocked(s.messages[m.ID])
 		s.topics[d.Name].ids = append(s.topics[d.Name].ids, m.ID)
 	case DestinationStream, DestinationArchive:
 		if _, ok := s.streams[d.Name]; !ok {
@@ -1672,6 +1803,7 @@ func (s *MemoryStore) appendCloneLocked(m Message, d Destination, req MoveReques
 		m.Offset = st.offset
 		m.Status = MessagePersisted
 		s.messages[m.ID] = &m
+		s.noteLeasedLocked(s.messages[m.ID])
 		st.ids = append(st.ids, m.ID)
 	}
 	if req.Mode == MoveCopy || req.Mode == MoveReplay {
@@ -1729,6 +1861,25 @@ func (s *MemoryStore) PurgeQueue(ctx context.Context, name string) (int, error) 
 	}
 	n := 0
 	for _, id := range q.ids[q.head:] {
+		if slot, isCold := s.cold[id]; isCold {
+			// Cold messages are queued and live; a purge removes them outright
+			// (compact storage never retains purged messages, which are terminal).
+			if slot.queue != name || !tenantAllowed(ctx, slot.tenant) {
+				continue
+			}
+			delete(s.cold, id)
+			delete(s.history, id)
+			if s.retainCompleted {
+				// Keep the same observable result as the hot path: a purged,
+				// retained message stays addressable by id.
+				m := decodeCold(id, slot)
+				m.Status = MessagePurged
+				s.messages[id] = &m
+				s.addHistoryLocked(id, MessagePurged, "purged", name, "", "queue purge", "", "")
+			}
+			n++
+			continue
+		}
 		if m := s.messages[id]; m != nil && m.Queue == name && !isTerminalQueueStatus(m.Status) {
 			if !tenantAllowed(ctx, m.TenantID) {
 				continue
@@ -1886,10 +2037,15 @@ func (s *MemoryStore) Stats(ctx context.Context) (StoreStats, error) {
 			st.DeadLetter++
 		}
 	}
+	for _, slot := range s.cold {
+		if tenantAllowed(ctx, slot.tenant) {
+			st.Messages++
+		}
+	}
 	for name, q := range s.queues {
 		count := 0
 		for _, id := range q.ids[q.head:] {
-			if m := s.messages[id]; m != nil && tenantAllowed(ctx, m.TenantID) {
+			if v := s.scanViewLocked(id); v.exists && tenantAllowed(ctx, v.tenant) {
 				count++
 			}
 		}
@@ -1931,13 +2087,14 @@ func (s *MemoryStore) SweepLeases(ctx context.Context, now time.Time) (int, erro
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	n := 0
-	for _, m := range s.messages {
+	for _, m := range s.leasedCandidatesLocked(s.nextSweepFull()) {
 		if m.Status == MessageLeased && !m.LeaseUntil.IsZero() && now.After(m.LeaseUntil) {
 			m.Status = MessageQueued
 			m.LeaseToken = ""
 			m.LeaseUntil = time.Time{}
 			m.Redeliveries++
 			s.addHistoryLocked(m.ID, MessageQueued, "lease_expired", m.Queue, "", "visibility timeout", m.ConsumerID, "")
+			s.dropLeased(m.ID)
 			n++
 		}
 	}
@@ -1959,7 +2116,7 @@ func (s *MemoryStore) prepareSweepLeases(ctx context.Context, now time.Time) ([]
 		return nil, ErrClosed
 	}
 	var expired []Message
-	for _, current := range s.messages {
+	for _, current := range s.leasedCandidatesLocked(s.nextSweepFull()) {
 		if current.Status != MessageLeased || current.LeaseUntil.IsZero() || !now.After(current.LeaseUntil) {
 			continue
 		}
@@ -1990,6 +2147,7 @@ func (s *MemoryStore) applySweepLeases(messages []Message) int {
 			continue
 		}
 		m.Status = prepared.Status
+		s.dropLeased(m.ID)
 		m.LeaseToken = ""
 		m.LeaseUntil = time.Time{}
 		m.Redeliveries = prepared.Redeliveries
@@ -2015,7 +2173,7 @@ func (s *MemoryStore) Cleanup(maxHistoryPerMessage int) {
 	}
 	// Purge idempotency keys for messages that no longer exist.
 	for k, msgID := range s.idemp {
-		if _, ok := s.messages[msgID]; !ok {
+		if !s.hasMsgLocked(msgID) {
 			delete(s.idemp, k)
 		}
 	}
@@ -2137,7 +2295,7 @@ func (s *MemoryStore) listIDsLocked(ids []string, limit int, dlqOnly bool) []Mes
 		if len(out) >= limit {
 			break
 		}
-		if m := s.messages[id]; m != nil {
+		if m := s.peekMsg(id); m != nil {
 			if isTerminalQueueStatus(m.Status) {
 				continue
 			}
@@ -2197,8 +2355,7 @@ func (s *MemoryStore) removeFromQueueLocked(queue, id string) {
 
 func (s *MemoryStore) advanceQueueHeadLocked(q *memoryQueue) {
 	for q.head < len(q.ids) {
-		m := s.messages[q.ids[q.head]]
-		if m != nil && m.Queue == q.cfg.Name && !isTerminalQueueStatus(m.Status) {
+		if v := s.scanViewLocked(q.ids[q.head]); v.exists && v.queue == q.cfg.Name && !isTerminalQueueStatus(v.status) {
 			break
 		}
 		q.head++
@@ -2219,7 +2376,7 @@ func (s *MemoryStore) listQueueIDsLocked(q *memoryQueue, queue string, limit int
 		if len(out) >= limit {
 			break
 		}
-		m := s.messages[id]
+		m := s.peekMsg(id)
 		if m == nil || m.Queue != queue || isTerminalQueueStatus(m.Status) {
 			continue
 		}

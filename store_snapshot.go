@@ -56,7 +56,7 @@ func (s *MemoryStore) Snapshot() MemoryStoreSnapshot {
 		Queues:    make(map[string]MemoryQueueSnapshot, len(s.queues)),
 		Topics:    make(map[string]MemoryTopicSnapshot, len(s.topics)),
 		Streams:   make(map[string]MemoryStreamSnapshot, len(s.streams)),
-		Messages:  make(map[string]Message, len(s.messages)),
+		Messages:  make(map[string]Message, len(s.messages)+len(s.cold)),
 		History:   make(map[string][]MessageHistory, len(s.history)),
 		Offsets:   make(map[string]map[string]uint64, len(s.offsets)),
 		Dedup:     make(map[string]time.Time, len(s.dedup)),
@@ -75,6 +75,9 @@ func (s *MemoryStore) Snapshot() MemoryStoreSnapshot {
 	}
 	for id, m := range s.messages {
 		snap.Messages[id] = cloneMessage(*m)
+	}
+	for id, slot := range s.cold {
+		snap.Messages[id] = decodeCold(id, slot)
 	}
 	for id, h := range s.history {
 		snap.History[id] = append([]MessageHistory(nil), h...)
@@ -121,6 +124,7 @@ func (s *MemoryStore) restoreSnapshot(snap MemoryStoreSnapshot, recoverInflight 
 	s.topics = map[string]*memoryTopic{}
 	s.streams = map[string]*memoryStream{}
 	s.messages = map[string]*Message{}
+	s.cold = nil
 	s.history = map[string][]MessageHistory{}
 	s.offsets = map[string]map[string]uint64{}
 	s.dedup = map[string]time.Time{}
@@ -158,6 +162,7 @@ func (s *MemoryStore) restoreSnapshot(snap MemoryStoreSnapshot, recoverInflight 
 			m.Redeliveries++
 		}
 		s.messages[id] = &m
+		s.noteLeasedLocked(&m)
 	}
 	// Version-1 snapshots did not persist queue counters. Reconstruct them when
 	// absent so old backups remain readable and messages do not become invisible.
@@ -166,12 +171,12 @@ func (s *MemoryStore) restoreSnapshot(snap MemoryStoreSnapshot, recoverInflight 
 			continue
 		}
 		for _, id := range queue.ids[queue.head:] {
-			message := s.messages[id]
-			if message == nil || message.Queue != queue.cfg.Name || isTerminalQueueStatus(message.Status) {
+			v := s.scanViewLocked(id)
+			if !v.exists || v.queue != queue.cfg.Name || isTerminalQueueStatus(v.status) {
 				continue
 			}
 			queue.depth++
-			if message.Priority != 0 {
+			if v.priority != 0 {
 				queue.hasPriority = true
 			}
 		}
@@ -199,6 +204,9 @@ func (s *MemoryStore) restoreSnapshot(snap MemoryStoreSnapshot, recoverInflight 
 	}
 	for k, v := range snap.MoveOps {
 		s.moveOps[k] = v
+	}
+	if s.compact {
+		s.demoteEligibleLocked()
 	}
 	s.closed = false
 }

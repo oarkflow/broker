@@ -338,183 +338,203 @@ func (c *BinaryMessageCodec) split(frame []byte) (FrameHeader, []byte, []byte, [
 	return h, frame[idx:endHeader], frame[endHeader:endPayload], frame[:endPayload], frame[macStart:macEnd], nil
 }
 
+// encodeMessageTLV writes only the fields that carry information. Absent keys
+// decode to zero values, so this is wire-compatible with every decoder while
+// shrinking a typical message from ~40 key/value pairs to the handful in use.
 func encodeMessageTLV(dst []byte, m Message, metadata map[string]string) []byte {
-	put := func(k, v string) { dst = appendTLV(dst, k, []byte(v)) }
-	putb := func(k string, b []byte) {
-		if len(b) > 0 {
-			dst = appendTLV(dst, k, b)
+	str := func(k, v string) {
+		if v != "" {
+			dst = appendTLVString(dst, k, v)
 		}
 	}
-	put("id", m.ID)
-	put("parent_id", m.ParentID)
-	put("topic", m.Topic)
-	put("queue", m.Queue)
-	put("stream", m.Stream)
-	put("partition", strconv.Itoa(m.Partition))
-	put("offset", strconv.FormatUint(m.Offset, 10))
-	put("key", m.Key)
-	put("routing_key", m.RoutingKey)
-	put("type", m.Type)
-	put("content_type", m.ContentType)
-	put("schema", m.Schema)
-	put("schema_version", m.SchemaVersion)
-	put("trace_id", m.TraceID)
-	put("span_id", m.SpanID)
-	put("correlation_id", m.CorrelationID)
-	put("causation_id", m.CausationID)
-	put("request_id", m.RequestID)
-	put("reply_to", m.ReplyTo)
-	put("reply_group", m.ReplyGroup)
-	put("idempotency_key", m.IdempotencyKey)
-	put("deduplication_id", m.DeduplicationID)
-	put("checksum", m.Checksum)
-	put("priority", strconv.Itoa(m.Priority))
-	put("created_at", timeToString(m.CreatedAt))
-	put("available_at", timeToString(m.AvailableAt))
-	put("expires_at", timeToString(m.ExpiresAt))
-	put("attempts", strconv.Itoa(m.Attempts))
-	put("max_attempts", strconv.Itoa(m.MaxAttempts))
-	put("redeliveries", strconv.Itoa(m.Redeliveries))
-	put("tenant_id", m.TenantID)
-	put("producer_id", m.ProducerID)
-	put("consumer_id", m.ConsumerID)
-	put("consumer_group", m.ConsumerGroup)
-	put("lease_token", m.LeaseToken)
-	put("lease_until", timeToString(m.LeaseUntil))
-	put("original_topic", m.OriginalTopic)
-	put("original_queue", m.OriginalQueue)
-	put("original_stream", m.OriginalStream)
-	put("original_offset", strconv.FormatUint(m.OriginalOffset, 10))
-	put("status", string(m.Status))
-	put("last_error", m.LastError)
-	put("dead_letter_reason", m.DeadLetterReason)
-	put("task_id", m.TaskID)
-	put("task_name", m.TaskName)
+	num := func(k string, v int64) {
+		if v != 0 {
+			var tmp [20]byte
+			dst = appendTLVBytes(dst, k, strconv.AppendInt(tmp[:0], v, 10))
+		}
+	}
+	unum := func(k string, v uint64) {
+		if v != 0 {
+			var tmp [20]byte
+			dst = appendTLVBytes(dst, k, strconv.AppendUint(tmp[:0], v, 10))
+		}
+	}
+	ts := func(k string, t time.Time) {
+		if !t.IsZero() {
+			num(k, t.UnixNano())
+		}
+	}
+	str("id", m.ID)
+	str("parent_id", m.ParentID)
+	str("topic", m.Topic)
+	str("queue", m.Queue)
+	str("stream", m.Stream)
+	num("partition", int64(m.Partition))
+	unum("offset", m.Offset)
+	str("key", m.Key)
+	str("routing_key", m.RoutingKey)
+	str("type", m.Type)
+	str("content_type", m.ContentType)
+	str("schema", m.Schema)
+	str("schema_version", m.SchemaVersion)
+	str("trace_id", m.TraceID)
+	str("span_id", m.SpanID)
+	str("correlation_id", m.CorrelationID)
+	str("causation_id", m.CausationID)
+	str("request_id", m.RequestID)
+	str("reply_to", m.ReplyTo)
+	str("reply_group", m.ReplyGroup)
+	str("idempotency_key", m.IdempotencyKey)
+	str("deduplication_id", m.DeduplicationID)
+	str("checksum", m.Checksum)
+	num("priority", int64(m.Priority))
+	ts("created_at", m.CreatedAt)
+	ts("available_at", m.AvailableAt)
+	ts("expires_at", m.ExpiresAt)
+	num("attempts", int64(m.Attempts))
+	num("max_attempts", int64(m.MaxAttempts))
+	num("redeliveries", int64(m.Redeliveries))
+	str("tenant_id", m.TenantID)
+	str("producer_id", m.ProducerID)
+	str("consumer_id", m.ConsumerID)
+	str("consumer_group", m.ConsumerGroup)
+	str("lease_token", m.LeaseToken)
+	ts("lease_until", m.LeaseUntil)
+	str("original_topic", m.OriginalTopic)
+	str("original_queue", m.OriginalQueue)
+	str("original_stream", m.OriginalStream)
+	unum("original_offset", m.OriginalOffset)
+	str("status", string(m.Status))
+	str("last_error", m.LastError)
+	str("dead_letter_reason", m.DeadLetterReason)
+	str("task_id", m.TaskID)
+	str("task_name", m.TaskName)
 	for k, v := range m.Headers {
-		put("h:"+k, v)
+		dst = appendTLVString2(dst, "h:", k, v)
 	}
 	for k, v := range metadata {
-		put("m:"+k, v)
+		dst = appendTLVString2(dst, "m:", k, v)
 	}
-	putb("payload_checksum", []byte(payloadChecksum(m.Payload)))
+	if len(m.Payload) > 0 {
+		dst = appendTLVString(dst, "payload_checksum", payloadChecksum(m.Payload))
+	}
 	return dst
 }
 
+// decodeMessageTLV decodes without allocating for keys or numeric values; only
+// string fields that are present allocate, and header/metadata maps are created
+// on first use.
 func decodeMessageTLV(src []byte) (Message, error) {
 	var m Message
-	m.Headers = map[string]string{}
-	m.Metadata = map[string]string{}
-	err := walkTLV(src, func(k string, v []byte) error {
-		s := string(v)
-		switch k {
+	err := walkTLVBytes(src, func(k, v []byte) error {
+		switch string(k) {
 		case "id":
-			m.ID = s
+			m.ID = string(v)
 		case "parent_id":
-			m.ParentID = s
+			m.ParentID = string(v)
 		case "topic":
-			m.Topic = s
+			m.Topic = string(v)
 		case "queue":
-			m.Queue = s
+			m.Queue = string(v)
 		case "stream":
-			m.Stream = s
+			m.Stream = string(v)
 		case "partition":
-			m.Partition = atoi(s)
+			m.Partition = int(parseInt64Bytes(v))
 		case "offset":
-			m.Offset = atou64(s)
+			m.Offset = parseUint64Bytes(v)
 		case "key":
-			m.Key = s
+			m.Key = string(v)
 		case "routing_key":
-			m.RoutingKey = s
+			m.RoutingKey = string(v)
 		case "type":
-			m.Type = s
+			m.Type = string(v)
 		case "content_type":
-			m.ContentType = s
+			m.ContentType = string(v)
 		case "schema":
-			m.Schema = s
+			m.Schema = string(v)
 		case "schema_version":
-			m.SchemaVersion = s
+			m.SchemaVersion = string(v)
 		case "trace_id":
-			m.TraceID = s
+			m.TraceID = string(v)
 		case "span_id":
-			m.SpanID = s
+			m.SpanID = string(v)
 		case "correlation_id":
-			m.CorrelationID = s
+			m.CorrelationID = string(v)
 		case "causation_id":
-			m.CausationID = s
+			m.CausationID = string(v)
 		case "request_id":
-			m.RequestID = s
+			m.RequestID = string(v)
 		case "reply_to":
-			m.ReplyTo = s
+			m.ReplyTo = string(v)
 		case "reply_group":
-			m.ReplyGroup = s
+			m.ReplyGroup = string(v)
 		case "idempotency_key":
-			m.IdempotencyKey = s
+			m.IdempotencyKey = string(v)
 		case "deduplication_id":
-			m.DeduplicationID = s
+			m.DeduplicationID = string(v)
 		case "checksum":
-			m.Checksum = s
+			m.Checksum = string(v)
 		case "priority":
-			m.Priority = atoi(s)
+			m.Priority = int(parseInt64Bytes(v))
 		case "created_at":
-			m.CreatedAt = stringToTime(s)
+			m.CreatedAt = bytesToTime(v)
 		case "available_at":
-			m.AvailableAt = stringToTime(s)
+			m.AvailableAt = bytesToTime(v)
 		case "expires_at":
-			m.ExpiresAt = stringToTime(s)
+			m.ExpiresAt = bytesToTime(v)
 		case "attempts":
-			m.Attempts = atoi(s)
+			m.Attempts = int(parseInt64Bytes(v))
 		case "max_attempts":
-			m.MaxAttempts = atoi(s)
+			m.MaxAttempts = int(parseInt64Bytes(v))
 		case "redeliveries":
-			m.Redeliveries = atoi(s)
+			m.Redeliveries = int(parseInt64Bytes(v))
 		case "tenant_id":
-			m.TenantID = s
+			m.TenantID = string(v)
 		case "producer_id":
-			m.ProducerID = s
+			m.ProducerID = string(v)
 		case "consumer_id":
-			m.ConsumerID = s
+			m.ConsumerID = string(v)
 		case "consumer_group":
-			m.ConsumerGroup = s
+			m.ConsumerGroup = string(v)
 		case "lease_token":
-			m.LeaseToken = s
+			m.LeaseToken = string(v)
 		case "lease_until":
-			m.LeaseUntil = stringToTime(s)
+			m.LeaseUntil = bytesToTime(v)
 		case "original_topic":
-			m.OriginalTopic = s
+			m.OriginalTopic = string(v)
 		case "original_queue":
-			m.OriginalQueue = s
+			m.OriginalQueue = string(v)
 		case "original_stream":
-			m.OriginalStream = s
+			m.OriginalStream = string(v)
 		case "original_offset":
-			m.OriginalOffset = atou64(s)
+			m.OriginalOffset = parseUint64Bytes(v)
 		case "status":
-			m.Status = MessageStatus(s)
+			m.Status = MessageStatus(v)
 		case "last_error":
-			m.LastError = s
+			m.LastError = string(v)
 		case "dead_letter_reason":
-			m.DeadLetterReason = s
+			m.DeadLetterReason = string(v)
 		case "task_id":
-			m.TaskID = s
+			m.TaskID = string(v)
 		case "task_name":
-			m.TaskName = s
+			m.TaskName = string(v)
 		default:
-			if len(k) > 2 && k[:2] == "h:" {
-				m.Headers[k[2:]] = s
-			}
-			if len(k) > 2 && k[:2] == "m:" {
-				m.Metadata[k[2:]] = s
+			if len(k) > 2 && k[0] == 'h' && k[1] == ':' {
+				if m.Headers == nil {
+					m.Headers = make(map[string]string, 4)
+				}
+				m.Headers[string(k[2:])] = string(v)
+			} else if len(k) > 2 && k[0] == 'm' && k[1] == ':' {
+				if m.Metadata == nil {
+					m.Metadata = make(map[string]string, 4)
+				}
+				m.Metadata[string(k[2:])] = string(v)
 			}
 		}
 		return nil
 	})
 	if err != nil {
 		return Message{}, err
-	}
-	if len(m.Headers) == 0 {
-		m.Headers = nil
-	}
-	if len(m.Metadata) == 0 {
-		m.Metadata = nil
 	}
 	return m, nil
 }
@@ -528,6 +548,117 @@ func appendTLV(dst []byte, key string, val []byte) []byte {
 	dst = append(dst, key...)
 	dst = append(dst, val...)
 	return dst
+}
+
+func appendTLVString(dst []byte, key, val string) []byte {
+	dst = binary.AppendUvarint(dst, uint64(len(key)))
+	dst = binary.AppendUvarint(dst, uint64(len(val)))
+	dst = append(dst, key...)
+	return append(dst, val...)
+}
+
+func appendTLVString2(dst []byte, prefix, key, val string) []byte {
+	dst = binary.AppendUvarint(dst, uint64(len(prefix)+len(key)))
+	dst = binary.AppendUvarint(dst, uint64(len(val)))
+	dst = append(dst, prefix...)
+	dst = append(dst, key...)
+	return append(dst, val...)
+}
+
+func appendTLVBytes(dst []byte, key string, val []byte) []byte {
+	dst = binary.AppendUvarint(dst, uint64(len(key)))
+	dst = binary.AppendUvarint(dst, uint64(len(val)))
+	dst = append(dst, key...)
+	return append(dst, val...)
+}
+
+// walkTLVBytes is walkTLV without the per-field key string allocation.
+func walkTLVBytes(src []byte, fn func(key, val []byte) error) error {
+	for len(src) > 0 {
+		kl, n := binary.Uvarint(src)
+		if n <= 0 {
+			return errf(ErrInvalidMessage, "invalid tlv key length")
+		}
+		src = src[n:]
+		vl, n := binary.Uvarint(src)
+		if n <= 0 {
+			return errf(ErrInvalidMessage, "invalid tlv value length")
+		}
+		src = src[n:]
+		if kl > uint64(len(src)) {
+			return io.ErrUnexpectedEOF
+		}
+		key := src[:kl]
+		src = src[kl:]
+		if vl > uint64(len(src)) {
+			return io.ErrUnexpectedEOF
+		}
+		val := src[:vl]
+		src = src[vl:]
+		if err := fn(key, val); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// parseInt64Bytes parses a decimal integer, returning 0 on malformed input
+// exactly like the previous strconv-with-ignored-error behavior.
+func parseInt64Bytes(b []byte) int64 {
+	if len(b) == 0 {
+		return 0
+	}
+	neg := false
+	if b[0] == '-' || b[0] == '+' {
+		neg = b[0] == '-'
+		b = b[1:]
+		if len(b) == 0 {
+			return 0
+		}
+	}
+	var n uint64
+	for _, c := range b {
+		if c < '0' || c > '9' || n > (1<<63)/10 {
+			return 0
+		}
+		n = n*10 + uint64(c-'0')
+	}
+	if neg {
+		if n > 1<<63 {
+			return 0
+		}
+		return -int64(n)
+	}
+	if n > 1<<63-1 {
+		return 0
+	}
+	return int64(n)
+}
+
+func parseUint64Bytes(b []byte) uint64 {
+	if len(b) == 0 {
+		return 0
+	}
+	var n uint64
+	for _, c := range b {
+		if c < '0' || c > '9' || n > (1<<64-1)/10 {
+			return 0
+		}
+		d := uint64(c - '0')
+		if n*10 > 1<<64-1-d {
+			return 0
+		}
+		n = n*10 + d
+	}
+	return n
+}
+
+func bytesToTime(b []byte) time.Time {
+	n := parseInt64Bytes(b)
+	if n == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, n).UTC()
 }
 
 func walkTLV(src []byte, fn func(string, []byte) error) error {

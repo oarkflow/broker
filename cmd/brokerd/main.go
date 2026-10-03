@@ -71,6 +71,7 @@ func main() {
 	debugEvents := flag.Bool("debug-events", envBool("BROKER_DEBUG_EVENTS"), "include debug heartbeat/lease-extension events in live logs")
 	messageHistory := flag.Int("message-history", int(envInt64("BROKER_MESSAGE_HISTORY", 0)), "message history entries retained per message; 0 disables hot-path history")
 	notificationHistory := flag.Int("notification-history", int(envInt64("BROKER_NOTIFICATION_HISTORY", 0)), "notification events retained in memory; 0 disables retention")
+	compactBacklog := flag.Bool("compact-backlog", envBool("BROKER_COMPACT_BACKLOG"), "hold queued, never-leased messages in a compact encoded form: about half the memory and a fraction of the GC cost for large backlogs")
 	retainCompleted := flag.Bool("retain-completed", envBool("BROKER_RETAIN_COMPLETED"), "retain completed message bodies in memory after durable acknowledgement")
 	publisherTracking := flag.Bool("publisher-tracking", envBool("BROKER_PUBLISHER_TRACKING"), "retain per-publisher counters/history")
 	consumerEventTracking := flag.Bool("consumer-event-tracking", envBool("BROKER_CONSUMER_EVENT_TRACKING"), "emit per-message consumer events")
@@ -182,6 +183,9 @@ func main() {
 
 	if configurable, ok := store.(interface{ SetHistoryLimit(int) }); ok {
 		configurable.SetHistoryLimit(*messageHistory)
+	}
+	if configurable, ok := store.(interface{ SetCompactBacklog(bool) }); ok {
+		configurable.SetCompactBacklog(*compactBacklog)
 	}
 	if configurable, ok := store.(interface{ SetRetainCompleted(bool) }); ok {
 		configurable.SetRetainCompleted(*retainCompleted)
