@@ -216,16 +216,27 @@ func (s *BinaryFileWALStore) applyRecovered(r walRecord) {
 	}
 }
 func (s *BinaryFileWALStore) write(r walRecord) error {
+	req, err := s.writeAsync(r)
+	if err != nil {
+		return err
+	}
+	return s.gc.await(req)
+}
+
+// writeAsync queues the record in WAL order and returns before the fsync. The
+// caller must hold writeMu while calling it and call s.gc.await(req) after
+// releasing the lock.
+func (s *BinaryFileWALStore) writeAsync(r walRecord) (*groupCommitReq, error) {
 	if s.file == nil || s.gc == nil {
-		return ErrClosed
+		return nil, ErrClosed
 	}
 	r.At = time.Now()
 	r.Checksum = "" // BWL1 CRC32C/HMAC protect the complete native record.
 	record, err := s.walCodec.encode(nil, r)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	return s.gc.writeUvarintPrefixed(record)
+	return s.gc.enqueue(record, true)
 }
 
 func uvarintLen(v uint64) int {
@@ -282,17 +293,28 @@ func (s *BinaryFileWALStore) AppendAtomicOwned(ctx context.Context, entries []Ap
 }
 func (s *BinaryFileWALStore) durableAppend(ctx context.Context, entries []AppendEntry) ([]Message, error) {
 	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
 	out, err := s.MemoryStore.prepareAppendAtomic(ctx, entries)
 	if err != nil {
+		s.writeMu.Unlock()
 		return nil, err
 	}
 	persisted := storedAppendEntries(out)
-	if err := s.write(walRecord{Op: "append_atomic", Entries: persisted}); err != nil {
+	req, err := s.writeAsync(walRecord{Op: "append_atomic", Entries: persisted})
+	if err != nil {
+		s.writeMu.Unlock()
 		return nil, err
 	}
-	if err := s.MemoryStore.appendRecoveredAtomic(persisted); err != nil {
-		return nil, fmt.Errorf("apply durable append: %w", err)
+	// Apply immediately, hidden from readers, so the next append validates
+	// against it; the fsync wait happens outside writeMu so concurrent appends
+	// share one commit.
+	applyErr := s.MemoryStore.appendRecoveredAtomicPending(persisted)
+	s.writeMu.Unlock()
+	if err := s.gc.await(req); err != nil {
+		return nil, err
+	}
+	s.MemoryStore.commitPending(persisted)
+	if applyErr != nil {
+		return nil, fmt.Errorf("apply durable append: %w", applyErr)
 	}
 	return out, nil
 }
@@ -301,18 +323,23 @@ func (s *BinaryFileWALStore) durableAppend(ctx context.Context, entries []Append
 // fsync the WAL record, then apply the mutation to the in-memory index.
 func (s *BinaryFileWALStore) Lease(ctx context.Context, req LeaseRequest) ([]Message, error) {
 	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
 	msgs, err := s.MemoryStore.prepareLease(ctx, req)
 	if err != nil || len(msgs) == 0 {
+		s.writeMu.Unlock()
 		return msgs, err
 	}
-	// WAL-first: persist before applying to memory.
-	if err := s.write(walRecord{Op: "lease_batch", Messages: msgs, Lease: req}); err != nil {
+	pending, err := s.writeAsync(walRecord{Op: "lease_batch", Messages: msgs, Lease: req})
+	if err != nil {
+		s.writeMu.Unlock()
 		return nil, err
 	}
-	// Apply mutation only after successful WAL write.
-	if err := s.MemoryStore.applyLease(ctx, msgs, req); err != nil {
+	applyErr := s.MemoryStore.applyLease(ctx, msgs, req)
+	s.writeMu.Unlock()
+	if err := s.gc.await(pending); err != nil {
 		return nil, err
+	}
+	if applyErr != nil {
+		return nil, applyErr
 	}
 	return msgs, nil
 }
@@ -320,46 +347,57 @@ func (s *BinaryFileWALStore) Lease(ctx context.Context, req LeaseRequest) ([]Mes
 // Ack implements WAL-first ordering: validate (read-only), WAL, then apply.
 func (s *BinaryFileWALStore) Ack(ctx context.Context, req AckRequest) error {
 	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
 	if err := s.MemoryStore.validateAckLease(ctx, req); err != nil {
+		s.writeMu.Unlock()
 		return err
 	}
-	if err := s.write(walRecord{Op: "ack", Ack: req}); err != nil {
+	pending, err := s.writeAsync(walRecord{Op: "ack", Ack: req})
+	if err != nil {
+		s.writeMu.Unlock()
 		return err
 	}
-	return s.MemoryStore.Ack(ctx, req)
+	applyErr := s.MemoryStore.Ack(ctx, req)
+	s.writeMu.Unlock()
+	if err := s.gc.await(pending); err != nil {
+		return err
+	}
+	return applyErr
 }
 
 // AckBatch implements WAL-first ordering: validate all, WAL the valid subset, then apply.
 func (s *BinaryFileWALStore) AckBatch(ctx context.Context, reqs []AckRequest) []error {
 	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
 	errs := make([]error, len(reqs))
-	// Validate all first — no mutations yet.
 	valid := make([]int, 0, len(reqs))
+	validReqs := make([]AckRequest, 0, len(reqs))
 	for i, req := range reqs {
 		if err := s.MemoryStore.validateAckLease(ctx, req); err != nil {
 			errs[i] = err
 		} else {
 			valid = append(valid, i)
+			validReqs = append(validReqs, req)
 		}
 	}
 	if len(valid) == 0 {
+		s.writeMu.Unlock()
 		return errs
 	}
-	validReqs := make([]AckRequest, 0, len(valid))
-	for _, i := range valid {
-		validReqs = append(validReqs, reqs[i])
-	}
-	// WAL-first: persist before any mutation.
-	if walErr := s.write(walRecord{Op: "ack_batch", Acks: validReqs}); walErr != nil {
+	pending, walErr := s.writeAsync(walRecord{Op: "ack_batch", Acks: validReqs})
+	if walErr != nil {
+		s.writeMu.Unlock()
 		for _, i := range valid {
 			errs[i] = walErr
 		}
 		return errs
 	}
-	// Apply to memory only after WAL success.
 	applyErrs := s.MemoryStore.AckBatch(ctx, validReqs)
+	s.writeMu.Unlock()
+	if walErr := s.gc.await(pending); walErr != nil {
+		for _, i := range valid {
+			errs[i] = walErr
+		}
+		return errs
+	}
 	for j, i := range valid {
 		errs[i] = applyErrs[j]
 	}
@@ -369,14 +407,21 @@ func (s *BinaryFileWALStore) AckBatch(ctx context.Context, reqs []AckRequest) []
 // Nack implements WAL-first ordering: validate (read-only), WAL, then apply.
 func (s *BinaryFileWALStore) Nack(ctx context.Context, req NackRequest) error {
 	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
 	if err := s.MemoryStore.validateNackLease(ctx, req); err != nil {
+		s.writeMu.Unlock()
 		return err
 	}
-	if err := s.write(walRecord{Op: "nack", Nack: req}); err != nil {
+	pending, err := s.writeAsync(walRecord{Op: "nack", Nack: req})
+	if err != nil {
+		s.writeMu.Unlock()
 		return err
 	}
-	return s.MemoryStore.Nack(ctx, req)
+	applyErr := s.MemoryStore.Nack(ctx, req)
+	s.writeMu.Unlock()
+	if err := s.gc.await(pending); err != nil {
+		return err
+	}
+	return applyErr
 }
 
 // ExtendLease implements WAL-first ordering: validate, snapshot the updated

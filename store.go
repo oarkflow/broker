@@ -235,6 +235,11 @@ type MemoryStore struct {
 	completedNext   int
 	completedLimit  int
 	closed          bool
+	// pending holds ids applied to memory whose WAL record is not yet fsynced.
+	// They are hidden from Get/ReadStream until committed; if the fsync fails the
+	// store is faulted and they stay hidden forever, so a failed append is never
+	// observable.
+	pending map[string]struct{}
 }
 
 func NewMemoryStore() *MemoryStore {
@@ -589,6 +594,8 @@ func (s *MemoryStore) AppendAtomicOwned(ctx context.Context, entries []AppendEnt
 // Replaying caller inputs would lose those generated values.
 func storedAppendEntries(messages []Message) []AppendEntry {
 	entries := make([]AppendEntry, 0, len(messages))
+	// One backing array for every single-element destination list.
+	destinations := make([]Destination, 0, len(messages))
 	for _, message := range messages {
 		// Drop-newest is intentionally not durable state: the incoming record was
 		// rejected by the queue's capacity policy and is never deliverable.
@@ -609,7 +616,8 @@ func storedAppendEntries(messages []Message) []AppendEntry {
 		default:
 			continue
 		}
-		entries = append(entries, AppendEntry{Message: message, Destinations: []Destination{destination}})
+		destinations = append(destinations, destination)
+		entries = append(entries, AppendEntry{Message: message, Destinations: destinations[len(destinations)-1 : len(destinations) : len(destinations)]})
 	}
 	return entries
 }
@@ -661,8 +669,10 @@ func (s *MemoryStore) prepareAppendAtomic(ctx context.Context, entries []AppendE
 			if dest.Name == "" {
 				continue
 			}
-			m := cloneMessage(msg)
+			// msg is already a private clone; only fan-out copies need another.
+			m := msg
 			if copyNo > 0 {
+				m = cloneMessage(msg)
 				m.ParentID = msg.ID
 				m.ID = msg.ID + ":copy:" + itoa(copyNo)
 			}
@@ -766,6 +776,39 @@ func (s *MemoryStore) appendRecoveredAtomic(entries []AppendEntry) error {
 		}
 	}
 	return nil
+}
+
+// appendRecoveredAtomicPending applies entries like appendRecoveredAtomic but
+// marks them pending until commitPending is called.
+func (s *MemoryStore) appendRecoveredAtomicPending(entries []AppendEntry) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.pending == nil {
+		s.pending = make(map[string]struct{}, len(entries))
+	}
+	for _, entry := range entries {
+		if _, err := s.appendLockedCollect(entry.Message, entry.Destinations, false, false, true); err != nil {
+			return err
+		}
+		s.pending[entry.Message.ID] = struct{}{}
+	}
+	return nil
+}
+
+func (s *MemoryStore) commitPending(entries []AppendEntry) {
+	s.mu.Lock()
+	for _, entry := range entries {
+		delete(s.pending, entry.Message.ID)
+	}
+	s.mu.Unlock()
+}
+
+func (s *MemoryStore) isPendingLocked(id string) bool {
+	if len(s.pending) == 0 {
+		return false
+	}
+	_, ok := s.pending[id]
+	return ok
 }
 
 func (s *MemoryStore) validateAtomicLocked(entries []AppendEntry) error {
@@ -1365,7 +1408,7 @@ func (s *MemoryStore) Get(ctx context.Context, id string) (Message, bool, error)
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	m, ok := s.messages[id]
-	if !ok {
+	if !ok || s.isPendingLocked(id) {
 		return Message{}, false, nil
 	}
 	if !tenantAllowed(ctx, m.TenantID) {
@@ -1745,7 +1788,7 @@ func (s *MemoryStore) ReadStream(ctx context.Context, req StreamReadRequest) ([]
 	out := make([]Message, 0, minInt(req.Limit, len(stream.ids)))
 	for _, id := range stream.ids {
 		m := s.messages[id]
-		if m == nil {
+		if m == nil || s.isPendingLocked(id) {
 			continue
 		}
 		if !tenantAllowed(ctx, m.TenantID) || (req.TenantID != "" && m.TenantID != req.TenantID) {
@@ -2525,26 +2568,37 @@ func (s *FileWALStore) applyRecovered(r walRecord) error {
 }
 
 func (s *FileWALStore) write(r walRecord) error {
+	req, err := s.writeAsync(r)
+	if err != nil {
+		return err
+	}
+	return s.gc.await(req)
+}
+
+// writeAsync queues the record in WAL order and returns before the fsync. The
+// caller must hold writeMu while calling it and call s.gc.await(req) after
+// releasing the lock.
+func (s *FileWALStore) writeAsync(r walRecord) (*groupCommitReq, error) {
 	if s.file == nil {
-		return ErrClosed
+		return nil, ErrClosed
 	}
 	r.At = time.Now()
 	r.Checksum = ""
 	payload, err := json.Marshal(r)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	sum := sha256.Sum256(payload)
 	r.Checksum = hex.EncodeToString(sum[:])
 	line, err := json.Marshal(r)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	// Optional AES-GCM encryption at rest
 	if s.gcm != nil {
 		nonce := make([]byte, s.gcm.NonceSize())
 		if _, err := io.ReadFull(cryptorand.Reader, nonce); err != nil {
-			return fmt.Errorf("wal: generate nonce: %w", err)
+			return nil, fmt.Errorf("wal: generate nonce: %w", err)
 		}
 		encrypted := s.gcm.Seal(nonce, nonce, line, nil)
 		// Base64-encode to avoid newlines in binary data breaking line-based reading
@@ -2553,7 +2607,7 @@ func (s *FileWALStore) write(r walRecord) error {
 		line = append([]byte("ENC:"), encoded...)
 	}
 	line = append(line, '\n')
-	return s.gc.write(line)
+	return s.gc.enqueue(line, false)
 }
 
 func verifyWALRecord(r walRecord) error {
@@ -2635,89 +2689,127 @@ func (s *FileWALStore) AppendAtomicOwned(ctx context.Context, entries []AppendEn
 }
 func (s *FileWALStore) durableAppend(ctx context.Context, entries []AppendEntry) ([]Message, error) {
 	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
 	out, err := s.MemoryStore.prepareAppendAtomic(ctx, entries)
 	if err != nil {
+		s.writeMu.Unlock()
 		return nil, err
 	}
 	persisted := storedAppendEntries(out)
-	if err := s.write(walRecord{Op: "append_atomic", Entries: persisted}); err != nil {
+	req, err := s.writeAsync(walRecord{Op: "append_atomic", Entries: persisted})
+	if err != nil {
+		s.writeMu.Unlock()
 		return nil, err
 	}
-	if err := s.MemoryStore.appendRecoveredAtomic(persisted); err != nil {
-		return nil, fmt.Errorf("apply durable append: %w", err)
+	// Apply immediately, hidden from readers, so the next append validates
+	// against it; the fsync wait happens outside writeMu so concurrent appends
+	// share one commit.
+	applyErr := s.MemoryStore.appendRecoveredAtomicPending(persisted)
+	s.writeMu.Unlock()
+	if err := s.gc.await(req); err != nil {
+		return nil, err
+	}
+	s.MemoryStore.commitPending(persisted)
+	if applyErr != nil {
+		return nil, fmt.Errorf("apply durable append: %w", applyErr)
 	}
 	return out, nil
 }
+
 func (s *FileWALStore) Lease(ctx context.Context, req LeaseRequest) ([]Message, error) {
 	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
 	msgs, err := s.MemoryStore.prepareLease(ctx, req)
 	if err != nil || len(msgs) == 0 {
+		s.writeMu.Unlock()
 		return msgs, err
 	}
-	if err := s.write(walRecord{Op: "lease_batch", Messages: msgs, Lease: req}); err != nil {
+	pending, err := s.writeAsync(walRecord{Op: "lease_batch", Messages: msgs, Lease: req})
+	if err != nil {
+		s.writeMu.Unlock()
 		return nil, err
 	}
-	if err := s.MemoryStore.applyLease(ctx, msgs, req); err != nil {
+	applyErr := s.MemoryStore.applyLease(ctx, msgs, req)
+	s.writeMu.Unlock()
+	if err := s.gc.await(pending); err != nil {
 		return nil, err
+	}
+	if applyErr != nil {
+		return nil, applyErr
 	}
 	return msgs, nil
 }
 func (s *FileWALStore) Ack(ctx context.Context, req AckRequest) error {
 	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
 	if err := s.MemoryStore.validateAckLease(ctx, req); err != nil {
+		s.writeMu.Unlock()
 		return err
 	}
-	if err := s.write(walRecord{Op: "ack", Ack: req}); err != nil {
+	pending, err := s.writeAsync(walRecord{Op: "ack", Ack: req})
+	if err != nil {
+		s.writeMu.Unlock()
 		return err
 	}
-	return s.MemoryStore.Ack(ctx, req)
+	applyErr := s.MemoryStore.Ack(ctx, req)
+	s.writeMu.Unlock()
+	if err := s.gc.await(pending); err != nil {
+		return err
+	}
+	return applyErr
 }
 func (s *FileWALStore) AckBatch(ctx context.Context, reqs []AckRequest) []error {
 	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
 	errs := make([]error, len(reqs))
-	valid := make([]AckRequest, 0, len(reqs))
+	valid := make([]int, 0, len(reqs))
+	validReqs := make([]AckRequest, 0, len(reqs))
 	for i, req := range reqs {
 		if err := s.MemoryStore.validateAckLease(ctx, req); err != nil {
 			errs[i] = err
 		} else {
-			valid = append(valid, req)
+			valid = append(valid, i)
+			validReqs = append(validReqs, req)
 		}
 	}
 	if len(valid) == 0 {
+		s.writeMu.Unlock()
 		return errs
 	}
-	if err := s.write(walRecord{Op: "ack_batch", Acks: valid}); err != nil {
-		for i := range errs {
-			if errs[i] == nil {
-				errs[i] = err
-			}
+	pending, walErr := s.writeAsync(walRecord{Op: "ack_batch", Acks: validReqs})
+	if walErr != nil {
+		s.writeMu.Unlock()
+		for _, i := range valid {
+			errs[i] = walErr
 		}
 		return errs
 	}
-	applied := s.MemoryStore.AckBatch(ctx, valid)
-	validIndex := 0
-	for i := range errs {
-		if errs[i] == nil {
-			errs[i] = applied[validIndex]
-			validIndex++
+	applyErrs := s.MemoryStore.AckBatch(ctx, validReqs)
+	s.writeMu.Unlock()
+	if walErr := s.gc.await(pending); walErr != nil {
+		for _, i := range valid {
+			errs[i] = walErr
 		}
+		return errs
+	}
+	for j, i := range valid {
+		errs[i] = applyErrs[j]
 	}
 	return errs
 }
 func (s *FileWALStore) Nack(ctx context.Context, req NackRequest) error {
 	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
 	if err := s.MemoryStore.validateNackLease(ctx, req); err != nil {
+		s.writeMu.Unlock()
 		return err
 	}
-	if err := s.write(walRecord{Op: "nack", Nack: req}); err != nil {
+	pending, err := s.writeAsync(walRecord{Op: "nack", Nack: req})
+	if err != nil {
+		s.writeMu.Unlock()
 		return err
 	}
-	return s.MemoryStore.Nack(ctx, req)
+	applyErr := s.MemoryStore.Nack(ctx, req)
+	s.writeMu.Unlock()
+	if err := s.gc.await(pending); err != nil {
+		return err
+	}
+	return applyErr
 }
 func (s *FileWALStore) ExtendLease(ctx context.Context, req LeaseRequest) error {
 	s.writeMu.Lock()
