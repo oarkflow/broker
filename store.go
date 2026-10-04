@@ -500,6 +500,11 @@ func mergeQueueConfig(old, new QueueConfig) QueueConfig {
 	return old
 }
 
+// Append stores a message and returns one entry per destination.
+//
+// The returned Messages share their Payload, Headers and Metadata with the
+// stored message; only the struct fields differ. Treat those three as read-only.
+// Use Get for a deep copy when the caller intends to modify them.
 func (s *MemoryStore) Append(ctx context.Context, msg Message, dests []Destination) ([]Message, error) {
 	select {
 	case <-ctx.Done():
@@ -608,7 +613,7 @@ func (s *MemoryStore) appendLockedCollect(msg Message, dests []Destination, coll
 						return out, err
 					}
 					if collect {
-						out = append(out, cloneMessage(m))
+						out = append(out, sharedMessage(m))
 					}
 					continue
 				}
@@ -650,7 +655,7 @@ func (s *MemoryStore) appendLockedCollect(msg Message, dests []Destination, coll
 			s.addHistoryLocked(m.ID, MessagePersisted, "stream_append", "", d.Name, "", "", "")
 		}
 		if collect {
-			out = append(out, cloneMessage(m))
+			out = append(out, sharedMessage(m))
 		}
 	}
 	if msg.DeduplicationID != "" {
@@ -997,6 +1002,11 @@ func (s *MemoryStore) validateDestinationsLocked(message Message, destinations [
 	return nil
 }
 
+// Lease leases up to req.Limit messages.
+//
+// The returned Messages share their Payload, Headers and Metadata with the stored
+// message; only the struct fields differ. Treat those three as read-only. Use Get
+// for a deep copy when the caller intends to modify them.
 func (s *MemoryStore) Lease(ctx context.Context, req LeaseRequest) ([]Message, error) {
 	select {
 	case <-ctx.Done():
@@ -1072,7 +1082,7 @@ func (s *MemoryStore) Lease(ctx context.Context, req LeaseRequest) ([]Message, e
 				continue
 			}
 			s.leaseMessageLocked(m, req, now)
-			out = append(out, cloneMessage(*m))
+			out = append(out, sharedMessage(*m))
 		}
 		s.advanceQueueHeadLocked(q)
 		return out, nil
@@ -1145,7 +1155,7 @@ func (s *MemoryStore) Lease(ctx context.Context, req LeaseRequest) ([]Message, e
 			continue
 		}
 		s.leaseMessageLocked(m, req, now)
-		out = append(out, cloneMessage(*m))
+		out = append(out, sharedMessage(*m))
 	}
 	s.advanceQueueHeadLocked(q)
 	return out, nil
@@ -1240,8 +1250,11 @@ func (s *MemoryStore) prepareLease(ctx context.Context, req LeaseRequest) ([]Mes
 		if req.Accept != nil && !req.Accept(cloneMessage(*m)) {
 			continue
 		}
-		// Clone the message and assign the lease fields without touching the live record.
-		clone := cloneMessage(*m)
+		// Copy the struct and assign the lease fields without touching the live
+		// record. Payload and maps are shared under the read-only contract that
+		// Lease documents; applyLease only rewrites scalar fields on the live
+		// message, and the WAL encoder only reads.
+		clone := sharedMessage(*m)
 		clone.Status = MessageLeased
 		clone.ConsumerID = req.ConsumerID
 		clone.ConsumerGroup = req.ConsumerGroup
@@ -2490,6 +2503,27 @@ func cloneMessage(in Message) Message {
 	}
 	return in
 }
+
+// sharedMessage returns a view of in that aliases in's payload, headers and
+// metadata instead of copying them.
+//
+// It exists because deep-copying Headers and Metadata dominated allocation on the
+// consume path: cloning two map[string]string values costs three allocations
+// each, and cloneMap accounted for over half of all allocations while leasing and
+// acknowledging. A Message handed to a caller by Lease or returned by Append is
+// already an immutable snapshot as far as the broker is concerned, because
+// nothing in the store rewrites a stored message's payload or maps after insert:
+// the fields that do change (Status, Attempts, LeaseToken, ConsumerID,
+// LastError, Redeliveries) are scalars or time values held in the struct, and
+// Update stores its own deep copy.
+//
+// The contract is therefore: treat Payload, Headers and Metadata on a returned
+// message as read-only. Assigning a new map or slice to those fields on a copy is
+// fine; writing through the existing map or slice corrupts the stored message and
+// any other holder of it. Get, ReadStream, ListQueue and History still return
+// deep copies, so callers who want to mutate have an API that hands them
+// ownership.
+func sharedMessage(in Message) Message { return in }
 
 func filterMessage(m Message, f MessageFilter) bool {
 	if f.Status != "" && m.Status != f.Status {

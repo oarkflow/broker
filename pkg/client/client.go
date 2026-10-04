@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -347,6 +348,62 @@ func decodeFrameBatch(data []byte, codec broker.FrameCodec) ([]broker.Message, e
 		out = append(out, msg)
 	}
 }
+
+// encodePayload prepares a publish payload for the JSON wire format.
+//
+// A []byte or json.RawMessage is sent verbatim as base64 with an explicit
+// payload_encoding, because encoding/json would otherwise turn it into a base64
+// JSON string and the broker would store the literal quote-and-base64
+// characters. That silently corrupted every binary payload, and it disagreed
+// with the embedded path, where a []byte payload is stored untouched. Every
+// other value keeps the previous json.Marshal behaviour.
+func encodePayload(payload any) (json.RawMessage, string, error) {
+	switch v := payload.(type) {
+	case json.RawMessage:
+		return json.RawMessage(v), "json", nil
+	case []byte:
+		quoted, err := json.Marshal(base64.StdEncoding.EncodeToString(v))
+		if err != nil {
+			return nil, "", err
+		}
+		return json.RawMessage(quoted), "base64", nil
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return nil, "", err
+	}
+	return json.RawMessage(raw), "json", nil
+}
+
+// applyTo fills the shared wire struct, so every client publish path carries the
+// same fields and cannot drift from the broker's PublishHTTPPayload.
+func (o PublishOptions) applyTo(req *broker.PublishHTTPPayload) {
+	req.Queue = o.Queue
+	req.Stream = o.Stream
+	req.Type = o.Type
+	req.ContentType = o.ContentType
+	req.Headers = o.Headers
+	req.Metadata = o.Metadata
+	req.Key = o.Key
+	req.RoutingKey = o.RoutingKey
+	req.Priority = o.Priority
+	req.TenantID = o.TenantID
+	req.CorrelationID = o.CorrelationID
+	req.CausationID = o.CausationID
+	req.IdempotencyKey = o.IdempotencyKey
+	req.MessageID = o.MessageID
+	req.Schema = o.Schema
+	req.SchemaVersion = o.SchemaVersion
+	req.TraceID = o.TraceID
+	req.DeduplicationID = o.DeduplicationID
+	req.DeduplicationWindowNS = o.DeduplicationWindow.Nanoseconds()
+	req.TTLNS = o.TTL.Nanoseconds()
+	req.DelayNS = o.Delay.Nanoseconds()
+	req.MaxAttempts = o.MaxAttempts
+	req.ProducerID = o.ProducerID
+	req.Strategy = string(o.Strategy)
+}
+
 func (c *Client) Publish(ctx context.Context, topic string, payload any, opts ...PublishOption) (broker.PublishResult, error) {
 	var o PublishOptions
 	for _, fn := range opts {
@@ -354,11 +411,12 @@ func (c *Client) Publish(ctx context.Context, topic string, payload any, opts ..
 			fn(&o)
 		}
 	}
-	raw, err := json.Marshal(payload)
+	raw, encoding, err := encodePayload(payload)
 	if err != nil {
 		return broker.PublishResult{}, err
 	}
-	req := broker.PublishHTTPPayload{Topic: topic, Queue: o.Queue, Stream: o.Stream, Type: o.Type, Payload: json.RawMessage(raw), Headers: o.Headers, Metadata: o.Metadata, Key: o.Key, RoutingKey: o.RoutingKey, Priority: o.Priority, TenantID: o.TenantID, IdempotencyKey: o.IdempotencyKey}
+	req := broker.PublishHTTPPayload{Topic: topic, Payload: raw, PayloadEncoding: encoding}
+	o.applyTo(&req)
 	var out broker.PublishResult
 	err = c.doJSON(ctx, http.MethodPost, "/v1/publish", req, &out)
 	return out, err
@@ -390,11 +448,13 @@ func (c *Client) PublishBatch(ctx context.Context, topic string, payloads []any,
 		Messages []broker.PublishHTTPPayload `json:"messages"`
 	}{Messages: make([]broker.PublishHTTPPayload, 0, len(payloads))}
 	for _, p := range payloads {
-		raw, err := json.Marshal(p)
+		raw, encoding, err := encodePayload(p)
 		if err != nil {
 			return broker.BatchPublishResult{}, err
 		}
-		req.Messages = append(req.Messages, broker.PublishHTTPPayload{Topic: topic, Queue: o.Queue, Stream: o.Stream, Type: o.Type, Payload: json.RawMessage(raw), Headers: o.Headers, Metadata: o.Metadata, Key: o.Key, RoutingKey: o.RoutingKey, Priority: o.Priority, TenantID: o.TenantID, IdempotencyKey: o.IdempotencyKey})
+		msg := broker.PublishHTTPPayload{Topic: topic, Payload: raw, PayloadEncoding: encoding}
+		o.applyTo(&msg)
+		req.Messages = append(req.Messages, msg)
 	}
 	var out broker.BatchPublishResult
 	err := c.doJSON(ctx, http.MethodPost, "/v1/publish/batch", req, &out)
@@ -421,11 +481,11 @@ func (c *Client) Request(ctx context.Context, subject string, payload any, respo
 	if timeout <= 0 {
 		timeout = 30 * time.Second
 	}
-	raw, err := json.Marshal(payload)
+	raw, encoding, err := encodePayload(payload)
 	if err != nil {
 		return err
 	}
-	req := broker.PublishHTTPPayload{Topic: subject, Payload: json.RawMessage(raw), TimeoutNS: timeout.Nanoseconds()}
+	req := broker.PublishHTTPPayload{Topic: subject, Payload: raw, PayloadEncoding: encoding, TimeoutNS: timeout.Nanoseconds()}
 	var resp broker.Response
 	if err := c.doJSON(ctx, http.MethodPost, "/v1/request", req, &resp); err != nil {
 		return err
@@ -445,11 +505,11 @@ func (c *Client) SubmitTask(ctx context.Context, name string, payload any, opts 
 			fn(&o)
 		}
 	}
-	raw, err := json.Marshal(payload)
+	raw, encoding, err := encodePayload(payload)
 	if err != nil {
 		return broker.TaskInfo{}, err
 	}
-	req := map[string]any{"name": name, "queue": o.Queue, "payload": json.RawMessage(raw), "tenant_id": o.TenantID, "priority": o.Priority, "max_attempts": o.MaxAttempts, "metadata": o.Metadata}
+	req := map[string]any{"name": name, "queue": o.Queue, "payload": raw, "payload_encoding": encoding, "tenant_id": o.TenantID, "priority": o.Priority, "max_attempts": o.MaxAttempts, "metadata": o.Metadata}
 	var out broker.TaskInfo
 	err = c.doJSON(ctx, http.MethodPost, "/v1/tasks/submit", req, &out)
 	return out, err
@@ -712,10 +772,29 @@ func hostnameID() string {
 	return h + "-" + fmt.Sprint(time.Now().UnixNano())
 }
 
+// PublishOptions mirrors the broker's PublishOptions. It previously carried only
+// seven fields, so the client could not reach content_type, schema, ttl, delay,
+// trace propagation, deduplication, max_attempts or a producer-chosen message
+// id, all of which the embedded API supported.
 type PublishOptions struct {
 	Queue, Stream, Type, Key, RoutingKey, TenantID, IdempotencyKey string
 	Headers, Metadata                                              map[string]string
 	Priority                                                       int
+
+	ContentType         string
+	Schema              string
+	SchemaVersion       string
+	MessageID           string
+	CorrelationID       string
+	CausationID         string
+	TraceID             string
+	DeduplicationID     string
+	DeduplicationWindow time.Duration
+	TTL                 time.Duration
+	Delay               time.Duration
+	MaxAttempts         int
+	ProducerID          string
+	Strategy            broker.StrategyType
 }
 type PublishOption func(*PublishOptions)
 
@@ -727,9 +806,30 @@ func WithMetadata(v map[string]string) PublishOption {
 	return func(o *PublishOptions) { o.Metadata = v }
 }
 func WithRoutingKey(v string) PublishOption { return func(o *PublishOptions) { o.RoutingKey = v } }
-func WithKey(v string) PublishOption        { return func(o *PublishOptions) { o.Key = v } }
-func WithPriority(v int) PublishOption      { return func(o *PublishOptions) { o.Priority = v } }
-func WithTenantID(v string) PublishOption   { return func(o *PublishOptions) { o.TenantID = v } }
+
+func WithContentType(v string) PublishOption { return func(o *PublishOptions) { o.ContentType = v } }
+func WithSchema(name, version string) PublishOption {
+	return func(o *PublishOptions) { o.Schema = name; o.SchemaVersion = version }
+}
+func WithMessageID(v string) PublishOption { return func(o *PublishOptions) { o.MessageID = v } }
+func WithCorrelationID(v string) PublishOption {
+	return func(o *PublishOptions) { o.CorrelationID = v }
+}
+func WithCausationID(v string) PublishOption { return func(o *PublishOptions) { o.CausationID = v } }
+func WithTraceID(v string) PublishOption     { return func(o *PublishOptions) { o.TraceID = v } }
+func WithDeduplication(id string, window time.Duration) PublishOption {
+	return func(o *PublishOptions) { o.DeduplicationID = id; o.DeduplicationWindow = window }
+}
+func WithTTL(v time.Duration) PublishOption   { return func(o *PublishOptions) { o.TTL = v } }
+func WithDelay(v time.Duration) PublishOption { return func(o *PublishOptions) { o.Delay = v } }
+func WithMaxAttempts(v int) PublishOption     { return func(o *PublishOptions) { o.MaxAttempts = v } }
+func WithProducerID(v string) PublishOption   { return func(o *PublishOptions) { o.ProducerID = v } }
+func WithStrategy(v broker.StrategyType) PublishOption {
+	return func(o *PublishOptions) { o.Strategy = v }
+}
+func WithKey(v string) PublishOption      { return func(o *PublishOptions) { o.Key = v } }
+func WithPriority(v int) PublishOption    { return func(o *PublishOptions) { o.Priority = v } }
+func WithTenantID(v string) PublishOption { return func(o *PublishOptions) { o.TenantID = v } }
 func WithIdempotencyKey(v string) PublishOption {
 	return func(o *PublishOptions) { o.IdempotencyKey = v }
 }

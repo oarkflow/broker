@@ -223,3 +223,110 @@ func TestLeaseFastPathStillDeliversMessages(t *testing.T) {
 		t.Fatalf("undeclared queue returned %v, want ErrQueueNotFound", err)
 	}
 }
+
+// The daemon defaults message history to 0 and documents that as disabling the
+// hot-path history, but MemoryStore defaults to 32 and Config had no way to set
+// it. An in-process embedder was therefore structurally slower than the same
+// broker run standalone, with no supported way to close the gap.
+func TestConfigMessageHistoryAppliesToStore(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("unset keeps the store default", func(t *testing.T) {
+		b, err := New(Config{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer b.Stop(ctx)
+		ms := b.Store().(*MemoryStore)
+		ms.mu.RLock()
+		got := ms.historyLimit
+		ms.mu.RUnlock()
+		if got != 32 {
+			t.Fatalf("unset MessageHistory changed the store default: got %d, want 32", got)
+		}
+	})
+
+	t.Run("explicit zero disables history", func(t *testing.T) {
+		b, err := New(Config{MessageHistory: IntPtr(0)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer b.Stop(ctx)
+		ms := b.Store().(*MemoryStore)
+		ms.mu.RLock()
+		got := ms.historyLimit
+		ms.mu.RUnlock()
+		if got != 0 {
+			t.Fatalf("MessageHistory=0 gave historyLimit %d, want 0", got)
+		}
+	})
+
+	t.Run("explicit value is honoured", func(t *testing.T) {
+		b, err := New(Config{MessageHistory: IntPtr(4)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer b.Stop(ctx)
+		ms := b.Store().(*MemoryStore)
+		ms.mu.RLock()
+		got := ms.historyLimit
+		ms.mu.RUnlock()
+		if got != 4 {
+			t.Fatalf("MessageHistory=4 gave historyLimit %d, want 4", got)
+		}
+	})
+
+	t.Run("applies to an injected durable store", func(t *testing.T) {
+		store, err := NewBinaryFileWALStore(filepath.Join(t.TempDir(), "wal"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, err := New(Config{Store: store, MessageHistory: IntPtr(0)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer b.Stop(ctx)
+		bs, ok := b.Store().(*BinaryFileWALStore)
+		if !ok {
+			t.Fatalf("unexpected store type %T", b.Store())
+		}
+		bs.MemoryStore.mu.RLock()
+		got := bs.historyLimit
+		bs.MemoryStore.mu.RUnlock()
+		if got != 0 {
+			t.Fatalf("injected store historyLimit %d, want 0", got)
+		}
+	})
+}
+
+// History is recorded on every state transition, so a disabled limit must leave
+// the history map empty while the message itself still works.
+func TestMessageHistoryZeroStillDelivers(t *testing.T) {
+	ctx := context.Background()
+	b, err := New(Config{MessageHistory: IntPtr(0)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Stop(ctx)
+	if err := b.DeclareQueue(ctx, QueueConfig{Name: "q"}); err != nil {
+		t.Fatal(err)
+	}
+	res, err := b.Publisher().Publish(ctx, "", []byte("payload"), WithQueue("q"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	msgs, err := b.Store().Lease(ctx, LeaseRequest{Queue: "q", ConsumerID: "c", Limit: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 1 {
+		t.Fatalf("leased %d messages, want 1", len(msgs))
+	}
+	history, err := b.Store().History(ctx, res.MessageID)
+	if err != nil {
+		t.Fatalf("history: %v", err)
+	}
+	if len(history) != 0 {
+		t.Fatalf("history recorded %d entries with the limit disabled, want 0", len(history))
+	}
+}

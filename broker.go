@@ -131,6 +131,19 @@ func New(cfg Config) (*Broker, error) {
 	if cfg.Store == nil {
 		cfg.Store = NewMemoryStore()
 	}
+	// Message history is written on every state transition, so it is a hot-path
+	// cost: measured on the lease and ack path it is about a third of all
+	// allocations and roughly a 1.4x throughput difference. MemoryStore defaults
+	// to 32 entries per message, while the daemon defaults to 0 and its flag help
+	// calls 0 out as disabling hot-path history. Without this an in-process
+	// embedder had no way to reach the daemon's setting short of type asserting
+	// the store after construction, so the embedded path was structurally slower
+	// than the same broker run standalone. Left nil, the store default applies.
+	if cfg.MessageHistory != nil {
+		if configurable, ok := cfg.Store.(interface{ SetHistoryLimit(int) }); ok {
+			configurable.SetHistoryLimit(*cfg.MessageHistory)
+		}
+	}
 	if cfg.StateStore == nil {
 		cfg.StateStore = NewMemoryStateStore()
 	}

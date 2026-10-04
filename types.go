@@ -318,6 +318,7 @@ type Config struct {
 	Backpressure                BackpressurePolicy `json:"backpressure"`
 	EnableNotifications         bool               `json:"enable_notifications"`
 	NotificationHistoryCapacity int                `json:"notification_history_capacity,omitempty"`
+	MessageHistory              *int               `json:"message_history,omitempty"`
 	EnablePublisherTracking     bool               `json:"enable_publisher_tracking,omitempty"`
 	EnableConsumerEventTracking bool               `json:"enable_consumer_event_tracking,omitempty"`
 	EnableRequestResponse       bool               `json:"enable_request_response"`
@@ -345,6 +346,10 @@ type Config struct {
 	// EncryptionKey is the AES encryption key for frame encryption at rest.
 	EncryptionKey []byte `json:"-"`
 }
+
+// IntPtr returns a pointer to v, for the optional numeric Config fields where
+// an explicit zero has to be distinguishable from "not set".
+func IntPtr(v int) *int { return &v }
 
 type Handler func(context.Context, Delivery) error
 

@@ -1,6 +1,7 @@
 package client
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"net/http"
@@ -650,5 +651,128 @@ func TestHostnameID(t *testing.T) {
 	id2 := hostnameID()
 	if id == id2 {
 		t.Fatalf("expected distinct hostname ids, got %s twice", id)
+	}
+}
+
+// TestPublishBinaryPayloadRoundTrips goes through the real client and a real
+// broker over HTTP. A []byte payload used to be marshalled by encoding/json into
+// a base64 JSON string that the broker stored verbatim as text, so binary data
+// was corrupted for every remote publisher while the embedded path stored it
+// untouched.
+func TestPublishBinaryPayloadRoundTrips(t *testing.T) {
+	b := broker.MustNew(broker.Config{})
+	t.Cleanup(func() { _ = b.Stop(context.Background()) })
+	ctx := context.Background()
+	if err := b.DeclareQueue(ctx, broker.QueueConfig{Name: "bin"}); err != nil {
+		t.Fatal(err)
+	}
+
+	admin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		admin := broker.AdminServer{Broker: b, Token: "secret", InsecureDev: false}
+		admin.Handler().ServeHTTP(w, r)
+	}))
+	t.Cleanup(admin.Close)
+
+	c := New(Config{BrokerURLs: []string{admin.URL}, Token: "secret"})
+
+	want := []byte{0x00, 0x01, 0x02, 0xfe, 0xff, 0x80, 'b', 'i', 'n'}
+	res, err := c.Publish(ctx, "bin", want, WithQueue("bin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, ok, err := b.Store().Get(ctx, res.MessageID)
+	if err != nil || !ok {
+		t.Fatalf("get: ok=%v err=%v", ok, err)
+	}
+	if !bytes.Equal(got.Payload, want) {
+		t.Fatalf("payload corrupted in transit:\n got %q\nwant %q", got.Payload, want)
+	}
+}
+
+// TestPublishJSONPayloadUnchanged guards the other half of the contract: values
+// that are already JSON must keep the previous encoding, so existing callers see
+// no behaviour change.
+func TestPublishJSONPayloadUnchanged(t *testing.T) {
+	b := broker.MustNew(broker.Config{})
+	t.Cleanup(func() { _ = b.Stop(context.Background()) })
+	ctx := context.Background()
+	if err := b.DeclareQueue(ctx, broker.QueueConfig{Name: "json"}); err != nil {
+		t.Fatal(err)
+	}
+	admin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		a := broker.AdminServer{Broker: b, Token: "secret"}
+		a.Handler().ServeHTTP(w, r)
+	}))
+	t.Cleanup(admin.Close)
+	c := New(Config{BrokerURLs: []string{admin.URL}, Token: "secret"})
+
+	res, err := c.Publish(ctx, "json", map[string]any{"a": 1}, WithQueue("json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, _, err := b.Store().Get(ctx, res.MessageID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got.Payload) != `{"a":1}` {
+		t.Fatalf("payload = %q, want %q", got.Payload, `{"a":1}`)
+	}
+}
+
+// TestPublishOptionsReachTheBroker pins that the client's PublishOptions can
+// actually express what the embedded API can. It previously carried seven
+// fields, so content_type, schema, ttl, trace propagation, deduplication,
+// max_attempts and a producer-chosen message id were unreachable remotely.
+func TestPublishOptionsReachTheBroker(t *testing.T) {
+	b := broker.MustNew(broker.Config{})
+	t.Cleanup(func() { _ = b.Stop(context.Background()) })
+	ctx := context.Background()
+	if err := b.DeclareQueue(ctx, broker.QueueConfig{Name: "opts"}); err != nil {
+		t.Fatal(err)
+	}
+	admin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		a := broker.AdminServer{Broker: b, Token: "secret"}
+		a.Handler().ServeHTTP(w, r)
+	}))
+	t.Cleanup(admin.Close)
+	c := New(Config{BrokerURLs: []string{admin.URL}, Token: "secret"})
+
+	res, err := c.Publish(ctx, "opts", []byte(`{"v":1}`),
+		WithQueue("opts"),
+		WithContentType("application/x-parity"),
+		WithSchema("order", "9"),
+		WithTraceID("trace-1"),
+		WithCausationID("cause-1"),
+		WithTTL(time.Hour),
+		WithMaxAttempts(7),
+		WithMessageID("producer-chosen"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, _, err := b.Store().Get(ctx, res.MessageID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.MessageID != "producer-chosen" {
+		t.Errorf("MessageID = %q, want the producer-chosen id", res.MessageID)
+	}
+	if got.ContentType != "application/x-parity" {
+		t.Errorf("ContentType = %q", got.ContentType)
+	}
+	if got.Schema != "order" || got.SchemaVersion != "9" {
+		t.Errorf("schema = %q/%q, want order/9", got.Schema, got.SchemaVersion)
+	}
+	if got.TraceID != "trace-1" {
+		t.Errorf("TraceID = %q", got.TraceID)
+	}
+	if got.CausationID != "cause-1" {
+		t.Errorf("CausationID = %q", got.CausationID)
+	}
+	if got.ExpiresAt.IsZero() {
+		t.Error("TTL was dropped: ExpiresAt is zero")
+	}
+	if got.MaxAttempts != 7 {
+		t.Errorf("MaxAttempts = %d, want 7", got.MaxAttempts)
 	}
 }

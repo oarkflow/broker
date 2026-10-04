@@ -2,6 +2,7 @@ package broker
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -49,6 +50,116 @@ type PublishHTTPPayload struct {
 	CorrelationID  string            `json:"correlation_id,omitempty"`
 	TimeoutNS      int64             `json:"timeout_ns,omitempty"`
 	IdempotencyKey string            `json:"idempotency_key,omitempty"`
+
+	// The fields below had no wire representation at all, so they were settable
+	// through the embedded Publisher and silently dropped by every HTTP publish
+	// path. Durations use nanoseconds to match timeout_ns and
+	// visibility_timeout_ns.
+	MessageID             string `json:"message_id,omitempty"`
+	ContentType           string `json:"content_type,omitempty"`
+	Schema                string `json:"schema,omitempty"`
+	SchemaVersion         string `json:"schema_version,omitempty"`
+	TraceID               string `json:"trace_id,omitempty"`
+	CausationID           string `json:"causation_id,omitempty"`
+	DeduplicationID       string `json:"deduplication_id,omitempty"`
+	DeduplicationWindowNS int64  `json:"deduplication_window_ns,omitempty"`
+	TTLNS                 int64  `json:"ttl_ns,omitempty"`
+	DelayNS               int64  `json:"delay_ns,omitempty"`
+	MaxAttempts           int    `json:"max_attempts,omitempty"`
+	ProducerID            string `json:"producer_id,omitempty"`
+	Strategy              string `json:"strategy,omitempty"`
+
+	// PayloadEncoding selects how Payload is interpreted. "json" is the default
+	// and means the payload already is JSON. "base64" means Payload is a base64
+	// JSON string holding bytes that are not valid JSON.
+	//
+	// Without this, a []byte payload published by pkg/client was marshalled by
+	// encoding/json into a base64 JSON *string*, and the server then stored the
+	// literal quote-and-base64 characters. Six arbitrary bytes were stored as
+	// eight ASCII bytes. The embedded path stores []byte verbatim, so this is
+	// also what makes the two agree on binary payloads.
+	PayloadEncoding string `json:"payload_encoding,omitempty"`
+}
+
+// PayloadBytes returns the payload as the publisher should store it, honouring
+// PayloadEncoding.
+func (p PublishHTTPPayload) PayloadBytes() ([]byte, error) {
+	if p.PayloadEncoding == "" || p.PayloadEncoding == "json" {
+		return []byte(p.Payload), nil
+	}
+	if p.PayloadEncoding == "base64" {
+		// Payload is a JSON string holding base64 text.
+		var encoded string
+		if err := json.Unmarshal(p.Payload, &encoded); err != nil {
+			return nil, fmt.Errorf("payload_encoding base64: %w", err)
+		}
+		decoded, err := base64.StdEncoding.DecodeString(encoded)
+		if err != nil {
+			return nil, fmt.Errorf("payload_encoding base64: %w", err)
+		}
+		return decoded, nil
+	}
+	return nil, errf(ErrInvalidMessage, "unknown payload_encoding %q", p.PayloadEncoding)
+}
+
+// PublishOptions converts a publish request body into publisher options.
+//
+// Every option-based HTTP publish path goes through this one function. The
+// mapping used to be written out separately in each handler, so any field added
+// to PublishOptions had to be threaded through all of them by hand. That is how
+// content_type, schema, schema_version, trace_id, causation_id,
+// deduplication_id, ttl, delay, max_attempts, producer_id, strategy and a
+// producer-chosen message_id ended up settable embedded and dropped remotely.
+func (p PublishHTTPPayload) PublishOptions() []PublishOption {
+	opts := make([]PublishOption, 0, 20)
+	add := func(o PublishOption) { opts = append(opts, o) }
+	if len(p.Headers) > 0 {
+		add(WithHeaders(p.Headers))
+	}
+	if len(p.Metadata) > 0 {
+		add(WithMetadata(p.Metadata))
+	}
+	for _, o := range []PublishOption{
+		WithType(p.Type),
+		WithContentType(p.ContentType),
+		WithKey(p.Key),
+		WithRoutingKey(p.RoutingKey),
+		WithPriority(p.Priority),
+		WithTenantID(p.TenantID),
+		WithCorrelationID(p.CorrelationID),
+		WithCausationID(p.CausationID),
+		WithTraceID(p.TraceID),
+		WithIdempotencyKey(p.IdempotencyKey),
+		WithMessageID(p.MessageID),
+		WithProducerID(p.ProducerID),
+	} {
+		add(o)
+	}
+	if p.Schema != "" || p.SchemaVersion != "" {
+		add(WithSchema(p.Schema, p.SchemaVersion))
+	}
+	if p.DeduplicationID != "" {
+		add(WithDeduplication(p.DeduplicationID, time.Duration(p.DeduplicationWindowNS)))
+	}
+	if p.TTLNS > 0 {
+		add(WithTTL(time.Duration(p.TTLNS)))
+	}
+	if p.DelayNS > 0 {
+		add(WithDelay(time.Duration(p.DelayNS)))
+	}
+	if p.MaxAttempts > 0 {
+		add(WithMaxAttempts(p.MaxAttempts))
+	}
+	if p.Strategy != "" {
+		add(WithStrategy(StrategyType(p.Strategy)))
+	}
+	if p.Queue != "" {
+		add(WithQueue(p.Queue))
+	}
+	if p.Stream != "" {
+		add(WithStream(p.Stream))
+	}
+	return opts
 }
 
 // legacyPublishHTTPPayload holds only the keys whose Go field names do not
@@ -495,22 +606,73 @@ func (a AdminServer) v1AckFrameBatch(w http.ResponseWriter, r *http.Request) {
 	}
 	writeBrokerJSON(w, map[string]any{"acked": acked, "errors": errorsOut})
 }
-func messageFromHTTPPayload(m PublishHTTPPayload) Message {
-	return Message{
-		Topic:          m.Topic,
-		Queue:          m.Queue,
-		Stream:         m.Stream,
-		Type:           m.Type,
-		Payload:        []byte(m.Payload),
-		Headers:        m.Headers,
-		Metadata:       m.Metadata,
-		Key:            m.Key,
-		RoutingKey:     m.RoutingKey,
-		Priority:       m.Priority,
-		TenantID:       m.TenantID,
-		CorrelationID:  m.CorrelationID,
-		IdempotencyKey: m.IdempotencyKey,
+
+// messageFromHTTPPayload builds a Message for the "Prefer: return=minimal"
+// publish path, which bypasses PublishOptions and hands the store an owned
+// Message directly.
+//
+// It folds PublishHTTPPayload.PublishOptions rather than listing fields again,
+// so the two remote publish paths cannot drift apart. The transformations here
+// mirror preparePublish: delay becomes AvailableAt, TTL becomes ExpiresAt, a
+// deduplication window is recorded in metadata, and a strategy becomes the
+// x-routing-strategy header.
+func messageFromHTTPPayload(p PublishHTTPPayload) Message {
+	var o PublishOptions
+	for _, opt := range p.PublishOptions() {
+		opt(&o)
 	}
+	payload, _ := p.PayloadBytes()
+	now := time.Now()
+	msg := Message{
+		Topic:           p.Topic,
+		Queue:           o.Queue,
+		Stream:          o.Stream,
+		Type:            o.Type,
+		ContentType:     o.ContentType,
+		Schema:          o.Schema,
+		SchemaVersion:   o.SchemaVersion,
+		Payload:         payload,
+		Headers:         o.Headers,
+		Metadata:        o.Metadata,
+		Key:             o.Key,
+		RoutingKey:      o.RoutingKey,
+		Priority:        o.Priority,
+		TenantID:        o.TenantID,
+		TraceID:         o.TraceID,
+		CorrelationID:   o.CorrelationID,
+		CausationID:     o.CausationID,
+		IdempotencyKey:  o.IdempotencyKey,
+		DeduplicationID: o.DeduplicationID,
+		ProducerID:      o.ProducerID,
+		ProducerEpoch:   o.ProducerEpoch,
+		CreatedAt:       now,
+		AvailableAt:     now,
+	}
+	if o.MessageID != "" {
+		msg.ID = o.MessageID
+	}
+	if o.Delay > 0 {
+		msg.AvailableAt = now.Add(o.Delay)
+	}
+	if o.TTL > 0 {
+		msg.ExpiresAt = now.Add(o.TTL)
+	}
+	if o.MaxAttempts > 0 {
+		msg.MaxAttempts = o.MaxAttempts
+	}
+	if o.DeduplicationWindow > 0 {
+		if msg.Metadata == nil {
+			msg.Metadata = map[string]string{}
+		}
+		msg.Metadata["_dedup_window_ns"] = fmt.Sprintf("%d", o.DeduplicationWindow.Nanoseconds())
+	}
+	if o.Strategy != "" {
+		if msg.Headers == nil {
+			msg.Headers = map[string]string{}
+		}
+		msg.Headers["x-routing-strategy"] = string(o.Strategy)
+	}
+	return msg
 }
 
 func (a AdminServer) v1Publish(w http.ResponseWriter, r *http.Request) {
@@ -523,14 +685,13 @@ func (a AdminServer) v1Publish(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid json", 400)
 		return
 	}
-	opts := []PublishOption{WithHeaders(req.Headers), WithMetadata(req.Metadata), WithType(req.Type), WithKey(req.Key), WithRoutingKey(req.RoutingKey), WithPriority(req.Priority), WithTenantID(req.TenantID), WithCorrelationID(req.CorrelationID), WithIdempotencyKey(req.IdempotencyKey)}
-	if req.Queue != "" {
-		opts = append(opts, WithQueue(req.Queue))
+	payload, err := req.PayloadBytes()
+	if err != nil {
+		http.Error(w, err.Error(), 400)
+		return
 	}
-	if req.Stream != "" {
-		opts = append(opts, WithStream(req.Stream))
-	}
-	res, err := a.Broker.Publisher().Publish(r.Context(), req.Topic, []byte(req.Payload), opts...)
+	opts := req.PublishOptions()
+	res, err := a.Broker.Publisher().Publish(r.Context(), req.Topic, payload, opts...)
 	if err != nil {
 		http.Error(w, err.Error(), 409)
 		return
@@ -560,14 +721,12 @@ func (a AdminServer) v1PublishBatch(w http.ResponseWriter, r *http.Request) {
 	}
 	items := make([]PublishBatchItem, len(req.Messages))
 	for i, m := range req.Messages {
-		opts := []PublishOption{WithHeaders(m.Headers), WithMetadata(m.Metadata), WithType(m.Type), WithKey(m.Key), WithRoutingKey(m.RoutingKey), WithPriority(m.Priority), WithTenantID(m.TenantID), WithCorrelationID(m.CorrelationID), WithIdempotencyKey(m.IdempotencyKey)}
-		if m.Queue != "" {
-			opts = append(opts, WithQueue(m.Queue))
+		payload, perr := m.PayloadBytes()
+		if perr != nil {
+			http.Error(w, perr.Error(), 400)
+			return
 		}
-		if m.Stream != "" {
-			opts = append(opts, WithStream(m.Stream))
-		}
-		items[i] = PublishBatchItem{Topic: m.Topic, Payload: []byte(m.Payload), Options: opts}
+		items[i] = PublishBatchItem{Topic: m.Topic, Payload: payload, Options: m.PublishOptions()}
 	}
 	res, _ := a.Broker.Publisher().PublishItems(r.Context(), items)
 	writeBrokerJSON(w, res)
