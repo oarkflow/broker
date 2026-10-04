@@ -27,6 +27,7 @@ type Broker struct {
 	cancel                context.CancelFunc
 	state                 atomic.Value
 	seq                   atomic.Uint64
+	queueMaxDepth         sync.Map
 	subsMu                sync.RWMutex
 	subs                  map[string]*Subscription
 	dispatchMu            sync.Mutex
@@ -495,7 +496,36 @@ func (b *Broker) DeclareQueue(ctx context.Context, cfg QueueConfig) error {
 	if err == nil && cfg.DLQ != "" {
 		_ = b.store.DeclareQueue(ctx, QueueConfig{Name: cfg.DLQ, VisibilityTimeout: cfg.VisibilityTimeout, RetryPolicy: cfg.RetryPolicy})
 	}
+	if err == nil {
+		b.noteQueueDepthLimit(cfg)
+	}
 	return err
+}
+
+// noteQueueDepthLimit records a queue's depth limit on the broker. Backpressure
+// needs the limit for queues it is about to publish to, and the limit lives in
+// the store's own queue config, which is not reachable for every Store
+// implementation. Keeping a broker-side map makes the limit available
+// regardless of which store is configured.
+func (b *Broker) noteQueueDepthLimit(cfg QueueConfig) {
+	if cfg.MaxDepth <= 0 {
+		return
+	}
+	b.queueMaxDepth.Store(cfg.Name, cfg.MaxDepth)
+	if cfg.DLQ != "" {
+		b.queueMaxDepth.Store(cfg.DLQ, cfg.MaxDepth)
+	}
+}
+
+// QueueMaxDepth reports the configured depth limit for a queue, or 0 when the
+// queue is unlimited or undeclared.
+func (b *Broker) QueueMaxDepth(name string) int {
+	if v, ok := b.queueMaxDepth.Load(name); ok {
+		if n, ok := v.(int); ok {
+			return n
+		}
+	}
+	return 0
 }
 func (b *Broker) DeclareTopic(ctx context.Context, cfg TopicConfig) error {
 	return b.store.DeclareTopic(ctx, cfg)

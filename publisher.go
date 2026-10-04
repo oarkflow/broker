@@ -616,19 +616,53 @@ func (p *Publisher) checkBackpressure(ctx context.Context, prep preparedPublish)
 	if p.b.cfg.Backpressure != BackpressureReject && p.b.cfg.Backpressure != BackpressureBlock {
 		return nil
 	}
+	// Previously this called Store.Stats once per destination, and Stats scans
+	// every message, queue, topic and stream in the store, so a publish to N
+	// destinations ran N full-store scans on the hot path while holding the
+	// store read lock. It also asserted the store to *MemoryStore, which meant
+	// backpressure silently did nothing on every WAL, segmented and distributed
+	// store, and read MemoryStore.queues without the store lock.
+	reporter, hasReporter := p.b.store.(QueueDepthReporter)
+	if !hasReporter {
+		return p.checkBackpressureViaStats(ctx, prep)
+	}
 	for _, d := range prep.dests {
-		if d.Kind == DestinationQueue || d.Kind == DestinationDLQ {
-			stats, err := p.b.store.Stats(ctx)
-			if err != nil {
-				continue
-			}
-			if depth, ok := stats.Queues[d.Name]; ok {
-				if ms, ok := p.b.store.(*MemoryStore); ok {
-					if q := ms.queues[d.Name]; q != nil && q.cfg.MaxDepth > 0 && depth >= q.cfg.MaxDepth {
-						return errf(ErrBackpressure, "queue %s depth %d >= max %d", d.Name, depth, q.cfg.MaxDepth)
-					}
-				}
-			}
+		if d.Kind != DestinationQueue && d.Kind != DestinationDLQ {
+			continue
+		}
+		max := reporter.queueMaxDepth(d.Name)
+		if max <= 0 {
+			max = p.b.QueueMaxDepth(d.Name)
+		}
+		if max <= 0 {
+			continue
+		}
+		if depth := reporter.queueDepth(d.Name); depth >= max {
+			return errf(ErrBackpressure, "queue %s depth %d >= max %d", d.Name, depth, max)
+		}
+	}
+	return nil
+}
+
+// checkBackpressureViaStats is the fallback for stores that expose neither
+// queue depth nor depth limits. It reads Stats once for all destinations rather
+// than once per destination.
+func (p *Publisher) checkBackpressureViaStats(ctx context.Context, prep preparedPublish) error {
+	stats, err := p.b.store.Stats(ctx)
+	if err != nil {
+		return nil
+	}
+	for _, d := range prep.dests {
+		if d.Kind != DestinationQueue && d.Kind != DestinationDLQ {
+			continue
+		}
+		depth, ok := stats.Queues[d.Name]
+		if !ok {
+			continue
+		}
+		max := p.b.QueueMaxDepth(d.Name)
+		if max > 0 && depth >= max {
+			return errf(ErrBackpressure, "queue %s depth %d >= max %d", d.Name, depth, max)
 		}
 	}
 	return nil

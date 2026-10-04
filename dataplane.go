@@ -23,15 +23,104 @@ type PollRequest struct {
 	WaitNS              int64  `json:"wait_ns,omitempty"`
 	VisibilityTimeoutNS int64  `json:"visibility_timeout_ns,omitempty"`
 }
+
+// PublishHTTPPayload is the request body for /v1/publish, /v1/publish/batch and
+// /v1/request. Keys are snake_case, matching PollRequest and the wire format
+// documented in docs/CODEC_FORMAT.md.
+//
+// This struct previously carried no tags, so encoding/json only ever matched the
+// Go field names. Because Go's fallback matching is case-insensitive it happened
+// to accept "Topic", but the underscore in "tenant_id" broke it: documented
+// clients silently lost tenant scoping, routing keys, correlation ids,
+// idempotency keys and request timeouts. UnmarshalJSON still accepts the old
+// spellings so existing clients keep working.
 type PublishHTTPPayload struct {
-	Topic, Queue, Stream, Type string
-	Payload                    json.RawMessage
-	Headers, Metadata          map[string]string
-	Key, RoutingKey            string
-	Priority                   int
-	TenantID, CorrelationID    string
-	TimeoutNS                  int64
-	IdempotencyKey             string
+	Topic          string            `json:"topic"`
+	Queue          string            `json:"queue,omitempty"`
+	Stream         string            `json:"stream,omitempty"`
+	Type           string            `json:"type,omitempty"`
+	Payload        json.RawMessage   `json:"payload"`
+	Headers        map[string]string `json:"headers,omitempty"`
+	Metadata       map[string]string `json:"metadata,omitempty"`
+	Key            string            `json:"key,omitempty"`
+	RoutingKey     string            `json:"routing_key,omitempty"`
+	Priority       int               `json:"priority,omitempty"`
+	TenantID       string            `json:"tenant_id,omitempty"`
+	CorrelationID  string            `json:"correlation_id,omitempty"`
+	TimeoutNS      int64             `json:"timeout_ns,omitempty"`
+	IdempotencyKey string            `json:"idempotency_key,omitempty"`
+}
+
+// legacyPublishHTTPPayload holds only the keys whose Go field names do not
+// match their snake_case tags case-insensitively. Single-word keys (topic,
+// queue, stream, type, payload, headers, metadata, key, priority) already match
+// without help.
+type legacyPublishHTTPPayload struct {
+	RoutingKey     string
+	TenantID       string
+	CorrelationID  string
+	IdempotencyKey string
+	TimeoutNS      int64
+}
+
+// legacyPublishKeys are the exact byte sequences that trigger the compatibility
+// pass. Checking for them keeps the documented wire format on a single decode.
+var legacyPublishKeys = [][]byte{
+	[]byte(`"RoutingKey"`),
+	[]byte(`"TenantID"`),
+	[]byte(`"CorrelationID"`),
+	[]byte(`"IdempotencyKey"`),
+	[]byte(`"TimeoutNS"`),
+}
+
+func (p *PublishHTTPPayload) UnmarshalJSON(data []byte) error {
+	type payload PublishHTTPPayload
+	var decoded payload
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	*p = PublishHTTPPayload(decoded)
+	legacy := false
+	for _, key := range legacyPublishKeys {
+		if bytes.Contains(data, key) {
+			legacy = true
+			break
+		}
+	}
+	if !legacy {
+		return nil
+	}
+	var old legacyPublishHTTPPayload
+	if err := json.Unmarshal(data, &old); err != nil {
+		return err
+	}
+	if p.RoutingKey == "" {
+		p.RoutingKey = old.RoutingKey
+	}
+	if p.TenantID == "" {
+		p.TenantID = old.TenantID
+	}
+	if p.CorrelationID == "" {
+		p.CorrelationID = old.CorrelationID
+	}
+	if p.IdempotencyKey == "" {
+		p.IdempotencyKey = old.IdempotencyKey
+	}
+	if p.TimeoutNS == 0 {
+		p.TimeoutNS = old.TimeoutNS
+	}
+	return nil
+}
+
+// decodePublishHTTPPayload reads a publish request body. It is the same as
+// json.Decoder.Decode but needs the raw bytes so PublishHTTPPayload can apply
+// its key compatibility rules.
+func decodePublishHTTPPayload(r *http.Request, dst *PublishHTTPPayload) error {
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal(body, dst)
 }
 
 func (a AdminServer) dataPlane(w http.ResponseWriter, r *http.Request) {
@@ -430,7 +519,7 @@ func (a AdminServer) v1Publish(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req PublishHTTPPayload
-	if json.NewDecoder(r.Body).Decode(&req) != nil {
+	if decodePublishHTTPPayload(r, &req) != nil {
 		http.Error(w, "invalid json", 400)
 		return
 	}
@@ -489,7 +578,7 @@ func (a AdminServer) v1Request(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req PublishHTTPPayload
-	if json.NewDecoder(r.Body).Decode(&req) != nil {
+	if decodePublishHTTPPayload(r, &req) != nil {
 		http.Error(w, "invalid json", 400)
 		return
 	}
