@@ -2475,12 +2475,15 @@ func strconvFormatInt(i int64) string { return strconv.FormatInt(i, 36) }
 // in the config to enable AES-GCM encryption of all WAL records at rest.
 type FileWALStore struct {
 	*MemoryStore
-	path    string
-	file    *os.File
-	gcm     cipher.AEAD
-	keyName string
-	gc      *groupCommitWriter
-	writeMu sync.Mutex
+	path        string
+	file        *os.File
+	gcm         cipher.AEAD
+	keyName     string
+	gc          *groupCommitWriter
+	writeMu     sync.Mutex
+	appendBatch *opBatcher
+	leaseBatch  *opBatcher
+	ackBatch    *opBatcher
 }
 
 func (*FileWALStore) ConfirmationLevel() ConfirmLevel { return ConfirmPersisted }
@@ -2553,6 +2556,9 @@ func NewFileWALStoreWithConfig(cfg FileWALStoreConfig) (*FileWALStore, error) {
 	}
 	st.file = f
 	st.gc = newGroupCommitWriter(f)
+	st.appendBatch = newOpBatcher(st.processAppendBatch)
+	st.leaseBatch = newOpBatcher(st.processLeaseBatch)
+	st.ackBatch = newOpBatcher(st.processAckBatch)
 	return st, nil
 }
 
@@ -2845,6 +2851,9 @@ func (s *FileWALStore) AppendAtomicOwned(ctx context.Context, entries []AppendEn
 	return err
 }
 func (s *FileWALStore) durableAppend(ctx context.Context, entries []AppendEntry) ([]Message, error) {
+	if s.appendBatch != nil {
+		return s.appendBatch.submit(ctx, entries)
+	}
 	s.writeMu.Lock()
 	out, err := s.MemoryStore.prepareAppendAtomic(ctx, entries)
 	if err != nil {
@@ -2873,6 +2882,9 @@ func (s *FileWALStore) durableAppend(ctx context.Context, entries []AppendEntry)
 }
 
 func (s *FileWALStore) Lease(ctx context.Context, req LeaseRequest) ([]Message, error) {
+	if s.leaseBatch != nil {
+		return s.leaseBatch.submit(ctx, req)
+	}
 	s.writeMu.Lock()
 	msgs, err := s.MemoryStore.prepareLease(ctx, req)
 	if err != nil || len(msgs) == 0 {
@@ -2895,6 +2907,10 @@ func (s *FileWALStore) Lease(ctx context.Context, req LeaseRequest) ([]Message, 
 	return msgs, nil
 }
 func (s *FileWALStore) Ack(ctx context.Context, req AckRequest) error {
+	if s.ackBatch != nil {
+		_, err := s.ackBatch.submit(ctx, req)
+		return err
+	}
 	s.writeMu.Lock()
 	if err := s.MemoryStore.validateAckLease(ctx, req); err != nil {
 		s.writeMu.Unlock()
@@ -3112,7 +3128,143 @@ func (s *FileWALStore) SweepLeases(ctx context.Context, now time.Time) (int, err
 	return s.MemoryStore.applySweepLeases(expired), nil
 }
 
+type appendPrep struct {
+	req       *opBatchRequest
+	out       []Message
+	persisted []AppendEntry
+}
+
+func (s *FileWALStore) processAppendBatch(batch []*opBatchRequest) {
+	s.writeMu.Lock()
+	preps := make([]appendPrep, 0, len(batch))
+	pendings := make([]*groupCommitReq, 0, len(batch))
+	for _, r := range batch {
+		entries, ok := r.payload.([]AppendEntry)
+		if !ok {
+			r.result <- opBatchResult{err: errors.New("invalid append payload")}
+			continue
+		}
+		out, err := s.MemoryStore.prepareAppendAtomic(r.ctx, entries)
+		if err != nil {
+			r.result <- opBatchResult{err: err}
+			continue
+		}
+		persisted := storedAppendEntries(out)
+		wreq, err := s.writeAsync(walRecord{Op: "append_atomic", Entries: persisted})
+		if err != nil {
+			r.result <- opBatchResult{err: err}
+			continue
+		}
+		applyErr := s.MemoryStore.appendRecoveredAtomicPending(persisted)
+		preps = append(preps, appendPrep{req: r, out: out, persisted: persisted})
+		pendings = append(pendings, wreq)
+		_ = applyErr
+	}
+	s.writeMu.Unlock()
+	for i, p := range preps {
+		if err := s.gc.await(pendings[i]); err != nil {
+			p.req.result <- opBatchResult{err: err}
+			continue
+		}
+		s.MemoryStore.commitPending(p.persisted)
+		p.req.result <- opBatchResult{messages: p.out}
+	}
+}
+
+type leasePrep struct {
+	req  *opBatchRequest
+	msgs []Message
+	lreq LeaseRequest
+}
+
+func (s *FileWALStore) processLeaseBatch(batch []*opBatchRequest) {
+	s.writeMu.Lock()
+	preps := make([]leasePrep, 0, len(batch))
+	pendings := make([]*groupCommitReq, 0, len(batch))
+	for _, r := range batch {
+		lreq, ok := r.payload.(LeaseRequest)
+		if !ok {
+			r.result <- opBatchResult{err: errors.New("invalid lease payload")}
+			continue
+		}
+		msgs, err := s.MemoryStore.prepareLease(r.ctx, lreq)
+		if err != nil {
+			r.result <- opBatchResult{err: err}
+			continue
+		}
+		if len(msgs) == 0 {
+			r.result <- opBatchResult{messages: msgs}
+			continue
+		}
+		wreq, err := s.writeAsync(walRecord{Op: "lease_batch", Messages: msgs, Lease: lreq})
+		if err != nil {
+			r.result <- opBatchResult{err: err}
+			continue
+		}
+		applyErr := s.MemoryStore.applyLease(r.ctx, msgs, lreq)
+		preps = append(preps, leasePrep{req: r, msgs: msgs, lreq: lreq})
+		pendings = append(pendings, wreq)
+		_ = applyErr
+	}
+	s.writeMu.Unlock()
+	for i, p := range preps {
+		if err := s.gc.await(pendings[i]); err != nil {
+			p.req.result <- opBatchResult{err: err}
+			continue
+		}
+		p.req.result <- opBatchResult{messages: p.msgs}
+	}
+}
+
+type ackPrep struct {
+	req *opBatchRequest
+	ack AckRequest
+}
+
+func (s *FileWALStore) processAckBatch(batch []*opBatchRequest) {
+	s.writeMu.Lock()
+	preps := make([]ackPrep, 0, len(batch))
+	pendings := make([]*groupCommitReq, 0, len(batch))
+	for _, r := range batch {
+		areq, ok := r.payload.(AckRequest)
+		if !ok {
+			r.result <- opBatchResult{err: errors.New("invalid ack payload")}
+			continue
+		}
+		if err := s.MemoryStore.validateAckLease(r.ctx, areq); err != nil {
+			r.result <- opBatchResult{err: err}
+			continue
+		}
+		wreq, err := s.writeAsync(walRecord{Op: "ack", Ack: areq})
+		if err != nil {
+			r.result <- opBatchResult{err: err}
+			continue
+		}
+		applyErr := s.MemoryStore.Ack(r.ctx, areq)
+		preps = append(preps, ackPrep{req: r, ack: areq})
+		pendings = append(pendings, wreq)
+		_ = applyErr
+	}
+	s.writeMu.Unlock()
+	for i, p := range preps {
+		if err := s.gc.await(pendings[i]); err != nil {
+			p.req.result <- opBatchResult{err: err}
+			continue
+		}
+		p.req.result <- opBatchResult{}
+	}
+}
+
 func (s *FileWALStore) Close() error {
+	if s.appendBatch != nil {
+		s.appendBatch.close()
+	}
+	if s.leaseBatch != nil {
+		s.leaseBatch.close()
+	}
+	if s.ackBatch != nil {
+		s.ackBatch.close()
+	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	var joined error
