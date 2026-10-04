@@ -334,13 +334,28 @@ type Config struct {
 	AuditEnabled                bool               `json:"audit_enabled,omitempty"`
 	RateLimit                   *RateLimitConfig   `json:"rate_limit,omitempty"`
 	Tenancy                     *TenancyConfig     `json:"tenancy,omitempty"`
-	ACL                         *ACL               `json:"-"`
-	OTLPEndpoint                string             `json:"otlp_endpoint,omitempty"`
-	OTLPInterval                time.Duration      `json:"otlp_interval,omitempty"`
-	OTLPHeaders                 map[string]string  `json:"otlp_headers,omitempty"`
-	Partition                   *PartitionConfig   `json:"partition,omitempty"`
-	WebSocket                   *WebSocketConfig   `json:"websocket,omitempty"`
-	ExactlyOnce                 *ExactlyOnceConfig `json:"exactly_once,omitempty"`
+	// ACL authorizes requests arriving on a listener: the HTTP admin and data
+	// plane, gRPC, the native RPC transport, WebSocket and the BST1 native stream.
+	//
+	// It is deliberately not a boundary for in-process calls. Code holding a
+	// *Broker has already run inside the process, so Publisher, Store, Consumers
+	// and the consumer registry are reachable directly and there is no credential
+	// to present. Treating those calls as untrusted would mean every embedder had
+	// to manufacture a principal for ordinary use, so instead the trust boundary
+	// is stated here: configure the ACL for network surfaces, and do not hand a
+	// *Broker to code you would not trust with full access.
+	//
+	// Tenant scoping is separate and does apply wherever a principal is present.
+	// resolveTenant and tenantAllowed restrict a tenant-scoped principal even
+	// inside the process; only an unscoped principal, which no listener ever
+	// produces, is unrestricted.
+	ACL          *ACL               `json:"-"`
+	OTLPEndpoint string             `json:"otlp_endpoint,omitempty"`
+	OTLPInterval time.Duration      `json:"otlp_interval,omitempty"`
+	OTLPHeaders  map[string]string  `json:"otlp_headers,omitempty"`
+	Partition    *PartitionConfig   `json:"partition,omitempty"`
+	WebSocket    *WebSocketConfig   `json:"websocket,omitempty"`
+	ExactlyOnce  *ExactlyOnceConfig `json:"exactly_once,omitempty"`
 	// SigningKey is the HMAC signing key for frame authentication.
 	SigningKey []byte `json:"-"`
 	// EncryptionKey is the AES encryption key for frame encryption at rest.

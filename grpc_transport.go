@@ -5,7 +5,9 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -56,6 +58,8 @@ type grpcConn struct {
 	id     string
 	conn   net.Conn
 	closed chan struct{}
+	// closeOnce guards closed, which more than one shutdown path can reach.
+	closeOnce sync.Once
 }
 
 type grpcRequest struct {
@@ -63,6 +67,10 @@ type grpcRequest struct {
 	Method  string            `json:"method"`
 	Body    json.RawMessage   `json:"body"`
 	Headers map[string]string `json:"headers,omitempty"`
+	// Context is an optional client deadline as Unix nanoseconds, matching the
+	// gRPC deadline convention. The server used to run every request on a
+	// background context, so a client could not cancel work it had started.
+	Context int64 `json:"context,omitempty"`
 }
 
 type grpcResponse struct {
@@ -188,10 +196,13 @@ func (gs *GRPCServer) Stop() {
 	if gs.ln != nil {
 		gs.ln.Close()
 	}
+	// Closing the socket is enough to unblock the connection goroutine, which then
+	// removes itself and closes its own closed channel. Stop used to close that
+	// channel too, so shutting down with any client connected panicked with
+	// "close of closed channel" from the goroutine's deferred cleanup.
 	gs.mu.Lock()
 	for id, c := range gs.conns {
 		c.conn.Close()
-		close(c.closed)
 		delete(gs.conns, id)
 	}
 	gs.mu.Unlock()
@@ -215,10 +226,14 @@ func (gs *GRPCServer) handleConn(conn net.Conn) {
 		delete(gs.conns, id)
 		gs.mu.Unlock()
 		conn.Close()
-		close(gc.closed)
+		gc.closeOnce.Do(func() { close(gc.closed) })
 	}()
 
-	decoder := json.NewDecoder(conn)
+	// Bound the bytes a single connection can make the broker buffer. The
+	// decoder previously read straight from the socket, so one client could
+	// stream an unbounded frame and exhaust memory. HTTP bounds this with
+	// MaxBytesReader and gRPC with MaxRecvMsgSize; this transport did neither.
+	decoder := json.NewDecoder(&maxBytesReader{conn: conn, limit: gs.cfg.MaxMessageSize})
 	encoder := json.NewEncoder(conn)
 	for {
 		select {
@@ -229,7 +244,8 @@ func (gs *GRPCServer) handleConn(conn net.Conn) {
 		conn.SetReadDeadline(time.Now().Add(gs.cfg.KeepAlive * 2))
 		var req grpcRequest
 		if err := decoder.Decode(&req); err != nil {
-			if err.Error() != "EOF" {
+			// A closed socket is the normal shutdown path, not a protocol error.
+			if !errors.Is(err, net.ErrClosed) && !errors.Is(err, io.EOF) && err.Error() != "EOF" {
 				log.Printf("[grpc] decode error: %v", err)
 			}
 			return
@@ -259,7 +275,10 @@ func (gs *GRPCServer) handleMethod(req grpcRequest) grpcResponse {
 			return grpcResponse{ID: req.ID, Error: "unauthorized: invalid token", Status: 401}
 		}
 	}
-	ctx := context.Background()
+	// A background context ignored broker shutdown and client disconnect
+	// entirely, so an in-flight request could not be cancelled. It also meant the
+	// tenant resolved for the request never reached the store.
+	ctx := gs.requestContext(req)
 	switch req.Method {
 	case GRPCMethodPublish:
 		return gs.handlePublish(ctx, req)
@@ -269,6 +288,8 @@ func (gs *GRPCServer) handleMethod(req grpcRequest) grpcResponse {
 		return gs.handleNack(ctx, req)
 	case GRPCMethodPoll:
 		return gs.handlePoll(ctx, req)
+	case GRPCMethodSubscribe:
+		return gs.handleSubscribe(ctx, req)
 	case GRPCMethodRequest:
 		return gs.handleRequest(ctx, req)
 	case GRPCMethodStats:
@@ -300,26 +321,54 @@ func (gs *GRPCServer) handleMethod(req grpcRequest) grpcResponse {
 
 func (gs *GRPCServer) handlePublish(ctx context.Context, req grpcRequest) grpcResponse {
 	var p struct {
-		Topic   string            `json:"topic"`
-		Queue   string            `json:"queue,omitempty"`
-		Payload json.RawMessage   `json:"payload"`
-		Type    string            `json:"type,omitempty"`
-		Headers map[string]string `json:"headers,omitempty"`
+		Topic           string            `json:"topic"`
+		Queue           string            `json:"queue,omitempty"`
+		Stream          string            `json:"stream,omitempty"`
+		Payload         json.RawMessage   `json:"payload"`
+		Type            string            `json:"type,omitempty"`
+		ContentType     string            `json:"content_type,omitempty"`
+		Headers         map[string]string `json:"headers,omitempty"`
+		Metadata        map[string]string `json:"metadata,omitempty"`
+		Key             string            `json:"key,omitempty"`
+		RoutingKey      string            `json:"routing_key,omitempty"`
+		TenantID        string            `json:"tenant_id,omitempty"`
+		CorrelationID   string            `json:"correlation_id,omitempty"`
+		CausationID     string            `json:"causation_id,omitempty"`
+		TraceID         string            `json:"trace_id,omitempty"`
+		IdempotencyKey  string            `json:"idempotency_key,omitempty"`
+		MessageID       string            `json:"message_id,omitempty"`
+		Priority        int               `json:"priority,omitempty"`
+		MaxAttempts     int               `json:"max_attempts,omitempty"`
+		Schema          string            `json:"schema,omitempty"`
+		SchemaVersion   string            `json:"schema_version,omitempty"`
+		PayloadEncoding string            `json:"payload_encoding,omitempty"`
+		TTLNS           int64             `json:"ttl_ns,omitempty"`
 	}
 	if err := json.Unmarshal(req.Body, &p); err != nil {
 		return grpcResponse{ID: req.ID, Error: err.Error(), Status: 400}
 	}
+	payload, perr := decodeNativePayload(p.Payload, p.PayloadEncoding)
+	if perr != nil {
+		return grpcResponse{ID: req.ID, Error: perr.Error(), Status: 400}
+	}
 	opts := []PublishOption{}
-	if p.Queue != "" {
-		opts = append(opts, WithQueue(p.Queue))
+	for _, o := range []PublishOption{
+		WithQueue(p.Queue), WithStream(p.Stream), WithType(p.Type),
+		WithContentType(p.ContentType), WithHeaders(p.Headers), WithMetadata(p.Metadata),
+		WithKey(p.Key), WithRoutingKey(p.RoutingKey), WithTenantID(p.TenantID),
+		WithCorrelationID(p.CorrelationID), WithCausationID(p.CausationID),
+		WithTraceID(p.TraceID), WithIdempotencyKey(p.IdempotencyKey),
+		WithMessageID(p.MessageID), WithPriority(p.Priority), WithMaxAttempts(p.MaxAttempts),
+	} {
+		opts = append(opts, o)
 	}
-	if p.Type != "" {
-		opts = append(opts, WithType(p.Type))
+	if p.Schema != "" || p.SchemaVersion != "" {
+		opts = append(opts, WithSchema(p.Schema, p.SchemaVersion))
 	}
-	if p.Headers != nil {
-		opts = append(opts, WithHeaders(p.Headers))
+	if p.TTLNS > 0 {
+		opts = append(opts, WithTTL(time.Duration(p.TTLNS)))
 	}
-	res, err := gs.broker.Publisher().Publish(ctx, p.Topic, p.Payload, opts...)
+	res, err := gs.broker.Publisher().Publish(ctx, p.Topic, payload, opts...)
 	if err != nil {
 		return grpcResponse{ID: req.ID, Error: err.Error(), Status: 409}
 	}
@@ -329,13 +378,23 @@ func (gs *GRPCServer) handlePublish(ctx context.Context, req grpcRequest) grpcRe
 
 func (gs *GRPCServer) handleAck(ctx context.Context, req grpcRequest) grpcResponse {
 	var a struct {
-		MessageID string `json:"message_id"`
-		Queue     string `json:"queue"`
+		MessageID  string `json:"message_id"`
+		Queue      string `json:"queue"`
+		ConsumerID string `json:"consumer_id,omitempty"`
+		LeaseToken string `json:"lease_token,omitempty"`
 	}
 	if err := json.Unmarshal(req.Body, &a); err != nil {
 		return grpcResponse{ID: req.ID, Error: err.Error(), Status: 400}
 	}
-	err := gs.broker.Store().Ack(ctx, AckRequest{MessageID: a.MessageID, Queue: a.Queue})
+	// The lease token is mandatory for a leased message: ackLocked rejects a
+	// missing or mismatched token with ErrLeaseLost. Omitting it made every ack
+	// over this transport fail.
+	err := gs.broker.Store().Ack(ctx, AckRequest{
+		MessageID:  a.MessageID,
+		Queue:      a.Queue,
+		ConsumerID: a.ConsumerID,
+		LeaseToken: a.LeaseToken,
+	})
 	if err != nil {
 		return grpcResponse{ID: req.ID, Error: err.Error(), Status: 409}
 	}
@@ -344,9 +403,11 @@ func (gs *GRPCServer) handleAck(ctx context.Context, req grpcRequest) grpcRespon
 
 func (gs *GRPCServer) handleNack(ctx context.Context, req grpcRequest) grpcResponse {
 	var n struct {
-		MessageID string `json:"message_id"`
-		Queue     string `json:"queue"`
-		Action    string `json:"action"`
+		MessageID  string `json:"message_id"`
+		Queue      string `json:"queue"`
+		Action     string `json:"action"`
+		ConsumerID string `json:"consumer_id,omitempty"`
+		LeaseToken string `json:"lease_token,omitempty"`
 	}
 	if err := json.Unmarshal(req.Body, &n); err != nil {
 		return grpcResponse{ID: req.ID, Error: err.Error(), Status: 400}
@@ -360,7 +421,17 @@ func (gs *GRPCServer) handleNack(ctx context.Context, req grpcRequest) grpcRespo
 	case "reject":
 		action = NackReject
 	}
-	err := gs.broker.Store().Nack(ctx, NackRequest{MessageID: n.MessageID, Queue: n.Queue, Action: action})
+	// IncrementAttempt must be set. Without it Attempts stayed at zero, the
+	// store's retry ceiling never tripped, and a failing message was redelivered
+	// forever. Every other transport (embedded, HTTP, gRPC) sets it.
+	err := gs.broker.Store().Nack(ctx, NackRequest{
+		MessageID:        n.MessageID,
+		Queue:            n.Queue,
+		Action:           action,
+		ConsumerID:       n.ConsumerID,
+		LeaseToken:       n.LeaseToken,
+		IncrementAttempt: true,
+	})
 	if err != nil {
 		return grpcResponse{ID: req.ID, Error: err.Error(), Status: 409}
 	}
@@ -369,9 +440,12 @@ func (gs *GRPCServer) handleNack(ctx context.Context, req grpcRequest) grpcRespo
 
 func (gs *GRPCServer) handlePoll(ctx context.Context, req grpcRequest) grpcResponse {
 	var p struct {
-		Queue    string `json:"queue"`
-		Limit    int    `json:"limit"`
-		Consumer string `json:"consumer"`
+		Queue               string `json:"queue"`
+		Limit               int    `json:"limit"`
+		Consumer            string `json:"consumer"`
+		ConsumerGroup       string `json:"consumer_group,omitempty"`
+		VisibilityTimeoutNS int64  `json:"visibility_timeout_ns,omitempty"`
+		TenantID            string `json:"tenant_id,omitempty"`
 	}
 	if err := json.Unmarshal(req.Body, &p); err != nil {
 		return grpcResponse{ID: req.ID, Error: err.Error(), Status: 400}
@@ -379,7 +453,19 @@ func (gs *GRPCServer) handlePoll(ctx context.Context, req grpcRequest) grpcRespo
 	if p.Limit <= 0 {
 		p.Limit = 1
 	}
-	msgs, err := gs.broker.Store().Lease(ctx, LeaseRequest{Queue: p.Queue, ConsumerID: p.Consumer, Limit: p.Limit})
+	// ConsumerGroup, VisibilityTimeout and TenantID were all missing here. Without
+	// a group every consumer in a competing set leased from the same implicit
+	// group, the default 30s visibility timeout ignored the caller's choice, and
+	// TenantID never reached the store so tenant scoping could not apply.
+	leaseReq := LeaseRequest{
+		Queue:             p.Queue,
+		ConsumerID:        p.Consumer,
+		ConsumerGroup:     firstNonEmpty(p.ConsumerGroup, p.Consumer),
+		Limit:             p.Limit,
+		VisibilityTimeout: time.Duration(p.VisibilityTimeoutNS),
+		TenantID:          p.TenantID,
+	}
+	msgs, err := gs.broker.Store().Lease(ctx, leaseReq)
 	if err != nil {
 		return grpcResponse{ID: req.ID, Error: err.Error(), Status: 409}
 	}
@@ -527,4 +613,133 @@ func (gs *GRPCServer) handlePurgeQueue(ctx context.Context, req grpcRequest) grp
 	}
 	body, _ := json.Marshal(map[string]int{"purged": n})
 	return grpcResponse{ID: req.ID, Status: 200, Body: body}
+}
+
+// maxBytesReader fails a read once more than limit bytes have been consumed on a
+// connection. GRPCConfig documents MaxMessageSize as limiting incoming message
+// size, but nothing enforced it: the JSON decoder read straight from the socket,
+// so a single client could make the broker buffer an unbounded frame.
+type maxBytesReader struct {
+	conn  net.Conn
+	limit int
+	read  int
+}
+
+var errNativeFrameTooLarge = errors.New("broker: native rpc frame exceeds max message size")
+
+func (r *maxBytesReader) Read(p []byte) (int, error) {
+	if r.read >= r.limit {
+		return 0, errNativeFrameTooLarge
+	}
+	if remaining := r.limit - r.read; len(p) > remaining+1 {
+		// Read one byte past the limit so an oversized frame is detected rather
+		// than silently truncated into a confusing decode error.
+		p = p[:remaining+1]
+	}
+	n, err := r.conn.Read(p)
+	r.read += n
+	if r.read > r.limit {
+		return n, errNativeFrameTooLarge
+	}
+	return n, err
+}
+
+// requestContext derives the context for one native RPC request. It is rooted in
+// the server context so shutdown and keep-alive deadlines cancel in-flight work,
+// and it carries the request deadline when the client sent one.
+//
+// This transport authenticates with a single static bearer token and has no ACL,
+// so there is no per-request principal to attach. Tenant scoping therefore has
+// to come from the request body, which the handlers now pass through. Adding a
+// real per-principal identity here would need an ACL on GRPCConfig.
+func (gs *GRPCServer) requestContext(req grpcRequest) context.Context {
+	ctx := gs.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if req.Context != 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithDeadline(ctx, time.Unix(0, req.Context))
+		// The handler runs synchronously and returns before the response is
+		// written, so releasing here bounds the cancel to the request.
+		defer cancel()
+	}
+	return ctx
+}
+
+// decodeNativePayload resolves a publish payload, honouring an explicit
+// base64 encoding so binary payloads survive the JSON transport.
+func decodeNativePayload(payload json.RawMessage, encoding string) ([]byte, error) {
+	if encoding == "" || encoding == "json" {
+		return []byte(payload), nil
+	}
+	var wire PublishHTTPPayload
+	wire.Payload = payload
+	wire.PayloadEncoding = encoding
+	return wire.PayloadBytes()
+}
+
+// handleSubscribe registers a remote consumer subscription. GRPCMethodSubscribe
+// was exported as a constant but never routed, so any client using it got a
+// permanent 404 from a server that advertised the method.
+func (gs *GRPCServer) handleSubscribe(ctx context.Context, req grpcRequest) grpcResponse {
+	var body struct {
+		ConsumerID string            `json:"consumer_id"`
+		Group      string            `json:"group,omitempty"`
+		Queue      string            `json:"queue,omitempty"`
+		Pattern    string            `json:"pattern,omitempty"`
+		Name       string            `json:"name,omitempty"`
+		TenantID   string            `json:"tenant_id,omitempty"`
+		AutoCreate *bool             `json:"auto_create,omitempty"`
+		Visibility time.Duration     `json:"visibility_timeout_ns,omitempty"`
+		Headers    map[string]string `json:"-"`
+	}
+	if err := json.Unmarshal(req.Body, &body); err != nil {
+		return grpcResponse{ID: req.ID, Error: err.Error(), Status: 400}
+	}
+	if body.ConsumerID == "" {
+		return grpcResponse{ID: req.ID, Error: "consumer_id required", Status: 400}
+	}
+	if body.TenantID != "" {
+		if tenant, terr := resolveTenant(ctx, body.TenantID); terr == nil {
+			body.TenantID = tenant
+		} else {
+			return grpcResponse{ID: req.ID, Error: terr.Error(), Status: 403}
+		}
+	}
+	sub := RemoteSubscription{
+		Queue:   body.Queue,
+		Pattern: body.Pattern,
+		Name:    body.Name,
+	}
+	if sub.Name == "" {
+		sub.Name = firstNonEmpty(firstNonEmpty(body.Pattern, body.Queue), body.ConsumerID)
+	}
+	if body.AutoCreate != nil {
+		sub.AutoCreate = *body.AutoCreate
+	}
+	info, err := gs.broker.RemoteConsumerSubscribe(ctx, body.ConsumerID, sub)
+	if err != nil {
+		return grpcResponse{ID: req.ID, Error: err.Error(), Status: grpcStatusFor(err)}
+	}
+	out, _ := json.Marshal(info)
+	return grpcResponse{ID: req.ID, Status: 200, Body: out}
+}
+
+// grpcStatusFor maps a broker error onto a status code, so a native RPC client
+// can distinguish an authorization failure from a conflict. Everything else keeps
+// the historical 409.
+func grpcStatusFor(err error) int {
+	switch {
+	case errors.Is(err, ErrUnauthorized):
+		return 403
+	case errors.Is(err, ErrInvalidMessage):
+		return 400
+	case errors.Is(err, ErrQueueNotFound), errors.Is(err, ErrTopicNotFound), errors.Is(err, ErrStreamNotFound), errors.Is(err, ErrMessageNotFound):
+		return 404
+	case errors.Is(err, ErrPaused), errors.Is(err, ErrStopped), errors.Is(err, ErrClosed):
+		return 409
+	default:
+		return 409
+	}
 }

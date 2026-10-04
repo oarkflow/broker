@@ -686,30 +686,40 @@ func (s *SegmentedWALStore) rotateSegmentLocked() error {
 	return s.initActiveSegment(nextSegID, startSeq)
 }
 
-func (s *SegmentedWALStore) writeRecordLocked(r walRecord) error {
+// writeRecordAsync enqueues a record for group commit and returns without waiting
+// for the fsync. The caller must hold writeMu, so records reach the log in enqueue
+// order, and must call gc.await on the result only after releasing it.
+//
+// Every operation in this store used to await its own Sync while still holding
+// writeMu, which meant one fsync per operation, fully serialized: the group-commit
+// writer could not coalesce anything, because no second operation could reach it
+// until the first Sync returned. Releasing the lock before the wait is what lets
+// concurrent appends, leases and acks share a single Sync.
+func (s *SegmentedWALStore) writeRecordAsync(r walRecord) (*groupCommitReq, error) {
 	if s.activeFile == nil || s.gc == nil {
-		return ErrClosed
+		return nil, ErrClosed
 	}
 
 	// Check if active segment exceeded maxSegmentSize
 	if s.activeMeta != nil && s.activeMeta.SizeBytes >= s.cfg.MaxSegmentSize {
 		if err := s.rotateSegmentLocked(); err != nil {
-			return fmt.Errorf("rotate segment: %w", err)
+			return nil, fmt.Errorf("rotate segment: %w", err)
 		}
 	}
 
 	r.At = time.Now()
 	record, err := s.walCodec.encode(nil, r)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	recLen := int64(len(record))
 	ulen := int64(uvarintLen(uint64(recLen)))
 	totalBytes := ulen + recLen
 
-	if err := s.gc.writeUvarintPrefixed(record); err != nil {
-		return err
+	req, err := s.gc.enqueue(record, true)
+	if err != nil {
+		return nil, err
 	}
 
 	seq := s.manifest.NextSeq
@@ -725,7 +735,19 @@ func (s *SegmentedWALStore) writeRecordLocked(r walRecord) error {
 		}
 	}
 
-	return nil
+	return req, nil
+}
+
+// writeRecordLocked is the synchronous form for callers that already hold
+// writeMu, which is what the name means and what the control-plane callers rely
+// on. It must not take the lock itself: sync.Mutex is not reentrant, so doing so
+// deadlocks every Declare/Pause/Resume/Purge caller.
+func (s *SegmentedWALStore) writeRecordLocked(r walRecord) error {
+	req, err := s.writeRecordAsync(r)
+	if err != nil {
+		return err
+	}
+	return s.gc.await(req)
 }
 
 func (s *SegmentedWALStore) write(r walRecord) error {
@@ -783,47 +805,74 @@ func (s *SegmentedWALStore) AppendAtomicOwned(ctx context.Context, entries []App
 
 func (s *SegmentedWALStore) durableAppend(ctx context.Context, entries []AppendEntry) ([]Message, error) {
 	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
 	out, err := s.MemoryStore.prepareAppendAtomic(ctx, entries)
 	if err != nil {
+		s.writeMu.Unlock()
 		return nil, err
 	}
 	persisted := storedAppendEntries(out)
-	if err := s.writeRecordLocked(walRecord{Op: "append_atomic", Entries: persisted}); err != nil {
+	req, err := s.writeRecordAsync(walRecord{Op: "append_atomic", Entries: persisted})
+	if err != nil {
+		s.writeMu.Unlock()
 		return nil, err
 	}
-	if err := s.MemoryStore.appendRecoveredAtomic(persisted); err != nil {
-		return nil, fmt.Errorf("apply durable append: %w", err)
+	// Apply while still holding writeMu, but hidden from readers, so the next
+	// append validates against it. The fsync wait happens after the unlock.
+	applyErr := s.MemoryStore.appendRecoveredAtomicPending(persisted)
+	s.writeMu.Unlock()
+
+	if err := s.gc.await(req); err != nil {
+		return nil, err
+	}
+	s.MemoryStore.commitPending(persisted)
+	if applyErr != nil {
+		return nil, fmt.Errorf("apply durable append: %w", applyErr)
 	}
 	return out, nil
 }
 
 func (s *SegmentedWALStore) Lease(ctx context.Context, req LeaseRequest) ([]Message, error) {
 	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
 	msgs, err := s.MemoryStore.prepareLease(ctx, req)
 	if err != nil || len(msgs) == 0 {
+		s.writeMu.Unlock()
 		return msgs, err
 	}
-	if err := s.writeRecordLocked(walRecord{Op: "lease_batch", Messages: msgs, Lease: req}); err != nil {
+	wreq, err := s.writeRecordAsync(walRecord{Op: "lease_batch", Messages: msgs, Lease: req})
+	if err != nil {
+		s.writeMu.Unlock()
 		return nil, err
 	}
-	if err := s.MemoryStore.applyLease(ctx, msgs, req); err != nil {
+	applyErr := s.MemoryStore.applyLease(ctx, msgs, req)
+	s.writeMu.Unlock()
+
+	if err := s.gc.await(wreq); err != nil {
 		return nil, err
+	}
+	if applyErr != nil {
+		return nil, applyErr
 	}
 	return msgs, nil
 }
 
 func (s *SegmentedWALStore) Ack(ctx context.Context, req AckRequest) error {
 	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
 	if err := s.MemoryStore.validateAckLease(ctx, req); err != nil {
+		s.writeMu.Unlock()
 		return err
 	}
-	if err := s.writeRecordLocked(walRecord{Op: "ack", Ack: req}); err != nil {
+	wreq, err := s.writeRecordAsync(walRecord{Op: "ack", Ack: req})
+	if err != nil {
+		s.writeMu.Unlock()
 		return err
 	}
-	return s.MemoryStore.Ack(ctx, req)
+	applyErr := s.MemoryStore.Ack(ctx, req)
+	s.writeMu.Unlock()
+
+	if err := s.gc.await(wreq); err != nil {
+		return err
+	}
+	return applyErr
 }
 
 func (s *SegmentedWALStore) AckBatch(ctx context.Context, reqs []AckRequest) []error {

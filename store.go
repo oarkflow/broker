@@ -20,6 +20,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -213,20 +214,38 @@ type memoryStream struct {
 	cfg    StreamConfig
 	ids    []string
 	offset uint64
+	// readHint is a lower bound on the index of the first entry whose offset
+	// exceeds the last requested after-offset. Stream offsets are assigned
+	// monotonically as ids are appended, so a consumer reading sequentially can
+	// start near the tail instead of scanning the whole stream from index 0.
+	//
+	// It is only ever a hint, and is corrected by walking backwards on each read,
+	// so removals and out-of-order reads cannot make it return the wrong message.
+	//
+	// Atomic because ReadStream runs under the store read lock, so several readers
+	// can be updating it concurrently. A stale or lost update only costs a longer
+	// backward walk.
+	readHint atomic.Int64
 }
 
 type MemoryStore struct {
-	mu              sync.RWMutex
-	queues          map[string]*memoryQueue
-	topics          map[string]*memoryTopic
-	streams         map[string]*memoryStream
-	messages        map[string]*Message
-	history         map[string][]MessageHistory
-	offsets         map[string]map[string]uint64
-	dedup           map[string]time.Time
-	idemp           map[string]string
-	producerSeq     map[string]ProducerState
-	moveOps         map[string]MoveResult
+	mu          sync.RWMutex
+	queues      map[string]*memoryQueue
+	topics      map[string]*memoryTopic
+	streams     map[string]*memoryStream
+	messages    map[string]*Message
+	history     map[string][]MessageHistory
+	offsets     map[string]map[string]uint64
+	dedup       map[string]time.Time
+	idemp       map[string]string
+	producerSeq map[string]ProducerState
+	moveOps     map[string]MoveResult
+	// moveOrder and moveOrderAt track move-result insertion so Cleanup can evict
+	// the oldest. moveOps alone cannot be pruned: its keys are caller-supplied
+	// operation ids, so nothing else in the store refers to them.
+	moveOrder       []string
+	moveOrderAt     []time.Time
+	moveSeen        map[string]struct{}
 	rand            *mathrand.Rand
 	historyLimit    int
 	retainCompleted bool
@@ -326,7 +345,7 @@ func (s *MemoryStore) nextSweepFull() bool {
 }
 
 func NewMemoryStore() *MemoryStore {
-	return &MemoryStore{queues: map[string]*memoryQueue{}, topics: map[string]*memoryTopic{}, streams: map[string]*memoryStream{}, messages: map[string]*Message{}, history: map[string][]MessageHistory{}, offsets: map[string]map[string]uint64{}, dedup: map[string]time.Time{}, idemp: map[string]string{}, producerSeq: map[string]ProducerState{}, moveOps: map[string]MoveResult{}, rand: mathrand.New(mathrand.NewSource(time.Now().UnixNano())), historyLimit: 32, retainCompleted: true, completed: map[string]struct{}{}, completedLimit: 65536, compact: compactBacklogDefault}
+	return &MemoryStore{queues: map[string]*memoryQueue{}, topics: map[string]*memoryTopic{}, streams: map[string]*memoryStream{}, messages: map[string]*Message{}, history: map[string][]MessageHistory{}, offsets: map[string]map[string]uint64{}, dedup: map[string]time.Time{}, idemp: map[string]string{}, producerSeq: map[string]ProducerState{}, moveOps: map[string]MoveResult{}, moveSeen: map[string]struct{}{}, rand: mathrand.New(mathrand.NewSource(time.Now().UnixNano())), historyLimit: 32, retainCompleted: true, completed: map[string]struct{}{}, completedLimit: 65536, compact: compactBacklogDefault}
 }
 
 func (*MemoryStore) ConfirmationLevel() ConfirmLevel { return ConfirmEnqueued }
@@ -1734,6 +1753,11 @@ func (s *MemoryStore) applyMovePlan(ctx context.Context, operationID string, req
 	result, err := s.moveLocked(ctx, req, plannedIDs, true)
 	if err == nil {
 		s.moveOps[operationID] = result
+		if _, seen := s.moveSeen[operationID]; !seen {
+			s.moveSeen[operationID] = struct{}{}
+			s.moveOrder = append(s.moveOrder, operationID)
+			s.moveOrderAt = append(s.moveOrderAt, time.Now())
+		}
 	}
 	return result, err
 }
@@ -2010,22 +2034,54 @@ func (s *MemoryStore) ReadStream(ctx context.Context, req StreamReadRequest) ([]
 			after = groups[offsetGroupKey(req.TenantID, req.ConsumerGroup)]
 		}
 	}
-	out := make([]Message, 0, minInt(req.Limit, len(stream.ids)))
-	for _, id := range stream.ids {
+	// Start from the hint and walk back to the true boundary. Entries are ordered
+	// by offset, so the first entry at or before the hint that still exceeds
+	// "after" marks the boundary; everything before it is at or below "after" and
+	// cannot match. The walk is what keeps the hint honest, so a stale hint costs
+	// a few steps rather than correctness. A hint that is too far forward walks
+	// back to the start, which is the same O(n) work the previous unconditional
+	// scan did, so this is never slower than before.
+	start := int(stream.readHint.Load())
+	if start > len(stream.ids) {
+		start = len(stream.ids)
+	}
+	if start < 0 {
+		start = 0
+	}
+	for start > 0 {
+		m := s.messages[stream.ids[start-1]]
+		// Entries are ordered by offset, so every index at or after the boundary
+		// also exceeds "after". Step back while the previous entry still
+		// qualifies, and stop at the first that does not. A removed entry counts
+		// as qualifying: over-scanning is harmless because the forward loop skips
+		// it, whereas stopping short would silently drop messages.
+		if m != nil && m.Offset <= after {
+			break
+		}
+		start--
+	}
+	out := make([]Message, 0, minInt(req.Limit, len(stream.ids)-start))
+	consumed := start
+	for i := start; i < len(stream.ids); i++ {
+		id := stream.ids[i]
 		m := s.messages[id]
 		if m == nil || s.isPendingLocked(id) {
-			continue
-		}
-		if !tenantAllowed(ctx, m.TenantID) || (req.TenantID != "" && m.TenantID != req.TenantID) {
 			continue
 		}
 		if m.Offset <= after {
 			continue
 		}
+		if !tenantAllowed(ctx, m.TenantID) || (req.TenantID != "" && m.TenantID != req.TenantID) {
+			continue
+		}
 		out = append(out, cloneMessage(*m))
+		consumed = i + 1
 		if len(out) >= req.Limit {
 			break
 		}
+	}
+	if int64(consumed) > stream.readHint.Load() {
+		stream.readHint.Store(int64(consumed))
 	}
 	return out, nil
 }
@@ -2269,6 +2325,49 @@ func (s *MemoryStore) Cleanup(maxHistoryPerMessage int) {
 		if len(hist) > maxHistoryPerMessage {
 			s.history[id] = hist[len(hist)-maxHistoryPerMessage:]
 		}
+	}
+	// Prune move results. moveOps is keyed by a caller-supplied operation id, so
+	// it grew without bound and nothing reclaimed it: unlike dedup and idemp,
+	// which this method already pruned, a move result stays valid forever. That
+	// is an unbounded leak on any workload that moves or reroutes messages in a
+	// loop. Drop the oldest first, and bound the retention window so a caller that
+	// never returns still cannot accumulate indefinitely.
+	s.pruneMoveOpsLocked()
+}
+
+// moveOpsMax bounds the retained move-operation results.
+const moveOpsMax = 4096
+
+// moveOpsTTL bounds how long a move result stays retrievable.
+const moveOpsTTL = time.Hour
+
+// pruneMoveOpsLocked drops expired and excess move-operation results. The caller
+// must hold s.mu.
+func (s *MemoryStore) pruneMoveOpsLocked() {
+	if len(s.moveOrder) == 0 {
+		return
+	}
+	cut := 0
+	now := time.Now()
+	for cut < len(s.moveOrder) {
+		id := s.moveOrder[cut]
+		if _, ok := s.moveSeen[id]; !ok {
+			cut++
+			continue
+		}
+		if cut < len(s.moveOrderAt) && now.Sub(s.moveOrderAt[cut]) < moveOpsTTL && len(s.moveOps) <= moveOpsMax {
+			break
+		}
+		delete(s.moveOps, id)
+		delete(s.moveSeen, id)
+		cut++
+	}
+	if cut == 0 {
+		return
+	}
+	s.moveOrder = append([]string(nil), s.moveOrder[cut:]...)
+	if len(s.moveOrderAt) >= cut {
+		s.moveOrderAt = append([]time.Time(nil), s.moveOrderAt[cut:]...)
 	}
 }
 

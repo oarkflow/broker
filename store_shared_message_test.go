@@ -2,8 +2,10 @@ package broker
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 // Lease and Append hand back a Message that shares Payload, Headers and Metadata
@@ -286,5 +288,221 @@ func TestAppendResultCarriesHeadersPerDestination(t *testing.T) {
 		if string(m.Payload) != "body" {
 			t.Errorf("entry %d payload = %q", i, m.Payload)
 		}
+	}
+}
+
+// ReadStream used to scan a stream's ids from index 0 on every call, so a
+// consumer reading from the tail of a long stream paid for every message ever
+// written. The read hint should make sequential reads O(limit) while returning
+// exactly the same messages.
+func TestReadStreamReturnsSameMessagesWithHint(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name    string
+		removed int
+		setup   func(t *testing.T, store *MemoryStore)
+	}{
+		{"dense", 0, func(t *testing.T, store *MemoryStore) {}},
+		{"with holes", 7, func(t *testing.T, store *MemoryStore) {
+			// Remove entries from the middle so indices no longer line up with
+			// offsets, which is what the backward correction has to handle.
+			if err := store.DeclareQueue(ctx, QueueConfig{Name: "sink"}); err != nil {
+				t.Fatal(err)
+			}
+			for i := 0; i < 20; i += 3 {
+				if _, err := store.Move(ctx, MoveRequest{
+					SourceType: DestinationStream, Source: "s",
+					DestinationType: DestinationQueue, Destination: "sink",
+					MessageIDs: []string{streamMsgID(i)},
+					Mode:       MoveRemoveSource,
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := NewMemoryStore()
+			defer store.Close()
+			if err := store.DeclareStream(ctx, StreamConfig{Name: "s"}); err != nil {
+				t.Fatal(err)
+			}
+			const total = 300
+			for i := 0; i < total; i++ {
+				if _, err := store.Append(ctx, Message{
+					ID: streamMsgID(i), Stream: "s", Payload: []byte("p"),
+				}, []Destination{{Kind: DestinationStream, Name: "s"}}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			tc.setup(t, store)
+
+			// Sequential tail reads, which is what the hint optimises.
+			var after uint64
+			seen := 0
+			for round := 0; round < 1000; round++ {
+				msgs, err := store.ReadStream(ctx, StreamReadRequest{Stream: "s", AfterOffset: after, Limit: 25})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(msgs) == 0 {
+					break
+				}
+				for _, m := range msgs {
+					if m.Offset <= after {
+						t.Fatalf("round %d returned offset %d <= after %d", round, m.Offset, after)
+					}
+					if m.Offset != after+1 && seen > 0 {
+						// Offsets may skip removed entries, but must not repeat or
+						// go backwards, which they cannot given monotonic assignment.
+						if m.Offset < after+1 {
+							t.Fatalf("round %d went backwards: %d after %d", round, m.Offset, after)
+						}
+					}
+					after = m.Offset
+					seen++
+				}
+			}
+			if want := total - tc.removed; seen != want {
+				t.Fatalf("sequential reads saw %d messages, want %d", seen, want)
+			}
+
+			// Out-of-order reads must still be correct: the hint is only a hint.
+			for _, probe := range []uint64{0, 1, 150, 299, 300, 5000} {
+				msgs, err := store.ReadStream(ctx, StreamReadRequest{Stream: "s", AfterOffset: probe, Limit: 10})
+				if err != nil {
+					t.Fatal(err)
+				}
+				for _, m := range msgs {
+					if m.Offset <= probe {
+						t.Fatalf("after=%d returned offset %d", probe, m.Offset)
+					}
+				}
+				if probe == 0 && len(msgs) != 10 {
+					t.Fatalf("after=0 returned %d messages, want 10", len(msgs))
+				}
+				if probe >= total && len(msgs) != 0 {
+					t.Fatalf("after=%d (past the end) returned %d messages", probe, len(msgs))
+				}
+			}
+		})
+	}
+}
+
+func streamMsgID(i int) string { return fmt.Sprintf("s-%04d", i) }
+
+// moveOps is keyed by a caller-supplied operation id, so nothing in the store
+// refers to those keys. Only the replicated-move path populates it, and it never
+// reclaimed them, so a replicated workload that moves messages in a loop grew the
+// map without bound. Cleanup now evicts them, and a restored snapshot rebuilds the
+// index so restored entries stay prunable.
+func TestCleanupPrunesMoveResults(t *testing.T) {
+	ctx := context.Background()
+	store := NewMemoryStore()
+	defer store.Close()
+	if err := store.DeclareQueue(ctx, QueueConfig{Name: "src"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DeclareQueue(ctx, QueueConfig{Name: "dst"}); err != nil {
+		t.Fatal(err)
+	}
+
+	record := func(opID string) {
+		t.Helper()
+		planned := map[string]string{}
+		if _, err := store.applyMovePlan(ctx, opID, MoveRequest{
+			SourceType: DestinationQueue, Source: "src",
+			DestinationType: DestinationQueue, Destination: "dst",
+			Mode: MoveRemoveSource,
+		}, planned); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	const ops = moveOpsMax + 500
+	for i := 0; i < ops; i++ {
+		record(fmt.Sprintf("op-%d", i))
+	}
+
+	store.mu.RLock()
+	before := len(store.moveOps)
+	store.mu.RUnlock()
+	if before != ops {
+		t.Fatalf("seeded %d move results, store holds %d", ops, before)
+	}
+
+	store.Cleanup(0)
+
+	store.mu.RLock()
+	after := len(store.moveOps)
+	order := len(store.moveOrder)
+	store.mu.RUnlock()
+	if after >= before {
+		t.Fatalf("Cleanup did not prune move results: %d -> %d", before, after)
+	}
+	if after > moveOpsMax {
+		t.Fatalf("move results still above the cap after Cleanup: %d > %d", after, moveOpsMax)
+	}
+	if order != after {
+		t.Fatalf("insertion index has %d entries but the map holds %d; they must stay in step", order, after)
+	}
+
+	// Repeating an operation id is idempotent and must not double-index it.
+	newest := fmt.Sprintf("op-%d", ops-1)
+	store.mu.RLock()
+	_, kept := store.moveOps[newest]
+	store.mu.RUnlock()
+	if !kept {
+		t.Fatalf("the most recent move result %q was evicted", newest)
+	}
+	record(newest)
+	store.mu.RLock()
+	orderAfter := len(store.moveOrder)
+	store.mu.RUnlock()
+	if orderAfter != order {
+		t.Fatalf("re-recording an existing operation id grew the index from %d to %d", order, orderAfter)
+	}
+}
+
+// A restored snapshot must carry a usable insertion index, otherwise its move
+// results could never be pruned.
+func TestRestoredMoveResultsStayPrunable(t *testing.T) {
+	source := NewMemoryStore()
+	defer source.Close()
+	source.mu.Lock()
+	for i := 0; i < 50; i++ {
+		source.moveOps[fmt.Sprintf("op-%d", i)] = MoveResult{Moved: 1}
+	}
+	source.mu.Unlock()
+	snap := source.Snapshot()
+
+	target := NewMemoryStore()
+	defer target.Close()
+	target.Restore(snap)
+
+	target.mu.RLock()
+	got := len(target.moveOps)
+	indexed := len(target.moveOrder)
+	target.mu.RUnlock()
+	if got != 50 {
+		t.Fatalf("restored %d move results, want 50", got)
+	}
+	if indexed != got {
+		t.Fatalf("restored %d move results but indexed %d; they must stay in step", got, indexed)
+	}
+
+	// Age them past the retention window and confirm they are reclaimed.
+	target.mu.Lock()
+	for i := range target.moveOrderAt {
+		target.moveOrderAt[i] = time.Now().Add(-2 * moveOpsTTL)
+	}
+	target.mu.Unlock()
+	target.Cleanup(0)
+
+	target.mu.RLock()
+	remaining := len(target.moveOps)
+	target.mu.RUnlock()
+	if remaining != 0 {
+		t.Fatalf("%d restored move results survived pruning", remaining)
 	}
 }

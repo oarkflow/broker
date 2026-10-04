@@ -131,6 +131,9 @@ func (s *MemoryStore) restoreSnapshot(snap MemoryStoreSnapshot, recoverInflight 
 	s.idemp = map[string]string{}
 	s.producerSeq = map[string]ProducerState{}
 	s.moveOps = map[string]MoveResult{}
+	s.moveSeen = map[string]struct{}{}
+	s.moveOrder = nil
+	s.moveOrderAt = nil
 	for name, q := range snap.Queues {
 		state := q.State
 		if state == "" {
@@ -202,8 +205,16 @@ func (s *MemoryStore) restoreSnapshot(snap MemoryStoreSnapshot, recoverInflight 
 	for k, v := range snap.Producers {
 		s.producerSeq[k] = v
 	}
+	// Rebuild the move-result insertion index alongside the map. Without it a
+	// restored snapshot would carry move results that Cleanup cannot identify as
+	// prunable, so they would never be reclaimed.
+	s.moveOrder = s.moveOrder[:0]
+	s.moveOrderAt = s.moveOrderAt[:0]
 	for k, v := range snap.MoveOps {
 		s.moveOps[k] = v
+		s.moveSeen[k] = struct{}{}
+		s.moveOrder = append(s.moveOrder, k)
+		s.moveOrderAt = append(s.moveOrderAt, time.Now())
 	}
 	if s.compact {
 		s.demoteEligibleLocked()

@@ -89,7 +89,45 @@ func New(cfg Config) *Client {
 	if cfg.Group == "" {
 		cfg.Group = cfg.ConsumerID
 	}
-	// Build HTTP client with TLS if configured
+	if cfg.Name == "" {
+		cfg.Name = cfg.ConsumerID
+	}
+	if cfg.Concurrency <= 0 {
+		cfg.Concurrency = 1
+	}
+	if cfg.MaxInFlight <= 0 {
+		cfg.MaxInFlight = cfg.Concurrency
+	}
+	if cfg.HeartbeatInterval <= 0 {
+		cfg.HeartbeatInterval = 10 * time.Second
+	}
+	if cfg.VisibilityTimeout <= 0 {
+		cfg.VisibilityTimeout = 30 * time.Second
+	}
+	if cfg.PollWait <= 0 {
+		cfg.PollWait = defaultPollWait
+	}
+	if cfg.PollLimit <= 0 {
+		cfg.PollLimit = 1
+	}
+	if cfg.FrameCodec == nil {
+		cfg.FrameCodec = broker.NewBinaryMessageCodec()
+	}
+	if cfg.LeaseExtensionInterval <= 0 {
+		cfg.LeaseExtensionInterval = cfg.VisibilityTimeout / 2
+		if cfg.LeaseExtensionInterval <= 0 {
+			cfg.LeaseExtensionInterval = 10 * time.Second
+		}
+	}
+	// Build the HTTP client only after PollWait has a value, so its timeout can
+	// exceed the long-poll window.
+	//
+	// The client used to be constructed first with a hardcoded 30s timeout, which
+	// then made the "PollWait + headroom" timeout below unreachable dead code.
+	// Since PollWait also defaulted to 30s, every long poll raced the client's own
+	// deadline: the server kept the request open for the remainder of its window
+	// after the client had already given up, and the worker loop slept and retried.
+	// Each attempt therefore left an orphaned handler behind.
 	if cfg.HTTPClient == nil {
 		transport := tunedTransport()
 		if cfg.TLSCertFile != "" && cfg.TLSKeyFile != "" {
@@ -121,44 +159,49 @@ func New(cfg Config) *Client {
 			t.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
 			transport = t
 		}
-		cfg.HTTPClient = &http.Client{Transport: transport, Timeout: 30 * time.Second}
-	}
-	if cfg.Name == "" {
-		cfg.Name = cfg.ConsumerID
-	}
-	if cfg.Concurrency <= 0 {
-		cfg.Concurrency = 1
-	}
-	if cfg.MaxInFlight <= 0 {
-		cfg.MaxInFlight = cfg.Concurrency
-	}
-	if cfg.HeartbeatInterval <= 0 {
-		cfg.HeartbeatInterval = 10 * time.Second
-	}
-	if cfg.VisibilityTimeout <= 0 {
-		cfg.VisibilityTimeout = 30 * time.Second
-	}
-	if cfg.PollWait <= 0 {
-		cfg.PollWait = 30 * time.Second
-	}
-	if cfg.PollLimit <= 0 {
-		cfg.PollLimit = 1
-	}
-	if cfg.FrameCodec == nil {
-		cfg.FrameCodec = broker.NewBinaryMessageCodec()
-	}
-	if cfg.LeaseExtensionInterval <= 0 {
-		cfg.LeaseExtensionInterval = cfg.VisibilityTimeout / 2
-		if cfg.LeaseExtensionInterval <= 0 {
-			cfg.LeaseExtensionInterval = 10 * time.Second
-		}
+		cfg.HTTPClient = &http.Client{Transport: transport, Timeout: cfg.PollWait + pollTimeoutHeadroom}
+	} else if cfg.HTTPClient.Timeout > 0 && cfg.HTTPClient.Timeout <= cfg.PollWait {
+		// A caller-supplied client is respected, but a timeout at or below the
+		// long-poll window guarantees the race above, so raise it rather than
+		// failing every poll at the deadline.
+		cfg.HTTPClient.Timeout = cfg.PollWait + pollTimeoutHeadroom
 	}
 	c := cfg.HTTPClient
-	if c == nil {
-		c = &http.Client{Timeout: cfg.PollWait + 10*time.Second}
-	}
 	return &Client{cfg: cfg, http: c, urls: urls}
 }
+
+// remoteError turns a data-plane error response into an error that behaves like
+// the equivalent in-process one.
+//
+// The server used to answer every failure with http.Error(w, err.Error(), 409),
+// so the client could only build a string. That made errors.Is(err,
+// broker.ErrNotLeader), errors.Is(err, broker.ErrLeaseLost) and
+// broker.ClassifyRetry all unusable for any remote caller, even though the broker
+// went to some length to embed the leader address in the message text. The server
+// now writes a typed envelope; a server that still answers with plain text falls
+// back to the previous string form.
+func remoteError(status int, body []byte) error {
+	if remote := broker.ParseRemoteError(status, body); remote != nil {
+		return remote
+	}
+	return fmt.Errorf("broker %s: %s", http.StatusText(status), strings.TrimSpace(string(body)))
+}
+
+// isRetryableStatus reports whether a status is worth retrying against the next
+// broker URL. A typed envelope tells us authoritatively: a not-leader or
+// stale-epoch response should be retried elsewhere, whereas a genuine 5xx should
+// not be replayed against a different broker.
+func isRetryableStatus(status int) bool {
+	return status == http.StatusTooManyRequests || status == http.StatusServiceUnavailable
+}
+
+// defaultPollWait is how long the client asks the broker to hold a poll open.
+const defaultPollWait = 30 * time.Second
+
+// pollTimeoutHeadroom is added to PollWait for the HTTP client deadline, so the
+// client's timeout only fires after the server would have answered on its own.
+const pollTimeoutHeadroom = 10 * time.Second
+
 func (c *Client) Config() Config { return c.cfg }
 func (c *Client) Register(ctx context.Context, reg broker.ConsumerRegistration) (broker.ConsumerInfo, error) {
 	if reg.ConsumerID == "" {
@@ -648,13 +691,13 @@ func (c *Client) doRawStatus(ctx context.Context, method, path, contentType stri
 		}
 		data, _ := io.ReadAll(resp.Body)
 		_ = resp.Body.Close()
-		if resp.StatusCode >= 500 && len(urls) > 1 {
-			last = fmt.Errorf("broker %s: %s", resp.Status, strings.TrimSpace(string(data)))
+		if resp.StatusCode >= 500 && len(urls) > 1 && !isRetryableStatus(resp.StatusCode) {
+			last = remoteError(resp.StatusCode, data)
 			continue
 		}
 		c.markActive(base)
 		if resp.StatusCode >= 300 {
-			return nil, resp.StatusCode, fmt.Errorf("broker %s: %s", resp.Status, strings.TrimSpace(string(data)))
+			return nil, resp.StatusCode, remoteError(resp.StatusCode, data)
 		}
 		return data, resp.StatusCode, nil
 	}
@@ -700,13 +743,13 @@ func (c *Client) doJSON(ctx context.Context, method, path string, in, out any) e
 		}
 		data, _ := io.ReadAll(resp.Body)
 		_ = resp.Body.Close()
-		if resp.StatusCode >= 500 && len(urls) > 1 {
-			last = fmt.Errorf("broker %s: %s", resp.Status, strings.TrimSpace(string(data)))
+		if resp.StatusCode >= 500 && len(urls) > 1 && !isRetryableStatus(resp.StatusCode) {
+			last = remoteError(resp.StatusCode, data)
 			continue
 		}
 		c.markActive(base)
 		if resp.StatusCode >= 300 {
-			return fmt.Errorf("broker %s: %s", resp.Status, strings.TrimSpace(string(data)))
+			return remoteError(resp.StatusCode, data)
 		}
 		if out != nil && len(data) > 0 {
 			return json.Unmarshal(data, out)

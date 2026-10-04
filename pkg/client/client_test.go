@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -774,5 +775,205 @@ func TestPublishOptionsReachTheBroker(t *testing.T) {
 	}
 	if got.MaxAttempts != 7 {
 		t.Errorf("MaxAttempts = %d, want 7", got.MaxAttempts)
+	}
+}
+
+// TestClientTimeoutExceedsPollWait pins the long-poll deadline relationship. The
+// client used to build its HTTP client with a hardcoded 30s timeout before
+// PollWait had a value, which left the intended "PollWait + headroom" timeout as
+// dead code. With PollWait also defaulting to 30s, every long poll raced the
+// client's own deadline: the broker held the request open for the rest of its
+// window after the client gave up, and the worker loop slept and retried, leaking
+// a handler per attempt.
+func TestClientTimeoutExceedsPollWait(t *testing.T) {
+	t.Run("default", func(t *testing.T) {
+		c := New(Config{BrokerURL: "http://127.0.0.1:1"})
+		cfg := c.Config()
+		if cfg.HTTPClient.Timeout <= cfg.PollWait {
+			t.Fatalf("client timeout %s must exceed PollWait %s", cfg.HTTPClient.Timeout, cfg.PollWait)
+		}
+	})
+
+	t.Run("larger poll wait", func(t *testing.T) {
+		c := New(Config{BrokerURL: "http://127.0.0.1:1", PollWait: 2 * time.Minute})
+		cfg := c.Config()
+		if cfg.HTTPClient.Timeout <= cfg.PollWait {
+			t.Fatalf("client timeout %s must exceed PollWait %s", cfg.HTTPClient.Timeout, cfg.PollWait)
+		}
+	})
+
+	t.Run("raised when a supplied client is too short", func(t *testing.T) {
+		c := New(Config{
+			BrokerURL:  "http://127.0.0.1:1",
+			PollWait:   45 * time.Second,
+			HTTPClient: &http.Client{Timeout: 20 * time.Second},
+		})
+		cfg := c.Config()
+		if cfg.HTTPClient.Timeout <= cfg.PollWait {
+			t.Fatalf("a supplied 20s timeout against a 45s PollWait was left in place (%s)", cfg.HTTPClient.Timeout)
+		}
+	})
+
+	t.Run("respects a generous supplied timeout", func(t *testing.T) {
+		c := New(Config{
+			BrokerURL:  "http://127.0.0.1:1",
+			PollWait:   5 * time.Second,
+			HTTPClient: &http.Client{Timeout: 10 * time.Minute},
+		})
+		cfg := c.Config()
+		if cfg.HTTPClient.Timeout != 10*time.Minute {
+			t.Fatalf("a generous supplied timeout was rewritten to %s", cfg.HTTPClient.Timeout)
+		}
+	})
+}
+
+// A long poll must return as soon as a message arrives rather than sitting until
+// the deadline, and must not leave the server handler running afterwards.
+func TestLongPollReturnsPromptlyOnMessage(t *testing.T) {
+	b := broker.MustNew(broker.Config{})
+	ctx := context.Background()
+	if err := b.DeclareQueue(ctx, broker.QueueConfig{Name: "lp"}); err != nil {
+		t.Fatal(err)
+	}
+	admin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		a := broker.AdminServer{Broker: b, Token: "secret"}
+		a.Handler().ServeHTTP(w, r)
+	}))
+	defer admin.Close()
+
+	c := New(Config{BrokerURLs: []string{admin.URL}, Token: "secret", PollWait: 20 * time.Second})
+
+	go func() {
+		time.Sleep(150 * time.Millisecond)
+		_, _ = b.Publisher().Publish(ctx, "", []byte("hello"), broker.WithQueue("lp"))
+	}()
+
+	start := time.Now()
+	msgs, err := c.Poll(ctx, "lp", 10)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("poll: %v", err)
+	}
+	if len(msgs) != 1 {
+		t.Fatalf("polled %d messages, want 1", len(msgs))
+	}
+	if elapsed > 5*time.Second {
+		t.Fatalf("long poll took %s to return an available message; it is not being woken early", elapsed)
+	}
+}
+
+// Errors from the data plane must behave like the in-process equivalents. The
+// server used to answer every failure with http.Error(w, err.Error(), 409), so a
+// remote caller received an opaque string: errors.Is against a broker sentinel
+// was always false and broker.ClassifyRetry never matched.
+func TestRemoteErrorsAreTyped(t *testing.T) {
+	b := broker.MustNew(broker.Config{})
+	t.Cleanup(func() { _ = b.Stop(context.Background()) })
+	ctx := context.Background()
+	if err := b.DeclareQueue(ctx, broker.QueueConfig{Name: "q"}); err != nil {
+		t.Fatal(err)
+	}
+	admin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		a := broker.AdminServer{Broker: b, Token: "secret"}
+		a.Handler().ServeHTTP(w, r)
+	}))
+	defer admin.Close()
+	c := New(Config{BrokerURLs: []string{admin.URL}, Token: "secret"})
+
+	t.Run("not_found", func(t *testing.T) {
+		_, err := c.Poll(ctx, "no-such-queue", 1)
+		if err == nil {
+			t.Fatal("expected an error")
+		}
+		if !errors.Is(err, broker.ErrQueueNotFound) {
+			t.Fatalf("errors.Is(err, ErrQueueNotFound) = false for %v", err)
+		}
+		var remote *broker.RemoteError
+		if !errors.As(err, &remote) {
+			t.Fatalf("error is not a RemoteError: %T", err)
+		}
+		if remote.Code != "queue_not_found" {
+			t.Errorf("code = %q", remote.Code)
+		}
+		if remote.Status != http.StatusNotFound {
+			t.Errorf("status = %d, want 404; the data plane flattened everything to 409", remote.Status)
+		}
+	})
+
+	t.Run("lease_lost", func(t *testing.T) {
+		if _, err := b.Publisher().Publish(ctx, "", []byte("x"), broker.WithQueue("q")); err != nil {
+			t.Fatal(err)
+		}
+		msgs, err := b.Store().Lease(ctx, broker.LeaseRequest{Queue: "q", ConsumerID: "c", Limit: 1})
+		if err != nil || len(msgs) != 1 {
+			t.Fatalf("lease: n=%d err=%v", len(msgs), err)
+		}
+		// Strip the lease token so the store must reject the ack.
+		stale := msgs[0]
+		stale.LeaseToken = ""
+		err = c.Ack(ctx, stale)
+		if err == nil {
+			t.Fatal("expected the ack to be rejected")
+		}
+		if !errors.Is(err, broker.ErrLeaseLost) {
+			t.Fatalf("errors.Is(err, ErrLeaseLost) = false for %v", err)
+		}
+		if err := b.Store().Ack(ctx, broker.AckRequest{
+			MessageID: msgs[0].ID, Queue: "q", ConsumerID: "c", LeaseToken: msgs[0].LeaseToken,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("unauthorized", func(t *testing.T) {
+		bad := New(Config{BrokerURLs: []string{admin.URL}, Token: "wrong-token"})
+		_, err := bad.Publish(ctx, "t", []byte("x"))
+		if err == nil {
+			t.Fatal("expected an auth failure")
+		}
+		// A bad credential is 401 unauthenticated, distinct from 403 unauthorized.
+		if !errors.Is(err, broker.ErrUnauthenticated) {
+			t.Fatalf("errors.Is(err, ErrUnauthenticated) = false for %v", err)
+		}
+		if errors.Is(err, broker.ErrUnauthorized) {
+			t.Fatalf("a bad credential must not be reported as ErrUnauthorized: %v", err)
+		}
+	})
+}
+
+// A typed retryable error must be classifiable, which is what a follower-aware
+// client needs to redirect.
+func TestRemoteRetryClassification(t *testing.T) {
+	err := broker.ParseRemoteError(http.StatusServiceUnavailable,
+		[]byte(`{"error":{"code":"not_leader","message":"broker: not leader; leader is node 3","retryable":true,"class":"not_leader","details":{"leader":"node-3","leader_epoch":"7"}}}`))
+	if err == nil {
+		t.Fatal("expected a parsed error")
+	}
+	class, ok := broker.ClassifyRetry(err)
+	if !ok || class != broker.RetryNotLeader {
+		t.Fatalf("ClassifyRetry = %q,%v; want not_leader,true", class, ok)
+	}
+	if !errors.Is(err, broker.ErrNotLeader) {
+		t.Fatal("errors.Is(err, ErrNotLeader) = false")
+	}
+	leader, epoch, _ := err.RetryHint()
+	if leader != "node-3" {
+		t.Errorf("leader = %q, want node-3", leader)
+	}
+	if epoch != 7 {
+		t.Errorf("leader epoch = %d, want 7", epoch)
+	}
+}
+
+// A server that answers with plain text must still produce a usable error rather
+// than a confusing zero value.
+func TestRemoteErrorFallsBackToPlainText(t *testing.T) {
+	err := broker.ParseRemoteError(http.StatusConflict, []byte("broker: something broke"))
+	if err != nil {
+		t.Fatalf("plain text should not parse as an envelope, got %+v", err)
+	}
+	got := remoteError(http.StatusConflict, []byte("broker: something broke"))
+	if got == nil || got.Error() == "" {
+		t.Fatal("expected a non-empty fallback error")
 	}
 }

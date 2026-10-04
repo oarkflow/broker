@@ -348,7 +348,7 @@ func (a AdminServer) v1PublishFrame(w http.ResponseWriter, r *http.Request) {
 	}
 	res, err := a.Broker.Publisher().Publish(r.Context(), topic, msg.Payload, opts...)
 	if err != nil {
-		http.Error(w, err.Error(), 409)
+		WriteBrokerError(w, err)
 		return
 	}
 	writeBrokerJSON(w, res)
@@ -693,7 +693,7 @@ func (a AdminServer) v1Publish(w http.ResponseWriter, r *http.Request) {
 	opts := req.PublishOptions()
 	res, err := a.Broker.Publisher().Publish(r.Context(), req.Topic, payload, opts...)
 	if err != nil {
-		http.Error(w, err.Error(), 409)
+		WriteBrokerError(w, err)
 		return
 	}
 	writeBrokerJSON(w, res)
@@ -772,7 +772,7 @@ func (a AdminServer) v1ConsumerRegister(w http.ResponseWriter, r *http.Request) 
 			http.Error(w, err.Error(), http.StatusForbidden)
 			return
 		}
-		http.Error(w, err.Error(), 409)
+		WriteBrokerError(w, err)
 		return
 	}
 	writeBrokerJSON(w, info)
@@ -835,7 +835,7 @@ func (a AdminServer) v1Consumer(w http.ResponseWriter, r *http.Request, tail str
 				http.Error(w, err.Error(), http.StatusForbidden)
 				return
 			}
-			http.Error(w, err.Error(), 409)
+			WriteBrokerError(w, err)
 			return
 		}
 		writeBrokerJSON(w, info)
@@ -917,35 +917,65 @@ func (a AdminServer) v1Consumer(w http.ResponseWriter, r *http.Request, tail str
 	}
 }
 
-func (a AdminServer) v1PollFrame(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost && r.Method != http.MethodGet {
-		methodBroker(w)
-		return
-	}
+// parsePollRequest reads a poll request from either the JSON body or the query
+// string, so both poll endpoints normalise identically.
+func parsePollRequest(w http.ResponseWriter, r *http.Request) (PollRequest, bool) {
 	var req PollRequest
 	if r.Method == http.MethodPost && r.Body != nil {
 		_ = json.NewDecoder(r.Body).Decode(&req)
 	}
+	q := r.URL.Query()
 	if req.Queue == "" {
-		req.Queue = r.URL.Query().Get("queue")
+		req.Queue = q.Get("queue")
 	}
 	if req.ConsumerID == "" {
-		req.ConsumerID = firstNonEmpty(r.URL.Query().Get("consumer_id"), r.URL.Query().Get("consumer"))
+		req.ConsumerID = firstNonEmpty(q.Get("consumer_id"), q.Get("consumer"))
 	}
 	if req.ConsumerGroup == "" {
-		req.ConsumerGroup = firstNonEmpty(r.URL.Query().Get("consumer_group"), r.URL.Query().Get("group"))
+		req.ConsumerGroup = firstNonEmpty(q.Get("consumer_group"), q.Get("group"))
 	}
 	if req.Limit <= 0 {
 		req.Limit = queryLimit(r, 1)
 	}
 	if req.ConsumerID == "" || req.Queue == "" {
 		http.Error(w, "consumer_id and queue required", 400)
-		return
+		return req, false
 	}
+	return req, true
+}
+
+// consumerBlocked reports whether a registered consumer is in a state that must
+// not receive messages. Unregistered consumers are not blocked, because the
+// stateless poll endpoints do not require prior registration.
+func (a AdminServer) consumerBlocked(consumerID string) bool {
+	info, ok := a.Broker.Consumers().Get(consumerID)
+	if !ok {
+		return false
+	}
+	return info.Paused || info.Draining || info.Banned ||
+		info.State == ConsumerPaused || info.State == ConsumerDraining ||
+		info.State == ConsumerStopped || info.State == ConsumerBanned
+}
+
+// leaseForConsumer runs the guarded lease loop behind both poll endpoints.
+//
+// The JSON and frame endpoints used to carry separate copies of this logic, and
+// the frame copy was missing the banned, paused and draining guard along with the
+// task start and the message.leased notification. A banned consumer polling
+// through /v1/poll/frame therefore kept receiving messages. Sharing one
+// implementation is the fix; the endpoints now differ only in how they encode
+// the result.
+//
+// It returns the leased messages, or ok=false when it has already written the
+// response.
+func (a AdminServer) leaseForConsumer(w http.ResponseWriter, r *http.Request, req PollRequest) ([]Message, bool) {
 	tenant, err := resolveTenant(r.Context(), req.TenantID)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusForbidden)
-		return
+		return nil, false
+	}
+	if a.consumerBlocked(req.ConsumerID) {
+		return []Message{}, true
 	}
 	wait := time.Duration(req.WaitNS)
 	if wait <= 0 {
@@ -956,30 +986,84 @@ func (a AdminServer) v1PollFrame(w http.ResponseWriter, r *http.Request) {
 	if vis <= 0 {
 		vis = queryDuration(r, "visibility_timeout", 0)
 	}
+	leaseReq := LeaseRequest{
+		Queue:             req.Queue,
+		ConsumerID:        req.ConsumerID,
+		ConsumerGroup:     firstNonEmpty(req.ConsumerGroup, req.ConsumerID),
+		Limit:             req.Limit,
+		VisibilityTimeout: vis,
+		TenantID:          tenant,
+	}
+	// One reusable timer for the whole wait instead of a fresh time.After per
+	// iteration, which allocated a runtime timer and was never drained.
+	var idle *time.Timer
+	defer func() {
+		if idle != nil {
+			idle.Stop()
+		}
+	}()
 	for {
-		msgs, err := a.Broker.store.Lease(r.Context(), LeaseRequest{Queue: req.Queue, ConsumerID: req.ConsumerID, ConsumerGroup: firstNonEmpty(req.ConsumerGroup, req.ConsumerID), Limit: req.Limit, VisibilityTimeout: vis, TenantID: tenant})
+		msgs, err := a.Broker.store.Lease(r.Context(), leaseReq)
 		if err != nil {
-			http.Error(w, err.Error(), 409)
-			return
+			WriteBrokerError(w, err)
+			return nil, false
 		}
 		if len(msgs) > 0 || wait <= 0 || time.Now().After(deadline) {
 			if len(msgs) > 0 {
 				a.Broker.Consumers().AddStats(req.ConsumerID, int64(len(msgs)), 0, 0, 0, "")
+				group := firstNonEmpty(req.ConsumerGroup, req.ConsumerID)
+				notify := a.Broker.cfg.EnableNotifications || a.Broker.cfg.EnableConsumerEventTracking
 				for i := range msgs {
 					msgs[i].ConsumerID = req.ConsumerID
-					msgs[i].ConsumerGroup = firstNonEmpty(req.ConsumerGroup, req.ConsumerID)
+					msgs[i].ConsumerGroup = group
 					msgs[i].Status = MessageProcessing
+					taskID := firstNonEmpty(msgs[i].TaskID, msgs[i].Headers["x-task-id"])
+					if taskID != "" {
+						a.Broker.startTask(r.Context(), taskID)
+					}
+					if notify {
+						a.Broker.emitConsumerNotification(req.ConsumerID, Notification{
+							Type: "message.leased", Source: a.Broker.cfg.Name, Severity: SeverityInfo,
+							MessageID: msgs[i].ID, TaskID: taskID, Topic: msgs[i].Topic, Queue: req.Queue,
+							Consumer: req.ConsumerID, ConsumerGroup: group, TenantID: msgs[i].TenantID,
+							Timestamp: time.Now(),
+							Data:      map[string]any{"lease_until": msgs[i].LeaseUntil, "attempts": msgs[i].Attempts},
+						})
+					}
 				}
 			}
-			writeFrameBatch(w, a.Broker.FrameCodec(), msgs)
-			return
+			return msgs, true
+		}
+		if idle == nil {
+			idle = time.NewTimer(pollRetryInterval)
+		} else {
+			idle.Reset(pollRetryInterval)
 		}
 		select {
-		case <-time.After(25 * time.Millisecond):
+		case <-idle.C:
 		case <-r.Context().Done():
-			return
+			return nil, false
 		}
 	}
+}
+
+// pollRetryInterval is how long a long poll waits before re-checking the queue.
+const pollRetryInterval = 25 * time.Millisecond
+
+func (a AdminServer) v1PollFrame(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost && r.Method != http.MethodGet {
+		methodBroker(w)
+		return
+	}
+	req, ok := parsePollRequest(w, r)
+	if !ok {
+		return
+	}
+	msgs, ok := a.leaseForConsumer(w, r, req)
+	if !ok {
+		return
+	}
+	writeFrameBatch(w, a.Broker.FrameCodec(), msgs)
 }
 
 func writeFrameBatch(w http.ResponseWriter, codec FrameCodec, msgs []Message) {
@@ -991,80 +1075,23 @@ func writeFrameBatch(w http.ResponseWriter, codec FrameCodec, msgs []Message) {
 	w.Header().Set("Content-Type", "application/vnd.pool.broker.frames")
 	_, _ = w.Write(body)
 }
+
 func (a AdminServer) v1Poll(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost && r.Method != http.MethodGet {
 		methodBroker(w)
 		return
 	}
-	var req PollRequest
-	if r.Method == http.MethodPost && r.Body != nil {
-		_ = json.NewDecoder(r.Body).Decode(&req)
-	}
-	if req.Queue == "" {
-		req.Queue = r.URL.Query().Get("queue")
-	}
-	if req.ConsumerID == "" {
-		req.ConsumerID = firstNonEmpty(r.URL.Query().Get("consumer_id"), r.URL.Query().Get("consumer"))
-	}
-	if req.ConsumerGroup == "" {
-		req.ConsumerGroup = firstNonEmpty(r.URL.Query().Get("consumer_group"), r.URL.Query().Get("group"))
-	}
-	if req.Limit <= 0 {
-		req.Limit = queryLimit(r, 1)
-	}
-	if req.ConsumerID == "" || req.Queue == "" {
-		http.Error(w, "consumer_id and queue required", 400)
+	req, ok := parsePollRequest(w, r)
+	if !ok {
 		return
 	}
-	tenant, err := resolveTenant(r.Context(), req.TenantID)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusForbidden)
+	msgs, ok := a.leaseForConsumer(w, r, req)
+	if !ok {
 		return
 	}
-	if info, ok := a.Broker.Consumers().Get(req.ConsumerID); ok && (info.Paused || info.Draining || info.Banned || info.State == ConsumerPaused || info.State == ConsumerDraining || info.State == ConsumerStopped || info.State == ConsumerBanned) {
-		writeBrokerJSON(w, []Message{})
-		return
-	}
-	wait := time.Duration(req.WaitNS)
-	if wait <= 0 {
-		wait = queryDuration(r, "wait", 0)
-	}
-	deadline := time.Now().Add(wait)
-	vis := time.Duration(req.VisibilityTimeoutNS)
-	if vis <= 0 {
-		vis = queryDuration(r, "visibility_timeout", 0)
-	}
-	for {
-		msgs, err := a.Broker.store.Lease(r.Context(), LeaseRequest{Queue: req.Queue, ConsumerID: req.ConsumerID, ConsumerGroup: firstNonEmpty(req.ConsumerGroup, req.ConsumerID), Limit: req.Limit, VisibilityTimeout: vis, TenantID: tenant})
-		if err != nil {
-			http.Error(w, err.Error(), 409)
-			return
-		}
-		if len(msgs) > 0 || wait <= 0 || time.Now().After(deadline) {
-			if len(msgs) > 0 {
-				a.Broker.Consumers().AddStats(req.ConsumerID, int64(len(msgs)), 0, 0, 0, "")
-				for i := range msgs {
-					msgs[i].ConsumerID = req.ConsumerID
-					msgs[i].ConsumerGroup = firstNonEmpty(req.ConsumerGroup, req.ConsumerID)
-					msgs[i].Status = MessageProcessing
-					if tid := firstNonEmpty(msgs[i].TaskID, msgs[i].Headers["x-task-id"]); tid != "" {
-						a.Broker.startTask(r.Context(), tid)
-					}
-					if a.Broker.cfg.EnableNotifications || a.Broker.cfg.EnableConsumerEventTracking {
-						a.Broker.emitConsumerNotification(req.ConsumerID, Notification{Type: "message.leased", Source: a.Broker.cfg.Name, Severity: SeverityInfo, MessageID: msgs[i].ID, TaskID: firstNonEmpty(msgs[i].TaskID, msgs[i].Headers["x-task-id"]), Topic: msgs[i].Topic, Queue: req.Queue, Consumer: req.ConsumerID, ConsumerGroup: req.ConsumerGroup, TenantID: msgs[i].TenantID, Timestamp: time.Now(), Data: map[string]any{"lease_until": msgs[i].LeaseUntil, "attempts": msgs[i].Attempts}})
-					}
-				}
-			}
-			writeBrokerJSON(w, msgs)
-			return
-		}
-		select {
-		case <-time.After(25 * time.Millisecond):
-		case <-r.Context().Done():
-			return
-		}
-	}
+	writeBrokerJSON(w, msgs)
 }
+
 func (a AdminServer) v1Message(w http.ResponseWriter, r *http.Request, tail string) {
 	parts := strings.Split(strings.Trim(tail, "/"), "/")
 	if len(parts) < 2 || parts[0] == "" {
@@ -1077,18 +1104,24 @@ func (a AdminServer) v1Message(w http.ResponseWriter, r *http.Request, tail stri
 		var req AckRequest
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		req.MessageID = id
-		// Validate lease token if message is leased
+		// Validate the lease token before the store does, so the failure is
+		// reported as ErrLeaseLost with the same code and status the frame ack
+		// endpoint and every in-process caller see. This path used to answer 403
+		// with bespoke text while /v1/ack/frame answered 409 with ErrLeaseLost, so
+		// the same logical failure was indistinguishable to a client.
 		m, hadMessage, _ := a.Broker.store.Get(r.Context(), id)
-		if hadMessage && m.LeaseToken != "" && req.LeaseToken == "" {
-			http.Error(w, "lease token required for leased message", 403)
-			return
-		}
-		if hadMessage && m.LeaseToken != "" && req.LeaseToken != m.LeaseToken {
-			http.Error(w, "invalid lease token", 403)
-			return
+		if hadMessage && m.LeaseToken != "" {
+			if req.LeaseToken == "" {
+				WriteBrokerError(w, errf(ErrLeaseLost, "lease token required for leased message %s", id))
+				return
+			}
+			if req.LeaseToken != m.LeaseToken {
+				WriteBrokerError(w, errf(ErrLeaseLost, "invalid lease token for message %s", id))
+				return
+			}
 		}
 		if err := a.Broker.store.Ack(r.Context(), req); err != nil {
-			http.Error(w, err.Error(), 409)
+			WriteBrokerError(w, err)
 			return
 		}
 		a.Broker.Consumers().AddStats(req.ConsumerID, 0, 1, 0, 0, "")
@@ -1103,15 +1136,21 @@ func (a AdminServer) v1Message(w http.ResponseWriter, r *http.Request, tail stri
 		var req NackRequest
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		req.MessageID = id
-		// Validate lease token if message is leased
+		// Validate the lease token before the store does, so the failure is
+		// reported as ErrLeaseLost with the same code and status the frame ack
+		// endpoint and every in-process caller see. This path used to answer 403
+		// with bespoke text while /v1/ack/frame answered 409 with ErrLeaseLost, so
+		// the same logical failure was indistinguishable to a client.
 		m, hadMessage, _ := a.Broker.store.Get(r.Context(), id)
-		if hadMessage && m.LeaseToken != "" && req.LeaseToken == "" {
-			http.Error(w, "lease token required for leased message", 403)
-			return
-		}
-		if hadMessage && m.LeaseToken != "" && req.LeaseToken != m.LeaseToken {
-			http.Error(w, "invalid lease token", 403)
-			return
+		if hadMessage && m.LeaseToken != "" {
+			if req.LeaseToken == "" {
+				WriteBrokerError(w, errf(ErrLeaseLost, "lease token required for leased message %s", id))
+				return
+			}
+			if req.LeaseToken != m.LeaseToken {
+				WriteBrokerError(w, errf(ErrLeaseLost, "invalid lease token for message %s", id))
+				return
+			}
 		}
 		if req.Action == "" {
 			req.Action = NackRequeue
@@ -1122,7 +1161,7 @@ func (a AdminServer) v1Message(w http.ResponseWriter, r *http.Request, tail stri
 		req.IncrementAttempt = true
 		m, hadMessage, _ = a.Broker.store.Get(r.Context(), id)
 		if err := a.Broker.store.Nack(r.Context(), req); err != nil {
-			http.Error(w, err.Error(), 409)
+			WriteBrokerError(w, err)
 			return
 		}
 		a.Broker.Consumers().AddStats(req.ConsumerID, 0, 0, 1, 0, req.Error)
@@ -1144,7 +1183,7 @@ func (a AdminServer) v1Message(w http.ResponseWriter, r *http.Request, tail stri
 		req.MessageID = id
 		m, _, _ := a.Broker.store.Get(r.Context(), id)
 		if err := a.Broker.store.ExtendLease(r.Context(), req); err != nil {
-			http.Error(w, err.Error(), 409)
+			WriteBrokerError(w, err)
 			return
 		}
 		a.Broker.notify.Publish(Notification{Type: "message.lease_extended", Source: firstNonEmpty(req.ConsumerID, "remote-consumer"), Severity: SeverityDebug, MessageID: id, TaskID: firstNonEmpty(m.TaskID, m.Headers["x-task-id"]), Topic: m.Topic, Queue: firstNonEmpty(req.Queue, m.Queue), Consumer: req.ConsumerID, ConsumerGroup: m.ConsumerGroup, TenantID: m.TenantID, Timestamp: time.Now(), Data: map[string]any{"extend_by": req.VisibilityTimeout.String()}})
@@ -1277,7 +1316,7 @@ func (a AdminServer) v1TaskSubmit(w http.ResponseWriter, r *http.Request) {
 	req.TenantID = tenant
 	h, err := a.Broker.Publisher().SubmitTask(r.Context(), req.Name, []byte(req.Payload), WithTaskQueue(req.Queue), WithTaskTenantID(req.TenantID), WithTaskPriority(req.Priority), WithTaskMaxAttempts(req.MaxAttempts), WithTaskMetadata(req.Metadata))
 	if err != nil {
-		http.Error(w, err.Error(), 409)
+		WriteBrokerError(w, err)
 		return
 	}
 	info, _ := h.Info(r.Context())
@@ -1310,13 +1349,13 @@ func (a AdminServer) v1Task(w http.ResponseWriter, r *http.Request, tail string)
 		var req struct{ Reason string }
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		if err := h.Cancel(r.Context(), req.Reason); err != nil {
-			http.Error(w, err.Error(), 409)
+			WriteBrokerError(w, err)
 			return
 		}
 		writeBrokerJSON(w, map[string]bool{"ok": true})
 	case "retry":
 		if err := h.Retry(r.Context()); err != nil {
-			http.Error(w, err.Error(), 409)
+			WriteBrokerError(w, err)
 			return
 		}
 		writeBrokerJSON(w, map[string]bool{"ok": true})
@@ -1355,7 +1394,7 @@ func (a AdminServer) v1SagaCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := a.Broker.SagaEngine().ExecuteSaga(r.Context(), inst.ID); err != nil {
-		http.Error(w, err.Error(), 409)
+		WriteBrokerError(w, err)
 		return
 	}
 	snapshot := inst.clone()

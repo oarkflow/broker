@@ -176,7 +176,7 @@ func (a AdminServer) wrap(next http.HandlerFunc) http.HandlerFunc {
 			if audit != nil {
 				audit.LogAdmin(r.Context(), AdminAuditEvent{Time: time.Now(), Principal: "anonymous", RemoteAddr: r.RemoteAddr, Method: r.Method, Path: r.URL.Path, Action: action, Allowed: false, Status: http.StatusUnauthorized, Reason: "missing or invalid bearer token"})
 			}
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			WriteBrokerError(w, ErrUnauthenticated)
 			return
 		}
 		acl := a.effectiveACL()
@@ -442,7 +442,7 @@ func (a AdminServer) queue(w http.ResponseWriter, r *http.Request) {
 			vis := time.Duration(req.VisibilityTimeout)
 			msgs, err := a.Broker.store.Lease(r.Context(), LeaseRequest{Queue: name, ConsumerID: req.ConsumerID, ConsumerGroup: req.ConsumerGroup, Limit: req.Limit, VisibilityTimeout: vis})
 			if err != nil {
-				http.Error(w, err.Error(), 409)
+				WriteBrokerError(w, err)
 				return
 			}
 			writeBrokerJSON(w, msgs)
@@ -468,7 +468,7 @@ func (a AdminServer) queue(w http.ResponseWriter, r *http.Request) {
 			}
 			n, err := a.Broker.PurgeQueue(r.Context(), name)
 			if err != nil {
-				http.Error(w, err.Error(), 409)
+				WriteBrokerError(w, err)
 				return
 			}
 			writeBrokerJSON(w, map[string]any{"ok": true, "purged": n})
@@ -622,7 +622,7 @@ func (a AdminServer) dlqQueue(w http.ResponseWriter, r *http.Request) {
 			}
 			res, err := a.Broker.store.Move(r.Context(), MoveRequest{SourceType: DestinationQueue, Source: name, DestinationType: DestinationQueue, Destination: dest, Mode: MoveReplay, ResetAttempts: true, ResetError: true, ResetLease: true, Reason: "dlq replay", Actor: "admin"})
 			if err != nil {
-				http.Error(w, err.Error(), 409)
+				WriteBrokerError(w, err)
 				return
 			}
 			writeBrokerJSON(w, res)
@@ -729,7 +729,7 @@ func (a AdminServer) publish(w http.ResponseWriter, r *http.Request) {
 	}
 	res, err := a.Broker.Publisher().Publish(r.Context(), req.Topic, []byte(req.Payload), opts...)
 	if err != nil {
-		http.Error(w, err.Error(), 409)
+		WriteBrokerError(w, err)
 		return
 	}
 	writeBrokerJSON(w, res)
@@ -797,7 +797,7 @@ func (a AdminServer) move(w http.ResponseWriter, r *http.Request) {
 	}
 	res, err := a.Broker.store.Move(r.Context(), req)
 	if err != nil {
-		http.Error(w, err.Error(), 409)
+		WriteBrokerError(w, err)
 		return
 	}
 	writeBrokerJSON(w, res)
@@ -899,7 +899,7 @@ func writeSSE(w http.ResponseWriter, n Notification) {
 }
 func writeBrokerErr(w http.ResponseWriter, err error) {
 	if err != nil {
-		http.Error(w, err.Error(), 409)
+		WriteBrokerError(w, err)
 		return
 	}
 	writeBrokerJSON(w, map[string]bool{"ok": true})

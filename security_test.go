@@ -435,3 +435,74 @@ func TestCrossProtocolQuotaAdmissionEnforcement(t *testing.T) {
 	defer release2()
 	defer release3()
 }
+
+// In-process calls are outside the ACL trust boundary by design: code holding a
+// *Broker has no credential to present. That is only safe while tenant scoping
+// still constrains any principal that is present, so this pins both halves.
+func TestInProcessTrustBoundaryAndTenantScoping(t *testing.T) {
+	ctx := context.Background()
+	b := MustNew(Config{})
+	defer b.Stop(ctx)
+	if err := b.DeclareQueue(ctx, QueueConfig{Name: "q"}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Unscoped in-process: no credential, so unrestricted. This is the documented
+	// boundary, not an oversight.
+	if _, err := b.Publisher().Publish(ctx, "", []byte("x"), WithQueue("q"), WithTenantID("tenant-a")); err != nil {
+		t.Fatalf("unscoped in-process publish: %v", err)
+	}
+
+	// A tenant-scoped principal must be confined, in process, exactly as it would
+	// be over a listener.
+	scoped := func(tenant string) context.Context {
+		return WithAdminPrincipal(ctx, AdminPrincipal{Name: "p", Tenants: []string{tenant}})
+	}
+	res, err := b.Publisher().Publish(scoped("tenant-a"), "", []byte("x"),
+		WithQueue("q"), WithTenantID("tenant-a"))
+	if err != nil {
+		t.Fatalf("in-tenant publish: %v", err)
+	}
+	stored, _, err := b.Store().Get(ctx, res.MessageID)
+	if err != nil || !ok(stored) {
+		t.Fatalf("get: %v", err)
+	}
+	if stored.TenantID != "tenant-a" {
+		t.Fatalf("TenantID = %q", stored.TenantID)
+	}
+
+	// Publishing into another tenant must be refused even in process.
+	if _, err := b.Publisher().Publish(scoped("tenant-a"), "", []byte("x"),
+		WithQueue("q"), WithTenantID("tenant-b")); err == nil {
+		t.Fatal("a tenant-a principal published into tenant-b in process; scoping is not applied internally")
+	}
+
+	// A lease scoped to another tenant must not see the message.
+	msgs, err := b.Store().Lease(scoped("tenant-b"), LeaseRequest{
+		Queue: "q", ConsumerID: "c", Limit: 10, TenantID: "tenant-b",
+	})
+	if err == nil && len(msgs) != 0 {
+		t.Fatalf("tenant-b lease received %d tenant-a messages", len(msgs))
+	}
+
+	// A single-tenant principal may omit tenant_id and be filled in safely.
+	res, err = b.Publisher().Publish(scoped("tenant-a"), "", []byte("x"), WithQueue("q"))
+	if err != nil {
+		t.Fatalf("omitted tenant_id: %v", err)
+	}
+	stored, _, err = b.Store().Get(ctx, res.MessageID)
+	if err != nil || !ok(stored) {
+		t.Fatalf("get: %v", err)
+	}
+	if stored.TenantID != "tenant-a" {
+		t.Fatalf("tenant_id was not filled in safely, got %q", stored.TenantID)
+	}
+
+	// A multi-tenant principal must choose explicitly.
+	multi := WithAdminPrincipal(ctx, AdminPrincipal{Name: "p", Tenants: []string{"tenant-a", "tenant-c"}})
+	if _, err := b.Publisher().Publish(multi, "", []byte("x"), WithQueue("q")); err == nil {
+		t.Fatal("a multi-tenant principal published without selecting a tenant")
+	}
+}
+
+func ok(m Message) bool { return m.ID != "" }

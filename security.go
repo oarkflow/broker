@@ -90,9 +90,11 @@ func scopedPrincipalFromContext(ctx context.Context) (AdminPrincipal, bool) {
 }
 
 // resolveTenant applies the authenticated principal's tenant scope. Embedded
-// calls without an HTTP principal remain unrestricted. A credential scoped to
-// one tenant may omit tenant_id; it is filled in safely. Multi-tenant scoped
-// credentials must select one of their allowed tenants explicitly.
+// calls without an HTTP principal remain unrestricted, because in-process code has
+// no credential to present; see Config.ACL for where the trust boundary sits. A
+// credential scoped to one tenant may omit tenant_id; it is filled in safely.
+// Multi-tenant scoped credentials must select one of their allowed tenants
+// explicitly.
 func resolveTenant(ctx context.Context, requested string) (string, error) {
 	p, scoped := scopedPrincipalFromContext(ctx)
 	if !scoped || len(p.Tenants) == 0 {
@@ -475,4 +477,22 @@ func (l NotificationAuditLogger) LogAdmin(ctx context.Context, e AdminAuditEvent
 		sev = SeverityWarn
 	}
 	l.Bus.Publish(Notification{Type: "admin.audit", Source: "admin", Severity: sev, Timestamp: e.Time, Data: map[string]any{"principal": e.Principal, "remote_addr": e.RemoteAddr, "method": e.Method, "path": e.Path, "action": e.Action, "allowed": e.Allowed, "status": e.Status, "reason": e.Reason}})
+}
+
+// WithAdminPrincipal attaches an authenticated principal to a context so that
+// in-process code runs under the same tenant scoping a listener would apply.
+//
+// This is the supported way for an embedder to apply per-tenant rules to its own
+// calls. Without it, in-process calls are unscoped, which is the documented trust
+// boundary rather than an oversight: see Config.ACL.
+//
+// A listener that authenticates a request must use this (or an equivalent
+// internal helper) rather than trusting callers to set the value themselves.
+func WithAdminPrincipal(ctx context.Context, p AdminPrincipal) context.Context {
+	return context.WithValue(ctx, adminPrincipalKey{}, p)
+}
+
+// AdminPrincipalFromContext returns the principal attached to ctx, if any.
+func AdminPrincipalFromContext(ctx context.Context) (AdminPrincipal, bool) {
+	return scopedPrincipalFromContext(ctx)
 }

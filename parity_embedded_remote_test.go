@@ -366,3 +366,119 @@ func TestEmbeddedVsRemoteAckLeaseToken(t *testing.T) {
 		t.Fatalf("ack with lease token: %v", err)
 	}
 }
+
+// A banned, paused or draining consumer must receive nothing through either poll
+// endpoint. The frame endpoint used to skip this guard entirely, so a banned
+// consumer polling through /v1/poll/frame kept receiving messages.
+func TestPollFrameHonoursConsumerState(t *testing.T) {
+	ctx := context.Background()
+	for _, state := range []struct {
+		name  string
+		setup func(t *testing.T, b *Broker) string
+	}{
+		{"banned", func(t *testing.T, b *Broker) string {
+			info, err := b.RegisterRemoteConsumer(ctx, ConsumerRegistration{
+				ConsumerID: "c1", Group: "g1", Capabilities: []string{"poll"},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := b.BanRemoteConsumer(ctx, info.ConsumerID, "test"); err != nil {
+				t.Fatal(err)
+			}
+			return info.ConsumerID
+		}},
+		{"paused", func(t *testing.T, b *Broker) string {
+			info, err := b.RegisterRemoteConsumer(ctx, ConsumerRegistration{
+				ConsumerID: "c2", Group: "g1", Capabilities: []string{"poll"},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := b.SetRemoteConsumerState(ctx, info.ConsumerID, ConsumerPaused, "test"); err != nil {
+				t.Fatal(err)
+			}
+			return info.ConsumerID
+		}},
+		{"draining", func(t *testing.T, b *Broker) string {
+			info, err := b.RegisterRemoteConsumer(ctx, ConsumerRegistration{
+				ConsumerID: "c3", Group: "g1", Capabilities: []string{"poll"},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := b.SetRemoteConsumerState(ctx, info.ConsumerID, ConsumerDraining, "test"); err != nil {
+				t.Fatal(err)
+			}
+			return info.ConsumerID
+		}},
+		{"stopped", func(t *testing.T, b *Broker) string {
+			info, err := b.RegisterRemoteConsumer(ctx, ConsumerRegistration{
+				ConsumerID: "c4", Group: "g1", Capabilities: []string{"poll"},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := b.SetRemoteConsumerState(ctx, info.ConsumerID, ConsumerStopped, "test"); err != nil {
+				t.Fatal(err)
+			}
+			return info.ConsumerID
+		}},
+	} {
+		for _, endpoint := range []string{"/v1/poll", "/v1/poll/frame"} {
+			t.Run(state.name+endpoint, func(t *testing.T) {
+				b := newParityBroker(t)
+				if err := b.Start(ctx); err != nil {
+					t.Fatal(err)
+				}
+				consumerID := state.setup(t, b)
+				admin := AdminServer{Broker: b, Token: "t", InsecureDev: true}
+
+				// Seed messages that must not be delivered.
+				for i := 0; i < 3; i++ {
+					if _, err := b.Publisher().Publish(ctx, "", []byte("secret"),
+						WithQueue("diff"), WithMessageID(fmt.Sprintf("secret-%d", i))); err != nil {
+						t.Fatal(err)
+					}
+				}
+
+				body, err := json.Marshal(map[string]any{
+					"queue": "diff", "consumer_id": consumerID, "consumer_group": "g1", "limit": 10,
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				req := httptest.NewRequest(http.MethodPost, endpoint, bytes.NewReader(body))
+				req.Header.Set("Content-Type", "application/json")
+				rec := httptest.NewRecorder()
+				admin.dataPlane(rec, req)
+				if rec.Code != http.StatusOK {
+					t.Fatalf("status %d body %s", rec.Code, rec.Body.String())
+				}
+
+				var msgs []Message
+				if endpoint == "/v1/poll/frame" {
+					msgs, err = DecodeMessageFrameBatch(rec.Body.Bytes(), b.FrameCodec(), 10)
+					if err != nil {
+						t.Fatalf("decode frames: %v", err)
+					}
+				} else if err := json.Unmarshal(rec.Body.Bytes(), &msgs); err != nil {
+					t.Fatalf("decode json: %v", err)
+				}
+				if len(msgs) != 0 {
+					t.Fatalf("%s delivered %d message(s) to a %s consumer: %+v",
+						endpoint, len(msgs), state.name, msgs)
+				}
+
+				// The messages must still be in the queue, not consumed.
+				remaining, err := b.Store().ListQueue(ctx, "diff", 10)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(remaining) != 3 {
+					t.Fatalf("queue holds %d messages, want 3 untouched", len(remaining))
+				}
+			})
+		}
+	}
+}

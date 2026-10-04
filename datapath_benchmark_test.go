@@ -3,6 +3,7 @@ package broker
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -461,4 +462,106 @@ func BenchmarkEmbeddedPublishOwned(b *testing.B) {
 			}
 		}
 	})
+}
+
+// BenchmarkReadStreamTail measures the read a stream consumer makes when it is
+// caught up at the tail, which is the common case for a live consumer. It used to
+// scan every id the stream had ever accumulated on every call.
+func BenchmarkReadStreamTail(b *testing.B) {
+	ctx := context.Background()
+	store := NewMemoryStore()
+	defer store.Close()
+	if err := store.DeclareStream(ctx, StreamConfig{Name: "s"}); err != nil {
+		b.Fatal(err)
+	}
+	const total = 50000
+	for i := 0; i < total; i++ {
+		if _, err := store.Append(ctx, Message{
+			ID: fmt.Sprintf("m-%d", i), Stream: "s", Payload: make([]byte, 64),
+		}, []Destination{{Kind: DestinationStream, Name: "s"}}); err != nil {
+			b.Fatal(err)
+		}
+	}
+	after := uint64(total - 100)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		// Read the same window repeatedly, which is what a caught-up consumer does.
+		if _, err := store.ReadStream(ctx, StreamReadRequest{Stream: "s", AfterOffset: after, Limit: 100}); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkReadStreamHead is the unchanged worst case: reading from offset zero
+// still has to walk from the start.
+func BenchmarkReadStreamHead(b *testing.B) {
+	ctx := context.Background()
+	store := NewMemoryStore()
+	defer store.Close()
+	if err := store.DeclareStream(ctx, StreamConfig{Name: "s"}); err != nil {
+		b.Fatal(err)
+	}
+	const total = 50000
+	for i := 0; i < total; i++ {
+		if _, err := store.Append(ctx, Message{
+			ID: fmt.Sprintf("m-%d", i), Stream: "s", Payload: make([]byte, 64),
+		}, []Destination{{Kind: DestinationStream, Name: "s"}}); err != nil {
+			b.Fatal(err)
+		}
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := store.ReadStream(ctx, StreamReadRequest{Stream: "s", AfterOffset: 0, Limit: 100}); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkSegmentedWALConcurrentAppends measures concurrent publishers against
+// the segmented WAL, the store the readiness tracker recommends. It used to hold
+// writeMu across its own fsync, so every publish paid a fully serialized Sync and
+// the group-commit writer had nothing to coalesce.
+func BenchmarkSegmentedWALConcurrentAppends(b *testing.B) {
+	runConcurrentAppends(b, func(tb testing.TB, dir string) Store {
+		store, err := NewSegmentedWALStore(SegmentedWALConfig{Dir: dir})
+		if err != nil {
+			tb.Fatal(err)
+		}
+		return store
+	})
+}
+
+// BenchmarkBinaryWALConcurrentAppends is the reference: BinaryFileWALStore
+// already released its write lock before awaiting the fsync, so it shows what
+// group-commit sharing looks like when it works.
+func BenchmarkBinaryWALConcurrentAppends(b *testing.B) {
+	runConcurrentAppends(b, func(tb testing.TB, dir string) Store {
+		store, err := NewBinaryFileWALStore(filepath.Join(dir, "wal"))
+		if err != nil {
+			tb.Fatal(err)
+		}
+		return store
+	})
+}
+
+func runConcurrentAppends(b *testing.B, open func(testing.TB, string) Store) {
+	ctx := context.Background()
+	store := open(b, b.TempDir())
+	defer store.Close()
+	if err := store.DeclareQueue(ctx, QueueConfig{Name: "q"}); err != nil {
+		b.Fatal(err)
+	}
+	dests := []Destination{{Kind: DestinationQueue, Name: "q"}}
+	b.ReportAllocs()
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			_, _ = store.Append(ctx, Message{
+				ID: newBenchID(), Queue: "q", Payload: make([]byte, 128),
+			}, dests)
+		}
+	})
+	b.ReportMetric(float64(b.N)/b.Elapsed().Seconds(), "append/s")
 }
