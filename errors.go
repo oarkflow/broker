@@ -284,33 +284,12 @@ func WriteBrokerError(w http.ResponseWriter, err error) {
 	if err == nil {
 		return
 	}
-	class, retryable := ClassifyRetry(err)
 	body := wireErrorBody{
 		Code:      ErrorCode(err),
 		Message:   err.Error(),
-		Retryable: retryable,
-		Class:     class,
-	}
-	var leader *RetryError
-	if errors.As(err, &leader) {
-		if leader.Leader != "" {
-			if body.Details == nil {
-				body.Details = map[string]string{}
-			}
-			body.Details["leader"] = leader.Leader
-		}
-		if leader.LeaderEpoch != 0 {
-			if body.Details == nil {
-				body.Details = map[string]string{}
-			}
-			body.Details["leader_epoch"] = fmt.Sprintf("%d", leader.LeaderEpoch)
-		}
-		if leader.RetryAfter > 0 {
-			if body.Details == nil {
-				body.Details = map[string]string{}
-			}
-			body.Details["retry_after"] = leader.RetryAfter.String()
-		}
+		Retryable: isRetryableBrokerError(err),
+		Class:     retryClassOf(err),
+		Details:   retryDetailsOf(err),
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(HTTPStatusForError(err))
@@ -376,4 +355,68 @@ func ParseRemoteError(status int, body []byte) *RemoteError {
 		Class:     env.Error.Class,
 		Details:   env.Error.Details,
 	}
+}
+
+// NotLeaderError reports that this node cannot serve the request because another
+// node leads, and names that node so a client can retry there instead of parsing
+// the message text.
+//
+// The distributed layer used to wrap cluster.ErrNotLeader with fmt.Errorf and
+// append the leader to the message string. errors.Is still matched, so
+// ClassifyRetry returned not_leader, but RetryError.Leader was never populated
+// and the leader address existed only as prose in an HTTP 409 body. A follower
+// aware client had no way to extract it.
+func NotLeaderError(leader string, epoch uint64) error {
+	return &RetryError{
+		Class:       RetryNotLeader,
+		Message:     "broker: not leader",
+		Leader:      leader,
+		LeaderEpoch: epoch,
+		Cause:       ErrNotLeader,
+	}
+}
+
+// StaleEpochError reports that the caller's leader epoch is behind the cluster's.
+func StaleEpochError(current uint64) error {
+	return &RetryError{
+		Class:       RetryStaleEpoch,
+		Message:     "broker: stale leader epoch",
+		LeaderEpoch: current,
+		Cause:       ErrStaleEpoch,
+	}
+}
+
+// isRetryableBrokerError reports whether err carries retry metadata worth acting
+// on. It backs the transport error envelopes.
+func isRetryableBrokerError(err error) bool {
+	_, ok := ClassifyRetry(err)
+	return ok
+}
+
+func retryClassOf(err error) RetryClassification {
+	if class, ok := ClassifyRetry(err); ok {
+		return class
+	}
+	return ""
+}
+
+func retryDetailsOf(err error) map[string]string {
+	var leader *RetryError
+	if !errors.As(err, &leader) {
+		return nil
+	}
+	details := map[string]string{}
+	if leader.Leader != "" {
+		details["leader"] = leader.Leader
+	}
+	if leader.LeaderEpoch != 0 {
+		details["leader_epoch"] = strconv.FormatUint(leader.LeaderEpoch, 10)
+	}
+	if leader.RetryAfter > 0 {
+		details["retry_after"] = leader.RetryAfter.String()
+	}
+	if len(details) == 0 {
+		return nil
+	}
+	return details
 }

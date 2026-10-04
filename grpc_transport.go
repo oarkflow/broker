@@ -370,7 +370,7 @@ func (gs *GRPCServer) handlePublish(ctx context.Context, req grpcRequest) grpcRe
 	}
 	res, err := gs.broker.Publisher().Publish(ctx, p.Topic, payload, opts...)
 	if err != nil {
-		return grpcResponse{ID: req.ID, Error: err.Error(), Status: 409}
+		return grpcErrorResponse(req.ID, err)
 	}
 	body, _ := json.Marshal(res)
 	return grpcResponse{ID: req.ID, Status: 200, Body: body}
@@ -396,7 +396,7 @@ func (gs *GRPCServer) handleAck(ctx context.Context, req grpcRequest) grpcRespon
 		LeaseToken: a.LeaseToken,
 	})
 	if err != nil {
-		return grpcResponse{ID: req.ID, Error: err.Error(), Status: 409}
+		return grpcErrorResponse(req.ID, err)
 	}
 	return grpcResponse{ID: req.ID, Status: 200}
 }
@@ -433,7 +433,7 @@ func (gs *GRPCServer) handleNack(ctx context.Context, req grpcRequest) grpcRespo
 		IncrementAttempt: true,
 	})
 	if err != nil {
-		return grpcResponse{ID: req.ID, Error: err.Error(), Status: 409}
+		return grpcErrorResponse(req.ID, err)
 	}
 	return grpcResponse{ID: req.ID, Status: 200}
 }
@@ -467,7 +467,7 @@ func (gs *GRPCServer) handlePoll(ctx context.Context, req grpcRequest) grpcRespo
 	}
 	msgs, err := gs.broker.Store().Lease(ctx, leaseReq)
 	if err != nil {
-		return grpcResponse{ID: req.ID, Error: err.Error(), Status: 409}
+		return grpcErrorResponse(req.ID, err)
 	}
 	body, _ := json.Marshal(msgs)
 	return grpcResponse{ID: req.ID, Status: 200, Body: body}
@@ -484,7 +484,7 @@ func (gs *GRPCServer) handleRequest(ctx context.Context, req grpcRequest) grpcRe
 	var out json.RawMessage
 	err := gs.broker.Publisher().Request(ctx, r.Subject, r.Payload, &out, WithTimeout(30*time.Second))
 	if err != nil {
-		return grpcResponse{ID: req.ID, Error: err.Error(), Status: 409}
+		return grpcErrorResponse(req.ID, err)
 	}
 	return grpcResponse{ID: req.ID, Status: 200, Body: out}
 }
@@ -511,7 +511,7 @@ func (gs *GRPCServer) handleDeclareQueue(ctx context.Context, req grpcRequest) g
 	}
 	err := gs.broker.DeclareQueue(ctx, cfg)
 	if err != nil {
-		return grpcResponse{ID: req.ID, Error: err.Error(), Status: 409}
+		return grpcErrorResponse(req.ID, err)
 	}
 	return grpcResponse{ID: req.ID, Status: 200}
 }
@@ -523,7 +523,7 @@ func (gs *GRPCServer) handleDeclareTopic(ctx context.Context, req grpcRequest) g
 	}
 	err := gs.broker.DeclareTopic(ctx, cfg)
 	if err != nil {
-		return grpcResponse{ID: req.ID, Error: err.Error(), Status: 409}
+		return grpcErrorResponse(req.ID, err)
 	}
 	return grpcResponse{ID: req.ID, Status: 200}
 }
@@ -535,7 +535,7 @@ func (gs *GRPCServer) handleDeclareStream(ctx context.Context, req grpcRequest) 
 	}
 	err := gs.broker.DeclareStream(ctx, cfg)
 	if err != nil {
-		return grpcResponse{ID: req.ID, Error: err.Error(), Status: 409}
+		return grpcErrorResponse(req.ID, err)
 	}
 	return grpcResponse{ID: req.ID, Status: 200}
 }
@@ -560,7 +560,7 @@ func (gs *GRPCServer) handleCommitOffset(ctx context.Context, req grpcRequest) g
 	}
 	err := gs.broker.CommitOffset(ctx, c)
 	if err != nil {
-		return grpcResponse{ID: req.ID, Error: err.Error(), Status: 409}
+		return grpcErrorResponse(req.ID, err)
 	}
 	return grpcResponse{ID: req.ID, Status: 200}
 }
@@ -572,7 +572,7 @@ func (gs *GRPCServer) handleMove(ctx context.Context, req grpcRequest) grpcRespo
 	}
 	res, err := gs.broker.Store().Move(ctx, m)
 	if err != nil {
-		return grpcResponse{ID: req.ID, Error: err.Error(), Status: 409}
+		return grpcErrorResponse(req.ID, err)
 	}
 	body, _ := json.Marshal(res)
 	return grpcResponse{ID: req.ID, Status: 200, Body: body}
@@ -585,7 +585,7 @@ func (gs *GRPCServer) handlePauseQueue(ctx context.Context, req grpcRequest) grp
 	}
 	err := gs.broker.PauseQueue(ctx, q.Name)
 	if err != nil {
-		return grpcResponse{ID: req.ID, Error: err.Error(), Status: 409}
+		return grpcErrorResponse(req.ID, err)
 	}
 	return grpcResponse{ID: req.ID, Status: 200}
 }
@@ -597,7 +597,7 @@ func (gs *GRPCServer) handleResumeQueue(ctx context.Context, req grpcRequest) gr
 	}
 	err := gs.broker.ResumeQueue(ctx, q.Name)
 	if err != nil {
-		return grpcResponse{ID: req.ID, Error: err.Error(), Status: 409}
+		return grpcErrorResponse(req.ID, err)
 	}
 	return grpcResponse{ID: req.ID, Status: 200}
 }
@@ -609,7 +609,7 @@ func (gs *GRPCServer) handlePurgeQueue(ctx context.Context, req grpcRequest) grp
 	}
 	n, err := gs.broker.PurgeQueue(ctx, q.Name)
 	if err != nil {
-		return grpcResponse{ID: req.ID, Error: err.Error(), Status: 409}
+		return grpcErrorResponse(req.ID, err)
 	}
 	body, _ := json.Marshal(map[string]int{"purged": n})
 	return grpcResponse{ID: req.ID, Status: 200, Body: body}
@@ -742,4 +742,21 @@ func grpcStatusFor(err error) int {
 	default:
 		return 409
 	}
+}
+
+// grpcErrorResponse renders an error for the native transport.
+//
+// A follower that cannot serve a request used to answer 409 with a bare string,
+// so a client had no way to learn which node leads. The error body is now the same
+// envelope the HTTP data plane writes, which carries the retry class and the
+// leader address as structured fields.
+func grpcErrorResponse(id string, err error) grpcResponse {
+	body, _ := json.Marshal(wireError{Error: wireErrorBody{
+		Code:      ErrorCode(err),
+		Message:   err.Error(),
+		Retryable: isRetryableBrokerError(err),
+		Class:     retryClassOf(err),
+		Details:   retryDetailsOf(err),
+	}})
+	return grpcResponse{ID: id, Error: err.Error(), Status: grpcStatusFor(err), Body: body}
 }

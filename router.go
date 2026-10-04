@@ -87,6 +87,41 @@ func (r *Router) Add(route Route) {
 	r.mu.Unlock()
 }
 
+// Remove deletes a route by name and reports whether one was found. Every Add has
+// a matching Remove: remote consumer subscriptions add routes to this global table,
+// so without a way to take them out again a fleet of transient workers grew the
+// routing table without bound.
+func (r *Router) Remove(name string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for i, route := range r.routes {
+		if route.Name != name {
+			continue
+		}
+		r.routes = append(r.routes[:i:i], r.routes[i+1:]...)
+		return true
+	}
+	return false
+}
+
+// RemovePrefix deletes every route whose name starts with prefix and returns how
+// many were removed.
+func (r *Router) RemovePrefix(prefix string) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	kept := r.routes[:0]
+	removed := 0
+	for _, route := range r.routes {
+		if strings.HasPrefix(route.Name, prefix) {
+			removed++
+			continue
+		}
+		kept = append(kept, route)
+	}
+	r.routes = kept
+	return removed
+}
+
 func (r *Router) Routes() []Route {
 	r.mu.RLock()
 	defer r.mu.RUnlock()

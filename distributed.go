@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -378,7 +379,19 @@ func (db *DistributedBroker) forwardToLeader() error {
 	if db.IsLeader() {
 		return nil
 	}
-	return fmt.Errorf("%w; leader is at %s", cluster.ErrNotLeader, leader)
+	return NotLeaderError(leader, db.raftTerm())
+}
+
+// raftTerm reports the current term from whichever Raft implementation is
+// configured, so a not-leader error can carry a fencing epoch.
+func (db *DistributedBroker) raftTerm() uint64 {
+	if db.raftCtrl != nil {
+		return db.raftCtrl.Term()
+	}
+	if db.raft != nil {
+		return db.raft.CurrentTerm()
+	}
+	return 0
 }
 
 func (db *DistributedBroker) DegradedMode() bool {
@@ -656,9 +669,9 @@ func (s *ReplicatedStore) proposeAndCommit(ctx context.Context, data []byte) err
 		if !s.raftCtrl.IsLeader() {
 			leadID := s.raftCtrl.LeaderID()
 			if leadID != 0 {
-				return fmt.Errorf("%w; leader is node %d", cluster.ErrNotLeader, leadID)
+				return NotLeaderError(strconv.FormatUint(uint64(leadID), 10), s.raftCtrl.Term())
 			}
-			return cluster.ErrNotLeader
+			return NotLeaderError("", 0)
 		}
 		if !s.cb.allow() {
 			return ErrCircuitOpen
@@ -684,9 +697,9 @@ func (s *ReplicatedStore) proposeAndCommit(ctx context.Context, data []byte) err
 	if !s.raft.IsLeader() {
 		leader := s.raft.Leader()
 		if leader != "" {
-			return fmt.Errorf("%w; leader is at %s", cluster.ErrNotLeader, leader)
+			return NotLeaderError(leader, s.raft.CurrentTerm())
 		}
-		return cluster.ErrNotLeader
+		return NotLeaderError("", 0)
 	}
 	if !s.cb.allow() {
 		return ErrCircuitOpen

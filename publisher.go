@@ -226,6 +226,11 @@ func (p *Publisher) publishItemsAligned(ctx context.Context, items []PublishBatc
 		if err == nil {
 			err = p.checkBackpressure(ctx, prep)
 		}
+		// Tenant quotas were only enforced on the single-message publish path, so
+		// a tenant could bypass its quota entirely by using /v1/publish/batch.
+		if err == nil && p.b.tenantMgr != nil {
+			err = p.b.tenantMgr.CheckPublishQuota(ctx, prep.msg.TenantID, prep.dests)
+		}
 		if err == nil {
 			err = validateConfirmation(prep.opts.ConfirmLevel, p.b.store)
 		}
@@ -323,6 +328,11 @@ func (p *Publisher) publishItemsMinimal(ctx context.Context, items []PublishBatc
 		if err == nil {
 			err = p.checkBackpressure(ctx, prep)
 		}
+		// Tenant quotas were only enforced on the single-message publish path, so
+		// a tenant could bypass its quota entirely by using /v1/publish/batch.
+		if err == nil && p.b.tenantMgr != nil {
+			err = p.b.tenantMgr.CheckPublishQuota(ctx, prep.msg.TenantID, prep.dests)
+		}
 		if err != nil {
 			errs[i] = err
 			if first == nil {
@@ -386,6 +396,11 @@ func (p *Publisher) publishMessagesMinimal(ctx context.Context, messages []Messa
 	now := time.Now()
 	for i := range messages {
 		entry, err := p.prepareOwnedMessage(ctx, messages[i], now)
+		// Tenant quotas were only enforced on the single-message publish path, so a
+		// tenant could bypass its quota by using the batch or frame endpoints.
+		if err == nil && p.b.tenantMgr != nil {
+			err = p.b.tenantMgr.CheckPublishQuota(ctx, entry.Message.TenantID, entry.Destinations)
+		}
 		if err != nil {
 			errs[i] = err
 			if first == nil {

@@ -3,7 +3,9 @@ package broker
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -328,5 +330,98 @@ func TestMessageHistoryZeroStillDelivers(t *testing.T) {
 	}
 	if len(history) != 0 {
 		t.Fatalf("history recorded %d entries with the limit disabled, want 0", len(history))
+	}
+}
+
+// Remote consumer subscriptions write into the broker's global routing table, and
+// the Router had no way to remove a route, so every transient worker permanently
+// widened the routing table. Unregistering must take its routes with it.
+func TestRemoteConsumerRoutesAreRemovedOnUnregister(t *testing.T) {
+	ctx := context.Background()
+	b, err := New(Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer b.Stop(ctx)
+
+	// A route the embedder added itself must survive.
+	b.AddRoute(Route{Name: "operator-owned", Mode: RouteTopic, Match: "manual.*"})
+
+	const workers = 25
+	for i := 0; i < workers; i++ {
+		id, err := b.RegisterRemoteConsumer(ctx, ConsumerRegistration{
+			ConsumerID: fmt.Sprintf("w-%d", i), Group: "g1", Capabilities: []string{"poll"},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := b.RemoteConsumerSubscribe(ctx, id.ConsumerID, RemoteSubscription{
+			Type: "pattern", Pattern: fmt.Sprintf("tenant.%d.orders", i), AutoCreate: true,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	withRoutes := b.Router().Routes()
+	if len(withRoutes) < workers {
+		t.Fatalf("expected at least %d routes while workers are connected, got %d", workers, len(withRoutes))
+	}
+
+	for i := 0; i < workers; i++ {
+		if err := b.UnregisterRemoteConsumer(ctx, fmt.Sprintf("w-%d", i)); err != nil {
+			t.Fatalf("unregister w-%d: %v", i, err)
+		}
+	}
+
+	remaining := b.Router().Routes()
+	for _, r := range remaining {
+		if r.Name != "operator-owned" {
+			t.Fatalf("route %q outlived its remote consumer; %d routes remain: %+v", r.Name, len(remaining), remaining)
+		}
+	}
+	if len(remaining) != 1 {
+		t.Fatalf("expected only the operator route to remain, got %d: %+v", len(remaining), remaining)
+	}
+
+	// And a message on a departed pattern must no longer route to the worker's queue.
+	if err := b.DeclareQueue(ctx, QueueConfig{Name: "target"}); err != nil {
+		t.Fatal(err)
+	}
+	dests, _ := b.Router().Route(ctx, Message{Topic: "tenant.0.orders"})
+	for _, d := range dests {
+		if strings.HasPrefix(d.Name, "sub.w-0.") {
+			t.Fatalf("a removed worker's queue is still a routing destination: %+v", dests)
+		}
+	}
+}
+
+func TestRouterRemove(t *testing.T) {
+	r := NewRouter()
+	r.Add(Route{Name: "a", Mode: RouteTopic, Match: "x.*"})
+	r.Add(Route{Name: "b", Mode: RouteTopic, Match: "y.*"})
+	r.Add(Route{Name: "c", Mode: RouteTopic, Match: "z.*"})
+	if got := len(r.Routes()); got != 3 {
+		t.Fatalf("routes = %d, want 3", got)
+	}
+	if !r.Remove("b") {
+		t.Fatal("Remove(b) reported not found")
+	}
+	if r.Remove("b") {
+		t.Fatal("Remove(b) removed twice")
+	}
+	if got := len(r.Routes()); got != 2 {
+		t.Fatalf("routes after remove = %d, want 2", got)
+	}
+	if n := r.RemovePrefix("nonexistent."); n != 0 {
+		t.Fatalf("RemovePrefix removed %d, want 0", n)
+	}
+	if n := r.RemovePrefix(""); n != 2 {
+		t.Fatalf("RemovePrefix(\"\") removed %d, want 2", n)
+	}
+	if got := len(r.Routes()); got != 0 {
+		t.Fatalf("routes = %d, want 0", got)
 	}
 }

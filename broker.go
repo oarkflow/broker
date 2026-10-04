@@ -28,6 +28,8 @@ type Broker struct {
 	state                 atomic.Value
 	seq                   atomic.Uint64
 	queueMaxDepth         sync.Map
+	remoteRoutesMu        sync.Mutex
+	remoteRoutes          map[string][]string
 	subsMu                sync.RWMutex
 	subs                  map[string]*Subscription
 	dispatchMu            sync.Mutex
@@ -646,10 +648,13 @@ func (b *Broker) StreamLagReport(ctx context.Context, stream string) (StreamCons
 	}, nil
 }
 
-func (b *Broker) SagaEngine() *SagaEngine             { return b.sagaEngine }
-func (b *Broker) TaskRouter() *TaskRouter             { return b.router.TaskRouter() }
-func (b *Broker) ConfigLoader() *RoutingConfigLoader  { return b.router.ConfigLoader() }
-func (b *Broker) AddRoute(route Route)                { b.router.Add(route) }
+func (b *Broker) SagaEngine() *SagaEngine            { return b.sagaEngine }
+func (b *Broker) TaskRouter() *TaskRouter            { return b.router.TaskRouter() }
+func (b *Broker) ConfigLoader() *RoutingConfigLoader { return b.router.ConfigLoader() }
+func (b *Broker) AddRoute(route Route)               { b.router.Add(route) }
+
+// RemoveRoute deletes a route by name, reporting whether one was found.
+func (b *Broker) RemoveRoute(name string) bool        { return b.router.Remove(name) }
 func (b *Broker) AddRoutingPlan(plan RoutingPlan)     { b.router.AddPlan(plan) }
 func (b *Broker) RemoveRoutingPlan(name string)       { b.router.RemovePlan(name) }
 func (b *Broker) LoadRoutingConfig(data []byte) error { return b.router.LoadRoutingConfig(data) }

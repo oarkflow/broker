@@ -375,7 +375,9 @@ func (b *Broker) RemoteConsumerSubscribe(ctx context.Context, id string, sub Rem
 		if sub.AutoCreate {
 			_ = b.DeclareQueue(ctx, QueueConfig{Name: sub.Queue, VisibilityTimeout: b.cfg.DefaultVisibility, RetryPolicy: b.cfg.DefaultRetry})
 		}
-		b.AddRoute(Route{Name: "remote-sub." + id + "." + sanitize(pattern), Mode: RouteTopic, Match: pattern, To: []Destination{{Kind: DestinationQueue, Name: sub.Queue}}, Enabled: true})
+		routeName := "remote-sub." + id + "." + sanitize(pattern)
+		b.AddRoute(Route{Name: routeName, Mode: RouteTopic, Match: pattern, To: []Destination{{Kind: DestinationQueue, Name: sub.Queue}}, Enabled: true})
+		b.trackRemoteRoute(id, routeName)
 		sub.Name = pattern
 		sub.Pattern = pattern
 	case "task":
@@ -398,7 +400,9 @@ func (b *Broker) RemoteConsumerSubscribe(ctx context.Context, id string, sub Rem
 		if sub.AutoCreate {
 			_ = b.DeclareQueue(ctx, QueueConfig{Name: sub.Queue, VisibilityTimeout: b.cfg.DefaultVisibility, RetryPolicy: b.cfg.DefaultRetry})
 		}
-		b.AddRoute(Route{Name: "remote-" + sub.Type + "." + id + "." + sanitize(sub.Name), Mode: RouteTopic, Match: sub.Name, To: []Destination{{Kind: DestinationQueue, Name: sub.Queue}}, Enabled: true})
+		routeName := "remote-" + sub.Type + "." + id + "." + sanitize(sub.Name)
+		b.AddRoute(Route{Name: routeName, Mode: RouteTopic, Match: sub.Name, To: []Destination{{Kind: DestinationQueue, Name: sub.Queue}}, Enabled: true})
+		b.trackRemoteRoute(id, routeName)
 	}
 	info, ok := b.Consumers().Subscribe(id, sub)
 	if !ok {
@@ -487,6 +491,10 @@ func (b *Broker) UnregisterRemoteConsumer(ctx context.Context, id string) error 
 	if !ok {
 		return ErrMessageNotFound
 	}
+	// A remote subscription writes into the broker's global routing table. Those
+	// routes outlived the consumer, because the Router had no way to remove a
+	// route, so every transient worker permanently widened the routing table.
+	b.dropRemoteRoutes(id)
 	if info.Group != "" {
 		b.ConsumerLeaveGroup(ctx, id, info.Group)
 	}
@@ -499,6 +507,36 @@ func (b *Broker) UnregisterRemoteConsumer(ctx context.Context, id string) error 
 	b.emitConsumerNotification(id, Notification{Type: "consumer.unregistered", Source: b.cfg.Name, Severity: SeverityInfo, Consumer: id, ConsumerGroup: info.Group, Timestamp: time.Now()})
 	return nil
 }
+
+// trackRemoteRoute records a route added on behalf of a remote consumer so it can
+// be removed when that consumer goes away.
+func (b *Broker) trackRemoteRoute(consumerID, routeName string) {
+	b.remoteRoutesMu.Lock()
+	if b.remoteRoutes == nil {
+		b.remoteRoutes = map[string][]string{}
+	}
+	b.remoteRoutes[consumerID] = append(b.remoteRoutes[consumerID], routeName)
+	b.remoteRoutesMu.Unlock()
+}
+
+// dropRemoteRoutes removes every route added for a remote consumer.
+func (b *Broker) dropRemoteRoutes(consumerID string) {
+	b.remoteRoutesMu.Lock()
+	prefix := "remote-"
+	routes := b.remoteRoutes[consumerID]
+	delete(b.remoteRoutes, consumerID)
+	b.remoteRoutesMu.Unlock()
+	for _, name := range routes {
+		b.router.Remove(name)
+	}
+	// Also sweep by prefix, in case a route was added for this consumer by an older
+	// path that did not record ownership.
+	if b.router != nil {
+		b.router.RemovePrefix(prefix + "sub." + consumerID + ".")
+		b.router.RemovePrefix(prefix)
+	}
+}
+
 func (b *Broker) emitConsumerNotification(id string, n Notification) {
 	b.notify.Publish(n)
 	if b.consumers != nil {

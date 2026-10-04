@@ -4,8 +4,11 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 )
@@ -474,4 +477,83 @@ func TestNativeTenantScopeIsNotWidened(t *testing.T) {
 
 func encodeNativeBase64(b []byte) string {
 	return base64.StdEncoding.EncodeToString(b)
+}
+
+// A follower cannot serve a request, and this transport used to answer with a
+// bare 409 string, so a client could not learn which node leads. The error must
+// carry the leader as structured data.
+func TestNativeNotLeaderIsStructured(t *testing.T) {
+	ctx := context.Background()
+	b, err := New(Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Stop(ctx)
+	c := dialNative(t, startNativeServer(t, b, GRPCConfig{}))
+
+	resp := c.call(GRPCMethodStats, map[string]any{})
+	if resp.Status == 200 {
+		t.Skip("this node is the leader; nothing to assert")
+	}
+
+	var env struct {
+		Error struct {
+			Code      string            `json:"code"`
+			Retryable bool              `json:"retryable"`
+			Class     string            `json:"class"`
+			Details   map[string]string `json:"details"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(resp.Body, &env); err != nil {
+		t.Fatalf("decode error envelope: %v (body %q)", err, resp.Body)
+	}
+	if env.Error.Code != "not_leader" {
+		t.Fatalf("code = %q, want not_leader", env.Error.Code)
+	}
+	if env.Error.Class != string(RetryNotLeader) {
+		t.Errorf("class = %q, want %q", env.Error.Class, RetryNotLeader)
+	}
+	if !env.Error.Retryable {
+		t.Error("not_leader must be marked retryable")
+	}
+}
+
+// The HTTP envelope and the native envelope must agree, so one client-side
+// handler works over either transport.
+func TestNotLeaderErrorIsStructuredForHTTP(t *testing.T) {
+	rec := httptest.NewRecorder()
+	WriteBrokerError(rec, NotLeaderError("node-3", 7))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want 503", rec.Code)
+	}
+	remote := ParseRemoteError(rec.Code, rec.Body.Bytes())
+	if remote == nil {
+		t.Fatalf("body did not parse as an envelope: %s", rec.Body.String())
+	}
+	if remote.Code != "not_leader" {
+		t.Errorf("code = %q", remote.Code)
+	}
+	if _, ok := ClassifyRetry(remote); !ok {
+		t.Error("ClassifyRetry did not match the recovered error")
+	}
+	if !errors.Is(remote, ErrNotLeader) {
+		t.Error("errors.Is(remote, ErrNotLeader) = false")
+	}
+	leader, epoch, _ := remote.RetryHint()
+	if leader != "node-3" {
+		t.Errorf("leader = %q, want node-3; it must not be message text only", leader)
+	}
+	if epoch != 7 {
+		t.Errorf("leader epoch = %d, want 7", epoch)
+	}
+}
+
+func TestStaleEpochErrorIsStructured(t *testing.T) {
+	class, ok := ClassifyRetry(StaleEpochError(9))
+	if !ok || class != RetryStaleEpoch {
+		t.Fatalf("ClassifyRetry = %q,%v", class, ok)
+	}
+	if !errors.Is(StaleEpochError(9), ErrStaleEpoch) {
+		t.Fatal("errors.Is(..., ErrStaleEpoch) = false")
+	}
 }
