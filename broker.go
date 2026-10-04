@@ -15,31 +15,36 @@ import (
 )
 
 type Broker struct {
-	cfg                   Config
-	store                 Store
-	stateStore            StateStore
-	router                *Router
-	codec                 Codec
-	frameCodec            FrameCodec
-	pool                  *fw.Pool
-	ownPool               bool
-	ctx                   context.Context
-	cancel                context.CancelFunc
-	state                 atomic.Value
-	seq                   atomic.Uint64
-	queueMaxDepth         sync.Map
-	remoteRoutesMu        sync.Mutex
-	remoteRoutes          map[string][]string
-	subsMu                sync.RWMutex
-	subs                  map[string]*Subscription
-	dispatchMu            sync.Mutex
-	consumerStrategies    map[consumerStrategyKey]ConsumerStrategy
-	dispatchAssignments   map[string]string
-	waitMu                sync.Mutex
-	waiters               map[string]chan Response
-	taskMu                sync.RWMutex
-	tasks                 map[string]*TaskInfo
-	taskWait              map[string][]chan TaskResult
+	cfg                 Config
+	store               Store
+	stateStore          StateStore
+	router              *Router
+	codec               Codec
+	frameCodec          FrameCodec
+	pool                *fw.Pool
+	ownPool             bool
+	ctx                 context.Context
+	cancel              context.CancelFunc
+	state               atomic.Value
+	seq                 atomic.Uint64
+	queueMaxDepth       sync.Map
+	remoteRoutesMu      sync.Mutex
+	remoteRoutes        map[string][]string
+	subsMu              sync.RWMutex
+	subs                map[string]*Subscription
+	dispatchMu          sync.Mutex
+	consumerStrategies  map[consumerStrategyKey]ConsumerStrategy
+	dispatchAssignments map[string]string
+	waitMu              sync.Mutex
+	waiters             map[string]chan Response
+	taskMu              sync.RWMutex
+	tasks               map[string]*TaskInfo
+	taskWait            map[string][]chan TaskResult
+	// taskCancels holds the cancel function of each task handler that is currently
+	// executing. RegisterTask used to hand the subscription's context to the
+	// handler, so there was nothing per-task to cancel: Cancel set the status and
+	// the work carried on regardless.
+	taskCancels           map[string]context.CancelFunc
 	notify                *NotificationBus
 	cluster               *Cluster
 	consumers             *ConsumerRegistry
@@ -156,7 +161,7 @@ func New(cfg Config) (*Broker, error) {
 		own = true
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	b := &Broker{cfg: cfg, store: cfg.Store, stateStore: cfg.StateStore, router: NewRouter(), codec: cfg.Codec, frameCodec: cfg.FrameCodec, pool: pool, ownPool: own, ctx: ctx, cancel: cancel, subs: map[string]*Subscription{}, consumerStrategies: map[consumerStrategyKey]ConsumerStrategy{}, dispatchAssignments: map[string]string{}, waiters: map[string]chan Response{}, tasks: map[string]*TaskInfo{}, taskWait: map[string][]chan TaskResult{}, notify: NewNotificationBus(cfg.NotificationHistoryCapacity), consumers: NewConsumerRegistry(512), cluster: NewCluster(firstNonEmpty(cfg.NodeID, "node-1"))}
+	b := &Broker{cfg: cfg, store: cfg.Store, stateStore: cfg.StateStore, router: NewRouter(), codec: cfg.Codec, frameCodec: cfg.FrameCodec, pool: pool, ownPool: own, ctx: ctx, cancel: cancel, subs: map[string]*Subscription{}, consumerStrategies: map[consumerStrategyKey]ConsumerStrategy{}, dispatchAssignments: map[string]string{}, waiters: map[string]chan Response{}, tasks: map[string]*TaskInfo{}, taskWait: map[string][]chan TaskResult{}, taskCancels: map[string]context.CancelFunc{}, notify: NewNotificationBus(cfg.NotificationHistoryCapacity), consumers: NewConsumerRegistry(512), cluster: NewCluster(firstNonEmpty(cfg.NodeID, "node-1"))}
 	if cfg.EnablePrometheus {
 		b.promMetrics = GlobalPrometheusMetrics()
 		if cfg.Hooks.OnStarted == nil {
@@ -542,6 +547,22 @@ func (b *Broker) QueueMaxDepth(name string) int {
 	}
 	return 0
 }
+
+// ListTopic returns the retained messages of a topic, oldest first.
+//
+// Topics had no read path before this: a message published to a topic could not be
+// read back, replayed or backfilled, so topic retention grew with nothing able to
+// consume it.
+func (b *Broker) ListTopic(ctx context.Context, name string, limit int) ([]Message, error) {
+	return b.store.ListTopic(ctx, name, limit)
+}
+
+// ReadTopic returns retained topic messages published after afterID, so a reader can
+// resume from where it stopped instead of restarting from the oldest message.
+func (b *Broker) ReadTopic(ctx context.Context, name, afterID string, limit int) ([]Message, error) {
+	return b.store.ReadTopic(ctx, name, afterID, limit)
+}
+
 func (b *Broker) DeclareTopic(ctx context.Context, cfg TopicConfig) error {
 	return b.store.DeclareTopic(ctx, cfg)
 }

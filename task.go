@@ -96,9 +96,23 @@ func (h taskHandle) Result(ctx context.Context, out any) error {
 	}
 	return nil
 }
+
+// defaultTaskWait bounds Wait when the caller supplies a context with no deadline.
+//
+// Without it, a task routed to a queue that has no handler never reaches a terminal
+// state and Wait blocks until the process exits: SubmitTask defaults the queue to
+// "tasks.<name>" while RegisterTask lets the caller override the queue, so a
+// mismatch is silent and the caller hangs rather than failing.
+const defaultTaskWait = 30 * time.Second
+
 func (h taskHandle) Wait(ctx context.Context) (TaskResult, error) {
 	if _, err := h.Info(ctx); err != nil {
 		return TaskResult{}, err
+	}
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, defaultTaskWait)
+		defer cancel()
 	}
 	ch := make(chan TaskResult, 1)
 	h.b.taskMu.Lock()
@@ -137,6 +151,9 @@ func (h taskHandle) Cancel(ctx context.Context, reason string) error {
 	if ti.ID != "" {
 		h.b.persistTask(ctx, ti)
 	}
+	// Stop the work, not just the bookkeeping. Without this the handler kept
+	// running and later overwrote the cancellation with its own result.
+	h.b.cancelTaskRun(h.id)
 	if ti.ID != "" {
 		if msg, ok, _ := h.b.store.Get(ctx, ti.MessageID); ok {
 			msg.Status = MessageCancelled
@@ -174,6 +191,50 @@ func (h taskHandle) Logs(ctx context.Context) ([]MessageHistory, error) {
 
 type TaskFuture interface{ TaskHandle }
 
+// Task returns a handle for a task by id, or nil when no such task is known.
+//
+// Cancel, Retry, Status and Wait were reachable only through the handle returned by
+// SubmitTask, which lives in memory and is lost on restart. Operator tooling that
+// holds a task id from a log, a database or a previous process therefore had no way
+// to cancel or inspect it: there was no Broker.GetTask, and GetTask existed only on
+// the internal StateStore.
+//
+// The returned handle reads through to the StateStore, so a task submitted before a
+// restart is still addressable.
+func (b *Broker) Task(id string) TaskHandle {
+	if id == "" {
+		return nil
+	}
+	return taskHandle{b: b, id: id}
+}
+
+// GetTask returns the current state of a task, and whether it is known.
+func (b *Broker) GetTask(ctx context.Context, id string) (TaskInfo, bool) {
+	info, err := taskHandle{b: b, id: id}.Info(ctx)
+	if err != nil {
+		return TaskInfo{}, false
+	}
+	return info, true
+}
+
+// CancelTask cancels a task by id. It reports whether the task was known.
+func (b *Broker) CancelTask(ctx context.Context, id, reason string) error {
+	h := b.Task(id)
+	if h == nil {
+		return ErrInvalidMessage
+	}
+	return h.Cancel(ctx, reason)
+}
+
+// RetryTask returns a failed task to its queue by id.
+func (b *Broker) RetryTask(ctx context.Context, id string) error {
+	h := b.Task(id)
+	if h == nil {
+		return ErrInvalidMessage
+	}
+	return h.Retry(ctx)
+}
+
 func (p *Publisher) SubmitTask(ctx context.Context, name string, payload any, opts ...TaskOption) (TaskHandle, error) {
 	var o TaskOptions
 	for _, fn := range opts {
@@ -197,7 +258,16 @@ func (p *Publisher) SubmitTask(ctx context.Context, name string, payload any, op
 	now := time.Now()
 	info := TaskInfo{ID: id, Name: name, Queue: queue, Status: TaskCreated, TenantID: o.TenantID, CreatedAt: now, UpdatedAt: now, Metadata: cloneMap(o.Metadata)}
 	p.b.taskMu.Lock()
-	p.b.tasks[id] = &info
+	// Store a separate allocation rather than &info. Keeping a pointer to the local
+	// meant the broker owned the same struct this function kept reading after
+	// unlocking, so a consumer that started the task concurrently raced this
+	// function's persistTask. The window was narrow before and became routine once
+	// queue wakeup removed the poll delay.
+	p.b.tasks[id] = &TaskInfo{
+		ID: info.ID, Name: info.Name, Queue: info.Queue, Status: info.Status,
+		TenantID: info.TenantID, CreatedAt: info.CreatedAt, UpdatedAt: info.UpdatedAt,
+		Metadata: cloneMap(info.Metadata),
+	}
 	p.b.taskMu.Unlock()
 	p.b.persistTask(ctx, info)
 	if p.b.cfg.Hooks.OnTaskCreated != nil {
@@ -270,21 +340,90 @@ func (b *Broker) RegisterTask(ctx context.Context, name string, handler TaskHand
 	return b.Subscribe(ctx, c, func(ctx context.Context, d Delivery) error {
 		tid := d.Message.Headers["x-task-id"]
 		ti, _ := taskHandle{b: b, id: tid}.Info(ctx)
+		// Each invocation gets its own cancellable context, registered against the
+		// task id so Cancel can actually stop the work. Previously the handler
+		// received the subscription's context, so a cancel could not reach it: the
+		// status changed to cancelled while the handler kept running, and on return
+		// it overwrote the cancellation with succeeded.
+		runCtx, cancel := context.WithCancel(ctx)
+		b.registerTaskCancel(tid, cancel)
+		defer func() {
+			cancel()
+			b.clearTaskCancel(tid)
+		}()
 		td := TaskDelivery{Delivery: d, Task: ti}
-		res, err := handler(ctx, td)
+		res, err := handler(runCtx, td)
+		if b.taskCancelled(tid) {
+			// Cancelled: acknowledge the message so it is not retried, but record no
+			// result. Returning the handler's context error here made the consumer
+			// treat the cancellation as a failure and failTask overwrote the
+			// cancelled status.
+			return nil
+		}
 		if err != nil {
 			return err
 		}
 		if res != nil {
-			_ = d.Respond(ctx, res)
+			_ = d.Respond(runCtx, res)
 		}
 		return nil
 	})
 }
 
+// registerTaskCancel records the cancel function for a running task handler.
+func (b *Broker) registerTaskCancel(id string, cancel context.CancelFunc) {
+	if id == "" {
+		return
+	}
+	b.taskMu.Lock()
+	if b.taskCancels == nil {
+		b.taskCancels = map[string]context.CancelFunc{}
+	}
+	b.taskCancels[id] = cancel
+	b.taskMu.Unlock()
+}
+
+func (b *Broker) clearTaskCancel(id string) {
+	if id == "" {
+		return
+	}
+	b.taskMu.Lock()
+	delete(b.taskCancels, id)
+	b.taskMu.Unlock()
+}
+
+// cancelTaskRun stops a running task handler, if one is running. It reports whether
+// a handler was found.
+func (b *Broker) cancelTaskRun(id string) bool {
+	b.taskMu.Lock()
+	cancel, ok := b.taskCancels[id]
+	b.taskMu.Unlock()
+	if !ok {
+		return false
+	}
+	cancel()
+	return true
+}
+
+// taskCancelled reports whether a task has been cancelled. Terminal transitions
+// consult this so a cancelled task cannot be overwritten by the result of work that
+// was already in flight when the cancel landed.
+func (b *Broker) taskCancelled(id string) bool {
+	b.taskMu.RLock()
+	defer b.taskMu.RUnlock()
+	t := b.tasks[id]
+	return t != nil && t.Status == TaskCancelled
+}
+
 func (b *Broker) startTask(ctx context.Context, id string) {
 	b.taskMu.Lock()
 	t := b.tasks[id]
+	if t != nil && t.Status == TaskCancelled {
+		// Cancelled before the handler started. Leave it cancelled; resurrecting it
+		// here is what made a cancel-before-start report success.
+		b.taskMu.Unlock()
+		return
+	}
 	if t != nil {
 		t.Status = TaskRunning
 		t.StartedAt = time.Now()
@@ -348,6 +487,13 @@ func (b *Broker) retryTask(ctx context.Context, id string, err error) {
 func (b *Broker) failTask(ctx context.Context, id string, err error) {
 	b.taskMu.Lock()
 	t := b.tasks[id]
+	if t != nil && t.Status == TaskCancelled {
+		// A cancelled task stays cancelled. A failure arriving from work that was
+		// already in flight must not rewrite the operator's intent, and must not
+		// wake waiters with a terminal result either.
+		b.taskMu.Unlock()
+		return
+	}
 	if t == nil {
 		t = &TaskInfo{ID: id, Status: TaskFailed, CreatedAt: time.Now()}
 		b.tasks[id] = t
@@ -378,6 +524,12 @@ func (b *Broker) completeTask(ctx context.Context, m Message, result []byte, err
 	}
 	b.taskMu.Lock()
 	t := b.tasks[m.TaskID]
+	if t != nil && t.Status == TaskCancelled {
+		// The task was cancelled while the handler was running. Its result must not
+		// resurrect it as succeeded.
+		b.taskMu.Unlock()
+		return
+	}
 	alreadySucceeded := false
 	if t != nil {
 		alreadySucceeded = t.Status == TaskSucceeded

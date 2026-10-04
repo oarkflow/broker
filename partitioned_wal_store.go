@@ -603,6 +603,71 @@ func (s *PartitionedBinaryWALStore) SweepLeases(ctx context.Context, now time.Ti
 	})
 	return total, err
 }
+
+// ListTopic gathers a topic's retained messages across shards. A topic is not
+// partitioned in this store, so every shard is asked and the results are merged in
+// publish order.
+func (s *PartitionedBinaryWALStore) ListTopic(ctx context.Context, name string, limit int) ([]Message, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	// forEachShard invokes the callback concurrently, one goroutine per shard, so
+	// the accumulator needs a lock. Appending unguarded raced and silently dropped
+	// messages.
+	var mu sync.Mutex
+	var all []Message
+	err := s.forEachShard(func(sh *BinaryFileWALStore) error {
+		msgs, err := sh.ListTopic(ctx, name, limit)
+		if err != nil {
+			if errors.Is(err, ErrTopicNotFound) {
+				return nil
+			}
+			return err
+		}
+		mu.Lock()
+		all = append(all, msgs...)
+		mu.Unlock()
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	sort.SliceStable(all, func(i, j int) bool { return all[i].CreatedAt.Before(all[j].CreatedAt) })
+	if len(all) > limit {
+		all = all[:limit]
+	}
+	return all, nil
+}
+
+// ReadTopic resumes a topic read across shards from the message id last seen.
+func (s *PartitionedBinaryWALStore) ReadTopic(ctx context.Context, name, afterID string, limit int) ([]Message, error) {
+	msgs, err := s.ListTopic(ctx, name, 0)
+	if err != nil {
+		return nil, err
+	}
+	if afterID == "" {
+		if limit > 0 && len(msgs) > limit {
+			return msgs[:limit], nil
+		}
+		return msgs, nil
+	}
+	out := make([]Message, 0, len(msgs))
+	found := false
+	for _, m := range msgs {
+		if !found {
+			if m.ID == afterID {
+				found = true
+			}
+			continue
+		}
+		out = append(out, m)
+		if limit > 0 && len(out) >= limit {
+			break
+		}
+	}
+	return out, nil
+}
+
 func (s *PartitionedBinaryWALStore) Close() error {
 	if s == nil {
 		return nil

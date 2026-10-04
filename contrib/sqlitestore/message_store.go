@@ -228,6 +228,16 @@ func (s *MessageStore) ListDLQ(ctx context.Context, name string, limit int) ([]b
 	defer s.mu.Unlock()
 	return s.mem.ListDLQ(ctx, name, limit)
 }
+func (s *MessageStore) ListTopic(ctx context.Context, name string, limit int) ([]broker.Message, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.mem.ListTopic(ctx, name, limit)
+}
+func (s *MessageStore) ReadTopic(ctx context.Context, name, afterID string, limit int) ([]broker.Message, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.mem.ReadTopic(ctx, name, afterID, limit)
+}
 func (s *MessageStore) Move(ctx context.Context, req broker.MoveRequest) (broker.MoveResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

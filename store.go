@@ -38,6 +38,8 @@ type Store interface {
 	History(context.Context, string) ([]MessageHistory, error)
 	ListQueue(context.Context, string, int) ([]Message, error)
 	ListDLQ(context.Context, string, int) ([]Message, error)
+	ListTopic(context.Context, string, int) ([]Message, error)
+	ReadTopic(context.Context, string, string, int) ([]Message, error)
 	Move(context.Context, MoveRequest) (MoveResult, error)
 	PauseQueue(context.Context, string) error
 	ResumeQueue(context.Context, string) error
@@ -1666,6 +1668,76 @@ func (s *MemoryStore) ListDLQ(ctx context.Context, name string, limit int) ([]Me
 	return s.ListQueue(ctx, name, limit)
 }
 
+// ListTopic returns the retained messages of a topic in publish order.
+//
+// Topics previously had no read path at all: ListQueue is queue-only and there was
+// no topic equivalent, so a message published to a topic could not be read back,
+// replayed or backfilled through the API, and topic retention grew unbounded with
+// nothing able to consume it. Publishing to a topic is therefore not the same as a
+// retained log, and callers needing replay should read a stream.
+func (s *MemoryStore) ListTopic(ctx context.Context, name string, limit int) ([]Message, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	t, ok := s.topics[name]
+	if !ok {
+		return nil, errf(ErrTopicNotFound, "topic %q not found", name)
+	}
+	out := make([]Message, 0, minInt(limit, len(t.ids)))
+	for _, id := range t.ids {
+		if len(out) >= limit {
+			break
+		}
+		m, ok := s.peekMsgOK(id)
+		if !ok || m == nil {
+			continue
+		}
+		if !tenantAllowed(ctx, m.TenantID) {
+			continue
+		}
+		out = append(out, cloneMessage(*m))
+	}
+	return out, nil
+}
+
+// ReadTopic returns retained topic messages published after afterID, in publish
+// order. It is the read side for topics, mirroring ReadStream, so a topic can be
+// consumed from where a previous reader stopped rather than only from the start.
+func (s *MemoryStore) ReadTopic(ctx context.Context, name, afterID string, limit int) ([]Message, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	t, ok := s.topics[name]
+	if !ok {
+		return nil, errf(ErrTopicNotFound, "topic %q not found", name)
+	}
+	start := 0
+	if afterID != "" {
+		for i, id := range t.ids {
+			if id == afterID {
+				start = i + 1
+				break
+			}
+		}
+	}
+	out := make([]Message, 0, minInt(limit, len(t.ids)-start))
+	for _, id := range t.ids[start:] {
+		if len(out) >= limit {
+			break
+		}
+		m, ok := s.peekMsgOK(id)
+		if !ok || m == nil || !tenantAllowed(ctx, m.TenantID) {
+			continue
+		}
+		out = append(out, cloneMessage(*m))
+	}
+	return out, nil
+}
+
 func (s *MemoryStore) Move(ctx context.Context, req MoveRequest) (MoveResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1695,7 +1767,28 @@ func (s *MemoryStore) moveLocked(ctx context.Context, req MoveRequest, plannedID
 			continue
 		}
 		newID := id
-		if req.Mode == MoveCopy || req.Mode == MoveReplay || !req.PreserveID {
+		isCopy := req.Mode == MoveCopy || req.Mode == MoveReplay
+		if isCopy {
+			// A copy needs its own id, because the source keeps the original and
+			// both live in s.messages at once. Generate one that is a pure function
+			// of (source id, destination) so that retrying the migration computes
+			// the same id and can recognise work it already did.
+			//
+			// Previously every attempt minted a fresh sequential id, so a retried
+			// copy or replay silently duplicated every message in the batch.
+			newID = plannedIDs[id]
+			if newID == "" {
+				if requirePlan {
+					return res, fmt.Errorf("replicated move: missing planned ID for %s", id)
+				}
+				newID = s.copyTargetIDLocked(id, req)
+			}
+			// Already copied by an earlier attempt of this migration.
+			if _, exists := s.messages[newID]; exists {
+				res.Skipped++
+				continue
+			}
+		} else if !req.PreserveID {
 			newID = plannedIDs[id]
 			if newID == "" {
 				if requirePlan {
@@ -1729,6 +1822,25 @@ func (s *MemoryStore) moveLocked(ctx context.Context, req MoveRequest, plannedID
 		}
 	}
 	return res, nil
+}
+
+// copyTargetIDLocked derives the id a copied message takes at its destination.
+//
+// It is a pure function of the source id, the mode and the destination, and it
+// deliberately does not search for a free slot. "This id is already taken" is the
+// signal the caller uses to recognise that an earlier attempt of the same migration
+// already did the work, so probing for a free alternative here would turn every
+// retry into a fresh duplicate.
+//
+// Source ids are unique within a store, so the derived id is too. If something
+// else already occupies it, the copy is skipped rather than duplicated, which is
+// the safe direction to fail.
+func (s *MemoryStore) copyTargetIDLocked(sourceID string, req MoveRequest) string {
+	id := sourceID + "@" + string(req.Mode)
+	if req.Destination != "" {
+		id += "@" + req.Destination
+	}
+	return id
 }
 
 func (s *MemoryStore) prepareMove(ctx context.Context, req MoveRequest) (map[string]string, MoveResult, error) {
