@@ -202,6 +202,40 @@ type memoryQueue struct {
 	depth       int
 	hasPriority bool
 	state       QueueState
+	// ready wakes a consumer waiting for work. It is a coalescing one-slot
+	// signal, not a queue: a publisher that notifies while a consumer is already
+	// awake loses nothing, because the consumer re-reads the store either way.
+	//
+	// Without it a waiting consumer learns about a newly available message only
+	// on its next poll tick, which puts a hard floor on pickup latency equal to
+	// the poll interval: 25ms over HTTP long-poll and 5ms for an embedded
+	// subscription. Publishing costs one non-blocking send.
+	ready chan struct{}
+}
+
+// notifyReady wakes one waiter without blocking. The channel has capacity one, so
+// repeated notifications coalesce and a publisher is never slowed by a slow or
+// absent consumer.
+func (q *memoryQueue) notifyReady() {
+	if q == nil || q.ready == nil {
+		return
+	}
+	select {
+	case q.ready <- struct{}{}:
+	default:
+	}
+}
+
+// notifyQueueReadyLocked wakes a consumer waiting on the named queue. A nack or
+// an expiry sweep can make a message leasable again, and a move can deliver one
+// into a queue that had none. Callers must hold s.mu.
+func (s *MemoryStore) notifyQueueReadyLocked(name string) {
+	if name == "" {
+		return
+	}
+	if q, ok := s.queues[name]; ok {
+		q.notifyReady()
+	}
 }
 
 type memoryTopic struct {
@@ -432,7 +466,7 @@ func (s *MemoryStore) DeclareQueue(ctx context.Context, cfg QueueConfig) error {
 	if cfg.RetryPolicy.MaxAttempts <= 0 {
 		cfg.RetryPolicy = DefaultRetryPolicy()
 	}
-	s.queues[cfg.Name] = &memoryQueue{cfg: cfg, state: QueueActive}
+	s.queues[cfg.Name] = &memoryQueue{cfg: cfg, state: QueueActive, ready: make(chan struct{}, 1)}
 	return nil
 }
 
@@ -623,9 +657,10 @@ func (s *MemoryStore) appendLockedCollect(msg Message, dests []Destination, coll
 			s.addHistoryLocked(m.ID, MessagePersisted, "topic_append", "", d.Name, "", "", "")
 		case DestinationQueue, DestinationDLQ:
 			if _, ok := s.queues[d.Name]; !ok {
-				s.queues[d.Name] = &memoryQueue{cfg: QueueConfig{Name: d.Name, VisibilityTimeout: 30 * time.Second, RetryPolicy: DefaultRetryPolicy()}, state: QueueActive}
+				s.queues[d.Name] = &memoryQueue{cfg: QueueConfig{Name: d.Name, VisibilityTimeout: 30 * time.Second, RetryPolicy: DefaultRetryPolicy()}, state: QueueActive, ready: make(chan struct{}, 1)}
 			}
 			q := s.queues[d.Name]
+			q.notifyReady()
 			if q.cfg.MaxDepth > 0 && q.depth >= q.cfg.MaxDepth {
 				if handled, err := s.applyBackpressureLocked(q, d.Name, &m); handled || err != nil {
 					if err != nil {
@@ -1354,6 +1389,9 @@ func (s *MemoryStore) ackLocked(req AckRequest) error {
 	m.LeaseToken = ""
 	m.LeaseUntil = time.Time{}
 	s.removeFromQueueLocked(m.Queue, m.ID)
+	// A consumer waiting on this queue may have been blocked by depth; freeing a
+	// slot can make it publishable again.
+	s.notifyQueueReadyLocked(m.Queue)
 	s.addHistoryLocked(m.ID, MessageCompleted, "acked", req.Queue, "", "", req.ConsumerID, "")
 	if !s.retainCompleted {
 		s.addCompletedTombstoneLocked(m.ID)
@@ -1464,6 +1502,8 @@ func (s *MemoryStore) Nack(ctx context.Context, req NackRequest) error {
 	m.LastError = req.Error
 	m.LeaseToken = ""
 	m.LeaseUntil = time.Time{}
+	// A nacked message becomes leasable again, so wake anyone waiting on it.
+	defer s.notifyQueueReadyLocked(m.Queue)
 	switch req.Action {
 	case NackDLQ, NackReject:
 		dlq := req.DLQ
@@ -1477,7 +1517,7 @@ func (s *MemoryStore) Nack(ctx context.Context, req NackRequest) error {
 		m.Status = MessageDeadLettered
 		m.DeadLetterReason = req.Reason
 		if _, ok := s.queues[dlq]; !ok {
-			s.queues[dlq] = &memoryQueue{cfg: QueueConfig{Name: dlq}, state: QueueActive}
+			s.queues[dlq] = &memoryQueue{cfg: QueueConfig{Name: dlq}, state: QueueActive, ready: make(chan struct{}, 1)}
 		}
 		dlqQueue := s.queues[dlq]
 		dlqQueue.ids = append(dlqQueue.ids, m.ID)
@@ -1802,7 +1842,7 @@ func (s *MemoryStore) applyBackpressureLocked(q *memoryQueue, queue string, inco
 			dlq = queue + ".dlq"
 		}
 		if _, ok := s.queues[dlq]; !ok {
-			s.queues[dlq] = &memoryQueue{cfg: QueueConfig{Name: dlq, VisibilityTimeout: q.cfg.VisibilityTimeout, RetryPolicy: q.cfg.RetryPolicy}, state: QueueActive}
+			s.queues[dlq] = &memoryQueue{cfg: QueueConfig{Name: dlq, VisibilityTimeout: q.cfg.VisibilityTimeout, RetryPolicy: q.cfg.RetryPolicy}, state: QueueActive, ready: make(chan struct{}, 1)}
 		}
 		incoming.OriginalQueue = firstNonEmpty(incoming.OriginalQueue, queue)
 		incoming.Queue = dlq
@@ -1826,7 +1866,7 @@ func (s *MemoryStore) appendCloneLocked(m Message, d Destination, req MoveReques
 	switch d.Kind {
 	case DestinationQueue, DestinationDLQ:
 		if _, ok := s.queues[d.Name]; !ok {
-			s.queues[d.Name] = &memoryQueue{cfg: QueueConfig{Name: d.Name}, state: QueueActive}
+			s.queues[d.Name] = &memoryQueue{cfg: QueueConfig{Name: d.Name}, state: QueueActive, ready: make(chan struct{}, 1)}
 		}
 		m.Queue = d.Name
 		m.Status = MessageQueued
@@ -1888,6 +1928,33 @@ func (s *MemoryStore) PauseQueue(ctx context.Context, name string) error {
 // queueExists reports whether a queue is currently declared. Durable stores use
 // it to validate before appending a control-plane WAL record, so a typo'd queue
 // name cannot leave a record that fails on replay.
+// QueueReady returns a channel that receives when the named queue may have
+// leasable work, closing the poll-interval floor on pickup latency.
+//
+// The send is coalescing and never blocks, so a publisher pays one non-blocking
+// channel operation. The signal is advisory: a waiter must re-read the store, and
+// a nil channel means the store does not support it, in which case the caller
+// falls back to polling. Callers must hold s.mu.
+func (s *MemoryStore) QueueReady(name string) <-chan struct{} {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	q, ok := s.queues[name]
+	if !ok {
+		return nil
+	}
+	// Never allocate here. The channel identity has to be stable for the life of
+	// the queue, otherwise a waiter could hold a channel that no publish ever
+	// signals, and creating one under a read lock would be a write under it.
+	return q.ready
+}
+
+// QueueSignaler is implemented by stores that can wake a waiting consumer as soon
+// as a message becomes available. The durable stores embed *MemoryStore, so they
+// satisfy it without extra code.
+type QueueSignaler interface {
+	QueueReady(name string) <-chan struct{}
+}
+
 func (s *MemoryStore) queueExists(name string) bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -2235,6 +2302,7 @@ func (s *MemoryStore) SweepLeases(ctx context.Context, now time.Time) (int, erro
 			m.Redeliveries++
 			s.addHistoryLocked(m.ID, MessageQueued, "lease_expired", m.Queue, "", "visibility timeout", m.ConsumerID, "")
 			s.dropLeased(m.ID)
+			s.notifyQueueReadyLocked(m.Queue)
 			n++
 		}
 	}

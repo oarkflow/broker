@@ -379,6 +379,13 @@ func (s *Subscription) loop() {
 	}()
 	t := time.NewTicker(s.b.cfg.PollInterval)
 	defer t.Stop()
+	// Wake as soon as the queue gains work instead of waiting out the poll
+	// interval. The ticker stays as a fallback for state the signal cannot cover:
+	// lease expiry, queue resume, and messages promoted out of cold storage.
+	var ready <-chan struct{}
+	if signaler, ok := s.b.store.(QueueSignaler); ok {
+		ready = signaler.QueueReady(s.cfg.Queue)
+	}
 	// Cleanup dedup map periodically
 	var dedupTicker *time.Ticker
 	var dedupTick <-chan time.Time
@@ -395,52 +402,61 @@ func (s *Subscription) loop() {
 			if s.dedup != nil {
 				s.dedup.Cleanup()
 			}
+		case <-ready:
 		case <-t.C:
-			if s.paused.Load() {
+		}
+		if ready == nil {
+			// The queue may not have existed when the subscription started. Retry
+			// the lookup so a later append is not missed; a nil channel simply
+			// parks on the ticker until then.
+			if signaler, ok := s.b.store.(QueueSignaler); ok {
+				ready = signaler.QueueReady(s.cfg.Queue)
+			}
+		}
+		if s.paused.Load() {
+			continue
+		}
+		if s.cfg.MaxInFlight > 0 && int(s.inFlight.Load()) >= s.cfg.MaxInFlight {
+			continue
+		}
+		n := s.cfg.BatchSize
+		if n <= 0 {
+			n = 1
+		}
+		req := LeaseRequest{Queue: s.cfg.Queue, ConsumerID: s.cfg.Name, ConsumerGroup: s.cfg.Group, Limit: n, VisibilityTimeout: s.cfg.VisibilityTimeout}
+		if s.strategy != nil {
+			candidates := s.b.QueueCandidates(s.cfg.Queue, s.cfg.Group)
+			req.Accept = func(msg Message) bool {
+				return s.b.assignConsumer(s.strategy, msg, candidates) == s.cfg.Name
+			}
+		}
+		msgs, err := s.b.store.Lease(s.ctx, req)
+		if err != nil || len(msgs) == 0 {
+			continue
+		}
+		if s.filter != nil && len(msgs) > 0 {
+			msgs = s.filterMessages(msgs)
+			if len(msgs) == 0 {
 				continue
 			}
-			if s.cfg.MaxInFlight > 0 && int(s.inFlight.Load()) >= s.cfg.MaxInFlight {
-				continue
+		}
+		if s.batchHandler != nil {
+			batch := append([]Message(nil), msgs...)
+			s.inFlight.Add(int64(len(batch)))
+			batchID := s.id + ":batch"
+			if len(batch) > 0 {
+				batchID = batch[0].ID + ":batch"
 			}
-			n := s.cfg.BatchSize
-			if n <= 0 {
-				n = 1
-			}
-			req := LeaseRequest{Queue: s.cfg.Queue, ConsumerID: s.cfg.Name, ConsumerGroup: s.cfg.Group, Limit: n, VisibilityTimeout: s.cfg.VisibilityTimeout}
-			if s.strategy != nil {
-				candidates := s.b.QueueCandidates(s.cfg.Queue, s.cfg.Group)
-				req.Accept = func(msg Message) bool {
-					return s.b.assignConsumer(s.strategy, msg, candidates) == s.cfg.Name
-				}
-			}
-			msgs, err := s.b.store.Lease(s.ctx, req)
-			if err != nil || len(msgs) == 0 {
-				continue
-			}
-			if s.filter != nil && len(msgs) > 0 {
-				msgs = s.filterMessages(msgs)
-				if len(msgs) == 0 {
-					continue
-				}
-			}
-			if s.batchHandler != nil {
-				batch := append([]Message(nil), msgs...)
-				s.inFlight.Add(int64(len(batch)))
-				batchID := s.id + ":batch"
-				if len(batch) > 0 {
-					batchID = batch[0].ID + ":batch"
-				}
-				_ = s.b.pool.SubmitFunc(func(ctx context.Context) error {
-					defer s.inFlight.Add(-int64(len(batch)))
-					return s.handleBatch(ctx, batch)
-				}, pool.JobOptions{ID: batchID, Queue: s.cfg.Queue, Timeout: s.cfg.Timeout, MaxAttempts: 1, ConcurrencyKey: s.batchOrderKey(batch), MaxConcurrentPerKey: s.orderLimit()})
-				continue
-			}
-			for _, m := range msgs {
-				m := m
-				s.inFlight.Add(1)
-				_ = s.b.pool.SubmitFunc(func(ctx context.Context) error { defer s.inFlight.Add(-1); return s.handle(ctx, m) }, pool.JobOptions{ID: m.ID, Queue: s.cfg.Queue, Priority: pool.Priority(m.Priority), Timeout: s.cfg.Timeout, MaxAttempts: 1, ConcurrencyKey: s.orderKey(m), MaxConcurrentPerKey: s.orderLimit()})
-			}
+			_ = s.b.pool.SubmitFunc(func(ctx context.Context) error {
+				defer s.inFlight.Add(-int64(len(batch)))
+				return s.handleBatch(ctx, batch)
+			}, pool.JobOptions{ID: batchID, Queue: s.cfg.Queue, Timeout: s.cfg.Timeout, MaxAttempts: 1, ConcurrencyKey: s.batchOrderKey(batch), MaxConcurrentPerKey: s.orderLimit()})
+			continue
+		}
+		for _, m := range msgs {
+			m := m
+			s.inFlight.Add(1)
+			_ = s.b.pool.SubmitFunc(func(ctx context.Context) error { defer s.inFlight.Add(-1); return s.handle(ctx, m) }, pool.JobOptions{ID: m.ID, Queue: s.cfg.Queue, Priority: pool.Priority(m.Priority), Timeout: s.cfg.Timeout, MaxAttempts: 1, ConcurrencyKey: s.orderKey(m), MaxConcurrentPerKey: s.orderLimit()})
 		}
 	}
 }

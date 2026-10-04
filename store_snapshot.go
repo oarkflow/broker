@@ -143,7 +143,7 @@ func (s *MemoryStore) restoreSnapshot(snap MemoryStoreSnapshot, recoverInflight 
 		if head < 0 || head > len(q.IDs) {
 			head = 0
 		}
-		s.queues[name] = &memoryQueue{cfg: q.Config, ids: append([]string(nil), q.IDs...), state: state, head: head, depth: q.Depth, hasPriority: q.HasPriority}
+		s.queues[name] = &memoryQueue{cfg: q.Config, ids: append([]string(nil), q.IDs...), state: state, head: head, depth: q.Depth, hasPriority: q.HasPriority, ready: make(chan struct{}, 1)}
 	}
 	for name, t := range snap.Topics {
 		state := t.State

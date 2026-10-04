@@ -994,14 +994,25 @@ func (a AdminServer) leaseForConsumer(w http.ResponseWriter, r *http.Request, re
 		VisibilityTimeout: vis,
 		TenantID:          tenant,
 	}
-	// One reusable timer for the whole wait instead of a fresh time.After per
-	// iteration, which allocated a runtime timer and was never drained.
+	// Wait for work on three things: a store signal that a message became
+	// available, a short fallback tick for state this signal cannot cover (lease
+	// expiry sweeping, queue resume, messages promoted out of cold storage), and
+	// request cancellation.
+	//
+	// Previously the loop slept a fixed 25ms between attempts, so a message
+	// published while a long poll was already waiting sat unclaimed for up to 25ms.
+	// That is a hard floor on pickup latency for every remote consumer, and it is
+	// paid on the common path where the message is available immediately.
 	var idle *time.Timer
 	defer func() {
 		if idle != nil {
 			idle.Stop()
 		}
 	}()
+	var ready <-chan struct{}
+	if signaler, ok := a.Broker.store.(QueueSignaler); ok {
+		ready = signaler.QueueReady(req.Queue)
+	}
 	for {
 		msgs, err := a.Broker.store.Lease(r.Context(), leaseReq)
 		if err != nil {
@@ -1039,7 +1050,16 @@ func (a AdminServer) leaseForConsumer(w http.ResponseWriter, r *http.Request, re
 		} else {
 			idle.Reset(pollRetryInterval)
 		}
+		if ready == nil {
+			// The queue may not have existed when the poll started. Retry the
+			// lookup so a later append is not missed; until then the fallback tick
+			// still bounds the wait.
+			if signaler, ok := a.Broker.store.(QueueSignaler); ok {
+				ready = signaler.QueueReady(req.Queue)
+			}
+		}
 		select {
+		case <-ready:
 		case <-idle.C:
 		case <-r.Context().Done():
 			return nil, false
