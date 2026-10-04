@@ -186,6 +186,112 @@ function decodePayload(p) {
   }
 }
 
+// ---- small form helpers, used by every create dialog ----
+
+function field(label, input, hint) {
+  return el('label', { class: 'fld' }, [
+    el('span', { text: label }),
+    input,
+    hint ? el('div', { class: 'hint', text: hint }) : null,
+  ]);
+}
+
+function textInput(placeholder, value) {
+  return el('input', { type: 'text', spellcheck: 'false', placeholder: placeholder || '', value: value || '' });
+}
+
+function numInput(placeholder, value) {
+  return el('input', { type: 'text', inputmode: 'numeric', placeholder: placeholder || '', value: value === undefined || value === null ? '' : String(value) });
+}
+
+function select(options, chosen) {
+  const s = el('select', null, options.map((o) => el('option', { value: o, text: o, selected: o === chosen })));
+  if (chosen) s.value = chosen;
+  return s;
+}
+
+// Durations cross the API as nanoseconds, which is hostile to type. Accept
+// "30", "30s", "5m" and send nanoseconds.
+function durationToNs(text, fallback) {
+  const t = String(text || '').trim().toLowerCase();
+  if (!t) return fallback;
+  const m = t.match(/^(\d+(?:\.\d+)?)\s*(ns|us|ms|s|m|h)?$/);
+  if (!m) return undefined;
+  const mult = { ns: 1, us: 1e3, ms: 1e6, s: 1e9, m: 6e10, h: 3.6e12 }[m[2] || 's'];
+  return Math.round(parseFloat(m[1]) * mult);
+}
+
+// A dialog that collects fields and POSTs the result. Keeps the create flows
+// uniform and stops each one re-implementing modal plumbing.
+function createDialog(opts) {
+  const body = el('div');
+  const inputs = {};
+  opts.fields.forEach((f) => {
+    let input;
+    if (f.kind === 'bool') {
+      input = el('input', { type: 'checkbox' });
+      input.checked = f.value === true;
+    } else if (f.options) {
+      input = select(f.options, f.value);
+    } else if (f.textarea) {
+      input = el('textarea', { placeholder: f.placeholder || '' });
+    } else {
+      input = textInput(f.placeholder, f.value);
+    }
+    inputs[f.name] = input;
+    body.appendChild(field(f.label, input, f.hint));
+  });
+  return confirm2(opts.title, body, opts.okLabel || 'Create').then(async (ok) => {
+    if (!ok) return;
+    const payload = {};
+    for (const f of opts.fields) {
+      if (f.kind === 'bool') {
+        payload[f.name] = inputs[f.name].checked === true;
+        continue;
+      }
+      const raw = inputs[f.name].value.trim();
+      if (f.required && !raw) { banner(f.label + ' is required'); return; }
+      if (!raw && !f.required) continue;
+      if (f.kind === 'number') {
+        const n = Number(raw);
+        if (!Number.isFinite(n)) { banner(f.label + ' must be a number'); return; }
+        payload[f.name] = n;
+      } else if (f.kind === 'duration') {
+        const ns = durationToNs(raw, undefined);
+        if (ns === undefined) { banner(f.label + ' is not a duration, try 30s or 5m'); return; }
+        payload[f.name] = ns;
+      } else if (f.kind === 'bool') {
+        payload[f.name] = inputs[f.name].checked === true;
+      } else if (f.kind === 'json') {
+        try { payload[f.name] = JSON.parse(raw); } catch (e) { banner(f.label + ' is not valid JSON: ' + e.message); return; }
+      } else if (f.kind === 'list') {
+        payload[f.name] = raw.split(',').map((x) => x.trim()).filter(Boolean);
+      } else if (f.kind === 'raw') {
+        // Pass the value through untouched: the caller builds the body itself.
+        payload[f.name] = raw;
+      } else {
+        payload[f.name] = raw;
+      }
+    }
+    if (opts.build) Object.assign(payload, opts.build(inputs, payload));
+    try {
+      const res = await api(opts.path, { method: opts.method || 'POST', body: payload });
+      banner(opts.success + ' ' + describeCreated(opts, res, payload), 'info');
+      render();
+    } catch (e) {
+      banner(e.message);
+    }
+  });
+}
+
+function describeCreated(opts, res, payload) {
+  if (res && res.consumer_id) return res.consumer_id;
+  if (res && res.id) return res.id;
+  if (res && res.message_id) return res.message_id;
+  if (res && res.id === false) return '';
+  return payload.name || payload.consumer_id || '';
+}
+
 function payloadText(p) {
   if (p === null || p === undefined) return '';
   if (typeof p === 'string') {
@@ -217,6 +323,90 @@ function closeModal(v) {
   const r = modalResolve;
   modalResolve = null;
   if (r) r(v);
+}
+
+// ---- creation actions, reachable from every relevant view ----
+
+const ACK_MODES = ['auto', 'manual', 'none'];
+
+function newQueue() {
+  return createDialog({
+    title: 'Declare queue',
+    path: '/queues',
+    success: 'declared queue',
+    fields: [
+      { name: 'name', label: 'Name', required: true, placeholder: 'orders' },
+      { name: 'max_inflight', label: 'Max in flight', kind: 'number', placeholder: '0 = unlimited' },
+      { name: 'max_depth', label: 'Max depth', kind: 'number', placeholder: '0 = unlimited' },
+      { name: 'visibility_timeout', label: 'Visibility timeout', kind: 'duration', placeholder: '30s', hint: 'Accepts 30s, 5m, 1h. Sent as nanoseconds.' },
+      { name: 'ack_mode', label: 'Ack mode', options: ACK_MODES, value: 'auto' },
+      { name: 'dlq', label: 'Dead-letter queue', placeholder: 'optional, e.g. orders.dlq' },
+    ],
+  });
+}
+
+function newTopic() {
+  return createDialog({
+    title: 'Declare topic',
+    path: '/topics',
+    success: 'declared topic',
+    fields: [
+      { name: 'name', label: 'Name', required: true, placeholder: 'orders.created' },
+      { name: 'partitions', label: 'Partitions', kind: 'number', value: 1 },
+      { name: 'retention', label: 'Retention', kind: 'duration', placeholder: '24h', hint: 'How long published messages are kept.' },
+    ],
+  });
+}
+
+function newStream() {
+  return createDialog({
+    title: 'Create stream',
+    path: '/streams',
+    success: 'created stream',
+    fields: [
+      { name: 'name', label: 'Name', required: true, placeholder: 'audit' },
+      { name: 'partitions', label: 'Partitions', kind: 'number', value: 1 },
+      { name: 'retention', label: 'Retention', kind: 'duration', placeholder: '168h' },
+      { name: 'compact', label: 'Compact', kind: 'bool' },
+    ],
+  });
+}
+
+function newConsumer() {
+  return createDialog({
+    title: 'Register consumer',
+    path: '/v1/consumers/register',
+    success: 'registered consumer',
+    fields: [
+      { name: 'consumer_id', label: 'Consumer id', placeholder: 'leave blank for the broker to assign one', hint: 'The broker generates an id when this is empty.' },
+      { name: 'group', label: 'Consumer group', value: 'default' },
+      { name: 'queues', label: 'Queues', kind: 'list', placeholder: 'orders, invoices', hint: 'Comma separated.' },
+      { name: 'topics', label: 'Topics', kind: 'list', placeholder: 'optional, comma separated' },
+      { name: 'concurrency', label: 'Concurrency', kind: 'number', value: 1 },
+      { name: 'max_inflight', label: 'Max in flight', kind: 'number' },
+      { name: 'ack_mode', label: 'Ack mode', options: ACK_MODES, value: 'manual' },
+    ],
+  });
+}
+
+function newRoute() {
+  return createDialog({
+    title: 'Add route',
+    path: '/routes',
+    success: 'added route',
+    fields: [
+      { name: 'name', label: 'Name', required: true, placeholder: 'orders-to-queue' },
+      { name: 'match', label: 'Match', required: true, placeholder: 'orders.*', hint: 'Topic pattern. * matches everything.' },
+      { name: 'mode', label: 'Mode', options: ['publish', 'subscribe', 'mirror'], value: 'publish' },
+      { name: 'queues', label: 'Destination queues', kind: 'list', placeholder: 'orders, invoices', hint: 'Comma separated. Each becomes a destination.' },
+      { name: 'enabled', label: 'Enabled', kind: 'bool', value: true },
+    ],
+    build: (inputs, payload) => {
+      payload.to = (payload.queues || []).map((q) => ({ type: 'queue', name: q }));
+      delete payload.queues;
+      return {};
+    },
+  });
 }
 
 // ---------------------------------------------------------------- views
@@ -279,7 +469,8 @@ VIEWS.queues = async function (root) {
   const st = await api('/stats');
   const rows = counts(storeStats(st).queues).filter((r) => !/\.dlq$/.test(r.name));
 
-  root.appendChild(panel('Queues (' + rows.length + ')', null, table([
+  root.appendChild(panel('Queues (' + rows.length + ')',
+    [el('button', { class: 'btn sm primary', text: 'New queue', onclick: newQueue })], table([
     { label: 'Queue', render: (r) => el('span', { class: 'mono', text: r.name }) },
     { label: 'Ready depth', num: true, render: (r) => num(r.count) },
     {
@@ -347,7 +538,8 @@ async function inspectQueue(name) {
 VIEWS.topics = async function (root) {
   const st = await api('/stats');
   const rows = counts(storeStats(st).topics);
-  root.appendChild(panel('Topics (' + rows.length + ')', null, table([
+  root.appendChild(panel('Topics (' + rows.length + ')',
+    [el('button', { class: 'btn sm primary', text: 'New topic', onclick: newTopic })], table([
     { label: 'Topic', render: (r) => el('span', { class: 'mono', text: r.name }) },
     { label: 'Retained', num: true, render: (r) => num(r.count) },
     { label: '', cls: 'actions', render: (r) => el('button', { class: 'btn sm', text: 'Read', onclick: () => readTopic(r.name) }) },
@@ -388,7 +580,8 @@ async function readTopic(name) {
 VIEWS.streams = async function (root) {
   const st = await api('/stats');
   const rows = counts(storeStats(st).streams);
-  root.appendChild(panel('Streams (' + rows.length + ')', null, table([
+  root.appendChild(panel('Streams (' + rows.length + ')',
+    [el('button', { class: 'btn sm primary', text: 'New stream', onclick: newStream })], table([
     { label: 'Stream', render: (r) => el('span', { class: 'mono', text: r.name }) },
     { label: 'Messages', num: true, render: (r) => num(typeof r.count === 'number' ? r.count : (r.detail && r.detail.messages)) },
     { label: '', cls: 'actions', render: (r) => el('span', null, [
@@ -443,7 +636,8 @@ VIEWS.consumers = async function (root) {
   const idOf = (c) => c.consumer_id || c.id || c.name || '';
   const sorted = rows.slice().sort((a, b) => idOf(a).localeCompare(idOf(b)));
 
-  root.appendChild(panel('Consumers (' + sorted.length + ')', null, table([
+  root.appendChild(panel('Consumers (' + sorted.length + ')',
+    [el('button', { class: 'btn sm primary', text: 'Register consumer', onclick: newConsumer })], table([
     { label: 'ID', render: (r) => el('span', { class: 'mono', text: idOf(r) }) },
     { label: 'Group', render: (r) => el('span', { class: 'mono', text: r.group || '—' }) },
     { label: 'State', render: (r) => (r.banned ? stateTag('banned') : r.draining ? stateTag('draining') : r.paused ? stateTag('paused') : stateTag(r.state)) },
@@ -601,7 +795,20 @@ VIEWS.dlq = async function (root) {
   root.appendChild(panel('Dead letters by queue', null, table([
     { label: 'Queue', render: (r) => el('span', { class: 'mono', text: r.name }) },
     { label: 'Dead', num: true, render: (r) => num(r.count) },
-    { label: '', cls: 'actions', render: (r) => el('button', { class: 'btn sm', text: 'Inspect', onclick: () => inspectDLQ(r.name) }) },
+    {
+      label: '', cls: 'actions', render: (r) => el('span', null, [
+        el('button', { class: 'btn sm', text: 'Inspect', onclick: () => inspectDLQ(r.name) }),
+        el('button', {
+          class: 'btn sm', text: 'Replay all',
+          onclick: async () => {
+            if (!await confirm2('Replay ' + r.name,
+              'Every dead letter moves back to its source queue with attempts and error reset. ' +
+              'If the consumer still fails they will dead-letter again.', 'Replay')) return;
+            await act('/dlq/' + encodeURIComponent(r.name) + '/replay-all', 'POST', 'replayed ' + r.name);
+          },
+        }),
+      ]),
+    },
   ], rows, 'no dead letters - nothing has exhausted its retries')));
 };
 
@@ -624,6 +831,86 @@ async function inspectDLQ(name) {
   }
   await m;
 }
+
+VIEWS.publish = async function (root) {
+  const target = select(['queue', 'topic', 'stream'], 'queue');
+  const name = textInput('orders');
+  const type = textInput('optional message type');
+  const payload = el('textarea', { placeholder: '{"hello":"world"}' });
+  payload.value = '{"hello":"world"}';
+  const out = el('div');
+
+  const form = el('div', { class: 'panel-body' }, [
+    el('div', { class: 'grid2' }, [
+      field('Target', target),
+      field('Name', name, 'Queue, topic or stream to publish into.'),
+    ]),
+    field('Type', type),
+    field('Payload', payload, 'Any JSON value. It is stored verbatim and returned base64-encoded.'),
+    el('div', { class: 'row' }, [
+      el('button', { class: 'btn primary', text: 'Publish', onclick: send }),
+      el('button', { class: 'btn ghost', text: 'Clear', onclick: () => { name.value = ''; payload.value = ''; out.textContent = ''; } }),
+    ]),
+  ]);
+
+  async function send() {
+    const n = name.value.trim();
+    if (!n) { banner('a queue, topic or stream name is required'); return; }
+    const raw = payload.value.trim() || '{}';
+    let parsed;
+    try { parsed = JSON.parse(raw); } catch (e) { banner('payload is not valid JSON: ' + e.message); return; }
+    const body = { type: type.value.trim() };
+    body[target.value] = n;
+    // The API takes payload as raw JSON, so pass the parsed value through.
+    body.payload = parsed;
+    try {
+      const res = await api('/publish', { method: 'POST', body: body });
+      const id = (res && (res.message_id || res.id)) || '';
+      banner('published ' + id, 'info');
+      out.textContent = '';
+      out.appendChild(el('div', { class: 'cards' }, [
+        card('Message id', id || '—'),
+        card('Copies', (res && res.messages && res.messages.length) || 1),
+      ]));
+      if (res && res.messages && res.messages.length > 1) {
+        out.appendChild(table([
+          { label: 'Destination', key: 'queue' },
+          { label: 'Id', render: (m) => el('span', { class: 'mono', text: m.id }) },
+        ], res.messages, ''));
+      }
+    } catch (e) {
+      out.textContent = '';
+      out.appendChild(el('p', { class: 'err', text: e.message }));
+    }
+  }
+
+  root.appendChild(panel('Publish', null, form));
+  root.appendChild(panel('Last publish', null, el('div', { class: 'panel-body' }, out)));
+};
+
+// ---- routes ----
+
+VIEWS.routes = async function (root) {
+  const list = await api('/routes');
+  const rows = Array.isArray(list) ? list : (list && list.routes) || [];
+  root.appendChild(panel('Routes (' + rows.length + ')',
+    [el('button', { class: 'btn sm primary', text: 'Add route', onclick: newRoute })],
+    table([
+      { label: 'Name', key: 'name' },
+      { label: 'Match', render: (r) => el('span', { class: 'mono', text: r.match || '—' }) },
+      { label: 'Mode', key: 'mode' },
+      { label: 'Enabled', render: (r) => (r.enabled ? stateTag('running') : stateTag('paused')) },
+      {
+        label: 'Destinations', render: (r) => {
+          const to = r.to || [];
+          if (!to.length) return '—';
+          return to.map((d) => d.name || d.queue || JSON.stringify(d)).join(', ');
+        },
+      },
+    ], rows, 'no routes configured; published messages go only where they are addressed')));
+  root.appendChild(el('p', { class: 'muted small' },
+    'Routes can be added and listed over HTTP but not removed; disable one by re-adding it with Enabled off.'));
+};
 
 VIEWS.cluster = async function (root) {
   const body = el('pre', { class: 'payload', text: 'loading…' });

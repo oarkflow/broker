@@ -103,6 +103,12 @@ input[type=text], input[type=password], select, textarea {
 }
 textarea { font-family: var(--mono); font-size: 12.5px; width: 100%; min-height: 90px; }
 .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.fld { display: flex; flex-direction: column; gap: 4px; margin-bottom: 10px; }
+.fld > span { font-size: 11px; text-transform: uppercase; letter-spacing: .5px; color: var(--fg-dim); }
+.fld input, .fld select, .fld textarea { width: 100%; }
+.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 0 12px; }
+.hint { font-size: 12px; color: var(--fg-dim); margin: -4px 0 10px; }
+@media (max-width: 720px) { .grid2 { grid-template-columns: 1fr; } }
 
 /* ---------- data display ---------- */
 .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(168px, 1fr)); gap: 12px; margin-bottom: 18px; }

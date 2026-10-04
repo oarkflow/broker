@@ -140,6 +140,24 @@ ss = json.load(sys.stdin)["store"]
 total = sum(ss["queues"].values()) + sum(ss["topics"].values())
 print("ok" if total == ss["messages"] else "%d != %d" % (total, ss["messages"]))')"
 
+# ---------------------------------------------------------------- creation
+# These are the exact bodies the console's create dialogs send.
+say "creating queues, topics, streams, consumers, routes"
+check "declare a queue"  200 "$(code -X POST "$ADDR/queues"  -d '{"name":"uiq","max_inflight":8,"visibility_timeout":30000000000,"ack_mode":"manual"}')"
+check "declare a topic"  200 "$(code -X POST "$ADDR/topics"  -d '{"name":"uitopic","partitions":1,"retention":86400000000000}')"
+check "create a stream"  200 "$(code -X POST "$ADDR/streams" -d '{"name":"uistream","partitions":1,"compact":true}')"
+check "add a route"     200 "$(code -X POST "$ADDR/routes"   -d '{"name":"ui-route","match":"uitopic","mode":"publish","to":[{"type":"queue","name":"uiq"}],"enabled":true}')"
+contains "the created queue exists"  '"uiq"'      "$(g "$ADDR/stats")"
+contains "the created topic exists"  '"uitopic"'  "$(g "$ADDR/stats")"
+contains "the created stream exists" '"uistream"' "$(g "$ADDR/streams")"
+check "publish to the new queue" 200 "$(code -X POST "$ADDR/publish" -d '{"queue":"uiq","type":"demo","payload":{"hello":"world"}}')"
+contains "the published message is readable" '"uiq"' "$(g "$ADDR/queues")"
+NEWQ="$(curl -s "${CURL[@]}" "${AUTH[@]+"${AUTH[@]}"}" "$ADDR/queues" | python3 -c 'import sys,json;print(json.load(sys.stdin)["uiq"])')"
+check "the new queue took the message" 1 "$NEWQ"
+check "list routes" 200 "$(code "$ADDR/routes")"
+contains "the route is listed" "ui-route" "$(g "$ADDR/routes")"
+check "replay a dead letter queue" 200 "$(code -X POST "$ADDR/dlq/uiq.dlq/replay-all" -d '{}')"
+
 # ---------------------------------------------------------------- broker lifecycle
 say "broker pause and resume"
 contains "broker starts running" '"state":"running"' "$(g "$ADDR/v1/broker")"

@@ -208,8 +208,12 @@ served from the binary and reads nothing server-side: every value it shows is
 fetched by the browser from the same endpoints you would call with `curl`, using
 your own credentials.
 
-Views: Overview, Queues, Topics, Streams, Consumers, Tasks, Dead letters,
-Cluster, Audit. It polls every 5 seconds while the **auto** box is ticked.
+Views: Overview, Queues, Topics, Streams, Publish, Consumers, Tasks, Dead letters,
+Routes, Cluster, Audit. It polls every 5 seconds while the **auto** box is ticked.
+
+You can create and control from the UI: declare queues, topics and streams,
+register consumers, add routes, publish messages, submit and cancel tasks, replay
+dead letters, and pause or resume the broker and individual queues.
 
 ### Publish a message
 
@@ -252,6 +256,60 @@ published `payload` is returned **base64-encoded**, because `Message.Payload` is
 curl -s "$BROKER/v1/topics/events?limit=1" \
   | python3 -c 'import sys,json,base64;print(base64.b64decode(json.load(sys.stdin)[0]["payload"]).decode())'
 ```
+
+### Create queues, topics, streams and consumers
+
+Everything the console can create is also a plain HTTP call. These are the exact
+bodies its dialogs send.
+
+```bash
+# Queue. Durations are nanoseconds.
+curl -s -X POST $BROKER/queues -d '{
+  "name": "orders",
+  "max_inflight": 10,
+  "max_depth": 500,
+  "visibility_timeout": 30000000000,
+  "ack_mode": "manual",
+  "dlq": "orders.dlq"
+}'
+
+# Topic, with retention
+curl -s -X POST $BROKER/topics -d '{"name":"orders.created","partitions":1,"retention":86400000000000}'
+
+# Stream, optionally compacted
+curl -s -X POST $BROKER/streams -d '{"name":"audit","partitions":1,"compact":true}'
+
+# Consumer. The id is optional; the broker assigns one when it is blank.
+curl -s -X POST $BROKER/v1/consumers/register -d '{
+  "consumer_id": "worker-1",
+  "group": "workers",
+  "queues": ["orders","invoices"],
+  "concurrency": 2,
+  "max_inflight": 8,
+  "ack_mode": "manual"
+}'
+
+# Route: forward matching topics to queues
+curl -s -X POST $BROKER/routes -d '{
+  "name": "orders-to-queue",
+  "match": "orders.*",
+  "mode": "publish",
+  "to": [{"type":"queue","name":"orders"}],
+  "enabled": true
+}'
+```
+
+`GET /routes` lists routes. There is **no delete route over HTTP** — disable one by
+re-adding it with `"enabled": false`. Route creation is refused on a
+tenant-scoped broker, because routes are global.
+
+The console exposes all of the above: **New queue**, **New topic**,
+**New stream**, **Register consumer**, **Add route**, and a **Publish** view that
+accepts any JSON payload and shows the resulting message id. The Dead letters view
+has a **Replay all** action per queue.
+
+Durations in the console accept `30s`, `5m`, `1h` and are converted to
+nanoseconds before sending. The HTTP API itself takes nanoseconds.
 
 ### Read a topic
 
@@ -531,8 +589,8 @@ trust. Trust the CA at the OS level, or use plain HTTP for local work.
 A script that starts a broker and exercises every management surface:
 
 ```bash
-bash scripts/manual_verify.sh          # 57 checks over HTTP
-bash scripts/manual_verify.sh --tls    # 62 checks, also proves auth is enforced
+bash scripts/manual_verify.sh          # 70 checks over HTTP
+bash scripts/manual_verify.sh --tls    # 75 checks, also proves auth is enforced
 ```
 
 It builds `brokerd`, runs it against a temporary WAL, and asserts the responses,
