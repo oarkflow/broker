@@ -19,6 +19,7 @@ An experimental message broker for Go with embedded, single-node, and distribute
 ## Table of Contents
 
 - [Quick Start](#quick-start)
+- [Running the Broker](#running-the-broker)
 - [Complete Examples](#complete-examples)
 - [Installation](#installation)
 - [Broker Modes](#broker-modes)
@@ -112,6 +113,489 @@ curl -X POST -H "Authorization: Bearer $BROKER_TOKEN" \
   http://localhost:8090/queues/jobs/pull \
   -d '{"consumer_id":"worker-1","limit":1}'
 ```
+
+## Running the Broker
+
+This is the complete operating guide: build, start, publish, consume, run tasks,
+and inspect everything. Every command here has been run against a real broker.
+
+### Build the binaries
+
+All binaries live in the `cmd` module and build from its own `go.mod`:
+
+```bash
+cd cmd
+go build -o /tmp/brokerd    ./brokerd        # broker + admin API + console
+go build -o /tmp/brokerctl  ./brokerctl      # CLI / TUI operator client
+go build -o /tmp/broker-worker ./broker-worker # remote worker process
+cd ..
+```
+
+### Start the broker
+
+Two modes. Pick one.
+
+**Local development — plain HTTP, no authentication:**
+
+```bash
+/tmp/brokerd --insecure-dev -addr 127.0.0.1:8090 -wal /tmp/broker-data -store wal
+```
+
+`--insecure-dev` disables authentication entirely: every request is treated as an
+admin with full permissions. Local use only. Anything reachable from a network
+must not use it.
+
+**Production-shaped — TLS and a bearer token:**
+
+```bash
+/tmp/brokerd \
+  -addr 127.0.0.1:8090 \
+  -token "$BROKER_TOKEN" \
+  -tls-cert cert.pem -tls-key key.pem \
+  -wal /var/lib/oarkflow -store wal
+```
+
+`brokerd` refuses to start unless one of these is true:
+
+- `--insecure-dev` is set, **or**
+- `-token` is set, **and**
+- TLS is configured via `-tls-cert` and `-tls-key`
+
+Both must be supplied together. Skipping TLS without `--insecure-dev` is a
+deliberate startup failure, not a warning.
+
+**Useful flags:**
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `-addr` | `:8090` | admin API, data plane and console listen address |
+| `-wal` | *(empty)* | WAL directory. Empty uses an in-memory store |
+| `-store` | auto | `memory`, `wal`, `wal2` (segmented), or `sqlite` |
+| `-wal-shards` | `1` | independent binary WAL shards |
+| `-profile` | `durable` | `durable`, `latency`, `throughput`, `lightweight` |
+| `-queue` | `default` | default queue name |
+| `-token` | *(empty)* | admin bearer token |
+| `-read-token` | *(empty)* | additional read-only token |
+| `-worker-token` | *(empty)* | token for remote workers |
+| `-publisher-token` | *(empty)* | publish-only token |
+| `-quiet` | `false` | suppress live broker event logs |
+| `-max-body` | `1MiB` | maximum HTTP request body |
+
+Every flag also has an environment variable equivalent (`BROKER_ADDR`,
+`BROKER_TOKEN`, `BROKER_WAL`, and so on).
+
+With `durable`, `latency` or `throughput` profiles, `brokerd` refuses to run on
+the in-memory store. Use `-store=wal`, `-store=wal2`, `-store=sqlite`, or
+`-profile=lightweight`.
+
+### Open the console
+
+With the broker running, open:
+
+```
+http://127.0.0.1:8090/console/
+```
+
+- The bare host `http://127.0.0.1:8090` redirects there automatically.
+- `/console` (no trailing slash) redirects to `/console/`.
+- Paste the admin token and press **Connect**. The token is kept in
+  `sessionStorage` for that tab only and sent as an `Authorization: Bearer`
+  header — never in a URL.
+- Under `--insecure-dev` there is no token; press Connect to proceed.
+
+The console has no build step and needs no Node tooling. It is a static app
+served from the binary and reads nothing server-side: every value it shows is
+fetched by the browser from the same endpoints you would call with `curl`, using
+your own credentials.
+
+Views: Overview, Queues, Topics, Streams, Consumers, Tasks, Dead letters,
+Cluster, Audit. It polls every 5 seconds while the **auto** box is ticked.
+
+### Publish a message
+
+```bash
+curl -s -X POST http://127.0.0.1:8090/publish \
+  -H 'Content-Type: application/json' \
+  -d '{"queue":"orders","payload":{"id":"order-1","amount":100}}'
+```
+
+Target a topic, a stream, or a queue — or set several at once:
+
+```bash
+# Topic with retention
+curl -s -X POST http://127.0.0.1:8090/publish \
+  -d '{"topic":"orders.created","payload":{"id":"order-1"}}'
+
+# Stream, for ordered replay
+curl -s -X POST http://127.0.0.1:8090/publish \
+  -d '{"stream":"audit","payload":{"action":"login"}}'
+
+# Fan out to a topic and a queue in one call
+curl -s -X POST http://127.0.0.1:8090/publish \
+  -d '{"topic":"orders.created","queue":"orders.process","payload":{"id":"order-1"}}'
+```
+
+Batch publishing takes a bare JSON **array**, not an object with a `messages`
+key. A `{"messages":[...]}` body is rejected with `400`:
+
+```bash
+curl -s -X POST http://127.0.0.1:8090/publish/batch \
+  -d '[{"queue":"orders","payload":{"n":1}},
+       {"queue":"orders","payload":{"n":2}}]'
+```
+
+With a token, add `-H "Authorization: Bearer $BROKER_TOKEN"`. Note that a
+published `payload` is returned **base64-encoded**, because `Message.Payload` is
+`[]byte`:
+
+```bash
+curl -s "$BROKER/v1/topics/events?limit=1" \
+  | python3 -c 'import sys,json,base64;print(base64.b64decode(json.load(sys.stdin)[0]["payload"]).decode())'
+```
+
+### Read a topic
+
+Topics keep a retained copy of what was published:
+
+```bash
+curl -s "$BROKER/v1/topics/orders.created?limit=20"
+
+# Resume after a known message id, for scrolling
+curl -s "$BROKER/v1/topics/orders.created?limit=20&after=msg-42-ab12cd34"
+```
+
+Pages never repeat or skip messages. An unknown topic returns `404` with
+`topic_not_found`.
+
+### Run a consumer
+
+**In-process**, which is the usual embedded shape:
+
+```go
+b.Subscribe(ctx, broker.ConsumerConfig{
+    Name: "email-worker", Queue: "email.send", AckMode: broker.AckAuto,
+}, func(ctx context.Context, d broker.Delivery) error {
+    log.Println("got", d.Message.ID, string(d.Message.Payload))
+    return nil // non-nil error triggers retry, then the DLQ
+})
+```
+
+**As a separate process** against a running broker:
+
+```bash
+/tmp/broker-worker \
+  -broker http://127.0.0.1:8090 \
+  -token "$BROKER_TOKEN" \
+  -id worker-1 -group workers \
+  -queue orders \
+  -task invoice.send
+```
+
+`broker-worker` needs at least one of `-queue`, `-pattern`, `-task`, `-request`
+or `-command`, and logs every message it handles. Once it connects you will see it
+register:
+
+```bash
+curl -s $BROKER/v1/consumers \
+  | python3 -c 'import sys,json;[print(c["consumer_id"],c["state"],c.get("queues")) for c in json.load(sys.stdin)]'
+# worker-1 ready ['orders']
+```
+
+End-to-end check — publish three messages with no worker attached, then start one:
+
+```bash
+for i in 1 2 3; do curl -s -X POST $BROKER/publish -d '{"queue":"orders","payload":{"n":1}}' -o /dev/null; done
+curl -s $BROKER/queues          # {"orders":3,...}
+# start broker-worker, then:
+curl -s $BROKER/queues          # {"orders":0,...}
+```
+
+Controlling a remote consumer:
+
+```bash
+CID=$(curl -s -X POST $BROKER/v1/consumers/register \
+      -d '{"consumer_id":"c1","queues":["orders"],"group":"g1"}' \
+      | python3 -c 'import sys,json;print(json.load(sys.stdin)["consumer_id"])')
+
+curl -s -X POST $BROKER/v1/consumers/$CID/pause
+curl -s -X POST $BROKER/v1/consumers/$CID/drain
+curl -s -X POST $BROKER/v1/consumers/$CID/resume
+curl -s -X POST $BROKER/v1/consumers/$CID/ban  -d '{"reason":"misbehaving"}'
+curl -s -X POST $BROKER/v1/consumers/$CID/unban
+curl -s -X POST $BROKER/v1/consumers/$CID/unregister
+```
+
+The identifier is **generated by the broker**. A `consumer_id` you send is
+honoured if you supply one; otherwise the server assigns its own and returns it.
+Always use the returned value.
+
+### Run a task
+
+A task is a message with a registered handler, tracked by id, with status,
+progress, result and logs. Submit one to a queue a task handler is watching:
+
+```bash
+TID=$(curl -s -X POST $BROKER/v1/tasks/submit \
+      -d '{"name":"invoice.send","queue":"tasks.invoice.send","payload":{"amount":42}}' \
+      | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
+
+curl -s $BROKER/v1/tasks/$TID
+curl -s $BROKER/v1/tasks/$TID/result
+curl -s $BROKER/v1/tasks/$TID/logs
+curl -s "$BROKER/v1/tasks?limit=50"
+```
+
+A completed task looks like this:
+
+```json
+{
+  "id": "task-4-1635d05f1d36",
+  "name": "invoice.send",
+  "status": "succeeded",
+  "progress": { "percent": 50, "message": "working" },
+  "result": "eyJtZXNzYWdlX2lkIjoi..."
+}
+```
+
+`result` is base64, like any payload.
+
+Task control:
+
+```bash
+curl -s -X POST $BROKER/v1/tasks/$TID/cancel   # stop a running task
+curl -s -X POST $BROKER/v1/tasks/$TID/retry    # re-queue its message
+```
+
+`cancel` interrupts a running handler through its context, and the task stays
+`cancelled` — a late completion cannot overwrite it.
+
+`retry` re-queues the underlying message with attempts and error reset. It does
+**not** change the status of the task you asked about; that record stays
+terminal, and the replayed message runs as a new task when a worker picks it up.
+
+Registering a task handler in Go:
+
+```go
+b.RegisterTask(ctx, "invoice.send", func(ctx context.Context, d broker.TaskDelivery) (any, error) {
+    _ = d.Progress(ctx, broker.Progress{Percent: 50, Message: "charging"})
+    return map[string]any{"ok": true}, nil // the returned value is the task result
+}, broker.ConsumerConfig{Name: "billing", Queue: "tasks.invoice.send"})
+```
+
+### Retries and the dead-letter queue
+
+A message is retried on nack, then dead-lettered once attempts are exhausted.
+The default is 3 attempts. To watch it happen, run a worker that always fails:
+
+```bash
+/tmp/broker-worker -broker $BROKER -id w2 -group g2 -queue risky -fail
+for i in 1 2 3 4 5; do curl -s -X POST $BROKER/publish -d '{"queue":"risky","payload":{"n":1}}' -o /dev/null; done
+sleep 5
+
+curl -s $BROKER/queues
+# {"risky":0,"risky.dlq":5,...}
+
+curl -s "$BROKER/dlq/risky.dlq/messages?limit=5"
+# each message shows attempts=3 and last_error="forced failure"
+```
+
+Replay a dead letter back to its queue:
+
+```bash
+curl -s -X POST $BROKER/dlq/risky.dlq/replay-all
+curl -s $BROKER/queues     # {"risky":5,"risky.dlq":0,...}
+```
+
+If the worker is still failing, messages will simply dead-letter again — stop the
+worker before replaying if you want to see the queue refill.
+
+### Pause, resume and queue control
+
+```bash
+# Broker-wide
+curl -s $BROKER/v1/broker                                    # {"state":"running"}
+curl -s -X POST $BROKER/v1/broker -d '{"action":"pause"}'
+curl -s -X POST $BROKER/v1/broker -d '{"action":"resume"}'
+```
+
+Know what broker pause actually does:
+
+- **Publishing is rejected** with `409` and `{"error":{"code":"paused"}}`.
+- **In-process pool workers stop.**
+- **Remote consumers are not stopped.** A `broker-worker` or HTTP poller will keep
+  draining whatever is already queued.
+
+For a hard stop, pause the queues themselves:
+
+```bash
+curl -s -X POST $BROKER/queues/orders/pause
+curl -s -X POST $BROKER/queues/orders/resume
+curl -s -X POST $BROKER/queues/orders/purge    # deletes every message; irreversible
+curl -s "$BROKER/queues/orders/messages?limit=20"
+```
+
+### Inspect broker state
+
+```bash
+curl -s $BROKER/stats
+```
+
+Note the shape — everything is nested under `store`, and `queues`, `topics` and
+`dlq` are **name → count** maps, not objects:
+
+```json
+{
+  "broker_state": "running",
+  "error": "",
+  "store": {
+    "queues": { "orders": 3, "orders.dlq": 0 },
+    "topics": { "events": 5 },
+    "streams": {},
+    "dlq":    { "orders.dlq": 0 },
+    "messages": 8, "leased": 0, "dead_letter": 0
+  }
+}
+```
+
+Extract a count with:
+
+```bash
+curl -s $BROKER/stats | python3 -c 'import sys,json;print(json.load(sys.stdin)["store"]["queues"]["orders"])'
+```
+
+Other endpoints:
+
+```bash
+curl -s $BROKER/healthz      # unauthenticated probe, always allowed
+curl -s $BROKER/readyz       # unauthenticated probe, always allowed
+curl -s $BROKER/queues
+curl -s $BROKER/topics
+curl -s $BROKER/streams
+curl -s $BROKER/dlq
+curl -s $BROKER/cluster/status
+curl -s "$BROKER/audit?limit=20"
+curl -s "$BROKER/lag?stream=audit"   # the stream name is required; bare /lag returns 400
+                                      # and an unknown stream returns 404
+```
+
+There is no `/queues/{name}` detail route — queue counters come from `/stats`,
+and queued messages from `/queues/{name}/messages`.
+
+`/audit` returns an empty list unless the broker was given an audit logger;
+`brokerd` does not set one.
+
+### Use the CLI
+
+`brokerctl` talks to a running broker. Global flags come **before** the
+subcommand; subcommand flags come after.
+
+```bash
+export BROKER_ADDR=http://127.0.0.1:8090
+export BROKER_TOKEN=your-secret-token     # omit under --insecure-dev
+
+/tmp/brokerctl stats
+/tmp/brokerctl queues
+/tmp/brokerctl topics
+/tmp/brokerctl consumers
+
+/tmp/brokerctl publish -queue orders -payload '{"id":"order-1"}'
+/tmp/brokerctl publish -topic orders.created -payload '{"id":"order-1"}'
+
+/tmp/brokerctl pull email.send -consumer cli -group cli -limit 1
+/tmp/brokerctl ack <message-id> -queue email.send -lease <lease-token> -consumer cli
+
+/tmp/brokerctl pause  orders
+/tmp/brokerctl resume orders
+
+/tmp/brokerctl dlq                       # dead-letter summary
+/tmp/brokerctl dlq-dashboard
+/tmp/brokerctl dlq-replay -queue orders.dlq
+
+/tmp/brokerctl cluster
+/tmp/brokerctl tui                       # interactive terminal UI
+```
+
+Point it at a different broker with `-addr` and `-token`, again before the
+subcommand:
+
+```bash
+/tmp/brokerctl -addr https://broker.internal:8090 -token "$BROKER_TOKEN" stats
+```
+
+`brokerctl` has no flag to skip TLS verification or to supply a private CA, so it
+cannot connect to a broker using a certificate your machine does not already
+trust. Trust the CA at the OS level, or use plain HTTP for local work.
+
+### Verify an installation
+
+A script that starts a broker and exercises every management surface:
+
+```bash
+bash scripts/manual_verify.sh          # 57 checks over HTTP
+bash scripts/manual_verify.sh --tls    # 62 checks, also proves auth is enforced
+```
+
+It builds `brokerd`, runs it against a temporary WAL, and asserts the responses,
+including that the console enforces CSP, that topic cursor paging does not repeat
+messages, and that unauthenticated requests get `401`.
+
+### Load and benchmark
+
+```bash
+cd cmd
+go build -o /tmp/loadgen ./loadgen
+go build -o /tmp/native-bench ./native-bench
+```
+
+`loadgen` drives publishers and consumers against a running broker;
+`native-bench` measures the native stream protocol. See `PERFORMANCE.md` for
+published numbers and the method behind them.
+
+### End-to-end smoke test
+
+Copy-paste this to confirm a working install in under a minute:
+
+```bash
+BROKER=http://127.0.0.1:8090
+
+# 1. broker up?
+curl -s $BROKER/healthz
+
+# 2. declare a queue and publish
+curl -s -X POST $BROKER/queues -d '{"name":"orders"}'
+for i in 1 2 3; do curl -s -X POST $BROKER/publish -d '{"queue":"orders","payload":{"n":1}}' -o /dev/null; done
+curl -s $BROKER/queues
+
+# 3. topic retention
+for i in 1 2 3; do curl -s -X POST $BROKER/publish -d '{"topic":"events","payload":{"n":1}}' -o /dev/null; done
+curl -s "$BROKER/v1/topics/events?limit=3"
+
+# 4. task with no worker attached: submit, then cancel
+TID=$(curl -s -X POST $BROKER/v1/tasks/submit -d '{"name":"demo","queue":"orders"}' \
+      | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
+curl -s $BROKER/v1/tasks/$TID
+curl -s -X POST $BROKER/v1/tasks/$TID/cancel
+curl -s $BROKER/v1/tasks/$TID     # status: cancelled
+
+# 5. console
+open $BROKER/console/
+```
+
+To see a consumer and a task actually run, start a worker first:
+
+```bash
+/tmp/broker-worker -broker $BROKER -id w1 -group g1 -queue orders -task invoice.send &
+
+curl -s $BROKER/v1/consumers
+for i in 1 2 3; do curl -s -X POST $BROKER/publish -d '{"queue":"orders","payload":{"n":1}}' -o /dev/null; done
+curl -s $BROKER/queues            # orders drains to 0
+
+TID=$(curl -s -X POST $BROKER/v1/tasks/submit \
+      -d '{"name":"invoice.send","queue":"tasks.invoice.send"}' \
+      | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
+sleep 2 && curl -s $BROKER/v1/tasks/$TID   # status: succeeded
+```
+
 
 ---
 

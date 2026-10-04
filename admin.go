@@ -13,6 +13,8 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+
+	"github.com/oarkflow/broker/console"
 )
 
 type AdminServer struct {
@@ -73,6 +75,23 @@ func (a AdminServer) Handler() http.Handler {
 	mux.HandleFunc("/events", a.wrap(a.events))
 	mux.HandleFunc("/routes", a.wrap(a.routes))
 	mux.HandleFunc("/cluster/status", a.wrap(a.clusterStatus))
+	// The console is mounted behind wrap, so it requires the same bearer token and
+	// passes the same ACL checks as every other admin route. It is a static app and
+	// reads no broker state server-side; all data is fetched by the browser from the
+	// endpoints above using the operator's own credentials.
+	mux.Handle("/console/", http.StripPrefix("/console", a.wrap(console.Handler().ServeHTTP)))
+	// The bare root redirected nowhere, so typing the host gave a bare 404 with no
+	// hint that a console existed. This is a static pointer, not broker state, so
+	// it is deliberately outside wrap: an unauthenticated visitor is sent to the
+	// sign-in gate rather than to a 401.
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Location", "/console/")
+		w.WriteHeader(http.StatusFound)
+	})
 	return mux
 }
 func (a AdminServer) ListenAndServe(addr string) *http.Server {

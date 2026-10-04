@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>oarkflow console</title>
+<link rel="stylesheet" href="/console/app.css">
+</head>
+<body>
+<div id="gate" class="gate" hidden>
+  <form class="gate-card" id="gate-form" autocomplete="off">
+    <h1>oarkflow</h1>
+    <p class="muted">This console uses the broker admin API. Paste an admin bearer token.</p>
+    <label for="token">Admin token</label>
+    <input id="token" name="token" type="password" spellcheck="false" required
+           placeholder="Bearer token" autocomplete="off">
+    <div class="gate-row">
+      <button type="submit" class="btn primary">Connect</button>
+      <span id="gate-error" class="err" role="alert"></span>
+    </div>
+    <p class="muted small">
+      The token is kept in <code>sessionStorage</code> for this tab only and is sent as an
+      <code>Authorization: Bearer</code> header. It is never placed in a URL.
+    </p>
+  </form>
+</div>
+
+<div id="app" class="app" hidden>
+  <aside class="side">
+    <div class="brand">oarkflow <span class="ver" id="ver"></span></div>
+    <nav id="nav">
+      <button class="nav-item active" data-view="overview">Overview</button>
+      <button class="nav-item" data-view="queues">Queues</button>
+      <button class="nav-item" data-view="topics">Topics</button>
+      <button class="nav-item" data-view="streams">Streams</button>
+      <button class="nav-item" data-view="consumers">Consumers</button>
+      <button class="nav-item" data-view="tasks">Tasks</button>
+      <button class="nav-item" data-view="dlq">Dead letters</button>
+      <button class="nav-item" data-view="cluster">Cluster</button>
+      <button class="nav-item" data-view="audit">Audit</button>
+    </nav>
+    <div class="side-foot">
+      <div class="conn"><span id="dot" class="dot"></span><span id="conn-label">connecting</span></div>
+      <button class="btn ghost sm" id="signout">Sign out</button>
+    </div>
+  </aside>
+
+  <main class="main">
+    <header class="top">
+      <h1 id="view-title">Overview</h1>
+      <div class="top-actions">
+        <span id="broker-pill" class="pill">state &mdash;</span>
+        <button class="btn" id="btn-pause" title="Stop accepting and dispatching broker-wide">Pause broker</button>
+        <button class="btn ghost" id="btn-refresh">Refresh</button>
+        <label class="auto"><input type="checkbox" id="auto" checked> auto 5s</label>
+      </div>
+    </header>
+    <div id="banner" class="banner" hidden role="alert"></div>
+    <section id="view" class="view"></section>
+  </main>
+</div>
+
+<div id="modal" class="modal" hidden>
+  <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+    <h2 id="modal-title"></h2>
+    <div id="modal-body"></div>
+    <div class="modal-row">
+      <button class="btn primary" id="modal-ok">Confirm</button>
+      <button class="btn ghost" id="modal-cancel">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<script src="/console/app.js"></script>
+</body>
+</html>

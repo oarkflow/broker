@@ -64,7 +64,7 @@ func statsByScan(ctx context.Context, s *MemoryStore) StoreStats {
 		}
 	}
 	for name, t := range s.topics {
-		count := s.visibleMessageCountLocked(ctx, t.ids, 0, "")
+		count := s.retainedTopicCountLocked(ctx, t.ids)
 		if count > 0 || !hasRestrictedTenantScope(ctx) {
 			st.Topics[name] = count
 		}

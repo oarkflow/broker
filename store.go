@@ -2366,7 +2366,10 @@ func (s *MemoryStore) Stats(ctx context.Context) (StoreStats, error) {
 		}
 	}
 	for name, t := range s.topics {
-		count := s.visibleMessageCountLocked(ctx, t.ids, 0, "")
+		// Deliberately not visibleMessageCountLocked: that helper requires
+		// Offset > after, but topic messages carry no stream offset, so with
+		// after=0 every topic counted 0 while ListTopic returned its messages.
+		count := s.retainedTopicCountLocked(ctx, t.ids)
 		if count > 0 || !hasRestrictedTenantScope(ctx) {
 			st.Topics[name] = count
 		}
@@ -2636,6 +2639,19 @@ func (s *MemoryStore) StreamHeadOffsetContext(ctx context.Context, stream, tenan
 		}
 	}
 	return head, nil
+}
+
+// retainedTopicCountLocked counts messages still retained for a topic. Topic
+// messages have no stream offset, so this must not apply the Offset > after filter
+// that stream lag depends on.
+func (s *MemoryStore) retainedTopicCountLocked(ctx context.Context, ids []string) int {
+	count := 0
+	for _, id := range ids {
+		if m := s.messages[id]; m != nil && tenantAllowed(ctx, m.TenantID) {
+			count++
+		}
+	}
+	return count
 }
 
 func (s *MemoryStore) visibleMessageCountLocked(ctx context.Context, ids []string, after uint64, tenant string) int {

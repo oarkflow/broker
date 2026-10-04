@@ -250,6 +250,10 @@ func (a AdminServer) dataPlane(w http.ResponseWriter, r *http.Request) {
 		a.v1PublishBatch(w, r)
 	case path == "/request":
 		a.v1Request(w, r)
+	case path == "/broker":
+		a.v1BrokerLifecycle(w, r)
+	case strings.HasPrefix(path, "/topics/"):
+		a.v1Topic(w, r, strings.TrimPrefix(path, "/topics/"))
 	case path == "/consumers" && r.Method == http.MethodGet:
 		writeBrokerJSON(w, a.Broker.Consumers().ListContext(r.Context()))
 	case path == "/consumers/register":
@@ -777,6 +781,62 @@ func (a AdminServer) v1ConsumerRegister(w http.ResponseWriter, r *http.Request) 
 	}
 	writeBrokerJSON(w, info)
 }
+
+// v1BrokerLifecycle exposes broker-wide pause and resume. Queue-level pause already
+// existed under /queues, but there was no way to stop the whole broker over HTTP.
+func (a AdminServer) v1BrokerLifecycle(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		writeBrokerJSON(w, map[string]any{"state": a.Broker.State()})
+	case http.MethodPost, http.MethodPut:
+		var req struct {
+			Action string `json:"action"`
+			Reason string `json:"reason,omitempty"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			WriteBrokerError(w, errf(ErrInvalidMessage, "invalid body: %v", err))
+			return
+		}
+		var err error
+		switch req.Action {
+		case "pause":
+			err = a.Broker.Pause(r.Context())
+		case "resume":
+			err = a.Broker.Resume(r.Context())
+		default:
+			WriteBrokerError(w, errf(ErrInvalidMessage, "action must be pause or resume, got %q", req.Action))
+			return
+		}
+		if err != nil {
+			WriteBrokerError(w, err)
+			return
+		}
+		writeBrokerJSON(w, map[string]any{"state": a.Broker.State(), "reason": req.Reason})
+	default:
+		methodBroker(w)
+	}
+}
+
+// v1Topic exposes topic retention. Topics had no read path over HTTP, so an operator
+// could see only counts, never what had actually been published.
+func (a AdminServer) v1Topic(w http.ResponseWriter, r *http.Request, tail string) {
+	name := strings.Trim(tail, "/")
+	if name == "" {
+		http.NotFound(w, r)
+		return
+	}
+	if r.Method != http.MethodGet {
+		methodBroker(w)
+		return
+	}
+	msgs, err := a.Broker.ReadTopic(r.Context(), name, r.URL.Query().Get("after"), queryLimit(r, 100))
+	if err != nil {
+		WriteBrokerError(w, err)
+		return
+	}
+	writeBrokerJSON(w, msgs)
+}
+
 func (a AdminServer) v1Consumer(w http.ResponseWriter, r *http.Request, tail string) {
 	parts := strings.Split(strings.Trim(tail, "/"), "/")
 	if len(parts) == 0 || parts[0] == "" {
