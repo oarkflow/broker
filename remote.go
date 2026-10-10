@@ -533,7 +533,6 @@ func (b *Broker) dropRemoteRoutes(consumerID string) {
 	// path that did not record ownership.
 	if b.router != nil {
 		b.router.RemovePrefix(prefix + "sub." + consumerID + ".")
-		b.router.RemovePrefix(prefix)
 	}
 }
 

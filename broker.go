@@ -49,6 +49,7 @@ type Broker struct {
 	cluster               *Cluster
 	consumers             *ConsumerRegistry
 	groupRebalancer       *GroupRebalancer
+	groupRebalancerOnce   sync.Once
 	sagaEngine            *SagaEngine
 	wg                    sync.WaitGroup
 	startedAt             time.Time

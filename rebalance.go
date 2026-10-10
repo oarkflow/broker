@@ -233,9 +233,11 @@ func (b *Broker) GroupRebalancer() *GroupRebalancer {
 	if b == nil {
 		return nil
 	}
-	if b.groupRebalancer == nil {
-		b.groupRebalancer = NewGroupRebalancer()
-	}
+	b.groupRebalancerOnce.Do(func() {
+		if b.groupRebalancer == nil {
+			b.groupRebalancer = NewGroupRebalancer()
+		}
+	})
 	return b.groupRebalancer
 }
 
