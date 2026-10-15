@@ -308,7 +308,7 @@ func ImportBinaryWAL(input io.Reader, path string, walCodec *WALRecordCodec) (re
 
 func knownWALOperation(op string) bool {
 	switch op {
-	case "declare_queue", "declare_topic", "declare_stream", "append", "append_atomic", "lease", "lease_batch", "update_batch", "ack", "ack_batch", "nack", "move", "pause_queue", "resume_queue", "purge_queue", "update", "commit_offset":
+	case "declare_queue", "declare_topic", "declare_stream", "append", "append_atomic", "stream_transaction", "lease", "lease_batch", "update_batch", "ack", "ack_batch", "nack", "move", "pause_queue", "resume_queue", "purge_queue", "update", "commit_offset", "sweep_leases":
 		return true
 	default:
 		return false

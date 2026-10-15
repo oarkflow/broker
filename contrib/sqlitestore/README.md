@@ -11,14 +11,13 @@ It provides two `database/sql` backed stores for the broker:
 - `StateStore`: persistent control-plane state for broker/task/consumer/publisher records.
 - `MessageStore`: persistent message data-plane for queues, topics, streams, leases, offsets, DLQ, and message movement.
 
-The package intentionally does **not** import a SQLite driver directly. Register the driver in your application or command binary:
+The package registers the pure-Go `modernc.org/sqlite` driver under `sqlite`.
+You can also register another compatible driver in your application:
 
 ```go
 package main
 
 import (
-    _ "modernc.org/sqlite" // or github.com/mattn/go-sqlite3
-
     "github.com/oarkflow/broker"
     "github.com/oarkflow/broker/contrib/sqlitestore"
 )
@@ -46,9 +45,18 @@ For very high write throughput, prefer the broker binary WAL store. For enterpri
 
 ## Root-module usage
 
-The root module has a `replace` entry so examples can import this contrib module locally. For your own application, either keep this submodule path or copy the same pattern:
+The examples module uses a local replacement for the contrib module. An
+application working from a checkout can use the same pattern:
 
 ```go
-require github.com/oarkflow/broker/contrib/sqlitestore v0.0.0
-replace github.com/oarkflow/broker/contrib/sqlitestore => ./contrib/sqlitestore
+require github.com/oarkflow/broker/contrib v0.0.0
+replace github.com/oarkflow/broker/contrib => ./contrib
 ```
+
+## Transactional application outbox
+
+`NewOutbox(db)` adds an outbox to the application's SQLite database.
+`EnqueueTx` records a message using the application's `*sql.Tx`; `Dispatch`
+delivers committed entries to a broker store with leased, fenced claims and
+persistent retry state. See the [integration guide](../../docs/TRANSACTIONAL_OUTBOX.md)
+for delivery guarantees and the runnable example.

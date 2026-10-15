@@ -85,6 +85,7 @@ type StrategyConfig struct {
 	Weight            int               `json:"weight,omitempty"`
 	HashKey           string            `json:"hash_key,omitempty"`
 	StickyKey         string            `json:"sticky_key,omitempty"`
+	MaxStickyBindings int               `json:"max_sticky_bindings,omitempty"`
 	PriorityThreshold int               `json:"priority_threshold,omitempty"`
 	Capabilities      []string          `json:"capabilities,omitempty"`
 	FallbackStrategy  StrategyType      `json:"fallback_strategy,omitempty"`
@@ -112,7 +113,7 @@ func NewStrategy(cfg StrategyConfig) ConsumerStrategy {
 	case StrategyAdaptiveLoadBalance:
 		return NewAdaptiveLoadBalanceStrategy()
 	case StrategyStickySession:
-		return NewStickySessionStrategy(cfg.StickyKey)
+		return newStickySessionStrategy(cfg.StickyKey, cfg.MaxStickyBindings)
 	case StrategyFanOut:
 		return NewFanOutStrategy()
 	case StrategyRuleBased:
@@ -158,7 +159,19 @@ type weightedRoundRobinStrategy struct {
 	mu            sync.Mutex
 	current       int
 	currentWeight int
-	candidates    []ConsumerCandidate
+	candidates    []weightedCandidate
+}
+
+type weightedCandidate struct {
+	id     string
+	weight int
+}
+
+func candidateWeight(c ConsumerCandidate) int {
+	if c.Weight <= 0 {
+		return 1
+	}
+	return c.Weight
 }
 
 func NewWeightedRoundRobinStrategy() ConsumerStrategy {
@@ -174,43 +187,31 @@ func (s *weightedRoundRobinStrategy) Select(_ context.Context, _ Message, candid
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if len(s.candidates) != len(candidates) {
+	changed := len(s.candidates) != len(candidates)
+	if !changed {
+		for i, c := range candidates {
+			if s.candidates[i].id != c.ConsumerID || s.candidates[i].weight != candidateWeight(c) {
+				changed = true
+				break
+			}
+		}
+	}
+	if changed {
 		s.current = 0
 		s.currentWeight = 0
-		s.candidates = append([]ConsumerCandidate(nil), candidates...)
+		s.candidates = make([]weightedCandidate, len(candidates))
+		for i, c := range candidates {
+			s.candidates[i] = weightedCandidate{id: c.ConsumerID, weight: candidateWeight(c)}
+		}
 	}
 
-	totalWeight := 0
-	for _, c := range candidates {
-		w := c.Weight
-		if w <= 0 {
-			w = 1
-		}
-		totalWeight += w
-	}
-
-	for {
-		if s.current >= len(candidates) {
-			s.current = 0
-			s.currentWeight = 0
-		}
-		w := candidates[s.current].Weight
-		if w <= 0 {
-			w = 1
-		}
-		if s.currentWeight < w {
-			s.currentWeight++
-			idx := s.current
-			s.current++
-			return []ConsumerCandidate{candidates[idx]}, nil
-		}
+	idx := s.current
+	s.currentWeight++
+	if s.currentWeight >= s.candidates[idx].weight {
 		s.currentWeight = 0
-		s.current++
-		if s.current >= len(candidates) {
-			s.current = 0
-			return []ConsumerCandidate{candidates[0]}, nil
-		}
+		s.current = (s.current + 1) % len(candidates)
 	}
+	return []ConsumerCandidate{candidates[idx]}, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -325,11 +326,9 @@ func (s *capabilityBasedStrategy) Select(_ context.Context, msg Message, candida
 	if taskType == "" {
 		taskType = msg.Type
 	}
-	caps := append(s.requiredCaps, taskType)
-
 	filtered := make([]ConsumerCandidate, 0, len(candidates))
 	for _, c := range candidates {
-		if s.hasCapabilities(c, caps) {
+		if s.hasCapabilities(c, s.requiredCaps) && (taskType == "" || s.hasCapabilities(c, []string{taskType})) {
 			filtered = append(filtered, c)
 		}
 	}
@@ -387,15 +386,12 @@ func NewPriorityAwareStrategy(threshold int) ConsumerStrategy {
 
 func (s *priorityAwareStrategy) Name() StrategyType { return StrategyPriorityAware }
 
-func (s *priorityAwareStrategy) Select(_ context.Context, msg Message, candidates []ConsumerCandidate) ([]ConsumerCandidate, error) {
+func (s *priorityAwareStrategy) Select(ctx context.Context, msg Message, candidates []ConsumerCandidate) ([]ConsumerCandidate, error) {
 	if len(candidates) == 0 {
 		return nil, nil
 	}
 	if msg.Priority >= s.threshold {
-		sort.Slice(candidates, func(i, j int) bool {
-			return candidates[i].LoadScore() > candidates[j].LoadScore()
-		})
-		return []ConsumerCandidate{candidates[0]}, nil
+		return NewLeastLoadedStrategy().Select(ctx, msg, candidates)
 	}
 	best := candidates[0]
 	bestSuccess := best.SuccessRate()
@@ -473,15 +469,29 @@ type stickySessionStrategy struct {
 	stickyKey string
 	mu        sync.RWMutex
 	binding   map[string]string
+	order     []string
+	next      int
+	limit     int
 }
 
+// NewStickySessionStrategy keeps up to 65,536 session bindings. New sessions
+// evict the oldest inserted binding at that limit. Use StrategyConfig with
+// MaxStickyBindings to choose a different bound.
 func NewStickySessionStrategy(stickyKey string) ConsumerStrategy {
+	return newStickySessionStrategy(stickyKey, 0)
+}
+
+func newStickySessionStrategy(stickyKey string, limit int) *stickySessionStrategy {
 	if stickyKey == "" {
 		stickyKey = "key"
+	}
+	if limit <= 0 {
+		limit = 65536
 	}
 	return &stickySessionStrategy{
 		stickyKey: stickyKey,
 		binding:   make(map[string]string),
+		limit:     limit,
 	}
 }
 
@@ -515,6 +525,15 @@ func (s *stickySessionStrategy) Select(_ context.Context, msg Message, candidate
 	}
 	if sessionKey != "" {
 		s.mu.Lock()
+		if _, exists := s.binding[sessionKey]; !exists {
+			if len(s.order) < s.limit {
+				s.order = append(s.order, sessionKey)
+			} else {
+				delete(s.binding, s.order[s.next])
+				s.order[s.next] = sessionKey
+				s.next = (s.next + 1) % s.limit
+			}
+		}
 		s.binding[sessionKey] = best.ConsumerID
 		s.mu.Unlock()
 	}

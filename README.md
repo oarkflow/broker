@@ -14,6 +14,16 @@ An experimental message broker for Go with embedded, single-node, and distribute
 
 > **Release status**: No current mode has a stable production-support contract. See the [release gates](docs/RELEASE_GATES.md) and [pre-v1 migration notes](docs/MIGRATION_PRE_V1.md).
 
+The [enhancement plan](docs/ENHANCEMENT_PLAN.md) covers durable messaging,
+low-latency delivery, client interoperability, and the measurements required
+to validate improvements.
+
+For publishing atomically with an application database update, see the
+[transactional SQLite outbox](docs/TRANSACTIONAL_OUTBOX.md) and its runnable example.
+
+[Atomic stream transactions](docs/STREAM_TRANSACTIONS.md) commit a consumer offset
+and output messages together through the embedded API, HTTP, or Go client.
+
 ---
 
 ## Table of Contents

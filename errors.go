@@ -35,6 +35,7 @@ var (
 	ErrLeaseLost          = errors.New("broker: lease lost")
 	ErrPermanent          = errors.New("broker: permanent error")
 	ErrTransactionClosed  = errors.New("broker: transaction closed")
+	ErrOffsetConflict     = errors.New("broker: committed stream offset changed")
 	ErrUnsupportedMode    = errors.New("broker: unsupported mode")
 	ErrBrokerUnavailable  = errors.New("broker: unavailable")
 	ErrCallbackFailed     = errors.New("broker: callback failed")
@@ -93,7 +94,7 @@ func ClassifyRetry(err error) (RetryClassification, bool) {
 		return RetryQuorumUnavailable, true
 	case errors.Is(err, ErrThrottled), errors.Is(err, ErrRateLimited), errors.Is(err, ErrBackpressure):
 		return RetryThrottled, true
-	case errors.Is(err, ErrTransactionAborted):
+	case errors.Is(err, ErrTransactionAborted), errors.Is(err, ErrOffsetConflict):
 		return RetryTransactionAborted, true
 	case errors.Is(err, ErrStorageUnavailable), errors.Is(err, ErrBrokerUnavailable):
 		return RetryStorageUnavailable, true
@@ -174,6 +175,7 @@ var errorCodes = map[error]string{
 	ErrLeaseLost:          "lease_lost",
 	ErrPermanent:          "permanent",
 	ErrTransactionClosed:  "transaction_closed",
+	ErrOffsetConflict:     "offset_conflict",
 	ErrUnsupportedMode:    "unsupported_mode",
 	ErrBrokerUnavailable:  "broker_unavailable",
 	ErrCallbackFailed:     "callback_failed",
@@ -238,7 +240,7 @@ func HTTPStatusForError(err error) int {
 		return http.StatusUnauthorized
 	case errors.Is(err, ErrUnauthorized), errors.Is(err, ErrConsumerBanned):
 		return http.StatusForbidden
-	case errors.Is(err, ErrLeaseLost):
+	case errors.Is(err, ErrLeaseLost), errors.Is(err, ErrOffsetConflict):
 		return http.StatusConflict
 	case errors.Is(err, ErrInvalidMessage), errors.Is(err, ErrPermanent), errors.Is(err, ErrUnsupportedMode):
 		return http.StatusBadRequest

@@ -12,6 +12,11 @@ func FuzzWALRecordDecode(f *testing.F) {
 		f.Fatal(err)
 	}
 	f.Add(seed)
+	transactionSeed, err := codec.encode(nil, walRecord{Op: "stream_transaction", Offset: OffsetCommit{Stream: "input", ConsumerGroup: "workers", Offset: 2}, ExpectedOffset: 1})
+	if err != nil {
+		f.Fatal(err)
+	}
+	f.Add(transactionSeed)
 	f.Add([]byte("BWL1"))
 	f.Fuzz(func(t *testing.T, data []byte) {
 		var record walRecord

@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -614,6 +615,14 @@ func (c *Client) ReadStream(ctx context.Context, stream, group string, after uin
 
 func (c *Client) CommitStreamOffset(ctx context.Context, stream, group string, offset uint64) error {
 	return c.doJSON(ctx, http.MethodPost, "/v1/streams/"+stream+"/commit", broker.OffsetCommit{Stream: stream, ConsumerGroup: group, Offset: offset}, nil)
+}
+
+// CommitStreamTransaction publishes outputs and advances the input offset in one
+// operation. ErrOffsetConflict means another commit changed the expected offset.
+func (c *Client) CommitStreamTransaction(ctx context.Context, stream string, tx broker.StreamTransactionHTTPPayload) ([]broker.PublishResult, error) {
+	var out []broker.PublishResult
+	err := c.doJSON(ctx, http.MethodPost, "/v1/streams/"+url.PathEscape(stream)+"/transactions", tx, &out)
+	return out, err
 }
 
 func (c *Client) StreamOffset(ctx context.Context, stream, group string) (uint64, error) {

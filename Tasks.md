@@ -92,8 +92,12 @@ removed because several described APIs rather than verified guarantees.
 - [x] Finish tenant enforcement for every admin, stream-offset, notification,
   task, schema, route, and control-plane read/write operation. Lease was the
   last bypass; schema registration is now guarded as well.
-- [ ] The legacy outbox has been renamed/documented as an in-memory retry buffer;
-  provide the real transactional integration contract.
+- [x] Provide a real transactional application outbox: `sqlitestore.NewOutbox`
+  enqueues using an application-owned SQL transaction and dispatches with durable
+  retry state, leased claims and fenced completion. Rollback, restart recovery,
+  append-before-completion interruption and competing workers are tested.
+  Legacy in-memory workers remain compatibility APIs and are documented as such.
+  See `docs/TRANSACTIONAL_OUTBOX.md` for the at-least-once contract.
 - [ ] Establish 80% core and 90% critical-path coverage. Current package
   coverage: 52.8% root, 42.1% cluster, 31.5% AMQP, 85.6% client (raised from
   12.4%), 42.7% pool, 100% queue (raised from 0%); generated API package
@@ -201,6 +205,10 @@ removed because several described APIs rather than verified guarantees.
 - [ ] Persist producer IDs, epochs, and sequences for idempotent publishing.
 - [ ] Add transactional consume-offset-plus-produce with durable commit/abort
   markers and coordinator recovery.
+  Single-store/shard offset-plus-produce now commits in one durable operation,
+  with expected-offset fencing, crash recovery and SQLite rollback tests. The
+  embedded, HTTP and Go client APIs are documented in `docs/STREAM_TRANSACTIONS.md`.
+  Multi-shard prepared transactions and coordinator recovery remain pending.
 - [x] Define and test `durable`, `latency`, `throughput`, and `lightweight`
   policy defaults; adaptive tuning for those profiles remains pending.
 - [ ] Add observable adaptive batching, overload admission control, lag-aware

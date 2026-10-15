@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/bits"
 	"path/filepath"
 	"sort"
 	"sync"
@@ -13,12 +14,15 @@ import (
 
 // PartitionedBinaryWALStore stripes messages across independent memory locks,
 // WAL files, group-commit goroutines and fsync pipelines. Messages with the same
-// idempotency, deduplication, key, or routing key are pinned to one shard.
+// producer identity, idempotency, deduplication, key, or routing key are pinned
+// to one shard (in that precedence order, with stream placement fixed).
 // Atomic batches are atomic per shard; cross-shard atomicity requires an outbox
 // or external transaction coordinator.
 type PartitionedBinaryWALStore struct {
 	shards          []*BinaryFileWALStore
 	index           sync.Map // message ID -> shard index
+	producerShards  sync.Map // producer ID -> shard index; recovered from WAL state
+	producerLocks   [64]sync.Mutex
 	retainCompleted atomic.Bool
 }
 
@@ -60,6 +64,10 @@ func NewPartitionedBinaryWALStore(dir string, shardCount int, codec FrameCodec) 
 		}
 		s.shards = append(s.shards, shard)
 	}
+	if err := s.rebuildProducerIndex(); err != nil {
+		_ = s.Close()
+		return nil, err
+	}
 	s.rebuildIndex()
 	return s, nil
 }
@@ -95,6 +103,61 @@ func (s *PartitionedBinaryWALStore) rebuildIndex() {
 		shard.mu.RUnlock()
 	}
 }
+
+func (s *PartitionedBinaryWALStore) rebuildProducerIndex() error {
+	for i, shard := range s.shards {
+		shard.mu.RLock()
+		for id := range shard.producerSeq {
+			previous, loaded := s.producerShards.LoadOrStore(id, i)
+			if loaded && previous.(int) != i {
+				shard.mu.RUnlock()
+				return errf(ErrStorageUnavailable, "producer %q has sequence history on multiple WAL shards; reconcile producer history before reopening", id)
+			}
+		}
+		shard.mu.RUnlock()
+	}
+	return nil
+}
+
+// Serialize reservation and append for sequenced producers so concurrent first
+// publishes cannot bind one producer to different shards. The WAL's producer
+// state is the durable source of the reservation. A failed first append may
+// leave a process-local reservation, but never consumes a sequence number.
+// Striped locks let unrelated producers append concurrently. Batches acquire
+// stripes in ascending order to avoid deadlocks. Callers must release the
+// returned mask using unlockProducers.
+func (s *PartitionedBinaryWALStore) prepareProducerAppend(entries []AppendEntry) (locked uint64, err error) {
+	for _, entry := range entries {
+		if entry.Message.ProducerID != "" && entry.Message.ProducerSequence != nil {
+			locked |= uint64(1) << (stableShardHash(entry.Message.ProducerID) % 64)
+		}
+	}
+	for pending := locked; pending != 0; pending &= pending - 1 {
+		s.producerLocks[bits.TrailingZeros64(pending)].Lock()
+	}
+	for _, entry := range entries {
+		msg := entry.Message
+		if msg.ProducerID == "" || msg.ProducerSequence == nil {
+			continue
+		}
+		idx := s.shardForMessage(msg, entry.Destinations)
+		for _, dest := range entry.Destinations {
+			if (dest.Kind == DestinationStream || dest.Kind == DestinationArchive) && s.shardForStable("stream:"+dest.Name) != idx {
+				s.unlockProducers(locked)
+				return 0, errf(ErrUnsupportedMode, "producer %q cannot span WAL shards; use a separate producer ID per stream shard", msg.ProducerID)
+			}
+		}
+		s.producerShards.Store(msg.ProducerID, idx)
+	}
+	return locked, nil
+}
+
+func (s *PartitionedBinaryWALStore) unlockProducers(locked uint64) {
+	for locked != 0 {
+		s.producerLocks[bits.TrailingZeros64(locked)].Unlock()
+		locked &= locked - 1
+	}
+}
 func stableShardHash(value string) uint64 {
 	const offset64 = uint64(14695981039346656037)
 	const prime64 = uint64(1099511628211)
@@ -112,10 +175,18 @@ func (s *PartitionedBinaryWALStore) shardForStable(value string) int {
 	return int(stableShardHash(value) % uint64(len(s.shards)))
 }
 func (s *PartitionedBinaryWALStore) shardForMessage(msg Message, dests []Destination) int {
+	if msg.ProducerID != "" && msg.ProducerSequence != nil {
+		if idx, ok := s.producerShards.Load(msg.ProducerID); ok {
+			return idx.(int)
+		}
+	}
 	for _, dest := range dests {
 		if dest.Kind == DestinationStream || dest.Kind == DestinationArchive {
 			return s.shardForStable("stream:" + dest.Name)
 		}
+	}
+	if msg.ProducerID != "" && msg.ProducerSequence != nil {
+		return s.shardForStable("producer:" + msg.ProducerID)
 	}
 	key := firstNonEmpty(msg.IdempotencyKey, firstNonEmpty(msg.DeduplicationID, firstNonEmpty(msg.Key, firstNonEmpty(msg.RoutingKey, msg.ID))))
 	return s.shardForStable(key)
@@ -187,6 +258,13 @@ func (s *PartitionedBinaryWALStore) DeclareStream(ctx context.Context, cfg Strea
 	return s.shards[s.shardForStable("stream:"+cfg.Name)].DeclareStream(ctx, cfg)
 }
 func (s *PartitionedBinaryWALStore) Append(ctx context.Context, msg Message, dests []Destination) ([]Message, error) {
+	locked, err := s.prepareProducerAppend([]AppendEntry{{Message: msg, Destinations: dests}})
+	if err != nil {
+		return nil, err
+	}
+	if locked != 0 {
+		defer s.unlockProducers(locked)
+	}
 	idx := s.shardForMessage(msg, dests)
 	out, err := s.shards[idx].Append(ctx, msg, dests)
 	if len(out) > 0 {
@@ -198,6 +276,13 @@ func (s *PartitionedBinaryWALStore) Append(ctx context.Context, msg Message, des
 func (s *PartitionedBinaryWALStore) AppendAtomic(ctx context.Context, entries []AppendEntry) ([]Message, error) {
 	if len(entries) == 0 {
 		return nil, nil
+	}
+	locked, err := s.prepareProducerAppend(entries)
+	if err != nil {
+		return nil, err
+	}
+	if locked != 0 {
+		defer s.unlockProducers(locked)
 	}
 	type group struct {
 		entries []AppendEntry
@@ -258,6 +343,13 @@ func (s *PartitionedBinaryWALStore) AppendAtomic(ctx context.Context, entries []
 	return out, nil
 }
 func (s *PartitionedBinaryWALStore) AppendAtomicMinimal(ctx context.Context, entries []AppendEntry) error {
+	locked, err := s.prepareProducerAppend(entries)
+	if err != nil {
+		return err
+	}
+	if locked != 0 {
+		defer s.unlockProducers(locked)
+	}
 	groups := make([][]AppendEntry, len(s.shards))
 	for _, entry := range entries {
 		idx := s.shardForMessage(entry.Message, entry.Destinations)
@@ -291,6 +383,13 @@ func (s *PartitionedBinaryWALStore) AppendAtomicMinimal(ctx context.Context, ent
 	return joined
 }
 func (s *PartitionedBinaryWALStore) AppendAtomicOwned(ctx context.Context, entries []AppendEntry) error {
+	locked, err := s.prepareProducerAppend(entries)
+	if err != nil {
+		return err
+	}
+	if locked != 0 {
+		defer s.unlockProducers(locked)
+	}
 	groups := make([][]AppendEntry, len(s.shards))
 	for _, entry := range entries {
 		idx := s.shardForMessage(entry.Message, entry.Destinations)

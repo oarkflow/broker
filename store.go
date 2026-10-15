@@ -2903,23 +2903,24 @@ type FileWALStoreConfig struct {
 }
 
 type walRecord struct {
-	Op        string        `json:"op"`
-	Message   Message       `json:"message,omitempty"`
-	Dests     []Destination `json:"dests,omitempty"`
-	Entries   []AppendEntry `json:"entries,omitempty"`
-	Queue     QueueConfig   `json:"queue,omitempty"`
-	Topic     TopicConfig   `json:"topic,omitempty"`
-	Stream    StreamConfig  `json:"stream,omitempty"`
-	Lease     LeaseRequest  `json:"lease,omitempty"`
-	Messages  []Message     `json:"messages,omitempty"`
-	Ack       AckRequest    `json:"ack,omitempty"`
-	Acks      []AckRequest  `json:"acks,omitempty"`
-	Nack      NackRequest   `json:"nack,omitempty"`
-	Move      MoveRequest   `json:"move,omitempty"`
-	QueueName string        `json:"queue_name,omitempty"`
-	Offset    OffsetCommit  `json:"offset,omitempty"`
-	At        time.Time     `json:"at"`
-	Checksum  string        `json:"checksum,omitempty"`
+	Op             string        `json:"op"`
+	Message        Message       `json:"message,omitempty"`
+	Dests          []Destination `json:"dests,omitempty"`
+	Entries        []AppendEntry `json:"entries,omitempty"`
+	Queue          QueueConfig   `json:"queue,omitempty"`
+	Topic          TopicConfig   `json:"topic,omitempty"`
+	Stream         StreamConfig  `json:"stream,omitempty"`
+	Lease          LeaseRequest  `json:"lease,omitempty"`
+	Messages       []Message     `json:"messages,omitempty"`
+	Ack            AckRequest    `json:"ack,omitempty"`
+	Acks           []AckRequest  `json:"acks,omitempty"`
+	Nack           NackRequest   `json:"nack,omitempty"`
+	Move           MoveRequest   `json:"move,omitempty"`
+	QueueName      string        `json:"queue_name,omitempty"`
+	Offset         OffsetCommit  `json:"offset,omitempty"`
+	ExpectedOffset uint64        `json:"expected_offset,omitempty"`
+	At             time.Time     `json:"at"`
+	Checksum       string        `json:"checksum,omitempty"`
 }
 
 func NewFileWALStore(dir string) (*FileWALStore, error) {
@@ -3098,6 +3099,8 @@ func (s *FileWALStore) applyRecovered(r walRecord) error {
 		_, err = s.MemoryStore.Append(ctx, r.Message, r.Dests)
 	case "append_atomic":
 		err = s.MemoryStore.appendRecoveredAtomic(r.Entries)
+	case "stream_transaction":
+		return s.MemoryStore.applyStreamTransaction(r)
 	case "lease":
 		err = s.MemoryStore.Update(ctx, r.Message)
 	case "lease_batch", "update_batch":

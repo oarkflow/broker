@@ -867,13 +867,28 @@ func (p *Publisher) RequestStream(ctx context.Context, subject string, request a
 		o.CorrelationID = p.b.nextID("corr")
 	}
 	ch := make(chan Response, 64)
-	p.b.registerWaiter(o.CorrelationID, ch)
-	_, err := p.Publish(ctx, subject, request, WithCorrelationID(o.CorrelationID), WithHeader("x-request-stream", "true"), WithHeaders(o.Headers), WithTenantID(o.TenantID))
-	if err != nil {
-		p.b.unregisterWaiter(o.CorrelationID)
+	if err := p.b.registerWaiter(o.CorrelationID, ch); err != nil {
 		return nil, err
 	}
-	return &responseStream{ctx: ctx, ch: ch, cancel: func() { p.b.unregisterWaiter(o.CorrelationID) }}, nil
+	var cancel context.CancelFunc
+	if o.Timeout > 0 {
+		ctx, cancel = context.WithTimeout(ctx, o.Timeout)
+	} else {
+		ctx, cancel = context.WithCancel(ctx)
+	}
+	stop := context.AfterFunc(ctx, func() { p.b.unregisterWaiter(o.CorrelationID, ch) })
+	_, err := p.Publish(ctx, subject, request, WithCorrelationID(o.CorrelationID), WithHeader("x-request-stream", "true"), WithHeaders(o.Headers), WithTenantID(o.TenantID))
+	if err != nil {
+		stop()
+		cancel()
+		p.b.unregisterWaiter(o.CorrelationID, ch)
+		return nil, err
+	}
+	return &responseStream{ctx: ctx, ch: ch, cancel: func() {
+		stop()
+		cancel()
+		p.b.unregisterWaiter(o.CorrelationID, ch)
+	}}, nil
 }
 
 func (p *Publisher) request(ctx context.Context, subject string, request any, opts ...RequestOption) (Response, error) {
@@ -897,10 +912,12 @@ func (p *Publisher) requestWithOptions(ctx context.Context, subject string, requ
 		o.ReplyTo = "_reply." + o.CorrelationID
 	}
 	ch := make(chan Response, 1)
-	p.b.registerWaiter(o.CorrelationID, ch)
+	if err := p.b.registerWaiter(o.CorrelationID, ch); err != nil {
+		return Response{}, err
+	}
 	ctx, cancel := context.WithTimeout(ctx, o.Timeout)
 	defer cancel()
-	defer p.b.unregisterWaiter(o.CorrelationID)
+	defer p.b.unregisterWaiter(o.CorrelationID, ch)
 	pubOpts := []PublishOption{WithHeaders(o.Headers), WithCorrelationID(o.CorrelationID), WithHeader("reply_to", o.ReplyTo), WithIdempotencyKey(o.IdempotencyKey), WithTenantID(o.TenantID), WithRequireDestination(o.RequireHandler)}
 	_, err := p.Publish(ctx, subject, request, pubOpts...)
 	if err != nil {
@@ -908,7 +925,10 @@ func (p *Publisher) requestWithOptions(ctx context.Context, subject string, requ
 		return Response{}, err
 	}
 	select {
-	case r := <-ch:
+	case r, ok := <-ch:
+		if !ok {
+			return Response{}, ErrClosed
+		}
 		p.b.recordPublisher(ctx, PublisherRecord{ID: o.CorrelationID, Operation: "request", Subject: subject, CorrelationID: o.CorrelationID, Status: "succeeded", CreatedAt: time.Now(), UpdatedAt: time.Now()})
 		return r, nil
 	case <-ctx.Done():
@@ -917,26 +937,30 @@ func (p *Publisher) requestWithOptions(ctx context.Context, subject string, requ
 	}
 }
 
-func (b *Broker) registerWaiter(corr string, ch chan Response) {
+func (b *Broker) registerWaiter(corr string, ch chan Response) error {
 	b.waitMu.Lock()
+	defer b.waitMu.Unlock()
+	if b.ctx.Err() != nil {
+		return ErrClosed
+	}
+	if _, exists := b.waiters[corr]; exists {
+		return errf(ErrDuplicateMessage, "request correlation %q is already active", corr)
+	}
 	b.waiters[corr] = ch
-	b.waitMu.Unlock()
+	return nil
 }
-func (b *Broker) unregisterWaiter(corr string) {
+func (b *Broker) unregisterWaiter(corr string, expected chan Response) {
 	b.waitMu.Lock()
-	if ch, ok := b.waiters[corr]; ok {
+	if ch, ok := b.waiters[corr]; ok && ch == expected {
 		delete(b.waiters, corr)
-		func() {
-			defer func() { recover() }()
-			close(ch)
-		}()
+		close(ch)
 	}
 	b.waitMu.Unlock()
 }
 func (b *Broker) completeResponse(resp Response) bool {
 	b.waitMu.Lock()
+	defer b.waitMu.Unlock()
 	ch := b.waiters[resp.CorrelationID]
-	b.waitMu.Unlock()
 	if ch == nil {
 		return false
 	}
@@ -946,18 +970,9 @@ func (b *Broker) completeResponse(resp Response) bool {
 		sent = true
 	default:
 	}
-	if resp.Headers != nil && resp.Headers["x-stream-end"] == "true" {
-		b.waitMu.Lock()
-		if b.waiters[resp.CorrelationID] == ch {
-			delete(b.waiters, resp.CorrelationID)
-			// Use recover to safely handle double-close if another goroutine
-			// already closed the channel between the check and this close.
-			func() {
-				defer func() { recover() }()
-				close(ch)
-			}()
-		}
-		b.waitMu.Unlock()
+	if sent && resp.Headers != nil && resp.Headers["x-stream-end"] == "true" {
+		delete(b.waiters, resp.CorrelationID)
+		close(ch)
 	}
 	return sent
 }
@@ -974,18 +989,27 @@ type responseStream struct {
 	cur    Response
 	err    error
 	cancel func()
+	done   bool
 }
 
 func (s *responseStream) Next() bool {
+	if s.done {
+		return false
+	}
 	select {
 	case r, ok := <-s.ch:
 		if !ok {
+			s.done = true
+			s.err = s.ctx.Err()
+			s.Close()
 			return false
 		}
 		s.cur = r
 		return true
 	case <-s.ctx.Done():
+		s.done = true
 		s.err = s.ctx.Err()
+		s.Close()
 		return false
 	}
 }
@@ -1002,6 +1026,20 @@ func (p *Publisher) BeginTx(ctx context.Context, opts ...TxOption) (PublishTx, e
 	return &publishTx{p: p}, nil
 }
 
+// BeginStreamTx builds outputs whose commit atomically advances an input stream
+// offset. A stale expectedOffset fails with ErrOffsetConflict. After an ambiguous
+// I/O failure, reconcile the group offset before retrying application work.
+func (p *Publisher) BeginStreamTx(ctx context.Context, offset OffsetCommit, expectedOffset uint64) (PublishTx, error) {
+	if _, ok := p.b.store.(StreamTransactionStore); !ok {
+		return nil, errf(ErrUnsupportedMode, "store does not support stream transactions")
+	}
+	tx, err := normalizeStreamTransaction(ctx, StreamTransaction{Offset: offset, ExpectedOffset: expectedOffset})
+	if err != nil {
+		return nil, err
+	}
+	return &publishTx{p: p, streamOffset: &tx.Offset, expectedOffset: expectedOffset}, nil
+}
+
 type PublishTx interface {
 	Publish(topic string, payload any, opts ...PublishOption) error
 	Commit(context.Context) ([]PublishResult, error)
@@ -1013,9 +1051,11 @@ type txMsg struct {
 	opts    []PublishOption
 }
 type publishTx struct {
-	p      *Publisher
-	closed bool
-	msgs   []txMsg
+	p              *Publisher
+	closed         bool
+	msgs           []txMsg
+	streamOffset   *OffsetCommit
+	expectedOffset uint64
 }
 
 func (tx *publishTx) Publish(topic string, payload any, opts ...PublishOption) error {
@@ -1033,9 +1073,25 @@ func (tx *publishTx) Commit(ctx context.Context) ([]PublishResult, error) {
 	preps := make([]preparedPublish, 0, len(tx.msgs))
 	entries := make([]AppendEntry, 0, len(tx.msgs))
 	for _, m := range tx.msgs {
-		prep, err := tx.p.preparePublish(ctx, m.topic, m.payload, m.opts...)
+		opts := m.opts
+		if tx.streamOffset != nil {
+			opts = append(append([]PublishOption(nil), opts...), func(o *PublishOptions) {
+				if o.TenantID == "" {
+					o.TenantID = tx.streamOffset.TenantID
+				}
+			})
+		}
+		prep, err := tx.p.preparePublish(ctx, m.topic, m.payload, opts...)
 		if err != nil {
 			return nil, err
+		}
+		if err := tx.p.checkBackpressure(ctx, prep); err != nil {
+			return nil, err
+		}
+		if tx.p.b.tenantMgr != nil {
+			if err := tx.p.b.tenantMgr.CheckPublishQuota(ctx, prep.msg.TenantID, prep.dests); err != nil {
+				return nil, err
+			}
 		}
 		if err := validateConfirmation(prep.opts.ConfirmLevel, tx.p.b.store); err != nil {
 			return nil, err
@@ -1043,11 +1099,21 @@ func (tx *publishTx) Commit(ctx context.Context) ([]PublishResult, error) {
 		preps = append(preps, prep)
 		entries = append(entries, AppendEntry{Message: prep.msg, Destinations: prep.dests})
 	}
-	atomicStore, ok := tx.p.b.store.(AtomicStore)
-	if !ok {
-		return nil, errf(ErrInvalidMessage, "store does not support atomic append")
+	var stored []Message
+	var err error
+	if tx.streamOffset != nil {
+		store, ok := tx.p.b.store.(StreamTransactionStore)
+		if !ok {
+			return nil, errf(ErrUnsupportedMode, "store does not support stream transactions")
+		}
+		stored, err = store.CommitStreamTransaction(ctx, StreamTransaction{Offset: *tx.streamOffset, ExpectedOffset: tx.expectedOffset, Entries: entries})
+	} else {
+		store, ok := tx.p.b.store.(AtomicStore)
+		if !ok {
+			return nil, errf(ErrInvalidMessage, "store does not support atomic append")
+		}
+		stored, err = store.AppendAtomic(ctx, entries)
 	}
-	stored, err := atomicStore.AppendAtomic(ctx, entries)
 	if err != nil {
 		for _, prep := range preps {
 			if tx.p.b.cfg.Hooks.OnPublishFailed != nil {

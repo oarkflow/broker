@@ -49,17 +49,21 @@ type Route struct {
 	Weight            int             `json:"weight,omitempty"`
 	HashKey           string          `json:"hash_key,omitempty"`
 	StickyKey         string          `json:"sticky_key,omitempty"`
+	MaxStickyBindings int             `json:"max_sticky_bindings,omitempty"`
 	Capabilities      []string        `json:"capabilities,omitempty"`
 	PriorityThreshold int             `json:"priority_threshold,omitempty"`
 	Rules             []RoutingRule   `json:"rules,omitempty"`
 	StrategyConfig    *StrategyConfig `json:"-"`
+	compiledStrategy  ConsumerStrategy
 }
 
 type Router struct {
-	mu           sync.RWMutex
-	routes       []Route
-	taskRouter   *TaskRouter
-	configLoader *RoutingConfigLoader
+	mu            sync.RWMutex
+	routes        []Route
+	exactRoutes   map[string][]int
+	patternRoutes []int
+	taskRouter    *TaskRouter
+	configLoader  *RoutingConfigLoader
 }
 
 func NewRouter() *Router {
@@ -82,9 +86,60 @@ func (r *Router) Add(route Route) {
 	if route.Strategy == "" {
 		route.Strategy = routeModeToStrategy(route.Mode)
 	}
+	route.compiledStrategy = r.buildStrategyForRoute(route)
 	r.mu.Lock()
 	r.routes = append(r.routes, route)
+	r.indexRoute(len(r.routes) - 1)
 	r.mu.Unlock()
+}
+
+// indexRoute separates exact subjects from wildcard/catch-all routes. Only
+// whole tokens are wildcards: "orders.cr*eated" is a literal subject.
+// All index operations run under mu, alongside changes to routes.
+func (r *Router) indexRoute(i int) {
+	pattern := r.routes[i].Match
+	if pattern == "" {
+		r.patternRoutes = append(r.patternRoutes, i)
+		return
+	}
+	for _, token := range strings.Split(pattern, ".") {
+		if token == "*" || token == "#" {
+			r.patternRoutes = append(r.patternRoutes, i)
+			return
+		}
+	}
+	if r.exactRoutes == nil {
+		r.exactRoutes = make(map[string][]int)
+	}
+	r.exactRoutes[pattern] = append(r.exactRoutes[pattern], i)
+}
+
+func (r *Router) rebuildIndex() {
+	r.exactRoutes = nil
+	r.patternRoutes = nil
+	for i := range r.routes {
+		r.indexRoute(i)
+	}
+}
+
+// Merge the two ordered index lists without allocating or reordering routes.
+// Registration order also determines which strategy gets the first selection.
+type routeIndexIterator struct {
+	exact, patterns []int
+}
+
+func (it *routeIndexIterator) next() (int, bool) {
+	if len(it.exact) > 0 && (len(it.patterns) == 0 || it.exact[0] < it.patterns[0]) {
+		i := it.exact[0]
+		it.exact = it.exact[1:]
+		return i, true
+	}
+	if len(it.patterns) > 0 {
+		i := it.patterns[0]
+		it.patterns = it.patterns[1:]
+		return i, true
+	}
+	return 0, false
 }
 
 // Remove deletes a route by name and reports whether one was found. Every Add has
@@ -99,6 +154,7 @@ func (r *Router) Remove(name string) bool {
 			continue
 		}
 		r.routes = append(r.routes[:i:i], r.routes[i+1:]...)
+		r.rebuildIndex()
 		return true
 	}
 	return false
@@ -119,6 +175,9 @@ func (r *Router) RemovePrefix(prefix string) int {
 		kept = append(kept, route)
 	}
 	r.routes = kept
+	if removed > 0 {
+		r.rebuildIndex()
+	}
 	return removed
 }
 
@@ -131,6 +190,8 @@ func (r *Router) Routes() []Route {
 func (r *Router) Clear() {
 	r.mu.Lock()
 	r.routes = nil
+	r.exactRoutes = nil
+	r.patternRoutes = nil
 	r.mu.Unlock()
 }
 
@@ -146,7 +207,9 @@ func (r *Router) Route(ctx context.Context, msg Message) ([]Destination, []Route
 	if subject == "" {
 		subject = msg.Queue
 	}
-	for _, route := range r.routes {
+	indexes := routeIndexIterator{exact: r.exactRoutes[subject], patterns: r.patternRoutes}
+	for i, ok := indexes.next(); ok; i, ok = indexes.next() {
+		route := r.routes[i]
 		if route.Disabled || !route.Enabled {
 			continue
 		}
@@ -191,7 +254,9 @@ func (r *Router) RouteWithStrategy(ctx context.Context, msg Message, candidates 
 		subject = msg.Queue
 	}
 	matched := make([]Route, 0, 2)
-	for _, route := range r.routes {
+	indexes := routeIndexIterator{exact: r.exactRoutes[subject], patterns: r.patternRoutes}
+	for i, ok := indexes.next(); ok; i, ok = indexes.next() {
+		route := r.routes[i]
 		if route.Disabled || !route.Enabled {
 			continue
 		}
@@ -219,9 +284,6 @@ func (r *Router) RouteWithStrategy(ctx context.Context, msg Message, candidates 
 		}
 		matched = append(matched, route)
 	}
-	if len(matched) == 0 {
-		return candidates, nil, nil
-	}
 	if len(candidates) > 0 && (msg.TenantID != "" || hasRestrictedTenantScope(ctx)) {
 		filtered := make([]ConsumerCandidate, 0, len(candidates))
 		for _, c := range candidates {
@@ -237,8 +299,7 @@ func (r *Router) RouteWithStrategy(ctx context.Context, msg Message, candidates 
 	}
 	for _, route := range matched {
 		if route.Strategy != "" {
-			strategy := r.buildStrategyForRoute(route)
-			result, err := strategy.Select(ctx, msg, candidates)
+			result, err := route.compiledStrategy.Select(ctx, msg, candidates)
 			if err == nil && len(result) > 0 {
 				return result, matched, nil
 			}
@@ -280,6 +341,7 @@ func (r *Router) buildStrategyForRoute(route Route) ConsumerStrategy {
 		Type:              route.Strategy,
 		HashKey:           route.HashKey,
 		StickyKey:         route.StickyKey,
+		MaxStickyBindings: route.MaxStickyBindings,
 		PriorityThreshold: route.PriorityThreshold,
 		Capabilities:      route.Capabilities,
 		FallbackStrategy:  route.Fallback,

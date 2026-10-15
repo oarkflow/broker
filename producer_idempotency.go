@@ -35,11 +35,14 @@ func validateProducerSequence(state ProducerState, msg Message) error {
 		return nil
 	}
 	seq := *msg.ProducerSequence
-	if state.ProducerID == "" || msg.ProducerEpoch > state.Epoch || !state.Initialized {
+	if state.ProducerID == "" || msg.ProducerEpoch > state.Epoch {
 		return nil
 	}
 	if msg.ProducerEpoch < state.Epoch {
 		return ErrProducerFenced
+	}
+	if !state.Initialized {
+		return nil
 	}
 	if seq == state.LastSequence {
 		return &DuplicateProducerSequenceError{ProducerID: msg.ProducerID, Epoch: msg.ProducerEpoch, Sequence: seq, MessageID: state.LastMessageID}
@@ -98,7 +101,8 @@ func (r *ProducerRegistry) RegisterProducer(producerID string, epoch int32) (*Pr
 			UpdatedAt:   time.Now(),
 		}
 		r.producers[producerID] = state
-		return state, nil
+		cp := *state
+		return &cp, nil
 	}
 
 	if epoch < state.Epoch {
@@ -108,11 +112,13 @@ func (r *ProducerRegistry) RegisterProducer(producerID string, epoch int32) (*Pr
 	if epoch > state.Epoch {
 		state.Epoch = epoch
 		state.LastSequence = 0
+		state.LastMessageID = ""
 		state.Initialized = false
 		state.UpdatedAt = time.Now()
 	}
 
-	return state, nil
+	cp := *state
+	return &cp, nil
 }
 
 // GetProducer returns the current state for a producer.
@@ -132,55 +138,20 @@ func (r *ProducerRegistry) CheckAndRecord(producerID string, epoch int32, seq ui
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	state, exists := r.producers[producerID]
-	if !exists {
-		state = &ProducerState{
-			ProducerID:    producerID,
-			Epoch:         epoch,
-			LastSequence:  seq,
-			LastMessageID: msgID,
-			Initialized:   true,
-			UpdatedAt:     time.Now(),
+	var state ProducerState
+	if current := r.producers[producerID]; current != nil {
+		state = *current
+	}
+	msg := Message{ID: msgID, ProducerID: producerID, ProducerEpoch: epoch, ProducerSequence: &seq}
+	if err := validateProducerSequence(state, msg); err != nil {
+		var duplicate *DuplicateProducerSequenceError
+		if errors.As(err, &duplicate) {
+			return true, duplicate.MessageID, nil
 		}
-		r.producers[producerID] = state
-		return false, "", nil
+		return false, "", err
 	}
-
-	if epoch < state.Epoch {
-		return false, "", ErrProducerFenced
-	}
-
-	if epoch > state.Epoch {
-		state.Epoch = epoch
-		state.LastSequence = seq
-		state.LastMessageID = msgID
-		state.Initialized = true
-		state.UpdatedAt = time.Now()
-		return false, "", nil
-	}
-
-	// Same epoch
-	if !state.Initialized {
-		state.LastSequence = seq
-		state.LastMessageID = msgID
-		state.Initialized = true
-		state.UpdatedAt = time.Now()
-		return false, "", nil
-	}
-
-	if seq <= state.LastSequence {
-		// Duplicate publish (retry)
-		return true, state.LastMessageID, nil
-	}
-
-	if seq > state.LastSequence+1 {
-		return false, "", ErrOutOfOrderSequence
-	}
-
-	// In-order expected sequence: seq == state.LastSequence + 1
-	state.LastSequence = seq
-	state.LastMessageID = msgID
-	state.UpdatedAt = time.Now()
+	state = advanceProducerState(state, msg)
+	r.producers[producerID] = &state
 	return false, "", nil
 }
 

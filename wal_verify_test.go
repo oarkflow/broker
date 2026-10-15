@@ -65,6 +65,12 @@ func TestExportImportBinaryWALRoundTripAndRefuseOverwrite(t *testing.T) {
 	if _, err := store.Append(ctx, Message{ID: "portable", TenantID: "a"}, []Destination{{Kind: DestinationStream, Name: "events"}}); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := store.CommitStreamTransaction(ctx, StreamTransaction{
+		Offset:  OffsetCommit{Stream: "events", ConsumerGroup: "workers", Offset: 1, TenantID: "a"},
+		Entries: []AppendEntry{{Message: Message{ID: "portable-output"}, Destinations: []Destination{{Kind: DestinationQueue, Name: "processed"}}}},
+	}); err != nil {
+		t.Fatal(err)
+	}
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -89,5 +95,11 @@ func TestExportImportBinaryWALRoundTripAndRefuseOverwrite(t *testing.T) {
 	message, ok, err := recovered.Get(ctx, "portable")
 	if err != nil || !ok || message.TenantID != "a" || message.Offset != 1 {
 		t.Fatalf("round-trip message=%+v ok=%t err=%v", message, ok, err)
+	}
+	if offset, err := recovered.ConsumerOffset(ctx, OffsetCommit{Stream: "events", ConsumerGroup: "workers", TenantID: "a"}); err != nil || offset != 1 {
+		t.Fatalf("round-trip transaction offset=%d, error=%v", offset, err)
+	}
+	if _, ok, err := recovered.Get(ctx, "portable-output"); err != nil || !ok {
+		t.Fatalf("round-trip transaction output exists=%v, error=%v", ok, err)
 	}
 }

@@ -2,6 +2,7 @@ package broker
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 )
@@ -72,5 +73,45 @@ func TestDurableOutboxDispatchAndLifecycle(t *testing.T) {
 	}
 	if string(storedMsg.Payload) != "job-1-payload" {
 		t.Fatalf("payload mismatch: %s", string(storedMsg.Payload))
+	}
+}
+
+func TestLegacyOutboxRestartOwnershipAndFlushFailure(t *testing.T) {
+	store := &failOnceProducerStore{MemoryStore: NewMemoryStore(), fail: true}
+	b := MustNew(Config{Store: store})
+	defer b.Stop(context.Background())
+	o, err := NewDurableOutbox(DurableOutboxConfig{Broker: b})
+	if err != nil {
+		t.Fatal(err)
+	}
+	message := Message{ID: "owned", Payload: []byte("original")}
+	dests := []Destination{{Kind: DestinationQueue, Name: "jobs"}}
+	if _, err := o.Enqueue(context.Background(), message, dests); err != nil {
+		t.Fatal(err)
+	}
+	message.Payload[0] = 'X'
+	dests[0].Name = "changed"
+	if err := o.Flush(context.Background()); !errors.Is(err, ErrStorageUnavailable) {
+		t.Fatalf("flush hid append failure: %v", err)
+	}
+	entry, _ := o.GetEntry("owned")
+	if entry.Status != OutboxFailed || entry.Attempts != 1 {
+		t.Fatalf("failed state: %+v", entry)
+	}
+	entry.Message.Payload[0] = 'Y'
+	if err := o.Flush(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	stored, ok, err := store.Get(context.Background(), "owned")
+	if err != nil || !ok || string(stored.Payload) != "original" || stored.Queue != "jobs" {
+		t.Fatalf("caller mutated queued entry: %+v, %v", stored, err)
+	}
+	for i := 0; i < 3; i++ {
+		if err := o.Start(); err != nil {
+			t.Fatal(err)
+		}
+		if err := o.Stop(); err != nil {
+			t.Fatal(err)
+		}
 	}
 }

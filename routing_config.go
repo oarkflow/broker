@@ -63,6 +63,7 @@ type RoutingPlan struct {
 	Weight            int           `json:"weight,omitempty"`
 	HashKey           string        `json:"hash_key,omitempty"`
 	StickyKey         string        `json:"sticky_key,omitempty"`
+	MaxStickyBindings int           `json:"max_sticky_bindings,omitempty"`
 	Capabilities      []string      `json:"capabilities,omitempty"`
 	PriorityThreshold int           `json:"priority_threshold,omitempty"`
 	Rules             []RoutingRule `json:"rules,omitempty"`
@@ -225,6 +226,7 @@ func (l *RoutingConfigLoader) BuildStrategy(plan RoutingPlan) ConsumerStrategy {
 		Type:              plan.Strategy,
 		HashKey:           plan.HashKey,
 		StickyKey:         plan.StickyKey,
+		MaxStickyBindings: plan.MaxStickyBindings,
 		PriorityThreshold: plan.PriorityThreshold,
 		Capabilities:      plan.Capabilities,
 		FallbackStrategy:  plan.Fallback,
@@ -441,23 +443,24 @@ func (tr *TaskRouter) SelectConsumers(ctx context.Context, msg Message, candidat
 	if len(candidates) == 0 {
 		return nil, nil
 	}
-	plan := tr.findPlan(msg)
+	tr.mu.RLock()
+	plan := tr.findPlanLocked(msg)
+	fallback := tr.fallback
+	tr.mu.RUnlock()
 	if plan == nil {
-		return tr.fallback.Select(ctx, msg, candidates)
+		return fallback.Select(ctx, msg, candidates)
 	}
 	result, err := plan.strategy.Select(ctx, msg, candidates)
 	if err != nil && plan.fallback != nil {
 		return plan.fallback.Select(ctx, msg, candidates)
 	}
 	if err != nil {
-		return tr.fallback.Select(ctx, msg, candidates)
+		return fallback.Select(ctx, msg, candidates)
 	}
 	return result, nil
 }
 
-func (tr *TaskRouter) findPlan(msg Message) *compiledPlan {
-	tr.mu.RLock()
-	defer tr.mu.RUnlock()
+func (tr *TaskRouter) findPlanLocked(msg Message) *compiledPlan {
 	if msg.Queue != "" {
 		for _, p := range tr.plans {
 			if p.plan.Queue == msg.Queue {

@@ -34,7 +34,7 @@ type DurableOutboxEntry struct {
 	PublishedAt  *time.Time          `json:"published_at,omitempty"`
 }
 
-// DurableOutboxConfig configures the background transactional outbox engine.
+// DurableOutboxConfig configures the legacy in-memory dispatch worker.
 type DurableOutboxConfig struct {
 	Broker          *Broker
 	PollInterval    time.Duration
@@ -44,7 +44,9 @@ type DurableOutboxConfig struct {
 	DispatchTimeout time.Duration
 }
 
-// DurableOutbox provides guaranteed, at-least-once message delivery from a durable store.
+// DurableOutbox is a legacy in-memory dispatch worker. Its entries do not survive
+// process restart and are not atomic with an application database transaction.
+// Deprecated: use contrib/sqlitestore.NewOutbox for a transactional SQL outbox.
 type DurableOutbox struct {
 	broker    *Broker
 	interval  time.Duration
@@ -54,13 +56,14 @@ type DurableOutbox struct {
 	timeout   time.Duration
 
 	mu      sync.RWMutex
+	lifeMu  sync.Mutex
 	entries map[string]*DurableOutboxEntry
 	stopCh  chan struct{}
 	doneCh  chan struct{}
 	running atomic.Bool
 }
 
-// NewDurableOutbox initializes a durable transactional outbox worker.
+// NewDurableOutbox initializes the legacy in-memory dispatch worker.
 func NewDurableOutbox(cfg DurableOutboxConfig) (*DurableOutbox, error) {
 	if cfg.Broker == nil {
 		return nil, errors.New("durable outbox: Broker is required")
@@ -94,8 +97,11 @@ func NewDurableOutbox(cfg DurableOutboxConfig) (*DurableOutbox, error) {
 	}, nil
 }
 
-// Enqueue stores a message into the outbox for background guaranteed dispatch.
+// Enqueue stores a message in memory for background dispatch.
 func (o *DurableOutbox) Enqueue(ctx context.Context, msg Message, dests []Destination) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	if msg.ID == "" {
 		msg.ID = o.broker.nextID("msg")
 	}
@@ -105,8 +111,8 @@ func (o *DurableOutbox) Enqueue(ctx context.Context, msg Message, dests []Destin
 
 	entry := &DurableOutboxEntry{
 		ID:           msg.ID,
-		Message:      msg,
-		Destinations: dests,
+		Message:      cloneMessage(msg),
+		Destinations: append([]Destination(nil), dests...),
 		Status:       OutboxPending,
 		Attempts:     0,
 		MaxAttempts:  o.maxRetry,
@@ -115,6 +121,10 @@ func (o *DurableOutbox) Enqueue(ctx context.Context, msg Message, dests []Destin
 	}
 
 	o.mu.Lock()
+	if _, exists := o.entries[msg.ID]; exists {
+		o.mu.Unlock()
+		return "", ErrDuplicateMessage
+	}
 	o.entries[msg.ID] = entry
 	o.mu.Unlock()
 
@@ -123,15 +133,21 @@ func (o *DurableOutbox) Enqueue(ctx context.Context, msg Message, dests []Destin
 
 // Start launches the background dispatch worker loop.
 func (o *DurableOutbox) Start() error {
+	o.lifeMu.Lock()
+	defer o.lifeMu.Unlock()
 	if !o.running.CompareAndSwap(false, true) {
 		return nil
 	}
+	o.stopCh = make(chan struct{})
+	o.doneCh = make(chan struct{})
 	go o.dispatchLoop()
 	return nil
 }
 
 // Stop cleanly terminates the outbox worker.
 func (o *DurableOutbox) Stop() error {
+	o.lifeMu.Lock()
+	defer o.lifeMu.Unlock()
 	if !o.running.CompareAndSwap(true, false) {
 		return nil
 	}
@@ -150,23 +166,26 @@ func (o *DurableOutbox) dispatchLoop() {
 		case <-o.stopCh:
 			return
 		case <-ticker.C:
-			o.flushPending()
+			_ = o.flushPending(context.Background())
 		}
 	}
 }
 
-// Flush forces an immediate synchronous dispatch of all pending outbox entries.
+// Flush synchronously dispatches up to BatchSize entries and returns failures.
 func (o *DurableOutbox) Flush(ctx context.Context) error {
-	o.flushPending()
-	return nil
+	return o.flushPending(ctx)
 }
 
-func (o *DurableOutbox) flushPending() {
+func (o *DurableOutbox) flushPending(parent context.Context) error {
+	if err := parent.Err(); err != nil {
+		return err
+	}
 	o.mu.Lock()
 	batch := make([]*DurableOutboxEntry, 0, o.batchSize)
 	for _, e := range o.entries {
 		if e.Status == OutboxPending || e.Status == OutboxFailed {
 			e.Status = OutboxInFlight
+			e.Attempts++
 			batch = append(batch, e)
 			if len(batch) >= o.batchSize {
 				break
@@ -176,12 +195,12 @@ func (o *DurableOutbox) flushPending() {
 	o.mu.Unlock()
 
 	if len(batch) == 0 {
-		return
+		return nil
 	}
 
+	var result error
 	for _, entry := range batch {
-		entry.Attempts++
-		ctx, cancel := context.WithTimeout(context.Background(), o.timeout)
+		ctx, cancel := context.WithTimeout(parent, o.timeout)
 
 		// Append message to store
 		_, err := o.broker.store.Append(ctx, entry.Message, entry.Destinations)
@@ -194,6 +213,7 @@ func (o *DurableOutbox) flushPending() {
 			now := time.Now()
 			entry.PublishedAt = &now
 		} else {
+			result = errors.Join(result, err)
 			entry.LastError = err.Error()
 			if entry.Attempts >= entry.MaxAttempts {
 				entry.Status = OutboxDeadLetter
@@ -212,6 +232,7 @@ func (o *DurableOutbox) flushPending() {
 		}
 		o.mu.Unlock()
 	}
+	return result
 }
 
 // PendingCount returns the number of outbox entries currently waiting to be published.
@@ -236,5 +257,11 @@ func (o *DurableOutbox) GetEntry(id string) (*DurableOutboxEntry, bool) {
 		return nil, false
 	}
 	copyEntry := *entry
+	copyEntry.Message = cloneMessage(entry.Message)
+	copyEntry.Destinations = append([]Destination(nil), entry.Destinations...)
+	if entry.PublishedAt != nil {
+		at := *entry.PublishedAt
+		copyEntry.PublishedAt = &at
+	}
 	return &copyEntry, true
 }
