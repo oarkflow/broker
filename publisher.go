@@ -877,7 +877,7 @@ func (p *Publisher) RequestStream(ctx context.Context, subject string, request a
 		ctx, cancel = context.WithCancel(ctx)
 	}
 	stop := context.AfterFunc(ctx, func() { p.b.unregisterWaiter(o.CorrelationID, ch) })
-	_, err := p.Publish(ctx, subject, request, WithCorrelationID(o.CorrelationID), WithHeader("x-request-stream", "true"), WithHeaders(o.Headers), WithTenantID(o.TenantID))
+	_, err := p.Publish(ctx, subject, request, WithCorrelationID(o.CorrelationID), WithHeaders(o.Headers), WithHeader("x-request-stream", "true"), WithTenantID(o.TenantID))
 	if err != nil {
 		stop()
 		cancel()

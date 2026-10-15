@@ -693,6 +693,14 @@ go build -o broker-worker ./cmd/broker-worker/
 
 ## Complete Examples
 
+The [example index](examples/README.md) maps every recent enhancement to a runnable
+scenario. Run all nine, including failure handling and durable-store restart:
+
+```bash
+cd examples
+go run ./enhancements -scenario all
+```
+
 Runnable, fail-fast examples for embedded workflows, durable WAL restart, and
 a real three-node etcd/Raft cluster are in
 [`examples/complete`](examples/complete/README.md). From the `examples` module:

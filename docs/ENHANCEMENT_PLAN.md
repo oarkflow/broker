@@ -6,6 +6,10 @@ and compatibility with existing messaging clients. This plan complements
 repository are starting points, not evidence of full NATS, Kafka or RabbitMQ
 compatibility.
 
+Runnable examples for the implemented changes are listed in the
+[examples index](../examples/README.md). Run `go run ./enhancements -scenario all`
+from the `examples` module, or use the index to select a single workflow.
+
 ## First implementation: subject routing
 
 Exact subjects now use an index shared by `Route` and `RouteWithStrategy`.

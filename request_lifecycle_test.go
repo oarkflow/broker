@@ -135,3 +135,32 @@ func TestBrokerStopReleasesRequestWaiters(t *testing.T) {
 		t.Fatal("broker stop retained request waiter")
 	}
 }
+
+func TestRequestStreamPreservesHeadersAndStreamMarker(t *testing.T) {
+	b := MustNew(Config{})
+	ctx := context.Background()
+	if err := b.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer b.Stop(ctx)
+	_, err := b.Subscribe(ctx, ConsumerConfig{Name: "stream-responder", Topic: "rpc.stream"}, func(ctx context.Context, d Delivery) error {
+		if d.Message.Headers["x-request-stream"] != "true" || d.Message.Headers["x-client"] != "example" {
+			return d.RespondError(ctx, ErrInvalidMessage, WithEndStream(true))
+		}
+		return d.Respond(ctx, "complete", WithEndStream(true))
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream, err := b.Publisher().RequestStream(ctx, "rpc.stream", nil, WithTimeout(time.Second), WithRequestHeader("x-client", "example"), WithRequestHeader("x-request-stream", "false"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.Close()
+	if !stream.Next() || stream.Message().Error != nil {
+		t.Fatalf("stream marker or user header lost: response=%+v, error=%v", stream.Message(), stream.Err())
+	}
+	if stream.Next() || stream.Err() != nil {
+		t.Fatalf("stream did not end cleanly: %v", stream.Err())
+	}
+}
