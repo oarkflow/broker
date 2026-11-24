@@ -133,6 +133,12 @@ func (s *RFC6455Server) serve(parent context.Context, conn *websocket.Conn, prin
 			s.write(conn, webSocketResponse{OK: false, Error: "invalid JSON request"})
 			continue
 		}
+		if err := s.cfg.ACL.AdmitRate(principal); err != nil {
+			if s.write(conn, webSocketResponse{ID: req.ID, OK: false, Error: err.Error()}) != nil {
+				return
+			}
+			continue
+		}
 		ctx := context.WithValue(parent, adminPrincipalKey{}, principal)
 		resp := s.dispatch(ctx, principal, req)
 		if err := s.write(conn, resp); err != nil {

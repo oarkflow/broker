@@ -1,6 +1,9 @@
 package broker
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
 // MemoryQueueSnapshot captures queue configuration, state, and ordered IDs for
 // durable snapshot stores. It is intentionally exported so contrib stores can
@@ -32,18 +35,19 @@ type MemoryStreamSnapshot struct {
 // preferred high-throughput append path; snapshot stores are intended for
 // embedded/single-node persistent deployments that prefer a SQL database.
 type MemoryStoreSnapshot struct {
-	Version   int                             `json:"version"`
-	CreatedAt time.Time                       `json:"created_at"`
-	Queues    map[string]MemoryQueueSnapshot  `json:"queues"`
-	Topics    map[string]MemoryTopicSnapshot  `json:"topics"`
-	Streams   map[string]MemoryStreamSnapshot `json:"streams"`
-	Messages  map[string]Message              `json:"messages"`
-	History   map[string][]MessageHistory     `json:"history"`
-	Offsets   map[string]map[string]uint64    `json:"offsets"`
-	Dedup     map[string]time.Time            `json:"dedup"`
-	Idemp     map[string]string               `json:"idemp"`
-	Producers map[string]ProducerState        `json:"producers,omitempty"`
-	MoveOps   map[string]MoveResult           `json:"move_ops,omitempty"`
+	Version   int                                `json:"version"`
+	CreatedAt time.Time                          `json:"created_at"`
+	Queues    map[string]MemoryQueueSnapshot     `json:"queues"`
+	Topics    map[string]MemoryTopicSnapshot     `json:"topics"`
+	Streams   map[string]MemoryStreamSnapshot    `json:"streams"`
+	Messages  map[string]Message                 `json:"messages"`
+	History   map[string][]MessageHistory        `json:"history"`
+	Offsets   map[string]map[string]uint64       `json:"offsets"`
+	OffsetTx  map[string]OffsetAppendTransaction `json:"offset_transactions,omitempty"`
+	Dedup     map[string]time.Time               `json:"dedup"`
+	Idemp     map[string]string                  `json:"idemp"`
+	Producers map[string]ProducerState           `json:"producers,omitempty"`
+	MoveOps   map[string]MoveResult              `json:"move_ops,omitempty"`
 }
 
 // Snapshot returns a consistent deep-copy image of the store.
@@ -51,7 +55,7 @@ func (s *MemoryStore) Snapshot() MemoryStoreSnapshot {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	snap := MemoryStoreSnapshot{
-		Version:   1,
+		Version:   4,
 		CreatedAt: time.Now(),
 		Queues:    make(map[string]MemoryQueueSnapshot, len(s.queues)),
 		Topics:    make(map[string]MemoryTopicSnapshot, len(s.topics)),
@@ -59,6 +63,7 @@ func (s *MemoryStore) Snapshot() MemoryStoreSnapshot {
 		Messages:  make(map[string]Message, len(s.messages)+len(s.cold)),
 		History:   make(map[string][]MessageHistory, len(s.history)),
 		Offsets:   make(map[string]map[string]uint64, len(s.offsets)),
+		OffsetTx:  make(map[string]OffsetAppendTransaction, len(s.offsetTx)),
 		Dedup:     make(map[string]time.Time, len(s.dedup)),
 		Idemp:     make(map[string]string, len(s.idemp)),
 		Producers: make(map[string]ProducerState, len(s.producerSeq)),
@@ -87,6 +92,9 @@ func (s *MemoryStore) Snapshot() MemoryStoreSnapshot {
 		for group, off := range groups {
 			snap.Offsets[stream][group] = off
 		}
+	}
+	for key, transaction := range s.offsetTx {
+		snap.OffsetTx[key] = cloneOffsetAppendTransaction(transaction)
 	}
 	for k, v := range s.dedup {
 		snap.Dedup[k] = v
@@ -120,6 +128,9 @@ func (s *MemoryStore) RestoreExact(snap MemoryStoreSnapshot) {
 func (s *MemoryStore) restoreSnapshot(snap MemoryStoreSnapshot, recoverInflight bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if snap.Version < 3 {
+		migrateLegacyTenantIndexes(&snap)
+	}
 	s.queues = map[string]*memoryQueue{}
 	s.topics = map[string]*memoryTopic{}
 	s.streams = map[string]*memoryStream{}
@@ -127,6 +138,7 @@ func (s *MemoryStore) restoreSnapshot(snap MemoryStoreSnapshot, recoverInflight 
 	s.cold = nil
 	s.history = map[string][]MessageHistory{}
 	s.offsets = map[string]map[string]uint64{}
+	s.offsetTx = map[string]OffsetAppendTransaction{}
 	s.dedup = map[string]time.Time{}
 	s.idemp = map[string]string{}
 	s.producerSeq = map[string]ProducerState{}
@@ -193,6 +205,9 @@ func (s *MemoryStore) restoreSnapshot(snap MemoryStoreSnapshot, recoverInflight 
 			s.offsets[stream][group] = off
 		}
 	}
+	for key, transaction := range snap.OffsetTx {
+		s.offsetTx[key] = cloneOffsetAppendTransaction(transaction)
+	}
 	now := time.Now()
 	for k, v := range snap.Dedup {
 		if v.After(now) {
@@ -220,4 +235,82 @@ func (s *MemoryStore) restoreSnapshot(snap MemoryStoreSnapshot, recoverInflight 
 		s.demoteEligibleLocked()
 	}
 	s.closed = false
+}
+
+// migrateLegacyTenantIndexes upgrades global dedup/idempotency/producer maps
+// from version 1 and delimiter-based offsets from versions 1 and 2.
+func migrateLegacyTenantIndexes(snap *MemoryStoreSnapshot) {
+	if snap.Version < 2 && snap.Dedup != nil {
+		migrated := make(map[string]time.Time, len(snap.Dedup))
+		matched := make(map[string]bool, len(snap.Dedup))
+		for _, msg := range snap.Messages {
+			if msg.DeduplicationID == "" {
+				continue
+			}
+			if expiry, ok := snap.Dedup[msg.DeduplicationID]; ok {
+				key := tenantScopedKey(msg.TenantID, msg.DeduplicationID)
+				if existing, exists := migrated[key]; !exists || expiry.After(existing) {
+					migrated[key] = expiry
+				}
+				matched[msg.DeduplicationID] = true
+			}
+		}
+		for key, expiry := range snap.Dedup {
+			if !matched[key] {
+				migrated[tenantScopedKey("", key)] = expiry
+			}
+		}
+		snap.Dedup = migrated
+	}
+	if snap.Version < 2 && snap.Idemp != nil {
+		migrated := make(map[string]string, len(snap.Idemp))
+		messagesByID := make(map[string]Message, len(snap.Messages))
+		for id, msg := range snap.Messages {
+			messagesByID[id] = msg
+		}
+		for key, messageID := range snap.Idemp {
+			tenantID := ""
+			if msg, ok := messagesByID[messageID]; ok {
+				tenantID = msg.TenantID
+			}
+			migrated[tenantScopedKey(tenantID, key)] = messageID
+		}
+		snap.Idemp = migrated
+	}
+	if snap.Version < 2 && snap.Producers != nil {
+		migrated := make(map[string]ProducerState, len(snap.Producers))
+		messagesByID := make(map[string]Message, len(snap.Messages))
+		for id, msg := range snap.Messages {
+			messagesByID[id] = msg
+		}
+		for key, state := range snap.Producers {
+			tenantID := ""
+			if msg, ok := messagesByID[state.LastMessageID]; ok {
+				tenantID = msg.TenantID
+			}
+			producerID := state.ProducerID
+			if producerID == "" {
+				producerID = key
+				state.ProducerID = producerID
+			}
+			migrated[producerStateKey(tenantID, producerID)] = state
+		}
+		snap.Producers = migrated
+	}
+	if snap.Version < 3 && snap.Offsets != nil {
+		for stream, groups := range snap.Offsets {
+			migrated := make(map[string]uint64, len(groups))
+			for stored, offset := range groups {
+				tenantID, group := "", stored
+				if tenant, legacyGroup, ok := strings.Cut(stored, "\x00"); ok {
+					tenantID, group = tenant, legacyGroup
+				}
+				key := offsetGroupKey(tenantID, group)
+				if offset > migrated[key] {
+					migrated[key] = offset
+				}
+			}
+			snap.Offsets[stream] = migrated
+		}
+	}
 }

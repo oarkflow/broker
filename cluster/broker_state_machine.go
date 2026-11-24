@@ -160,21 +160,22 @@ type snapshotBrokerStore interface {
 type BrokerCommandType string
 
 const (
-	BrokerCmdDeclareQueue  BrokerCommandType = "declare_queue"
-	BrokerCmdDeclareTopic  BrokerCommandType = "declare_topic"
-	BrokerCmdDeclareStream BrokerCommandType = "declare_stream"
-	BrokerCmdAppend        BrokerCommandType = "append"
-	BrokerCmdAppendAtomic  BrokerCommandType = "append_atomic"
-	BrokerCmdAck           BrokerCommandType = "ack"
-	BrokerCmdNack          BrokerCommandType = "nack"
-	BrokerCmdLease         BrokerCommandType = "lease"
-	BrokerCmdUpdate        BrokerCommandType = "update"
-	BrokerCmdUpdateBatch   BrokerCommandType = "update_batch"
-	BrokerCmdMove          BrokerCommandType = "move"
-	BrokerCmdCommitOffset  BrokerCommandType = "commit_offset"
-	BrokerCmdPauseQueue    BrokerCommandType = "pause_queue"
-	BrokerCmdResumeQueue   BrokerCommandType = "resume_queue"
-	BrokerCmdPurgeQueue    BrokerCommandType = "purge_queue"
+	BrokerCmdDeclareQueue       BrokerCommandType = "declare_queue"
+	BrokerCmdDeclareTopic       BrokerCommandType = "declare_topic"
+	BrokerCmdDeclareStream      BrokerCommandType = "declare_stream"
+	BrokerCmdAppend             BrokerCommandType = "append"
+	BrokerCmdAppendAtomic       BrokerCommandType = "append_atomic"
+	BrokerCmdAck                BrokerCommandType = "ack"
+	BrokerCmdNack               BrokerCommandType = "nack"
+	BrokerCmdLease              BrokerCommandType = "lease"
+	BrokerCmdUpdate             BrokerCommandType = "update"
+	BrokerCmdUpdateBatch        BrokerCommandType = "update_batch"
+	BrokerCmdMove               BrokerCommandType = "move"
+	BrokerCmdCommitOffset       BrokerCommandType = "commit_offset"
+	BrokerCmdCommitOffsetAppend BrokerCommandType = "commit_offset_append"
+	BrokerCmdPauseQueue         BrokerCommandType = "pause_queue"
+	BrokerCmdResumeQueue        BrokerCommandType = "resume_queue"
+	BrokerCmdPurgeQueue         BrokerCommandType = "purge_queue"
 )
 
 // BrokerCommand is the serialized command embedded in a Raft LogEntry.Data.
@@ -240,6 +241,8 @@ func (sm *BrokerStateMachine) Apply(entry *LogEntry) error {
 		return sm.applyExtended(ctx, func(store extendedBrokerStore) error { return store.ReplicateMove(ctx, cmd.Payload) })
 	case BrokerCmdCommitOffset:
 		return sm.applyExtended(ctx, func(store extendedBrokerStore) error { return store.ReplicateCommitOffset(ctx, cmd.Payload) })
+	case BrokerCmdCommitOffsetAppend:
+		return sm.applyOffsetAppend(ctx, cmd.Payload)
 	case BrokerCmdPauseQueue:
 		return sm.applyPauseQueue(ctx, cmd.Payload)
 	case BrokerCmdResumeQueue:
@@ -257,6 +260,16 @@ func (sm *BrokerStateMachine) applyExtended(ctx context.Context, apply func(exte
 		return fmt.Errorf("broker sm: backing store does not support extended replicated mutations")
 	}
 	return apply(store)
+}
+
+func (sm *BrokerStateMachine) applyOffsetAppend(ctx context.Context, payload json.RawMessage) error {
+	store, ok := sm.store.(interface {
+		ReplicateCommitOffsetAndAppend(context.Context, json.RawMessage) error
+	})
+	if !ok {
+		return fmt.Errorf("broker sm: backing store does not support replicated offset append")
+	}
+	return store.ReplicateCommitOffsetAndAppend(ctx, payload)
 }
 
 func (sm *BrokerStateMachine) applyDeclareQueue(ctx context.Context, payload json.RawMessage) error {

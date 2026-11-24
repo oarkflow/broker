@@ -511,6 +511,7 @@ func (s *PartitionedBinaryWALStore) Move(ctx context.Context, req MoveRequest) (
 		result.Copied += r.Copied
 		result.Skipped += r.Skipped
 		result.MessageIDs = append(result.MessageIDs, r.MessageIDs...)
+		result.DestinationMessageIDs = append(result.DestinationMessageIDs, r.DestinationMessageIDs...)
 		mu.Unlock()
 		return e
 	})
@@ -542,6 +543,9 @@ func (s *PartitionedBinaryWALStore) CommitOffset(ctx context.Context, c OffsetCo
 }
 func (s *PartitionedBinaryWALStore) ConsumerOffset(ctx context.Context, c OffsetCommit) (uint64, error) {
 	return s.shards[s.shardForStable("stream:"+c.Stream)].ConsumerOffset(ctx, c)
+}
+func (s *PartitionedBinaryWALStore) ConsumerOffsets(ctx context.Context, stream, tenant string) (map[string]uint64, error) {
+	return s.shards[s.shardForStable("stream:"+stream)].ConsumerOffsets(ctx, stream, tenant)
 }
 func (s *PartitionedBinaryWALStore) StreamLagContext(ctx context.Context, stream, group, tenant string) (uint64, error) {
 	return s.shards[s.shardForStable("stream:"+stream)].StreamLagContext(ctx, stream, group, tenant)

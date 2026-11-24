@@ -274,6 +274,9 @@ type PartitionConfig struct {
 	Partitions int `json:"partitions,omitempty"`
 	// Strategy is the partitioning strategy. Default: "hash".
 	Strategy PartitionStrategy `json:"strategy,omitempty"`
+	// HotPartitionThreshold marks a partition hot when its depth is at least
+	// this multiple of the topic's average partition depth. Default: 2.
+	HotPartitionThreshold float64 `json:"hot_partition_threshold,omitempty"`
 }
 
 // PartitionStrategy determines how messages are assigned to partitions.
@@ -284,6 +287,7 @@ const (
 	PartitionRoundRobin PartitionStrategy = "round_robin"
 	PartitionRandom     PartitionStrategy = "random"
 	PartitionKey        PartitionStrategy = "key"
+	PartitionLeastDepth PartitionStrategy = "least_depth"
 )
 
 // PartitionRouter routes messages to specific partitions.
@@ -300,10 +304,15 @@ func NewPartitionRouter(cfg PartitionConfig) *PartitionRouter {
 	if cfg.Strategy == "" {
 		cfg.Strategy = PartitionHash
 	}
+	if cfg.HotPartitionThreshold <= 1 {
+		cfg.HotPartitionThreshold = 2
+	}
 	return &PartitionRouter{config: cfg}
 }
 
-// SelectPartition returns the partition index for a message.
+// SelectPartition returns the partition index for a message. A standalone
+// PartitionRouter has no queue-depth source, so PartitionLeastDepth uses
+// round-robin for unkeyed messages; Broker.SelectPartition applies live depths.
 func (pr *PartitionRouter) SelectPartition(msg Message) int {
 	switch pr.config.Strategy {
 	case PartitionRoundRobin:
@@ -317,6 +326,16 @@ func (pr *PartitionRouter) SelectPartition(msg Message) int {
 			key = msg.RoutingKey
 		}
 		return int(hashKey(key) % uint32(pr.config.Partitions))
+	case PartitionLeastDepth:
+		key := msg.Key
+		if key == "" {
+			key = msg.RoutingKey
+		}
+		if key != "" {
+			return int(hashKey(key) % uint32(pr.config.Partitions))
+		}
+		idx := pr.counter.Add(1) - 1
+		return int(idx % uint64(pr.config.Partitions))
 	case PartitionHash:
 		fallthrough
 	default:
@@ -326,6 +345,26 @@ func (pr *PartitionRouter) SelectPartition(msg Message) int {
 		}
 		return int(hashKey(key) % uint32(pr.config.Partitions))
 	}
+}
+
+func (pr *PartitionRouter) selectLeastDepth(depths []int) int {
+	if len(depths) == 0 {
+		return 0
+	}
+	minDepth := depths[0]
+	for _, depth := range depths[1:] {
+		if depth < minDepth {
+			minDepth = depth
+		}
+	}
+	start := int((pr.counter.Add(1) - 1) % uint64(len(depths)))
+	for offset := 0; offset < len(depths); offset++ {
+		partition := (start + offset) % len(depths)
+		if depths[partition] == minDepth {
+			return partition
+		}
+	}
+	return start
 }
 
 // PartitionCount returns the configured partition count.

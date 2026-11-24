@@ -57,6 +57,28 @@ func OpenMessageStore(driver, dsn string) (*MessageStore, error) {
 	return s, nil
 }
 
+// OpenStores opens the SQLite message and control-plane stores on one database
+// connection pool. Broker.Close closes the message store, which owns the pool;
+// the returned StateStore deliberately shares it without taking ownership.
+func OpenStores(driver, dsn string) (*MessageStore, *StateStore, error) {
+	db, err := sql.Open(driver, dsn)
+	if err != nil {
+		return nil, nil, err
+	}
+	messages, err := NewMessageStore(db)
+	if err != nil {
+		_ = db.Close()
+		return nil, nil, err
+	}
+	state, err := NewStateStore(db)
+	if err != nil {
+		_ = db.Close()
+		return nil, nil, err
+	}
+	messages.own = true
+	return messages, state, nil
+}
+
 func NewMessageStore(db *sql.DB) (*MessageStore, error) {
 	if db == nil {
 		return nil, broker.ErrClosed
@@ -285,10 +307,24 @@ func (s *MessageStore) CommitOffset(ctx context.Context, commit broker.OffsetCom
 	}
 	return s.persistLocked(ctx)
 }
+func (s *MessageStore) CommitOffsetAndAppend(ctx context.Context, commit broker.OffsetCommit, entries []broker.AppendEntry) ([]broker.Message, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out, err := s.mem.CommitOffsetAndAppend(ctx, commit, entries)
+	if err != nil {
+		return nil, err
+	}
+	return out, s.persistLocked(ctx)
+}
 func (s *MessageStore) ConsumerOffset(ctx context.Context, commit broker.OffsetCommit) (uint64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.mem.ConsumerOffset(ctx, commit)
+}
+func (s *MessageStore) ConsumerOffsets(ctx context.Context, stream, tenant string) (map[string]uint64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.mem.ConsumerOffsets(ctx, stream, tenant)
 }
 func (s *MessageStore) StreamLagContext(ctx context.Context, stream, group, tenant string) (uint64, error) {
 	s.mu.Lock()

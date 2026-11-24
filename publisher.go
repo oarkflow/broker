@@ -150,6 +150,7 @@ func (p *Publisher) PublishOwned(ctx context.Context, msg Message, opts ...Publi
 		// The store cannot take ownership, so fall back to a copying append.
 		stored, err := p.b.store.Append(ctx, entry.Message, entry.Destinations)
 		if err != nil {
+			p.recordBackpressureError(err, 1)
 			return PublishResult{}, err
 		}
 		return p.publishResult(entry.Message.ID, stored, entry.Destinations), nil
@@ -159,6 +160,7 @@ func (p *Publisher) PublishOwned(ctx context.Context, msg Message, opts ...Publi
 		if errors.As(err, &duplicate) {
 			return PublishResult{MessageID: duplicate.MessageID, Duplicate: true}, nil
 		}
+		p.recordBackpressureError(err, 1)
 		return PublishResult{}, err
 	}
 	return p.publishResult(entry.Message.ID, nil, entry.Destinations), nil
@@ -270,6 +272,7 @@ func (p *Publisher) publishItemsAligned(ctx context.Context, items []PublishBatc
 		}
 		// Never retry an ambiguous atomic failure item-by-item; the store may
 		// have synced the transaction before surfacing an I/O error.
+		p.recordBackpressureError(err, uint64(len(indices)))
 		for _, idx := range indices {
 			errs[idx] = err
 		}
@@ -283,6 +286,7 @@ func (p *Publisher) publishItemsAligned(ctx context.Context, items []PublishBatc
 		stored, err := p.b.store.Append(ctx, prep.msg, prep.dests)
 		idx := indices[j]
 		if err != nil {
+			p.recordBackpressureError(err, 1)
 			errs[idx] = err
 			if first == nil {
 				first = err
@@ -347,6 +351,7 @@ func (p *Publisher) publishItemsMinimal(ctx context.Context, items []PublishBatc
 		return errs, first
 	}
 	var err error
+	sequentialAppendFailure := false
 	switch store := p.b.store.(type) {
 	case OwnedAtomicStore:
 		err = store.AppendAtomicOwned(ctx, entries)
@@ -358,6 +363,7 @@ func (p *Publisher) publishItemsMinimal(ctx context.Context, items []PublishBatc
 		for _, entry := range entries {
 			if _, appendErr := p.b.store.Append(ctx, entry.Message, entry.Destinations); appendErr != nil {
 				err = appendErr
+				sequentialAppendFailure = true
 				break
 			}
 		}
@@ -368,6 +374,11 @@ func (p *Publisher) publishItemsMinimal(ctx context.Context, items []PublishBatc
 	for _, idx := range indices {
 		errs[idx] = err
 	}
+	count := uint64(len(indices))
+	if sequentialAppendFailure {
+		count = 1
+	}
+	p.recordBackpressureError(err, count)
 	if first == nil {
 		first = err
 	}
@@ -415,6 +426,7 @@ func (p *Publisher) publishMessagesMinimal(ctx context.Context, messages []Messa
 		return errs, first
 	}
 	var err error
+	sequentialAppendFailure := false
 	switch store := p.b.store.(type) {
 	case OwnedAtomicStore:
 		err = store.AppendAtomicOwned(ctx, entries)
@@ -426,6 +438,7 @@ func (p *Publisher) publishMessagesMinimal(ctx context.Context, messages []Messa
 		for i := range entries {
 			if _, appendErr := p.b.store.Append(ctx, entries[i].Message, entries[i].Destinations); appendErr != nil {
 				err = appendErr
+				sequentialAppendFailure = true
 				break
 			}
 		}
@@ -445,6 +458,11 @@ func (p *Publisher) publishMessagesMinimal(ctx context.Context, messages []Messa
 		}
 	}
 	if err != nil {
+		count := uint64(len(indices))
+		if sequentialAppendFailure {
+			count = 1
+		}
+		p.recordBackpressureError(err, count)
 		for _, index := range indices {
 			errs[index] = err
 		}
@@ -470,9 +488,11 @@ func isEntryScopedPublishError(err error) bool {
 func (p *Publisher) appendOneEntry(ctx context.Context, entry AppendEntry) error {
 	if store, ok := p.b.store.(AtomicStore); ok {
 		_, err := store.AppendAtomic(ctx, []AppendEntry{entry})
+		p.recordBackpressureError(err, 1)
 		return err
 	}
 	_, err := p.b.store.Append(ctx, entry.Message, entry.Destinations)
+	p.recordBackpressureError(err, 1)
 	return err
 }
 
@@ -600,6 +620,7 @@ func (p *Publisher) publish(ctx context.Context, topic string, payload any, opts
 	}
 	stored, err := p.b.store.Append(ctx, prep.msg, prep.dests)
 	if err != nil {
+		p.recordBackpressureError(err, 1)
 		var duplicate *DuplicateProducerSequenceError
 		if errors.As(err, &duplicate) {
 			return PublishResult{MessageID: duplicate.MessageID, Duplicate: true}, nil
@@ -767,36 +788,51 @@ func (b *Broker) recordPublisher(ctx context.Context, rec PublisherRecord) {
 	}
 }
 
-// checkBackpressure checks if the target queues are full and applies broker-level backpressure.
-// This only applies when the broker's default backpressure policy is set to reject or block.
-// Queue-specific backpressure policies (drop_oldest, drop_newest, dlq) are handled by the store.
+// checkBackpressure enforces configured queue/topic publish rate limits and,
+// for reject/block policies, checks queue depth before appending. Queue-specific
+// drop and DLQ policies remain enforced by the store.
 func (p *Publisher) checkBackpressure(ctx context.Context, prep preparedPublish) error {
-	if p.b.cfg.Backpressure != BackpressureReject && p.b.cfg.Backpressure != BackpressureBlock {
-		return nil
+	if p.b.cfg.Backpressure == BackpressureReject || p.b.cfg.Backpressure == BackpressureBlock {
+		// Previously this called Store.Stats once per destination, and Stats scans
+		// every message, queue, topic and stream in the store, so a publish to N
+		// destinations ran N full-store scans on the hot path while holding the
+		// store read lock. It also asserted the store to *MemoryStore, which meant
+		// backpressure silently did nothing on every WAL, segmented and distributed
+		// store, and read MemoryStore.queues without the store lock.
+		reporter, hasReporter := p.b.store.(QueueDepthReporter)
+		if !hasReporter {
+			if err := p.checkBackpressureViaStats(ctx, prep); err != nil {
+				return err
+			}
+		} else {
+			for _, d := range prep.dests {
+				if d.Kind != DestinationQueue && d.Kind != DestinationDLQ {
+					continue
+				}
+				max := reporter.queueMaxDepth(d.Name)
+				if max <= 0 {
+					max = p.b.QueueMaxDepth(d.Name)
+				}
+				if max <= 0 {
+					continue
+				}
+				if depth := reporter.queueDepth(d.Name); depth >= max {
+					p.recordBackpressureRejections(1)
+					return errf(ErrBackpressure, "queue %s depth %d >= max %d", d.Name, depth, max)
+				}
+			}
+		}
 	}
-	// Previously this called Store.Stats once per destination, and Stats scans
-	// every message, queue, topic and stream in the store, so a publish to N
-	// destinations ran N full-store scans on the hot path while holding the
-	// store read lock. It also asserted the store to *MemoryStore, which meant
-	// backpressure silently did nothing on every WAL, segmented and distributed
-	// store, and read MemoryStore.queues without the store lock.
-	reporter, hasReporter := p.b.store.(QueueDepthReporter)
-	if !hasReporter {
-		return p.checkBackpressureViaStats(ctx, prep)
-	}
-	for _, d := range prep.dests {
-		if d.Kind != DestinationQueue && d.Kind != DestinationDLQ {
-			continue
-		}
-		max := reporter.queueMaxDepth(d.Name)
-		if max <= 0 {
-			max = p.b.QueueMaxDepth(d.Name)
-		}
-		if max <= 0 {
-			continue
-		}
-		if depth := reporter.queueDepth(d.Name); depth >= max {
-			return errf(ErrBackpressure, "queue %s depth %d >= max %d", d.Name, depth, max)
+	if p.b.rateLimiter != nil {
+		if rejected, ok := p.b.rateLimiter.AllowDestinations(prep.dests); !ok {
+			if p.b.promMetrics != nil {
+				p.b.promMetrics.RecordRateLimited()
+			}
+			kind := "topic"
+			if rejected.Kind == DestinationQueue || rejected.Kind == DestinationDLQ {
+				kind = "queue"
+			}
+			return errf(ErrRateLimited, "%s %s publish rate exceeded", kind, rejected.Name)
 		}
 	}
 	return nil
@@ -820,10 +856,23 @@ func (p *Publisher) checkBackpressureViaStats(ctx context.Context, prep prepared
 		}
 		max := p.b.QueueMaxDepth(d.Name)
 		if max > 0 && depth >= max {
+			p.recordBackpressureRejections(1)
 			return errf(ErrBackpressure, "queue %s depth %d >= max %d", d.Name, depth, max)
 		}
 	}
 	return nil
+}
+
+func (p *Publisher) recordBackpressureRejections(count uint64) {
+	if p != nil && p.b != nil && p.b.promMetrics != nil && count > 0 {
+		p.b.promMetrics.RecordBackpressuredN(count)
+	}
+}
+
+func (p *Publisher) recordBackpressureError(err error, count uint64) {
+	if errors.Is(err, ErrBackpressure) {
+		p.recordBackpressureRejections(count)
+	}
 }
 
 func (p *Publisher) Request(ctx context.Context, subject string, request any, response any, opts ...RequestOption) error {
@@ -1037,6 +1086,14 @@ func (tx *publishTx) Commit(ctx context.Context) ([]PublishResult, error) {
 		if err != nil {
 			return nil, err
 		}
+		if err := tx.p.checkBackpressure(ctx, prep); err != nil {
+			return nil, err
+		}
+		if tx.p.b.tenantMgr != nil {
+			if err := tx.p.b.tenantMgr.CheckPublishQuota(ctx, prep.msg.TenantID, prep.dests); err != nil {
+				return nil, err
+			}
+		}
 		if err := validateConfirmation(prep.opts.ConfirmLevel, tx.p.b.store); err != nil {
 			return nil, err
 		}
@@ -1049,6 +1106,7 @@ func (tx *publishTx) Commit(ctx context.Context) ([]PublishResult, error) {
 	}
 	stored, err := atomicStore.AppendAtomic(ctx, entries)
 	if err != nil {
+		tx.p.recordBackpressureError(err, uint64(len(entries)))
 		for _, prep := range preps {
 			if tx.p.b.cfg.Hooks.OnPublishFailed != nil {
 				prep.event.Error = err

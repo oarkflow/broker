@@ -164,17 +164,26 @@ func (s *GRPCV1Server) authorizeStream(srv any, ss grpc.ServerStream, info *grpc
 		}
 		defer release()
 	}
-	wrapped := &wrappedStream{ServerStream: ss, ctx: context.WithValue(ctx, adminPrincipalKey{}, principal)}
+	wrapped := &wrappedStream{ServerStream: ss, ctx: context.WithValue(ctx, adminPrincipalKey{}, principal), acl: s.cfg.ACL, principal: principal}
 	return handler(srv, wrapped)
 }
 
 type wrappedStream struct {
 	grpc.ServerStream
-	ctx context.Context
+	ctx       context.Context
+	acl       *ACL
+	principal AdminPrincipal
 }
 
 func (w *wrappedStream) Context() context.Context {
 	return w.ctx
+}
+
+func (w *wrappedStream) RecvMsg(message any) error {
+	if err := w.acl.AdmitRate(w.principal); err != nil {
+		return status.Error(codes.ResourceExhausted, err.Error())
+	}
+	return w.ServerStream.RecvMsg(message)
 }
 
 func grpcMethodPermission(method string) string {

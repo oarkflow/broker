@@ -277,9 +277,9 @@ type ConsumerConfig struct {
 	Topic               string            `json:"topic"`
 	Pattern             string            `json:"pattern"`
 	Concurrency         int               `json:"concurrency"`
-	MaxInFlight         int               `json:"max_inflight"`
-	BatchSize           int               `json:"batch_size"`
-	BatchWait           time.Duration     `json:"batch_wait"`
+	MaxInFlight         int               `json:"max_inflight"` // Maximum leased messages queued or executing; 0 is unlimited.
+	BatchSize           int               `json:"batch_size"`   // Maximum messages leased for one handler invocation.
+	BatchWait           time.Duration     `json:"batch_wait"`   // Maximum batch-only collection wait; adaptive wait stays below VisibilityTimeout.
 	VisibilityTimeout   time.Duration     `json:"visibility_timeout"`
 	AckMode             AckMode           `json:"ack_mode"`
 	RetryPolicy         RetryPolicy       `json:"retry_policy"`

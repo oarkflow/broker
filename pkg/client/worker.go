@@ -67,6 +67,7 @@ type Worker struct {
 	inflight        chan struct{}
 	activeMu        sync.Mutex
 	active          map[string]context.CancelFunc
+	cancelled       map[string]time.Time
 	stopping        atomic.Bool
 }
 
@@ -78,7 +79,7 @@ func NewWorker(cfg Config) (*Worker, error) {
 		pool = fw.MustNew(fw.Config{MinWorkers: cfg.Concurrency, MaxWorkers: maxInt(cfg.Concurrency*8, cfg.Concurrency), QueueSize: maxInt(cfg.MaxInFlight*8, 1024), RecoverPanics: true})
 		own = true
 	}
-	return &Worker{client: c, pool: pool, ownPool: own, queueHandlers: map[string]Handler{}, topicHandlers: map[string]Handler{}, patternHandlers: map[string]Handler{}, taskHandlers: map[string]TaskHandler{}, requestHandlers: map[string]RequestHandler{}, commandHandlers: map[string]RequestHandler{}, taskQueues: map[string]string{}, requestQueues: map[string]string{}, commandQueues: map[string]string{}, pollQueues: map[string]struct{}{}, inflight: make(chan struct{}, c.cfg.MaxInFlight), active: map[string]context.CancelFunc{}}, nil
+	return &Worker{client: c, pool: pool, ownPool: own, queueHandlers: map[string]Handler{}, topicHandlers: map[string]Handler{}, patternHandlers: map[string]Handler{}, taskHandlers: map[string]TaskHandler{}, requestHandlers: map[string]RequestHandler{}, commandHandlers: map[string]RequestHandler{}, taskQueues: map[string]string{}, requestQueues: map[string]string{}, commandQueues: map[string]string{}, pollQueues: map[string]struct{}{}, inflight: make(chan struct{}, c.cfg.MaxInFlight), active: map[string]context.CancelFunc{}, cancelled: map[string]time.Time{}}, nil
 }
 func (w *Worker) Client() *Client { return w.client }
 func (w *Worker) HandleQueue(q string, h Handler) {
@@ -176,6 +177,9 @@ func (w *Worker) Run(ctx context.Context) error {
 	<-runCtx.Done()
 	w.stopping.Store(true)
 	wg.Wait()
+	w.activeMu.Lock()
+	clear(w.cancelled)
+	w.activeMu.Unlock()
 	_ = w.client.doJSON(context.Background(), "POST", "/v1/consumers/"+w.client.cfg.ConsumerID+"/unregister", nil, nil)
 	if w.ownPool {
 		_ = w.pool.Shutdown(context.Background())
@@ -208,7 +212,7 @@ func (w *Worker) eventLoop(ctx context.Context, cancel context.CancelFunc) {
 					w.client.cfg.Hooks.OnNotification(NotificationEvent{Notification: e, Time: time.Now()})
 				}
 				if e.Type == "task.cancelled" {
-					w.cancelMessage(firstNonEmpty(e.MessageID, asString(e.Data["message_id"])))
+					w.markMessageCancelled(firstNonEmpty(e.MessageID, asString(e.Data["message_id"])))
 				}
 				if e.Type == "consumer.draining" || e.Type == "broker.stopping" || e.Type == "broker.draining" {
 					if w.client.cfg.Hooks.OnDrain != nil {
@@ -264,13 +268,25 @@ func (w *Worker) pollLoop(ctx context.Context, queue string) {
 func (w *Worker) handle(ctx context.Context, m broker.Message) (err error) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	w.trackMessage(m.ID, cancel)
+	if !w.trackMessage(m.ID, cancel) {
+		cancel()
+		if err := w.ackCancelledTask(ctx, m); err != nil {
+			return fmt.Errorf("ack task %s cancelled before handler start: %w", m.ID, err)
+		}
+		return nil
+	}
 	defer w.untrackMessage(m.ID)
 	stopExtend := w.startLeaseExtender(ctx, m)
 	defer stopExtend()
 	d := Delivery{Message: m, client: w.client}
 	if w.client.cfg.Hooks.BeforeHandle != nil {
 		if err := w.client.cfg.Hooks.BeforeHandle(MessageEvent{Message: m, Queue: m.Queue, Time: time.Now()}); err != nil {
+			if w.takeMessageCancellation(m.ID) {
+				if ackErr := w.ackCancelledTask(ctx, m); ackErr != nil {
+					return fmt.Errorf("ack cancelled task %s: %w", m.ID, ackErr)
+				}
+				return nil
+			}
 			_ = d.Nack(ctx, NackError(err.Error()), NackReason("before_handle"))
 			return err
 		}
@@ -291,6 +307,12 @@ func (w *Worker) handle(ctx context.Context, m broker.Message) (err error) {
 		_ = w.nackOrDLQ(ctx, d, err)
 		return err
 	}
+	if kind == "task" && w.takeMessageCancellation(m.ID) {
+		if err := w.ackCancelledTask(ctx, m); err != nil {
+			return fmt.Errorf("ack cancelled task %s: %w", m.ID, err)
+		}
+		return nil
+	}
 	switch kind {
 	case "request":
 		res, e := h.(RequestHandler)(ctx, d)
@@ -302,6 +324,12 @@ func (w *Worker) handle(ctx context.Context, m broker.Message) (err error) {
 		}
 	case "task":
 		res, e := h.(TaskHandler)(ctx, d)
+		if w.takeMessageCancellation(m.ID) {
+			if ackErr := w.ackCancelledTask(ctx, m); ackErr != nil {
+				return fmt.Errorf("ack cancelled task %s: %w", m.ID, ackErr)
+			}
+			return nil
+		}
 		if e != nil {
 			err = e
 		} else {
@@ -419,13 +447,20 @@ func (w *Worker) snapshotPollQueues() map[string]struct{} {
 	return out
 }
 
-func (w *Worker) trackMessage(id string, cancel context.CancelFunc) {
+func (w *Worker) trackMessage(id string, cancel context.CancelFunc) bool {
 	if id == "" || cancel == nil {
-		return
+		return true
 	}
 	w.activeMu.Lock()
+	w.pruneCancelledLocked(time.Now())
+	if _, cancelled := w.cancelled[id]; cancelled {
+		delete(w.cancelled, id)
+		w.activeMu.Unlock()
+		return false
+	}
 	w.active[id] = cancel
 	w.activeMu.Unlock()
+	return true
 }
 func (w *Worker) untrackMessage(id string) {
 	if id == "" {
@@ -433,6 +468,7 @@ func (w *Worker) untrackMessage(id string) {
 	}
 	w.activeMu.Lock()
 	delete(w.active, id)
+	delete(w.cancelled, id)
 	w.activeMu.Unlock()
 }
 func (w *Worker) cancelMessage(id string) {
@@ -444,6 +480,72 @@ func (w *Worker) cancelMessage(id string) {
 	w.activeMu.Unlock()
 	if cancel != nil {
 		cancel()
+	}
+}
+
+func (w *Worker) markMessageCancelled(id string) {
+	if id == "" {
+		return
+	}
+	now := time.Now()
+	w.activeMu.Lock()
+	w.pruneCancelledLocked(now)
+	if w.cancelled == nil {
+		w.cancelled = map[string]time.Time{}
+	}
+	cancel := w.active[id]
+	if cancel != nil {
+		w.cancelled[id] = now.Add(w.pendingCancellationTTL())
+	} else {
+		maxPending := maxInt(w.client.cfg.PollLimit+2*w.client.cfg.MaxInFlight, 64)
+		if len(w.cancelled) >= maxPending {
+			var oldestID string
+			var oldest time.Time
+			for messageID, expires := range w.cancelled {
+				if oldestID == "" || expires.Before(oldest) {
+					oldestID, oldest = messageID, expires
+				}
+			}
+			delete(w.cancelled, oldestID)
+		}
+		w.cancelled[id] = now.Add(w.pendingCancellationTTL())
+	}
+	w.activeMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+func (w *Worker) takeMessageCancellation(id string) bool {
+	if id == "" {
+		return false
+	}
+	w.activeMu.Lock()
+	_, cancelled := w.cancelled[id]
+	delete(w.cancelled, id)
+	w.activeMu.Unlock()
+	return cancelled
+}
+
+func (w *Worker) pendingCancellationTTL() time.Duration {
+	ttl := 2 * w.client.cfg.VisibilityTimeout
+	if ttl < time.Minute {
+		ttl = time.Minute
+	}
+	return ttl
+}
+
+func (w *Worker) ackCancelledTask(ctx context.Context, m broker.Message) error {
+	settleCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	return w.client.Ack(settleCtx, m)
+}
+
+func (w *Worker) pruneCancelledLocked(now time.Time) {
+	for id, expires := range w.cancelled {
+		if !now.Before(expires) {
+			delete(w.cancelled, id)
+		}
 	}
 }
 func (w *Worker) startLeaseExtender(ctx context.Context, m broker.Message) func() {

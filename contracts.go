@@ -36,23 +36,28 @@ type ReplicationPolicy struct {
 
 // ProfileDefaults exposes the concrete policy selected by a named profile.
 type ProfileDefaults struct {
-	Profile               PerformanceProfile `json:"profile"`
-	Ack                   AckPolicy          `json:"ack"`
-	Replication           ReplicationPolicy  `json:"replication"`
-	PollInterval          time.Duration      `json:"poll_interval"`
-	NotificationRetention int                `json:"notification_retention"`
+	Profile                          PerformanceProfile `json:"profile"`
+	Ack                              AckPolicy          `json:"ack"`
+	Replication                      ReplicationPolicy  `json:"replication"`
+	PollInterval                     time.Duration      `json:"poll_interval"`
+	NotificationRetention            int                `json:"notification_retention"`
+	ConsumerBatchSize                int                `json:"consumer_batch_size"`
+	ConsumerBatchWaitInitial         time.Duration      `json:"consumer_batch_wait_initial"`
+	ConsumerBatchWaitFloor           time.Duration      `json:"consumer_batch_wait_floor"`
+	ConsumerBatchWaitGrowthDivisor   int                `json:"consumer_batch_wait_growth_divisor"`
+	ConsumerBatchWaitDecreaseDivisor int                `json:"consumer_batch_wait_decrease_divisor"`
 }
 
 func DefaultsForProfile(profile PerformanceProfile) (ProfileDefaults, error) {
 	switch profile {
 	case "", ProfileDurable:
-		return ProfileDefaults{Profile: ProfileDurable, Ack: AckQuorum, Replication: ReplicationPolicy{ReplicationFactor: 3, MinInSyncReplicas: 2, Acknowledgement: AckQuorum}, PollInterval: 5 * time.Millisecond, NotificationRetention: 1000}, nil
+		return ProfileDefaults{Profile: ProfileDurable, Ack: AckQuorum, Replication: ReplicationPolicy{ReplicationFactor: 3, MinInSyncReplicas: 2, Acknowledgement: AckQuorum}, PollInterval: 5 * time.Millisecond, NotificationRetention: 1000, ConsumerBatchSize: 32, ConsumerBatchWaitInitial: 200 * time.Microsecond, ConsumerBatchWaitFloor: 50 * time.Microsecond, ConsumerBatchWaitGrowthDivisor: 8, ConsumerBatchWaitDecreaseDivisor: 4}, nil
 	case ProfileLatency:
-		return ProfileDefaults{Profile: profile, Ack: AckLeader, Replication: ReplicationPolicy{ReplicationFactor: 3, MinInSyncReplicas: 1, Acknowledgement: AckLeader}, PollInterval: time.Millisecond, NotificationRetention: 250}, nil
+		return ProfileDefaults{Profile: profile, Ack: AckLeader, Replication: ReplicationPolicy{ReplicationFactor: 3, MinInSyncReplicas: 1, Acknowledgement: AckLeader}, PollInterval: time.Millisecond, NotificationRetention: 250, ConsumerBatchSize: 1, ConsumerBatchWaitInitial: 50 * time.Microsecond, ConsumerBatchWaitFloor: 10 * time.Microsecond, ConsumerBatchWaitGrowthDivisor: 16, ConsumerBatchWaitDecreaseDivisor: 2}, nil
 	case ProfileThroughput:
-		return ProfileDefaults{Profile: profile, Ack: AckQuorum, Replication: ReplicationPolicy{ReplicationFactor: 3, MinInSyncReplicas: 2, Acknowledgement: AckQuorum}, PollInterval: 10 * time.Millisecond, NotificationRetention: 1000}, nil
+		return ProfileDefaults{Profile: profile, Ack: AckQuorum, Replication: ReplicationPolicy{ReplicationFactor: 3, MinInSyncReplicas: 2, Acknowledgement: AckQuorum}, PollInterval: 10 * time.Millisecond, NotificationRetention: 1000, ConsumerBatchSize: 128, ConsumerBatchWaitInitial: time.Millisecond, ConsumerBatchWaitFloor: 250 * time.Microsecond, ConsumerBatchWaitGrowthDivisor: 4, ConsumerBatchWaitDecreaseDivisor: 8}, nil
 	case ProfileLightweight:
-		return ProfileDefaults{Profile: profile, Ack: AckLeader, Replication: ReplicationPolicy{ReplicationFactor: 1, MinInSyncReplicas: 1, Acknowledgement: AckLeader}, PollInterval: 10 * time.Millisecond, NotificationRetention: 0}, nil
+		return ProfileDefaults{Profile: profile, Ack: AckLeader, Replication: ReplicationPolicy{ReplicationFactor: 1, MinInSyncReplicas: 1, Acknowledgement: AckLeader}, PollInterval: 10 * time.Millisecond, NotificationRetention: 0, ConsumerBatchSize: 16, ConsumerBatchWaitInitial: 100 * time.Microsecond, ConsumerBatchWaitFloor: 25 * time.Microsecond, ConsumerBatchWaitGrowthDivisor: 8, ConsumerBatchWaitDecreaseDivisor: 4}, nil
 	default:
 		return ProfileDefaults{}, fmt.Errorf("%w: unknown performance profile %q", ErrInvalidMessage, profile)
 	}

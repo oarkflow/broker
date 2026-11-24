@@ -22,7 +22,7 @@ func main() {
 		DefaultVisibility: 30 * time.Second,
 		Partition: &broker.PartitionConfig{
 			Partitions: 4,
-			Strategy:   broker.PartitionHash,
+			Strategy:   broker.PartitionLeastDepth,
 		},
 	})
 	if err := b.Start(ctx); err != nil {
@@ -46,21 +46,16 @@ func main() {
 		}
 	}
 
-	// Create a partition router to determine which partition to use
-	router := broker.NewPartitionRouter(broker.PartitionConfig{Partitions: 4, Strategy: broker.PartitionHash})
-
-	// Publish ordered messages per user using explicit partition queues
+	// Publish ordered messages per user. The keyed routing keeps each user on
+	// one stable hash partition; unkeyed messages use least-depth balancing.
 	for userID := 1; userID <= 3; userID++ {
 		for step := 1; step <= 5; step++ {
 			key := fmt.Sprintf("user-%d", userID)
-			msg := broker.Message{Key: key, ID: fmt.Sprintf("msg-%d-%d", userID, step)}
-			partitionIdx := router.SelectPartition(msg)
-			queueName := fmt.Sprintf("events.p%d", partitionIdx)
-			_, err := b.Publisher().Publish(ctx, "events.user", map[string]any{
+			_, err := b.PublishPartitioned(ctx, "events", map[string]any{
 				"user_id": userID,
 				"step":    step,
 				"action":  fmt.Sprintf("step-%d", step),
-			}, broker.WithQueue(queueName), broker.WithKey(key))
+			}, broker.WithKey(key))
 			if err != nil {
 				log.Printf("[publisher] error: %v", err)
 			}
@@ -77,8 +72,8 @@ func main() {
 
 	// Get partition stats
 	stats, _ := b.TopicPartitionStats(ctx, "events", 4)
-	log.Printf("[partitioning] topic events has %d partitions with %d total messages",
-		len(stats.Partitions), stats.TotalMsgs)
+	log.Printf("[partitioning] topic events has %d partitions, %d total messages, hot partitions=%v",
+		len(stats.Partitions), stats.TotalMsgs, stats.HotPartitions)
 
 	time.Sleep(3 * time.Second)
 }

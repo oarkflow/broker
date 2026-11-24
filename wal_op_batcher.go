@@ -88,8 +88,19 @@ func (b *opBatcher) run() {
 					break collect
 				}
 				batch = append(batch, req)
-			case <-timer.C:
-				break collect
+			default:
+				// Drain work already waiting before honoring the coalescing timer.
+				// When the queue is empty, the nested select waits for either the
+				// next request or the normal low-load batching delay.
+				select {
+				case req, ok := <-b.requests:
+					if !ok {
+						break collect
+					}
+					batch = append(batch, req)
+				case <-timer.C:
+					break collect
+				}
 			}
 		}
 		if !timer.Stop() {

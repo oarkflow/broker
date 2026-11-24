@@ -33,12 +33,14 @@ const (
 // ConsumerCandidate represents a consumer that can receive a routed message.
 type ConsumerCandidate struct {
 	ConsumerID   string            `json:"consumer_id"`
+	Queue        string            `json:"queue,omitempty"`
 	Group        string            `json:"group"`
 	TenantID     string            `json:"tenant_id,omitempty"`
 	Weight       int               `json:"weight"`
 	Capabilities []string          `json:"capabilities,omitempty"`
 	Metadata     map[string]string `json:"metadata,omitempty"`
 	InFlight     int               `json:"in_flight"`
+	Assigned     int               `json:"assigned,omitempty"` // Outstanding messages assigned to this consumer.
 	MaxInFlight  int               `json:"max_in_flight"`
 	Acked        int64             `json:"acked"`
 	Failed       int64             `json:"failed"`
@@ -48,12 +50,15 @@ type ConsumerCandidate struct {
 	AvgLatency   time.Duration     `json:"avg_latency"`
 }
 
-// LoadScore returns a 0.0 (fully loaded) to 1.0 (idle) score for a consumer.
+// LoadScore returns a 0.0 (fully loaded) to 1.0 (idle) score. Outstanding
+// dispatch assignments are combined with InFlight without double-counting the
+// same leased messages, which keeps selection current during concurrent polls.
 func (c *ConsumerCandidate) LoadScore() float64 {
+	load := max(c.InFlight, c.Assigned)
 	if c.MaxInFlight <= 0 {
-		return 1.0
+		return 1 / float64(1+max(load, 0))
 	}
-	available := c.MaxInFlight - c.InFlight
+	available := c.MaxInFlight - load
 	if available <= 0 {
 		return 0.0
 	}
@@ -217,7 +222,9 @@ func (s *weightedRoundRobinStrategy) Select(_ context.Context, _ Message, candid
 // Least Loaded
 // ---------------------------------------------------------------------------
 
-type leastLoadedStrategy struct{}
+type leastLoadedStrategy struct {
+	cursor atomic.Uint64
+}
 
 func NewLeastLoadedStrategy() ConsumerStrategy {
 	return &leastLoadedStrategy{}
@@ -229,12 +236,14 @@ func (s *leastLoadedStrategy) Select(_ context.Context, _ Message, candidates []
 	if len(candidates) == 0 {
 		return nil, nil
 	}
-	best := candidates[0]
+	start := int((s.cursor.Add(1) - 1) % uint64(len(candidates)))
+	best := candidates[start]
 	bestScore := best.LoadScore()
-	for i := 1; i < len(candidates); i++ {
-		score := candidates[i].LoadScore()
+	for offset := 1; offset < len(candidates); offset++ {
+		candidate := candidates[(start+offset)%len(candidates)]
+		score := candidate.LoadScore()
 		if score > bestScore {
-			best = candidates[i]
+			best = candidate
 			bestScore = score
 		}
 	}

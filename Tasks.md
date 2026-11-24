@@ -49,6 +49,9 @@ removed because several described APIs rather than verified guarantees.
 - [x] Tenant-filtered store statistics, stream lag/offsets, notifications,
   tasks, sagas, and SSE broadcasts; tenant-scoped credentials are fenced from
   global routes, audit, metrics, consumers, and consumer groups.
+- [x] Encode tenant and consumer-group offset keys injectively, persist the
+  tenant explicitly in new WAL offset records, and migrate delimiter-based
+  snapshot/WAL state during restore/replay.
 - [x] Durable publish appends are prepared and synced before becoming visible;
   forced WAL failures cannot expose an unacknowledged ghost message.
 - [x] Added backup-preserving BWL1 verify/tail-repair plus verified JSON
@@ -92,8 +95,76 @@ removed because several described APIs rather than verified guarantees.
 - [x] Finish tenant enforcement for every admin, stream-offset, notification,
   task, schema, route, and control-plane read/write operation. Lease was the
   last bypass; schema registration is now guarded as well.
-- [ ] The legacy outbox has been renamed/documented as an in-memory retry buffer;
-  provide the real transactional integration contract.
+- [x] Topic/pattern subscriptions own uniquely named router entries and remove
+  them when stopped, preventing stale routes and unbounded router growth.
+- [x] Consumers do not invoke handlers if persisting the processing state fails;
+  the leased message or batch is requeued and the storage error is surfaced.
+- [x] Ack/Nack handles become settled only after the store commits the operation;
+  failed settlements remain retryable and auto-ack errors reach the worker.
+- [x] Local and remote progress operations surface message/task persistence
+  errors and emit success notifications only after required writes succeed.
+- [x] Cancelling a task restored from persistent state hydrates the local task
+  record, stops local execution, and returns task/message persistence failures.
+- [x] Task submission rejects reused IDs and stops before publishing if the
+  initial task record cannot be persisted; post-publish status failures include
+  the task handle and ID so callers can recover the accepted work.
+- [x] Retrying a failed task moves its dead-lettered message back to the task
+  queue, resets attempts/error state, and persists the task's queued status.
+- [x] Task start, progress, retry, failure, and completion transitions hydrate
+  records from the state store after restart instead of silently updating only
+  an empty process-local task map; durable state is written before in-memory
+  transitions, hooks, and terminal waiter notifications are exposed.
+- [x] Task submission preserves a consumer's faster `running` or terminal
+  transition after publish instead of writing a stale `queued` status over it.
+- [x] Task cancellation is serialized with completion and cannot overwrite a
+  succeeded, failed, or dead-lettered terminal result; repeated cancellation is
+  idempotent. A cancelled task is acknowledged without invoking its handler,
+  including when cancellation wins between lease and handler startup; the
+  remote client retains early cancellation events until that delivery starts.
+- [x] Consumer retry/dead-letter task transitions and their hooks now happen
+  only after the store accepts the corresponding Nack; task state is persisted
+  before hooks and waiter notifications, and Nack/task-store failures are
+  returned to the caller. `RespondError` only emits the response, so a retryable
+  handler error cannot prematurely mark a task terminal before settlement.
+- [x] `TaskHandle.Wait` returns an already-terminal persisted task immediately
+  after restart instead of waiting on an in-memory notification that cannot
+  arrive, and removes timed-out waiters so they do not accumulate until task
+  completion.
+- [x] Consumer offset reads reject missing stream/group identifiers and honor
+  canceled contexts, matching the commit path's input and cancellation checks.
+- [x] Tenant-wide offset display keys fall back to injective encoded keys when
+  a tenant or group contains the legacy NUL separator, avoiding cross-tenant
+  collisions in unrestricted stats and listings.
+- [x] The legacy outbox is documented as an in-memory retry buffer, and a
+  database-local transactional outbox contract is available through SQLite.
+  - [x] `DurableOutbox` now persists dispatch entries through the optional
+    `OutboxStateStore` interface, restores in-flight work after restart, and
+    includes a SQLite implementation. This provides at-least-once restart
+    recovery when the state store is durable; it does not atomically commit
+    with an application database, and a crash after append can cause a
+    duplicate delivery.
+  - [x] Added `EnqueueTx` and the SQLite `OutboxTransaction` adapter so an
+    application can commit its business rows and outbox row in one caller-owned
+    SQL transaction. This is database-local atomicity; broker message dispatch
+    still happens after commit and remains at-least-once.
+  - [ ] Add equivalent transaction adapters for other database backends as
+    needed; the legacy `PublishRetryBuffer` remains process-local.
+- [x] Add outbox claim leases with token-fenced completion so multiple dispatchers
+  can share SQLite or memory outbox state and recover expired claims. Delivery
+  remains at-least-once if a worker appends just before its lease expires.
+  - [x] Reject claim leases shorter than the sequential batch dispatch budget
+    plus grace, preventing a configured lease from expiring during normal
+    worst-case dispatch and allowing a second worker to reclaim live work.
+  - [x] Outbox dispatch returns both the original failure and any failure to
+    persist pending recovery state, using a bounded recovery-write context.
+- [x] Make the outbox worker lifecycle safe for concurrent Start/Stop calls and
+  reject restart on an already stopped instance; persisted work resumes through
+  a newly constructed outbox.
+- [x] Add persisted exponential retry scheduling and a retryable dead-letter
+  phase. If DLQ publication fails, retry the DLQ phase without resending the
+  original message.
+- [x] Add bounded retention pruning for published and dead-lettered outbox
+  records so the in-memory index and persistent state do not grow indefinitely.
 - [ ] Establish 80% core and 90% critical-path coverage. Current package
   coverage: 52.8% root, 42.1% cluster, 31.5% AMQP, 85.6% client (raised from
   12.4%), 42.7% pool, 100% queue (raised from 0%); generated API package
@@ -198,13 +269,80 @@ removed because several described APIs rather than verified guarantees.
 
 ## P3 — delivery, profiles, and adaptive operation
 
-- [ ] Persist producer IDs, epochs, and sequences for idempotent publishing.
+- [x] Persist producer IDs, epochs, and sequences for idempotent publishing;
+  deduplication, idempotency, and producer state indexes are tenant-scoped,
+  and version-1 snapshots migrate their legacy global indexes during restore.
 - [ ] Add transactional consume-offset-plus-produce with durable commit/abort
   markers and coordinator recovery.
+  - [x] Added `Broker.CommitOffsetAndAppend` for memory, SQLite, and the
+    single-node WAL stores. The append batch and offset are one locked
+    in-memory operation; WAL stores persist one combined record, while SQLite
+    saves both in its transactional snapshot.
+  - [x] Added a single replicated command so the offset and output batch apply
+    together on each broker state machine.
+  - [x] Added optional `OffsetCommit.TransactionID` deduplication. The bounded
+    outcome cache is part of snapshots and WAL/replicated records; reusing an ID
+    with different input fails with `ErrTransactionConflict`.
+  - [x] Consumer offset lag reads the committed offset from the store, so a
+    restarted or externally committed consumer group does not report stale lag
+    from the process-local compatibility cache. The cache is tenant-scoped, and
+    context-aware reads preserve tenant isolation.
+  - [x] `GetAllOffsetsContext` uses an optional durable store lister where
+    available, including memory, WAL, replicated, partitioned WAL, and SQLite
+    stores; custom stores without the extension retain the cache fallback.
+  - [ ] Add a distributed transaction coordinator and recovery protocol for
+    failures across multiple resources/partitions.
 - [x] Define and test `durable`, `latency`, `throughput`, and `lightweight`
-  policy defaults; adaptive tuning for those profiles remains pending.
+  policy defaults, including default batch-consumer sizes and profile-specific
+  adaptive batch-wait starting points, floors, and adjustment rates.
 - [ ] Add observable adaptive batching, overload admission control, lag-aware
   assignment, hot-partition detection, balancing, and bounded fairness.
+  - [x] WAL group commit drains requests already queued before honoring its
+    coalescing timer, preserving the timer wait when the queue is empty.
+  - [x] WAL group-commit coalescing wait adapts between 50 and 300 microseconds
+    based on whether a batch reaches its previous batch-size target; expose the
+    current wait through store stats and Prometheus.
+  - [x] Queue and topic rate-limit settings now govern publish admission with
+    configured token refill and burst sizes; count rejected publishes in
+    Prometheus. Multi-destination publishes charge all distinct destination
+    buckets atomically, so a rejected publish spends no quota on destinations
+    that had capacity.
+  - [x] Expose queue-depth backpressure rejections alongside rate-limit
+    rejections in Prometheus and OTLP, including store-level races where an
+    append loses the capacity check after preflight.
+  - [x] Atomic `Publisher.Tx` commits run the same queue/topic admission and
+    tenant publish-quota checks as single-message and batch publishing.
+  - [x] Least-loaded assignment uses stable consumer ordering, rotates ties,
+    and includes outstanding dispatch assignments in load scores so a batch
+    of concurrent queue polls does not choose from the same stale load snapshot.
+  - [x] Topic partition stats identify hot partitions by depth skew and expose
+    per-partition skew ratios; the hot threshold is configurable.
+  - [x] Configured partition reassignment now transfers queued messages with
+    one store move, rechecks their queued state atomically, preserves offsets
+    when requested, wakes destination consumers, and skips a transfer when the
+    destination queue has reached its configured depth limit. Move validates
+    source membership under the store lock so overlapping passes cannot append
+    the same globally keyed message more than once.
+  - [x] Add least-depth partition selection for unkeyed publishes; preserve
+    stable hash placement for keyed messages and rotate equal-depth choices.
+  - [x] Batch subscriptions honor `BatchWait` and cap lease size to available
+    `MaxInFlight` slots; configured wait is kept below the visibility timeout.
+  - [x] If the worker pool rejects a leased message or batch, restore the
+    in-flight count and requeue the lease without incrementing its attempt.
+  - [x] RateLimiter treats non-positive rates as unlimited, defaults a missing
+    burst to the rate, and avoids zero-rate panics or impossible `WaitN` loops.
+  - [x] Queue/topic rate-limit maps are copied when the limiter is created, so
+    later caller mutations cannot race with publish admission.
+  - [x] Expose batch-consumer batch/message totals, maximum batch size, and
+    message collection time in Prometheus.
+  - [x] Adapt each batch consumer's collection wait within its configured
+    `BatchWait` ceiling based on batch fill and report the mean current wait
+    for active consumers.
+  - [x] Durable outbox dispatch sorts the full in-memory due set by creation
+    time and ID before selecting a batch, preventing arbitrary map iteration
+    from repeatedly excluding older entries.
+  - [x] Export durable outbox dispatch attempts, failures, successful publishes,
+    and dead-letter completions through Prometheus and OTLP.
 
 ## P4 — protocol and security conformance
 
@@ -213,10 +351,42 @@ removed because several described APIs rather than verified guarantees.
 - [x] Add RFC 6455 WebSocket; keep SSE separate.
 - [ ] Pass standard-client AMQP 0-9-1 and MQTT 3.1.1 interoperability suites,
   including reconnect, flow control, confirms, sessions, and QoS state recovery.
+  - [x] AMQP consumer goroutines now stop on cancel/channel/connection close;
+    unsettled deliveries are requeued on close, ACK/NACK use the broker's
+    lease token, auto-ack consume/get paths acknowledge after delivery, and
+    content frame sequences are serialized per channel across concurrent
+    consumers and `basic.get`. `basic.qos` prefetch count is enforced per
+    consumer or across the channel when the global flag is set.
+    Standard-client interoperability remains unverified.
+  - [x] MQTT subscription consumers now stop on unsubscribe/disconnect, are
+    restored on reconnect, and old same-client-ID connections are closed
+    before the replacement attaches. Subscription metadata persists through
+    the optional `MQTTSessionStore` interface (SQLite and memory stores
+    implement it); `+` filters map to the broker wildcard and malformed
+    CONNECT/SUBSCRIBE/UNSUBSCRIBE packets are rejected. Durable queued delivery
+    still depends on the message store. Inbound QoS 2 handshakes persist their
+    in-flight payload/sequence and use a stable, per-session-generation message
+    idempotency key, but duplicate suppression depends on the message store
+    retaining that key through recovery. Standard-client interoperability
+    remains unverified. CONNECT Last Will payloads now publish on unexpected
+    disconnect; graceful DISCONNECT and broker shutdown suppress the Will.
+    MQTT publish contexts carry the authenticated principal, tenant-scoped
+    topic routes are tenant-fenced, and multi-tenant credentials are refused
+    because MQTT 3.1.1 has no tenant selector. ACL `message:publish` and
+    `message:read` permissions gate inbound publishes and subscriptions.
+    RETAIN publications now replace tenant-scoped retained state, empty retained
+    payloads clear it, and matching subscriptions replay it with RETAIN set.
+    Memory and SQLite state stores persist retained values; other state stores
+    use a server-local fallback. Outbound QoS 1 packets wait for `PUBACK`, are
+    persisted with packet identifiers for session recovery, and resume with
+    the DUP flag. Outbound QoS 2 persists its PUBLISH/PUBREL phase, resumes with
+    the same packet identifier, and completes the PUBREC/PUBREL/PUBCOMP handshake.
 - [ ] Centralize listener authentication, tenant-aware RBAC, credential hashing,
   rotation/revocation, certificate mapping, quotas, deadlines, and frame limits.
-  Hashing, rotation/revocation, certificate mapping, core RBAC, deadlines, and
-  frame limits are implemented; cross-protocol per-principal quotas remain.
+  Hashing, rotation/revocation, certificate mapping, core RBAC, deadlines,
+  frame limits, and shared per-principal quotas are implemented. Unary
+  requests, streaming messages, and long-lived protocol operations now charge
+  the same ACL rate bucket; open connections share the concurrency limit.
 - [x] Refuse anonymous or unsafe plaintext `brokerd` production operation;
   insecure operation requires the explicit development flag.
 - [x] Native BST1 stream: the authenticated token/mTLS handshake already

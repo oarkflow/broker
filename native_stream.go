@@ -625,6 +625,18 @@ func (s *NativeStreamServer) serveConn(c net.Conn) {
 		}
 		respOp := op | nativeResponseFlag
 		var resp []byte
+		if op != nativeOpPing && s.cfg.ACL != nil {
+			if err := s.cfg.ACL.AdmitRate(principal); err != nil {
+				resp = appendNativeError(nil, err.Error())
+				if writeErr := writeNativeFrameWithChannel(w, respOp, chanID, corr, resp); writeErr != nil {
+					return
+				}
+				if flushErr := w.Flush(); flushErr != nil {
+					return
+				}
+				continue
+			}
+		}
 		switch op {
 		case nativeOpPing:
 		case nativeOpProduce:

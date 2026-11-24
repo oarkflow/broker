@@ -103,6 +103,7 @@ func main() {
 		EncryptionKey:     []byte(*frameEncryptionKey),
 	})
 	var store broker.Store
+	var stateStore broker.StateStore
 	profile, profileErr := broker.DefaultsForProfile(broker.PerformanceProfile(*profileName))
 	if profileErr != nil {
 		logger.Log.Fatal("invalid performance profile", zlog.Err(profileErr))
@@ -115,11 +116,12 @@ func main() {
 	case "", "memory":
 		store = broker.NewMemoryStore()
 	case "sqlite":
-		st, err := sqlitestore.OpenMessageStore(*sqliteDriver, *sqliteDSN)
+		st, state, err := sqlitestore.OpenStores(*sqliteDriver, *sqliteDSN)
 		if err != nil {
 			logger.Log.Fatal("open sqlite message store", zlog.String("driver", *sqliteDriver), zlog.String("dsn", *sqliteDSN), zlog.Err(err))
 		}
 		store = st
+		stateStore = state
 	case "wal", "filewal", "file-wal":
 		if *wal == "" {
 			logger.Log.Fatal("-wal is required when -store=wal")
@@ -195,6 +197,7 @@ func main() {
 		Mode:                        broker.ModeStandalone,
 		PerformanceProfile:          profile.Profile,
 		Store:                       store,
+		StateStore:                  stateStore,
 		DefaultQueue:                *queue,
 		FrameCodec:                  frameCodec,
 		NotificationHistoryCapacity: *notificationHistory,

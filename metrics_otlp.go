@@ -366,6 +366,19 @@ func (e *OTLPExporter) Collect() *OTLPExportRequest {
 	addSum("broker.messages.retried", "Total message delivery retries", "1", m.retried.Load())
 	addSum("broker.messages.moved", "Total messages moved across destinations", "1", m.moved.Load())
 	addSum("broker.store.fenced", "Total storage fencing occurrences", "1", m.storeFenced.Load())
+	addSum("broker.publish.rate_limited", "Total publishes rejected by queue or topic rate limits", "1", m.publishRateLimited.Load())
+	addSum("broker.publish.backpressured", "Total publishes rejected by queue-depth admission checks", "1", m.publishBackpressured.Load())
+	addSum("broker.outbox.dispatch.attempts", "Total durable outbox message append attempts", "1", m.outboxDispatchAttempts.Load())
+	addSum("broker.outbox.dispatch.failures", "Total failed durable outbox message append attempts", "1", m.outboxDispatchFailures.Load())
+	addSum("broker.outbox.published", "Total durable outbox entries successfully published", "1", m.outboxPublished.Load())
+	addSum("broker.outbox.dead_lettered", "Total durable outbox entries successfully routed to the dead-letter queue", "1", m.outboxDeadLettered.Load())
+	addSum("broker.consumer.batches", "Total batches submitted to batch consumers", "1", m.consumerBatches.Load())
+	addSum("broker.consumer.batch.messages", "Total messages submitted in consumer batches", "1", m.consumerBatchMessages.Load())
+	addSum("broker.consumer.batch.collection_wait", "Total time spent collecting messages for consumer batches", "ns", m.consumerBatchWaitNanos.Load())
+	addSum("broker.wal.group_commit.batches", "Total WAL group-commit batches processed", "1", m.walCommitBatches.Load())
+	addSum("broker.wal.group_commit.requests", "Total WAL requests included in group commits", "1", m.walCommitRequests.Load())
+	addSum("broker.wal.group_commit.coalesce_wait", "Total time spent coalescing WAL requests before writes", "ns", m.walCommitCoalesceWaitNanos.Load())
+	addSum("broker.wal.group_commit.errors", "Total failed WAL group-commit batches", "1", m.walCommitErrors.Load())
 	addSum("broker.bytes.published", "Total payload bytes published", "By", m.publishedBytes.Load())
 	addSum("broker.bytes.delivered", "Total payload bytes delivered", "By", m.deliveredBytes.Load())
 
@@ -379,6 +392,20 @@ func (e *OTLPExporter) Collect() *OTLPExportRequest {
 	addGauge("broker.runtime.memory_alloc_bytes", "Memory allocated in bytes", "By", m.memoryAllocBytes.Load())
 	addGauge("broker.rate.published", "Instantaneous message publish rate", "1/s", int64(m.publishRate.Load()))
 	addGauge("broker.rate.consumed", "Instantaneous message consume rate", "1/s", int64(m.consumeRate.Load()))
+	addGauge("broker.consumer.batch.size.max", "Largest consumer batch observed", "1", int64(m.consumerMaxBatchSize.Load()))
+	addGauge("broker.wal.group_commit.batch.size.max", "Largest WAL group-commit batch observed", "1", int64(m.walCommitMaxBatch.Load()))
+	addGauge("broker.wal.group_commit.current_coalesce_wait", "Current adaptive WAL coalescing wait", "ns", int64(m.walCommitCurrentWaitNanos.Load()))
+	var currentBatchWaitTotal int64
+	var currentBatchWaitCount int64
+	m.consumerBatchWaitCurrent.Range(func(_, value any) bool {
+		currentBatchWaitTotal += value.(int64)
+		currentBatchWaitCount++
+		return true
+	})
+	if currentBatchWaitCount > 0 {
+		currentBatchWaitTotal /= currentBatchWaitCount
+	}
+	addGauge("broker.consumer.batch.current_wait", "Mean current adaptive wait across active batch consumers", "ns", currentBatchWaitTotal)
 
 	// Per-queue metrics
 	m.queueDepth.Range(func(k, v any) bool {

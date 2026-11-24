@@ -34,7 +34,7 @@ type Broker struct {
 	subs                map[string]*Subscription
 	dispatchMu          sync.Mutex
 	consumerStrategies  map[consumerStrategyKey]ConsumerStrategy
-	dispatchAssignments map[string]string
+	dispatchAssignments map[string]dispatchAssignment
 	waitMu              sync.Mutex
 	waiters             map[string]chan Response
 	taskMu              sync.RWMutex
@@ -162,7 +162,7 @@ func New(cfg Config) (*Broker, error) {
 		own = true
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	b := &Broker{cfg: cfg, store: cfg.Store, stateStore: cfg.StateStore, router: NewRouter(), codec: cfg.Codec, frameCodec: cfg.FrameCodec, pool: pool, ownPool: own, ctx: ctx, cancel: cancel, subs: map[string]*Subscription{}, consumerStrategies: map[consumerStrategyKey]ConsumerStrategy{}, dispatchAssignments: map[string]string{}, waiters: map[string]chan Response{}, tasks: map[string]*TaskInfo{}, taskWait: map[string][]chan TaskResult{}, taskCancels: map[string]context.CancelFunc{}, notify: NewNotificationBus(cfg.NotificationHistoryCapacity), consumers: NewConsumerRegistry(512), cluster: NewCluster(firstNonEmpty(cfg.NodeID, "node-1"))}
+	b := &Broker{cfg: cfg, store: cfg.Store, stateStore: cfg.StateStore, router: NewRouter(), codec: cfg.Codec, frameCodec: cfg.FrameCodec, pool: pool, ownPool: own, ctx: ctx, cancel: cancel, subs: map[string]*Subscription{}, consumerStrategies: map[consumerStrategyKey]ConsumerStrategy{}, dispatchAssignments: map[string]dispatchAssignment{}, waiters: map[string]chan Response{}, tasks: map[string]*TaskInfo{}, taskWait: map[string][]chan TaskResult{}, taskCancels: map[string]context.CancelFunc{}, notify: NewNotificationBus(cfg.NotificationHistoryCapacity), consumers: NewConsumerRegistry(512), cluster: NewCluster(firstNonEmpty(cfg.NodeID, "node-1"))}
 	if cfg.EnablePrometheus {
 		b.promMetrics = GlobalPrometheusMetrics()
 		if cfg.Hooks.OnStarted == nil {
@@ -234,6 +234,7 @@ func New(cfg Config) (*Broker, error) {
 	if err := b.store.DeclareQueue(context.Background(), QueueConfig{Name: cfg.DefaultDLQ, VisibilityTimeout: cfg.DefaultVisibility, RetryPolicy: cfg.DefaultRetry}); err != nil {
 		return nil, fmt.Errorf("declare default DLQ: %w", err)
 	}
+	b.noteQueueDepthLimit(QueueConfig{Name: cfg.DefaultQueue, DLQ: cfg.DefaultDLQ})
 	return b, nil
 }
 
@@ -523,19 +524,24 @@ func (b *Broker) DeclareQueue(ctx context.Context, cfg QueueConfig) error {
 	return err
 }
 
-// noteQueueDepthLimit records a queue's depth limit on the broker. Backpressure
-// needs the limit for queues it is about to publish to, and the limit lives in
-// the store's own queue config, which is not reachable for every Store
-// implementation. Keeping a broker-side map makes the limit available
-// regardless of which store is configured.
+// noteQueueDepthLimit records a queue's depth limit and declaration in the
+// broker. Backpressure needs the limit for queues about to receive publishes,
+// and tenant-scoped subscriptions need to know whether a queue already exists.
+// The limit lives in each store's queue config, which is not reachable for
+// every Store implementation, so this index works with all configured stores.
 func (b *Broker) noteQueueDepthLimit(cfg QueueConfig) {
-	if cfg.MaxDepth <= 0 {
+	if cfg.Name == "" {
 		return
 	}
 	b.queueMaxDepth.Store(cfg.Name, cfg.MaxDepth)
-	if cfg.DLQ != "" {
+	if cfg.DLQ != "" && cfg.DLQ != cfg.Name {
 		b.queueMaxDepth.Store(cfg.DLQ, cfg.MaxDepth)
 	}
+}
+
+func (b *Broker) queueDeclared(name string) bool {
+	_, ok := b.queueMaxDepth.Load(name)
+	return ok
 }
 
 // QueueMaxDepth reports the configured depth limit for a queue, or 0 when the
@@ -610,6 +616,35 @@ func (b *Broker) CommitOffset(ctx context.Context, commit OffsetCommit) error {
 		b.notify.Publish(Notification{Type: "stream.offset_committed", Source: b.cfg.Name, Severity: SeverityInfo, Stream: commit.Stream, TenantID: tenant, Timestamp: time.Now(), Data: map[string]any{"group": commit.ConsumerGroup, "offset": commit.Offset}})
 	}
 	return err
+}
+
+// CommitOffsetAndAppend atomically checkpoints a stream consumer group and
+// appends the supplied output messages. The configured Store must implement
+// OffsetAppendStore; the method never falls back to two separate mutations.
+// Set OffsetCommit.TransactionID to deduplicate retries. Reusing an ID with
+// different input returns ErrTransactionConflict. Stores retain the most recent
+// 4096 transaction outcomes; older IDs may be evicted. On ReplicatedStore, a
+// caller timeout can leave the commit result unknown, so use a stable ID. A
+// retry resolves full messages while they remain in the store; after message
+// cleanup, it returns the retained message metadata.
+func (b *Broker) CommitOffsetAndAppend(ctx context.Context, commit OffsetCommit, entries []AppendEntry) ([]Message, error) {
+	tenant, err := resolveTenant(ctx, commit.TenantID)
+	if err != nil {
+		return nil, err
+	}
+	commit.TenantID = tenant
+	store, ok := b.store.(OffsetAppendStore)
+	if !ok {
+		return nil, ErrUnsupportedMode
+	}
+	publisher := &Publisher{b: b}
+	stored, err := store.CommitOffsetAndAppend(ctx, commit, entries)
+	if err != nil {
+		publisher.recordBackpressureError(err, uint64(len(entries)))
+		return nil, err
+	}
+	b.notify.Publish(Notification{Type: "stream.offset_committed", Source: b.cfg.Name, Severity: SeverityInfo, Stream: commit.Stream, TenantID: tenant, Timestamp: time.Now(), Data: map[string]any{"group": commit.ConsumerGroup, "offset": commit.Offset}})
+	return stored, nil
 }
 
 func (b *Broker) ConsumerOffset(ctx context.Context, commit OffsetCommit) (uint64, error) {

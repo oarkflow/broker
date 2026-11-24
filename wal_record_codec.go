@@ -62,6 +62,13 @@ const (
 	// walOpSweepLeases is appended after the released codes so on-disk records
 	// written by earlier builds keep their operation bytes.
 	walOpSweepLeases
+	// walOpCommitOffsetTenant adds an explicit tenant field while preserving the
+	// original offset operation encoding for old WAL records.
+	walOpCommitOffsetTenant
+	walOpCommitOffsetAppend
+	// walOpCommitOffsetAppendTxn extends the prior combined operation with a
+	// transaction ID and retained retry outcome without changing its encoding.
+	walOpCommitOffsetAppendTxn
 )
 
 // WALCodecConfig configures the native BWL1 WAL record codec.
@@ -444,6 +451,12 @@ func walOperationCode(op string) (byte, bool) {
 		return walOpUpdate, true
 	case "commit_offset":
 		return walOpCommitOffset, true
+	case "commit_offset_tenant":
+		return walOpCommitOffsetTenant, true
+	case "commit_offset_append":
+		return walOpCommitOffsetAppend, true
+	case "commit_offset_append_txn":
+		return walOpCommitOffsetAppendTxn, true
 	case "sweep_leases":
 		return walOpSweepLeases, true
 	default:
@@ -487,6 +500,12 @@ func walOperationName(op byte) (string, bool) {
 		return "update", true
 	case walOpCommitOffset:
 		return "commit_offset", true
+	case walOpCommitOffsetTenant:
+		return "commit_offset_tenant", true
+	case walOpCommitOffsetAppend:
+		return "commit_offset_append", true
+	case walOpCommitOffsetAppendTxn:
+		return "commit_offset_append_txn", true
 	case walOpSweepLeases:
 		return "sweep_leases", true
 	default:
@@ -529,6 +548,25 @@ func encodeWALOperation(w *walBinaryWriter, op byte, r walRecord) {
 		w.message(r.Message, 0)
 	case walOpCommitOffset:
 		w.offsetCommit(r.Offset)
+	case walOpCommitOffsetTenant:
+		w.offsetCommit(r.Offset)
+		w.string(r.Offset.TenantID)
+	case walOpCommitOffsetAppend:
+		w.offsetCommit(r.Offset)
+		w.string(r.Offset.TenantID)
+		w.appendEntries(r.Entries)
+	case walOpCommitOffsetAppendTxn:
+		w.offsetCommit(r.Offset)
+		w.string(r.Offset.TenantID)
+		w.string(r.Offset.TransactionID)
+		w.appendEntries(r.Entries)
+		w.string(r.OffsetTransaction.Fingerprint)
+		w.messages(r.OffsetTransaction.Messages)
+		createdAt := int64(0)
+		if !r.OffsetTransaction.CreatedAt.IsZero() {
+			createdAt = r.OffsetTransaction.CreatedAt.UnixNano()
+		}
+		w.varint(createdAt)
 	case walOpSweepLeases:
 		w.messages(r.Messages)
 	}
@@ -569,6 +607,23 @@ func decodeWALOperation(r *walBinaryReader, op byte, out *walRecord) {
 		out.Message = r.message(Message{})
 	case walOpCommitOffset:
 		out.Offset = r.offsetCommit()
+	case walOpCommitOffsetTenant:
+		out.Offset = r.offsetCommit()
+		out.Offset.TenantID = r.string()
+	case walOpCommitOffsetAppend:
+		out.Offset = r.offsetCommit()
+		out.Offset.TenantID = r.string()
+		out.Entries = r.appendEntries()
+	case walOpCommitOffsetAppendTxn:
+		out.Offset = r.offsetCommit()
+		out.Offset.TenantID = r.string()
+		out.Offset.TransactionID = r.string()
+		out.Entries = r.appendEntries()
+		out.OffsetTransaction.Fingerprint = r.string()
+		out.OffsetTransaction.Messages = r.messages()
+		if createdAt := r.varint(); createdAt != 0 {
+			out.OffsetTransaction.CreatedAt = time.Unix(0, createdAt).UTC()
+		}
 	case walOpSweepLeases:
 		out.Messages = r.messages()
 	}

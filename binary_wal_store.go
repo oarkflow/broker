@@ -47,6 +47,14 @@ func (s *BinaryFileWALStore) StoreHealth() error {
 	return s.gc.healthError()
 }
 
+func (s *BinaryFileWALStore) Stats(ctx context.Context) (StoreStats, error) {
+	stats, err := s.MemoryStore.Stats(ctx)
+	if err == nil && s.gc != nil {
+		stats.WALGroupCommit = s.gc.stats()
+	}
+	return stats, err
+}
+
 func (s *BinaryFileWALStore) SetHealthCallback(fn func(error)) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
@@ -216,7 +224,13 @@ func (s *BinaryFileWALStore) applyRecovered(r walRecord) {
 	case "update":
 		_ = s.MemoryStore.Update(ctx, r.Message)
 	case "commit_offset":
+		_ = s.MemoryStore.CommitOffset(ctx, legacyOffsetCommit(r.Offset))
+	case "commit_offset_tenant":
 		_ = s.MemoryStore.CommitOffset(ctx, r.Offset)
+	case "commit_offset_append":
+		_ = s.MemoryStore.appendRecoveredOffsetAtomic(r.Entries, r.Offset, r.OffsetTransaction)
+	case "commit_offset_append_txn":
+		_ = s.MemoryStore.appendRecoveredOffsetAtomic(r.Entries, r.Offset, r.OffsetTransaction)
 	case "sweep_leases":
 		_ = s.MemoryStore.applySweepLeases(r.Messages)
 	}
@@ -588,10 +602,51 @@ func (s *BinaryFileWALStore) CommitOffset(ctx context.Context, commit OffsetComm
 		return err
 	}
 	// WAL-first: persist before updating the in-memory offset map.
-	if err := s.write(walRecord{Op: "commit_offset", Offset: persisted}); err != nil {
+	if err := s.write(walRecord{Op: "commit_offset_tenant", Offset: persisted}); err != nil {
 		return err
 	}
 	return s.MemoryStore.CommitOffset(context.Background(), persisted)
+}
+
+func (s *BinaryFileWALStore) CommitOffsetAndAppend(ctx context.Context, commit OffsetCommit, entries []AppendEntry) ([]Message, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	commit, entries, fingerprint, err := prepareOffsetAppendRequest(ctx, commit, entries)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := s.MemoryStore.ConsumerOffset(ctx, commit); err != nil {
+		return nil, err
+	}
+	if transaction, found, err := s.MemoryStore.lookupOffsetAppendTransaction(commit, fingerprint); err != nil {
+		return nil, err
+	} else if found {
+		return transaction.Messages, nil
+	}
+	persistedOffset, err := durableOffsetCommit(ctx, commit)
+	if err != nil {
+		return nil, err
+	}
+	prepared, err := s.MemoryStore.prepareAppendAtomic(ctx, entries)
+	if err != nil {
+		return nil, err
+	}
+	persistedEntries := storedAppendEntries(prepared)
+	transaction := OffsetAppendTransaction{}
+	if fingerprint != "" {
+		transaction = OffsetAppendTransaction{Fingerprint: fingerprint, Messages: compactOffsetAppendMessages(prepared), CreatedAt: time.Now()}
+	}
+	op := "commit_offset_append"
+	if fingerprint != "" {
+		op = "commit_offset_append_txn"
+	}
+	if err := s.write(walRecord{Op: op, Offset: persistedOffset, Entries: persistedEntries, OffsetTransaction: transaction}); err != nil {
+		return nil, err
+	}
+	if err := s.MemoryStore.appendRecoveredOffsetAtomic(persistedEntries, persistedOffset, transaction); err != nil {
+		return nil, fmt.Errorf("apply durable offset and append: %w", err)
+	}
+	return prepared, nil
 }
 
 // SweepLeases implements WAL-first ordering: prepare the deterministic expiry

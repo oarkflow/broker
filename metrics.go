@@ -16,16 +16,33 @@ type PrometheusMetrics struct {
 	mu sync.RWMutex
 
 	// Counters
-	published      atomic.Uint64
-	delivered      atomic.Uint64
-	acked          atomic.Uint64
-	nacked         atomic.Uint64
-	deadLettered   atomic.Uint64
-	retried        atomic.Uint64
-	moved          atomic.Uint64
-	publishedBytes atomic.Uint64
-	deliveredBytes atomic.Uint64
-	storeFenced    atomic.Uint64
+	published                  atomic.Uint64
+	delivered                  atomic.Uint64
+	acked                      atomic.Uint64
+	nacked                     atomic.Uint64
+	deadLettered               atomic.Uint64
+	retried                    atomic.Uint64
+	moved                      atomic.Uint64
+	publishedBytes             atomic.Uint64
+	deliveredBytes             atomic.Uint64
+	storeFenced                atomic.Uint64
+	publishRateLimited         atomic.Uint64
+	publishBackpressured       atomic.Uint64
+	outboxDispatchAttempts     atomic.Uint64
+	outboxDispatchFailures     atomic.Uint64
+	outboxPublished            atomic.Uint64
+	outboxDeadLettered         atomic.Uint64
+	consumerBatches            atomic.Uint64
+	consumerBatchMessages      atomic.Uint64
+	consumerMaxBatchSize       atomic.Uint64
+	consumerBatchWaitNanos     atomic.Uint64
+	consumerBatchWaitCurrent   sync.Map // *Subscription -> adaptive wait in nanoseconds
+	walCommitBatches           atomic.Uint64
+	walCommitRequests          atomic.Uint64
+	walCommitMaxBatch          atomic.Uint64
+	walCommitCoalesceWaitNanos atomic.Uint64
+	walCommitCurrentWaitNanos  atomic.Uint64
+	walCommitErrors            atomic.Uint64
 
 	// Per-queue counters
 	queueDepth  sync.Map // queue -> *atomic.Int64
@@ -149,6 +166,68 @@ func (m *PrometheusMetrics) RecordStoreFenced() {
 	m.storeFenced.Add(1)
 }
 
+// RecordRateLimited records a publish rejected by queue or topic admission.
+func (m *PrometheusMetrics) RecordRateLimited() {
+	m.publishRateLimited.Add(1)
+}
+
+// RecordBackpressured records a publish rejected by queue-depth admission.
+func (m *PrometheusMetrics) RecordBackpressured() {
+	m.RecordBackpressuredN(1)
+}
+
+func (m *PrometheusMetrics) RecordBackpressuredN(count uint64) {
+	m.publishBackpressured.Add(count)
+}
+
+// RecordOutboxDispatchAttempt records an attempt to append an outbox message.
+func (m *PrometheusMetrics) RecordOutboxDispatchAttempt() {
+	m.outboxDispatchAttempts.Add(1)
+}
+
+// RecordOutboxDispatchFailure records a failed append attempt for an outbox message.
+func (m *PrometheusMetrics) RecordOutboxDispatchFailure() {
+	m.outboxDispatchFailures.Add(1)
+}
+
+// RecordOutboxPublished records a successfully persisted outbox publish outcome.
+func (m *PrometheusMetrics) RecordOutboxPublished() {
+	m.outboxPublished.Add(1)
+}
+
+// RecordOutboxDeadLettered records a successfully completed outbox DLQ append.
+func (m *PrometheusMetrics) RecordOutboxDeadLettered() {
+	m.outboxDeadLettered.Add(1)
+}
+
+// SetConsumerBatchWait updates the current adaptive wait for a batch consumer.
+func (m *PrometheusMetrics) SetConsumerBatchWait(subscription *Subscription, wait time.Duration) {
+	if subscription != nil {
+		m.consumerBatchWaitCurrent.Store(subscription, int64(wait))
+	}
+}
+
+// RemoveConsumerBatchWait removes an inactive batch consumer from the current wait gauge.
+func (m *PrometheusMetrics) RemoveConsumerBatchWait(subscription *Subscription) {
+	if subscription != nil {
+		m.consumerBatchWaitCurrent.Delete(subscription)
+	}
+}
+
+// RecordConsumerBatch records one delivered consumer batch and its collection wait.
+func (m *PrometheusMetrics) RecordConsumerBatch(subscription *Subscription, size int, wait, currentWait time.Duration) {
+	if size < 0 {
+		size = 0
+	}
+	m.SetConsumerBatchWait(subscription, currentWait)
+	m.consumerBatches.Add(1)
+	m.consumerBatchMessages.Add(uint64(size))
+	updateAtomicMax(&m.consumerMaxBatchSize, uint64(size))
+	if wait > 0 {
+		m.consumerBatchWaitNanos.Add(uint64(wait))
+	}
+}
+
 // SetActiveConsumers sets the active consumer count.
 func (m *PrometheusMetrics) SetActiveConsumers(n int) {
 	m.activeConsumers.Store(int64(n))
@@ -159,11 +238,17 @@ func (m *PrometheusMetrics) SetActiveSubscriptions(n int) {
 	m.activeSubscriptions.Store(int64(n))
 }
 
-// UpdateStoreStats updates store-level gauge metrics.
+// UpdateStoreStats updates store-level metrics from a store stats snapshot.
 func (m *PrometheusMetrics) UpdateStoreStats(stats StoreStats) {
 	m.storeMessages.Store(int64(stats.Messages))
 	m.storeLeased.Store(int64(stats.Leased))
 	m.storeDeadLetter.Store(int64(stats.DeadLetter))
+	m.walCommitBatches.Store(stats.WALGroupCommit.Batches)
+	m.walCommitRequests.Store(stats.WALGroupCommit.Requests)
+	m.walCommitMaxBatch.Store(stats.WALGroupCommit.MaxBatchSize)
+	m.walCommitCoalesceWaitNanos.Store(stats.WALGroupCommit.CoalesceWaitNanos)
+	m.walCommitCurrentWaitNanos.Store(stats.WALGroupCommit.CurrentCoalesceWaitNanos)
+	m.walCommitErrors.Store(stats.WALGroupCommit.Errors)
 }
 
 // recordLatency records a latency value into the appropriate bucket.
@@ -255,6 +340,61 @@ func (m *PrometheusMetrics) exposition() string {
 	b.WriteString("# TYPE broker_store_fenced_total counter\n")
 	fmt.Fprintf(&b, "broker_store_fenced_total %d\n", m.storeFenced.Load())
 
+	b.WriteString("# HELP broker_publish_rate_limited_total Total publishes rejected by queue or topic rate limits.\n")
+	b.WriteString("# TYPE broker_publish_rate_limited_total counter\n")
+	fmt.Fprintf(&b, "broker_publish_rate_limited_total %d\n", m.publishRateLimited.Load())
+
+	b.WriteString("# HELP broker_publish_backpressured_total Total publishes rejected by queue-depth admission checks.\n")
+	b.WriteString("# TYPE broker_publish_backpressured_total counter\n")
+	fmt.Fprintf(&b, "broker_publish_backpressured_total %d\n", m.publishBackpressured.Load())
+
+	b.WriteString("# HELP broker_outbox_dispatch_attempts_total Total durable outbox message append attempts.\n")
+	b.WriteString("# TYPE broker_outbox_dispatch_attempts_total counter\n")
+	fmt.Fprintf(&b, "broker_outbox_dispatch_attempts_total %d\n", m.outboxDispatchAttempts.Load())
+
+	b.WriteString("# HELP broker_outbox_dispatch_failures_total Total failed durable outbox message append attempts.\n")
+	b.WriteString("# TYPE broker_outbox_dispatch_failures_total counter\n")
+	fmt.Fprintf(&b, "broker_outbox_dispatch_failures_total %d\n", m.outboxDispatchFailures.Load())
+
+	b.WriteString("# HELP broker_outbox_published_total Total durable outbox entries successfully published.\n")
+	b.WriteString("# TYPE broker_outbox_published_total counter\n")
+	fmt.Fprintf(&b, "broker_outbox_published_total %d\n", m.outboxPublished.Load())
+
+	b.WriteString("# HELP broker_outbox_dead_lettered_total Total durable outbox entries successfully routed to the dead-letter queue.\n")
+	b.WriteString("# TYPE broker_outbox_dead_lettered_total counter\n")
+	fmt.Fprintf(&b, "broker_outbox_dead_lettered_total %d\n", m.outboxDeadLettered.Load())
+
+	b.WriteString("# HELP broker_consumer_batches_total Total batches submitted to batch consumers.\n")
+	b.WriteString("# TYPE broker_consumer_batches_total counter\n")
+	fmt.Fprintf(&b, "broker_consumer_batches_total %d\n", m.consumerBatches.Load())
+
+	b.WriteString("# HELP broker_consumer_batch_messages_total Total messages submitted in consumer batches.\n")
+	b.WriteString("# TYPE broker_consumer_batch_messages_total counter\n")
+	fmt.Fprintf(&b, "broker_consumer_batch_messages_total %d\n", m.consumerBatchMessages.Load())
+
+	b.WriteString("# HELP broker_consumer_batch_size_max Largest consumer batch observed.\n")
+	b.WriteString("# TYPE broker_consumer_batch_size_max gauge\n")
+	fmt.Fprintf(&b, "broker_consumer_batch_size_max %d\n", m.consumerMaxBatchSize.Load())
+
+	b.WriteString("# HELP broker_consumer_batch_collection_wait_seconds_total Total time spent collecting messages for consumer batches.\n")
+	b.WriteString("# TYPE broker_consumer_batch_collection_wait_seconds_total counter\n")
+	fmt.Fprintf(&b, "broker_consumer_batch_collection_wait_seconds_total %.9f\n", float64(m.consumerBatchWaitNanos.Load())/float64(time.Second))
+
+	var currentWaitTotal int64
+	var currentWaitCount int64
+	m.consumerBatchWaitCurrent.Range(func(_, value any) bool {
+		currentWaitTotal += value.(int64)
+		currentWaitCount++
+		return true
+	})
+	currentWaitMean := 0.0
+	if currentWaitCount > 0 {
+		currentWaitMean = float64(currentWaitTotal) / float64(currentWaitCount) / float64(time.Second)
+	}
+	b.WriteString("# HELP broker_consumer_batch_current_wait_seconds Mean current adaptive wait across active batch consumers.\n")
+	b.WriteString("# TYPE broker_consumer_batch_current_wait_seconds gauge\n")
+	fmt.Fprintf(&b, "broker_consumer_batch_current_wait_seconds %.9f\n", currentWaitMean)
+
 	b.WriteString("# HELP broker_active_consumers Number of active consumers.\n")
 	b.WriteString("# TYPE broker_active_consumers gauge\n")
 	fmt.Fprintf(&b, "broker_active_consumers %d\n", m.activeConsumers.Load())
@@ -274,6 +414,30 @@ func (m *PrometheusMetrics) exposition() string {
 	b.WriteString("# HELP broker_store_dead_letter Total dead-lettered messages.\n")
 	b.WriteString("# TYPE broker_store_dead_letter gauge\n")
 	fmt.Fprintf(&b, "broker_store_dead_letter %d\n", m.storeDeadLetter.Load())
+
+	b.WriteString("# HELP broker_wal_group_commit_batches_total Total WAL group-commit batches processed.\n")
+	b.WriteString("# TYPE broker_wal_group_commit_batches_total counter\n")
+	fmt.Fprintf(&b, "broker_wal_group_commit_batches_total %d\n", m.walCommitBatches.Load())
+
+	b.WriteString("# HELP broker_wal_group_commit_requests_total Total WAL requests included in group commits.\n")
+	b.WriteString("# TYPE broker_wal_group_commit_requests_total counter\n")
+	fmt.Fprintf(&b, "broker_wal_group_commit_requests_total %d\n", m.walCommitRequests.Load())
+
+	b.WriteString("# HELP broker_wal_group_commit_max_batch_size Largest WAL group-commit batch observed.\n")
+	b.WriteString("# TYPE broker_wal_group_commit_max_batch_size gauge\n")
+	fmt.Fprintf(&b, "broker_wal_group_commit_max_batch_size %d\n", m.walCommitMaxBatch.Load())
+
+	b.WriteString("# HELP broker_wal_group_commit_coalesce_wait_seconds_total Total time spent coalescing WAL requests before writes.\n")
+	b.WriteString("# TYPE broker_wal_group_commit_coalesce_wait_seconds_total counter\n")
+	fmt.Fprintf(&b, "broker_wal_group_commit_coalesce_wait_seconds_total %.9f\n", float64(m.walCommitCoalesceWaitNanos.Load())/float64(time.Second))
+
+	b.WriteString("# HELP broker_wal_group_commit_current_coalesce_wait_seconds Current adaptive WAL coalescing wait.\n")
+	b.WriteString("# TYPE broker_wal_group_commit_current_coalesce_wait_seconds gauge\n")
+	fmt.Fprintf(&b, "broker_wal_group_commit_current_coalesce_wait_seconds %.9f\n", float64(m.walCommitCurrentWaitNanos.Load())/float64(time.Second))
+
+	b.WriteString("# HELP broker_wal_group_commit_errors_total Total failed WAL group-commit batches.\n")
+	b.WriteString("# TYPE broker_wal_group_commit_errors_total counter\n")
+	fmt.Fprintf(&b, "broker_wal_group_commit_errors_total %d\n", m.walCommitErrors.Load())
 
 	b.WriteString("# HELP broker_goroutines Number of goroutines.\n")
 	b.WriteString("# TYPE broker_goroutines gauge\n")

@@ -65,9 +65,9 @@ type PartitionReassignment struct {
 }
 
 type ReassignmentRule struct {
-	// SourceTopic is the topic to reassign from.
+	// SourceTopic is the source queue to reassign from.
 	SourceTopic string `json:"source_topic"`
-	// DestTopic is the topic to reassign to.
+	// DestTopic is the destination queue to reassign to.
 	DestTopic string `json:"dest_topic"`
 	// Filter is an optional message filter.
 	Filter *MessageFilter `json:"filter,omitempty"`
@@ -89,6 +89,7 @@ func (pr *PartitionReassignment) AddRule(rule ReassignmentRule) {
 	if rule.BatchSize <= 0 {
 		rule.BatchSize = 100
 	}
+	rule = cloneReassignmentRule(rule)
 	rule.Enabled = true
 	pr.mu.Lock()
 	pr.rules = append(pr.rules, rule)
@@ -113,8 +114,19 @@ func (pr *PartitionReassignment) ListRules() []ReassignmentRule {
 	pr.mu.RLock()
 	defer pr.mu.RUnlock()
 	out := make([]ReassignmentRule, len(pr.rules))
-	copy(out, pr.rules)
+	for i, rule := range pr.rules {
+		out[i] = cloneReassignmentRule(rule)
+	}
 	return out
+}
+
+func cloneReassignmentRule(rule ReassignmentRule) ReassignmentRule {
+	if rule.Filter != nil {
+		filter := *rule.Filter
+		filter.Headers = cloneMap(rule.Filter.Headers)
+		rule.Filter = &filter
+	}
+	return rule
 }
 
 // Execute performs a single reassignment pass for all active rules.
@@ -139,52 +151,51 @@ func (pr *PartitionReassignment) Execute(ctx context.Context) (int, error) {
 }
 
 func (pr *PartitionReassignment) reassignOne(ctx context.Context, rule ReassignmentRule) (int, error) {
-	srcStats, err := pr.broker.Store().Stats(ctx)
+	if rule.SourceTopic == "" || rule.DestTopic == "" || rule.SourceTopic == rule.DestTopic {
+		return 0, errf(ErrInvalidMessage, "partition reassignment requires distinct source and destination queues")
+	}
+	msgs, err := pr.broker.Store().ListQueue(ctx, rule.SourceTopic, rule.BatchSize)
 	if err != nil {
 		return 0, err
 	}
-	srcDepth, ok := srcStats.Queues[rule.SourceTopic]
-	if !ok || srcDepth == 0 {
+	ids := make([]string, 0, len(msgs))
+	for _, msg := range msgs {
+		if msg.Status != MessageQueued {
+			continue
+		}
+		if rule.Filter != nil && !filterMessage(msg, *rule.Filter) {
+			continue
+		}
+		ids = append(ids, msg.ID)
+	}
+	if len(ids) == 0 {
 		return 0, nil
 	}
-	limit := rule.BatchSize
-	if limit > srcDepth {
-		limit = srcDepth
+	moveFilter := MessageFilter{Status: MessageQueued}
+	if rule.Filter != nil {
+		if rule.Filter.Status != "" && rule.Filter.Status != MessageQueued {
+			return 0, nil
+		}
+		moveFilter.Type = rule.Filter.Type
+		moveFilter.TenantID = rule.Filter.TenantID
+		moveFilter.Headers = rule.Filter.Headers
 	}
-	msgs, err := pr.broker.Store().Lease(ctx, LeaseRequest{
-		Queue:      rule.SourceTopic,
-		ConsumerID: "reassignment-" + rule.SourceTopic,
-		Limit:      limit,
+	result, err := pr.broker.Store().Move(ctx, MoveRequest{
+		SourceType:      DestinationQueue,
+		Source:          rule.SourceTopic,
+		DestinationType: DestinationQueue,
+		Destination:     rule.DestTopic,
+		MessageIDs:      ids,
+		Filter:          moveFilter,
+		Mode:            MoveRemoveSource,
+		PreserveID:      true,
+		PreserveOffset:  rule.PreserveOffset,
+		Reason:          "partition reassignment",
 	})
 	if err != nil {
 		return 0, err
 	}
-	reassigned := 0
-	for _, msg := range msgs {
-		if rule.Filter != nil && !filterMessage(msg, *rule.Filter) {
-			_ = pr.broker.Store().Ack(ctx, AckRequest{MessageID: msg.ID, Queue: rule.SourceTopic})
-			continue
-		}
-		_, err := pr.broker.Publisher().Publish(ctx, msg.Topic, msg.Payload,
-			WithQueue(rule.DestTopic),
-			WithHeaders(msg.Headers),
-			WithKey(msg.Key),
-			WithType(msg.Type),
-			WithMessageID(msg.ID),
-		)
-		if err != nil {
-			_ = pr.broker.Store().Nack(ctx, NackRequest{
-				MessageID:        msg.ID,
-				Queue:            rule.SourceTopic,
-				Action:           NackRetry,
-				IncrementAttempt: true,
-			})
-			continue
-		}
-		_ = pr.broker.Store().Ack(ctx, AckRequest{MessageID: msg.ID, Queue: rule.SourceTopic})
-		reassigned++
-	}
-	return reassigned, nil
+	return result.Moved, nil
 }
 
 // StartReassignmentLoop starts periodic partition reassignment.
@@ -220,16 +231,21 @@ func (b *Broker) PartitionReassignment() *PartitionReassignment {
 
 // TopicPartitionStats returns statistics for a topic's partitions.
 type TopicPartitionStats struct {
-	Topic      string          `json:"topic"`
-	Partitions []PartitionInfo `json:"partitions"`
-	TotalMsgs  int             `json:"total_messages"`
+	Topic             string          `json:"topic"`
+	Partitions        []PartitionInfo `json:"partitions"`
+	TotalMsgs         int             `json:"total_messages"`
+	AverageDepth      float64         `json:"average_depth"`
+	MaxPartitionDepth int             `json:"max_partition_depth"`
+	HotPartitions     []int           `json:"hot_partitions,omitempty"`
 }
 
 type PartitionInfo struct {
-	Partition int    `json:"partition"`
-	Name      string `json:"name"`
-	Depth     int    `json:"depth"`
-	Offset    uint64 `json:"offset"`
+	Partition int     `json:"partition"`
+	Name      string  `json:"name"`
+	Depth     int     `json:"depth"`
+	Offset    uint64  `json:"offset"`
+	SkewRatio float64 `json:"skew_ratio"`
+	Hot       bool    `json:"hot"`
 }
 
 // TopicPartitionStats returns partition statistics for a topic.
@@ -242,15 +258,84 @@ func (b *Broker) TopicPartitionStats(ctx context.Context, topic string, partitio
 		return nil, err
 	}
 	result := &TopicPartitionStats{Topic: topic, Partitions: make([]PartitionInfo, partitions)}
+	depths := make([]int, partitions)
 	for i := 0; i < partitions; i++ {
 		name := PartitionedTopicName(topic, i)
 		depth := stats.Queues[name]
+		depths[i] = depth
 		result.Partitions[i] = PartitionInfo{
 			Partition: i,
 			Name:      name,
 			Depth:     depth,
 		}
 		result.TotalMsgs += depth
+		if depth > result.MaxPartitionDepth {
+			result.MaxPartitionDepth = depth
+		}
+	}
+	result.AverageDepth = float64(result.TotalMsgs) / float64(partitions)
+	threshold := 2.0
+	if b.partitionRouter != nil && b.partitionRouter.config.HotPartitionThreshold > 1 {
+		threshold = b.partitionRouter.config.HotPartitionThreshold
+	}
+	if result.AverageDepth > 0 {
+		for i, depth := range depths {
+			ratio := float64(depth) / result.AverageDepth
+			result.Partitions[i].SkewRatio = ratio
+			if ratio >= threshold && float64(depth) > result.AverageDepth {
+				result.Partitions[i].Hot = true
+				result.HotPartitions = append(result.HotPartitions, i)
+			}
+		}
 	}
 	return result, nil
+}
+
+// SelectPartition chooses a partition using the broker's configured strategy.
+// PartitionLeastDepth sends unkeyed messages to a currently shallowest
+// partition, rotating ties. Messages with a key or routing key remain hash
+// assigned so repeated keys continue to map to the same partition.
+func (b *Broker) SelectPartition(ctx context.Context, topic string, msg Message) (int, error) {
+	if b == nil || b.partitionRouter == nil {
+		return 0, ErrClosed
+	}
+	router := b.partitionRouter
+	if router.config.Strategy != PartitionLeastDepth || msg.Key != "" || msg.RoutingKey != "" {
+		return router.SelectPartition(msg), nil
+	}
+	depths := make([]int, router.config.Partitions)
+	if reporter, ok := b.store.(QueueDepthReporter); ok {
+		for i := range depths {
+			depths[i] = reporter.queueDepth(PartitionedTopicName(topic, i))
+		}
+	} else {
+		stats, err := b.store.Stats(ctx)
+		if err != nil {
+			return 0, err
+		}
+		for i := range depths {
+			depths[i] = stats.Queues[PartitionedTopicName(topic, i)]
+		}
+	}
+	return router.selectLeastDepth(depths), nil
+}
+
+// PublishPartitioned publishes to a queue named <topic>.p<partition>, using
+// the broker's configured partition count and strategy.
+func (b *Broker) PublishPartitioned(ctx context.Context, topic string, payload any, opts ...PublishOption) (PublishResult, error) {
+	if b == nil || b.partitionRouter == nil {
+		return PublishResult{}, ErrClosed
+	}
+	var options PublishOptions
+	for _, fn := range opts {
+		if fn != nil {
+			fn(&options)
+		}
+	}
+	partition, err := b.SelectPartition(ctx, topic, Message{ID: options.MessageID, Key: options.Key, RoutingKey: options.RoutingKey})
+	if err != nil {
+		return PublishResult{}, err
+	}
+	opts = append(opts, WithQueue(PartitionedTopicName(topic, partition)))
+	return b.Publisher().Publish(ctx, topic, payload, opts...)
 }

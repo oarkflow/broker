@@ -32,6 +32,7 @@ type Connection struct {
 	clientHeartbeat uint16
 	vhost           string
 	username        string
+	principal       broker.AdminPrincipal
 	closed          chan struct{}
 	closeOnce       sync.Once
 	release         func()
@@ -144,6 +145,11 @@ func (c *Connection) handleMethodFrame(frame *Frame) error {
 	method, err := ParseMethodFrame(frame.Payload)
 	if err != nil {
 		return err
+	}
+	if c.state.Load() == connStateOpen && c.server.cfg.ACL != nil {
+		if err := c.server.cfg.ACL.AdmitRate(c.principal); err != nil {
+			return err
+		}
 	}
 
 	switch method.ClassID {
@@ -268,6 +274,7 @@ func (c *Connection) authenticate(mechanism string, response []byte) error {
 		}
 		if c.server.cfg.ACL != nil {
 			if principal, ok := c.server.cfg.ACL.Authenticate(password); ok {
+				c.principal = principal
 				release, err := c.server.cfg.ACL.AdmitConnection(principal)
 				if err != nil {
 					return err
@@ -297,6 +304,7 @@ func (c *Connection) authenticate(mechanism string, response []byte) error {
 		}
 		if c.server.cfg.ACL != nil {
 			if principal, ok := c.server.cfg.ACL.AuthenticateCertificate(state.VerifiedChains[0][0]); ok {
+				c.principal = principal
 				release, err := c.server.cfg.ACL.AdmitConnection(principal)
 				if err != nil {
 					return err
@@ -421,13 +429,8 @@ func (c *Connection) handleConnectionClose(args []byte) error {
 
 	log.Printf("[amqp] connection close: %d %s", replyCode, replyText)
 
-	// Close all channels
-	c.channelsMu.Lock()
-	for _, ch := range c.channels {
-		ch.close()
-	}
-	c.channels = make(map[uint16]*Channel)
-	c.channelsMu.Unlock()
+	// Close all channels.
+	c.closeChannels()
 
 	// Send Connection.CloseOk
 	return c.codec.WriteMethodFrame(0, ClassConnection, MethodConnectionCloseOk, nil)
@@ -527,9 +530,23 @@ func (c *Connection) removeChannel(id uint16) {
 	c.channelsMu.Unlock()
 }
 
+func (c *Connection) closeChannels() {
+	c.channelsMu.Lock()
+	channels := make([]*Channel, 0, len(c.channels))
+	for _, ch := range c.channels {
+		channels = append(channels, ch)
+	}
+	c.channels = make(map[uint16]*Channel)
+	c.channelsMu.Unlock()
+	for _, ch := range channels {
+		ch.close()
+	}
+}
+
 // Close closes the connection.
 func (c *Connection) Close() error {
 	c.closeOnce.Do(func() {
+		c.closeChannels()
 		if c.release != nil {
 			c.release()
 		}

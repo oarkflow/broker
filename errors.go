@@ -31,22 +31,25 @@ var (
 	// ErrUnauthorized which is an authenticated principal lacking permission.
 	// The two need separating so a client can tell "authenticate again" from
 	// "you are not allowed", which is also how the HTTP status differs.
-	ErrUnauthenticated    = errors.New("broker: unauthenticated")
-	ErrLeaseLost          = errors.New("broker: lease lost")
-	ErrPermanent          = errors.New("broker: permanent error")
-	ErrTransactionClosed  = errors.New("broker: transaction closed")
-	ErrUnsupportedMode    = errors.New("broker: unsupported mode")
-	ErrBrokerUnavailable  = errors.New("broker: unavailable")
-	ErrCallbackFailed     = errors.New("broker: callback failed")
-	ErrCancelled          = errors.New("broker: cancelled")
-	ErrConsumerBanned     = errors.New("broker: consumer banned")
-	ErrRateLimited        = errors.New("broker: rate limited")
-	ErrNotLeader          = errors.New("broker: not leader")
-	ErrStaleEpoch         = errors.New("broker: stale leader epoch")
-	ErrQuorumUnavailable  = errors.New("broker: quorum unavailable")
-	ErrThrottled          = errors.New("broker: throttled")
-	ErrTransactionAborted = errors.New("broker: transaction aborted")
-	ErrStorageUnavailable = errors.New("broker: storage unavailable")
+	ErrUnauthenticated     = errors.New("broker: unauthenticated")
+	ErrLeaseLost           = errors.New("broker: lease lost")
+	ErrOutboxClaimLost     = errors.New("broker: outbox claim lost")
+	ErrPermanent           = errors.New("broker: permanent error")
+	ErrTransactionClosed   = errors.New("broker: transaction closed")
+	ErrTransactionConflict = errors.New("broker: transaction id reused with different input")
+	ErrUnsupportedMode     = errors.New("broker: unsupported mode")
+	ErrBrokerUnavailable   = errors.New("broker: unavailable")
+	ErrCallbackFailed      = errors.New("broker: callback failed")
+	ErrCancelled           = errors.New("broker: cancelled")
+	ErrConsumerBanned      = errors.New("broker: consumer banned")
+	ErrTaskAlreadyExists   = errors.New("broker: task already exists")
+	ErrRateLimited         = errors.New("broker: rate limited")
+	ErrNotLeader           = errors.New("broker: not leader")
+	ErrStaleEpoch          = errors.New("broker: stale leader epoch")
+	ErrQuorumUnavailable   = errors.New("broker: quorum unavailable")
+	ErrThrottled           = errors.New("broker: throttled")
+	ErrTransactionAborted  = errors.New("broker: transaction aborted")
+	ErrStorageUnavailable  = errors.New("broker: storage unavailable")
 )
 
 type RetryClassification string
@@ -174,6 +177,7 @@ var errorCodes = map[error]string{
 	ErrLeaseLost:          "lease_lost",
 	ErrPermanent:          "permanent",
 	ErrTransactionClosed:  "transaction_closed",
+	ErrTaskAlreadyExists:  "task_already_exists",
 	ErrUnsupportedMode:    "unsupported_mode",
 	ErrBrokerUnavailable:  "broker_unavailable",
 	ErrCallbackFailed:     "callback_failed",
@@ -247,7 +251,7 @@ func HTTPStatusForError(err error) int {
 	case errors.Is(err, ErrQueueNotFound), errors.Is(err, ErrTopicNotFound),
 		errors.Is(err, ErrStreamNotFound), errors.Is(err, ErrMessageNotFound):
 		return http.StatusNotFound
-	case errors.Is(err, ErrDuplicateMessage):
+	case errors.Is(err, ErrDuplicateMessage), errors.Is(err, ErrTaskAlreadyExists):
 		return http.StatusConflict
 	case errors.Is(err, ErrBackpressure), errors.Is(err, ErrRateLimited), errors.Is(err, ErrThrottled):
 		return http.StatusTooManyRequests

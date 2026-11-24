@@ -65,6 +65,20 @@ type MinimalAtomicStore interface {
 	AppendAtomicMinimal(context.Context, []AppendEntry) error
 }
 
+// OffsetAppendStore atomically commits a stream consumer offset with a batch of
+// produced messages. Implementations must persist both effects as one unit.
+type OffsetAppendStore interface {
+	CommitOffsetAndAppend(context.Context, OffsetCommit, []AppendEntry) ([]Message, error)
+}
+
+// ConsumerOffsetLister is an optional extension for stores that can enumerate
+// durable consumer-group offsets for a stream. It keeps custom Store
+// implementations source-compatible while allowing built-in stores to provide
+// authoritative offset listings.
+type ConsumerOffsetLister interface {
+	ConsumerOffsets(context.Context, string, string) (map[string]uint64, error)
+}
+
 // OwnedAtomicStore is the zero-copy batch append path. Ownership of message
 // payload/header/metadata slices and maps transfers to the store; callers must
 // not mutate entries after the method returns.
@@ -150,6 +164,17 @@ type OffsetCommit struct {
 	ConsumerGroup string `json:"consumer_group"`
 	Offset        uint64 `json:"offset"`
 	TenantID      string `json:"tenant_id,omitempty"`
+	// TransactionID makes CommitOffsetAndAppend retries idempotent when set.
+	TransactionID string `json:"transaction_id,omitempty"`
+}
+
+// OffsetAppendTransaction retains compact output metadata for retry-safe
+// offset-plus-append operations. Entries are scoped by tenant and bounded by
+// the store; full messages are resolved from the message index when available.
+type OffsetAppendTransaction struct {
+	Fingerprint string    `json:"fingerprint"`
+	Messages    []Message `json:"messages,omitempty"`
+	CreatedAt   time.Time `json:"created_at"`
 }
 
 type MoveRequest struct {
@@ -178,23 +203,37 @@ type MessageFilter struct {
 }
 
 type MoveResult struct {
-	Moved       int      `json:"moved"`
-	Copied      int      `json:"copied"`
-	Skipped     int      `json:"skipped"`
-	MessageIDs  []string `json:"message_ids,omitempty"`
-	Destination string   `json:"destination"`
-	DryRun      bool     `json:"dry_run"`
+	Moved                 int      `json:"moved"`
+	Copied                int      `json:"copied"`
+	Skipped               int      `json:"skipped"`
+	MessageIDs            []string `json:"message_ids,omitempty"`
+	DestinationMessageIDs []string `json:"destination_message_ids,omitempty"`
+	Destination           string   `json:"destination"`
+	DryRun                bool     `json:"dry_run"`
 }
 
 type StoreStats struct {
-	Queues     map[string]int               `json:"queues"`
-	Topics     map[string]int               `json:"topics"`
-	Streams    map[string]int               `json:"streams"`
-	Offsets    map[string]map[string]uint64 `json:"offsets,omitempty"`
-	DLQ        map[string]int               `json:"dlq"`
-	Messages   int                          `json:"messages"`
-	Leased     int                          `json:"leased"`
-	DeadLetter int                          `json:"dead_letter"`
+	Queues         map[string]int               `json:"queues"`
+	Topics         map[string]int               `json:"topics"`
+	Streams        map[string]int               `json:"streams"`
+	Offsets        map[string]map[string]uint64 `json:"offsets,omitempty"`
+	DLQ            map[string]int               `json:"dlq"`
+	Messages       int                          `json:"messages"`
+	Leased         int                          `json:"leased"`
+	DeadLetter     int                          `json:"dead_letter"`
+	WALGroupCommit WALGroupCommitStats          `json:"wal_group_commit,omitempty"`
+}
+
+// WALGroupCommitStats reports cumulative work performed by a WAL group-commit
+// writer. CoalesceWaitNanos is the total time requests spent being collected
+// into batches, excluding WAL writes and fsyncs.
+type WALGroupCommitStats struct {
+	Batches                  uint64 `json:"batches"`
+	Requests                 uint64 `json:"requests"`
+	MaxBatchSize             uint64 `json:"max_batch_size"`
+	CoalesceWaitNanos        uint64 `json:"coalesce_wait_nanos"`
+	CurrentCoalesceWaitNanos uint64 `json:"current_coalesce_wait_nanos"`
+	Errors                   uint64 `json:"errors"`
 }
 
 type memoryQueue struct {
@@ -272,6 +311,7 @@ type MemoryStore struct {
 	messages    map[string]*Message
 	history     map[string][]MessageHistory
 	offsets     map[string]map[string]uint64
+	offsetTx    map[string]OffsetAppendTransaction
 	dedup       map[string]time.Time
 	idemp       map[string]string
 	producerSeq map[string]ProducerState
@@ -381,7 +421,7 @@ func (s *MemoryStore) nextSweepFull() bool {
 }
 
 func NewMemoryStore() *MemoryStore {
-	return &MemoryStore{queues: map[string]*memoryQueue{}, topics: map[string]*memoryTopic{}, streams: map[string]*memoryStream{}, messages: map[string]*Message{}, history: map[string][]MessageHistory{}, offsets: map[string]map[string]uint64{}, dedup: map[string]time.Time{}, idemp: map[string]string{}, producerSeq: map[string]ProducerState{}, moveOps: map[string]MoveResult{}, moveSeen: map[string]struct{}{}, rand: mathrand.New(mathrand.NewSource(time.Now().UnixNano())), historyLimit: 32, retainCompleted: true, completed: map[string]struct{}{}, completedLimit: 65536, compact: compactBacklogDefault}
+	return &MemoryStore{queues: map[string]*memoryQueue{}, topics: map[string]*memoryTopic{}, streams: map[string]*memoryStream{}, messages: map[string]*Message{}, history: map[string][]MessageHistory{}, offsets: map[string]map[string]uint64{}, offsetTx: map[string]OffsetAppendTransaction{}, dedup: map[string]time.Time{}, idemp: map[string]string{}, producerSeq: map[string]ProducerState{}, moveOps: map[string]MoveResult{}, moveSeen: map[string]struct{}{}, rand: mathrand.New(mathrand.NewSource(time.Now().UnixNano())), historyLimit: 32, retainCompleted: true, completed: map[string]struct{}{}, completedLimit: 65536, compact: compactBacklogDefault}
 }
 
 func (*MemoryStore) ConfirmationLevel() ConfirmLevel { return ConfirmEnqueued }
@@ -605,17 +645,19 @@ func (s *MemoryStore) appendLockedCollect(msg Message, dests []Destination, coll
 		msg.Status = MessageAccepted
 	}
 	if !replay && msg.DeduplicationID != "" {
-		if until, ok := s.dedup[msg.DeduplicationID]; ok && until.After(time.Now()) {
+		key := tenantScopedKey(msg.TenantID, msg.DeduplicationID)
+		if until, ok := s.dedup[key]; ok && until.After(time.Now()) {
 			return nil, ErrDuplicateMessage
 		}
 	}
 	if !replay && msg.IdempotencyKey != "" {
-		if existing, ok := s.idemp[msg.IdempotencyKey]; ok && existing != "" {
+		key := tenantScopedKey(msg.TenantID, msg.IdempotencyKey)
+		if existing, ok := s.idemp[key]; ok && existing != "" {
 			return nil, ErrDuplicateMessage
 		}
 	}
 	if !replay && msg.ProducerID != "" && msg.ProducerSequence != nil {
-		if err := validateProducerSequence(s.producerSeq[msg.ProducerID], msg); err != nil {
+		if err := validateProducerSequence(s.producerSeq[producerStateKey(msg.TenantID, msg.ProducerID)], msg); err != nil {
 			return nil, err
 		}
 	}
@@ -715,13 +757,14 @@ func (s *MemoryStore) appendLockedCollect(msg Message, dests []Destination, coll
 		}
 	}
 	if msg.DeduplicationID != "" {
-		s.dedup[msg.DeduplicationID] = time.Now().Add(dedupWindow(msg))
+		s.dedup[tenantScopedKey(msg.TenantID, msg.DeduplicationID)] = time.Now().Add(dedupWindow(msg))
 	}
 	if msg.IdempotencyKey != "" {
-		s.idemp[msg.IdempotencyKey] = msg.ID
+		s.idemp[tenantScopedKey(msg.TenantID, msg.IdempotencyKey)] = msg.ID
 	}
 	if msg.ProducerID != "" && msg.ProducerSequence != nil {
-		s.producerSeq[msg.ProducerID] = advanceProducerState(s.producerSeq[msg.ProducerID], msg)
+		key := producerStateKey(msg.TenantID, msg.ProducerID)
+		s.producerSeq[key] = advanceProducerState(s.producerSeq[key], msg)
 	}
 	return out, nil
 }
@@ -975,6 +1018,7 @@ func (s *MemoryStore) validateAtomicLocked(entries []AppendEntry) error {
 			return errf(ErrInvalidMessage, "message id required")
 		}
 		if id := entry.Message.DeduplicationID; id != "" {
+			id = tenantScopedKey(entry.Message.TenantID, id)
 			if seenDedup == nil {
 				seenDedup = make(map[string]struct{})
 			}
@@ -987,6 +1031,7 @@ func (s *MemoryStore) validateAtomicLocked(entries []AppendEntry) error {
 			}
 		}
 		if key := entry.Message.IdempotencyKey; key != "" {
+			key = tenantScopedKey(entry.Message.TenantID, key)
 			if seenIdemp == nil {
 				seenIdemp = make(map[string]struct{})
 			}
@@ -999,6 +1044,7 @@ func (s *MemoryStore) validateAtomicLocked(entries []AppendEntry) error {
 			}
 		}
 		if producerID := entry.Message.ProducerID; producerID != "" && entry.Message.ProducerSequence != nil {
+			producerID = producerStateKey(entry.Message.TenantID, producerID)
 			state, ok := pendingProducers[producerID]
 			if !ok {
 				state = s.producerSeq[producerID]
@@ -1749,7 +1795,7 @@ func (s *MemoryStore) moveLocked(ctx context.Context, req MoveRequest, plannedID
 	ids := s.resolveMoveIDsLocked(req)
 	for _, id := range ids {
 		m, ok := s.msgLockedOK(id)
-		if !ok {
+		if !ok || !s.moveSourceMatchesLocked(req, m) {
 			res.Skipped++
 			continue
 		}
@@ -1761,9 +1807,36 @@ func (s *MemoryStore) moveLocked(ctx context.Context, req MoveRequest, plannedID
 			res.Skipped++
 			continue
 		}
+		if moveIsSelfTransfer(req) {
+			res.Skipped++
+			continue
+		}
+		if req.DestinationType == DestinationQueue || req.DestinationType == DestinationDLQ {
+			if destination := s.queues[req.Destination]; destination != nil && destination.cfg.MaxDepth > 0 && destination.depth >= destination.cfg.MaxDepth {
+				// A move must not bypass the destination queue's admission cap.
+				// Skip instead of applying drop policies: the source remains intact
+				// so a later pass can retry once the destination has capacity.
+				res.Skipped++
+				continue
+			}
+		}
+		if req.DryRun && (req.Mode == MoveCopy || req.Mode == MoveReplay) {
+			copyID := plannedIDs[id]
+			if copyID == "" {
+				copyID = s.copyTargetIDLocked(id, req)
+			}
+			if s.hasMsgLocked(copyID) {
+				res.Skipped++
+				continue
+			}
+		}
 		res.MessageIDs = append(res.MessageIDs, id)
 		if req.DryRun {
-			res.Moved++
+			if req.Mode == MoveCopy || req.Mode == MoveReplay {
+				res.Copied++
+			} else {
+				res.Moved++
+			}
 			continue
 		}
 		newID := id
@@ -1784,8 +1857,9 @@ func (s *MemoryStore) moveLocked(ctx context.Context, req MoveRequest, plannedID
 				newID = s.copyTargetIDLocked(id, req)
 			}
 			// Already copied by an earlier attempt of this migration.
-			if _, exists := s.messages[newID]; exists {
+			if s.hasMsgLocked(newID) {
 				res.Skipped++
+				res.DestinationMessageIDs = append(res.DestinationMessageIDs, newID)
 				continue
 			}
 		} else if !req.PreserveID {
@@ -1798,7 +1872,9 @@ func (s *MemoryStore) moveLocked(ctx context.Context, req MoveRequest, plannedID
 			}
 		}
 		clone := cloneMessage(*m)
-		clone.ParentID = firstNonEmpty(clone.ParentID, m.ID)
+		if newID != m.ID {
+			clone.ParentID = firstNonEmpty(clone.ParentID, m.ID)
+		}
 		clone.ID = newID
 		clone.LeaseToken = ""
 		clone.LeaseUntil = time.Time{}
@@ -1815,6 +1891,7 @@ func (s *MemoryStore) moveLocked(ctx context.Context, req MoveRequest, plannedID
 		}
 		d := Destination{Kind: req.DestinationType, Name: req.Destination}
 		s.appendCloneLocked(clone, d, req, &res)
+		res.DestinationMessageIDs = append(res.DestinationMessageIDs, newID)
 		if req.Mode != MoveCopy && req.Mode != MoveReplay {
 			s.removeFromSourceLocked(req.SourceType, req.Source, id)
 			m.Status = MessageMoved
@@ -1848,24 +1925,56 @@ func (s *MemoryStore) prepareMove(ctx context.Context, req MoveRequest) (map[str
 	defer s.mu.RUnlock()
 	res := MoveResult{Destination: req.Destination, DryRun: req.DryRun}
 	planned := make(map[string]string)
-	for _, id := range s.resolveMoveIDsLocked(req) {
+	ids := s.resolveMoveIDsLocked(req)
+	projectedDepth, maxDepth := 0, 0
+	if req.DestinationType == DestinationQueue || req.DestinationType == DestinationDLQ {
+		if destination := s.queues[req.Destination]; destination != nil {
+			projectedDepth, maxDepth = destination.depth, destination.cfg.MaxDepth
+		}
+	}
+	for _, id := range ids {
 		message, ok := s.peekMsgOK(id)
-		if !ok || !tenantAllowed(ctx, message.TenantID) || !filterMessage(*message, req.Filter) {
+		if !ok || !s.moveSourceMatchesLocked(req, message) || !tenantAllowed(ctx, message.TenantID) || !filterMessage(*message, req.Filter) {
 			res.Skipped++
 			continue
 		}
-		res.MessageIDs = append(res.MessageIDs, id)
-		if req.DryRun {
-			res.Moved++
+		if moveIsSelfTransfer(req) {
+			res.Skipped++
 			continue
 		}
-		if req.Mode == MoveCopy || req.Mode == MoveReplay || !req.PreserveID {
-			planned[id] = s.nextMoveIDLocked(id, req.Mode)
+		if maxDepth > 0 && projectedDepth >= maxDepth {
+			res.Skipped++
+			continue
 		}
 		if req.Mode == MoveCopy || req.Mode == MoveReplay {
+			copyID := s.copyTargetIDLocked(id, req)
+			if s.hasMsgLocked(copyID) {
+				res.Skipped++
+				res.DestinationMessageIDs = append(res.DestinationMessageIDs, copyID)
+				continue
+			}
+			planned[id] = copyID
+			res.DestinationMessageIDs = append(res.DestinationMessageIDs, copyID)
+		} else if !req.PreserveID && !req.DryRun {
+			planned[id] = s.nextMoveIDLocked(id, req.Mode)
+			res.DestinationMessageIDs = append(res.DestinationMessageIDs, planned[id])
+		} else if req.PreserveID {
+			res.DestinationMessageIDs = append(res.DestinationMessageIDs, id)
+		}
+		res.MessageIDs = append(res.MessageIDs, id)
+		if req.DryRun {
+			if req.Mode == MoveCopy || req.Mode == MoveReplay {
+				res.Copied++
+			} else {
+				res.Moved++
+			}
+		} else if req.Mode == MoveCopy || req.Mode == MoveReplay {
 			res.Copied++
 		} else {
 			res.Moved++
+		}
+		if req.DestinationType == DestinationQueue || req.DestinationType == DestinationDLQ {
+			projectedDepth++
 		}
 	}
 	return planned, res, nil
@@ -1981,15 +2090,19 @@ func (s *MemoryStore) appendCloneLocked(m Message, d Destination, req MoveReques
 			s.queues[d.Name] = &memoryQueue{cfg: QueueConfig{Name: d.Name}, state: QueueActive, ready: make(chan struct{}, 1)}
 		}
 		m.Queue = d.Name
-		m.Status = MessageQueued
 		if d.Kind == DestinationDLQ {
 			m.Status = MessageDeadLettered
+		} else if m.AvailableAt.After(time.Now()) {
+			m.Status = MessageScheduled
+		} else {
+			m.Status = MessageQueued
 		}
 		s.messages[m.ID] = &m
 		s.noteLeasedLocked(s.messages[m.ID])
 		q := s.queues[d.Name]
 		q.ids = append(q.ids, m.ID)
 		q.depth++
+		q.notifyReady()
 		if m.Priority != 0 {
 			q.hasPriority = true
 		}
@@ -2284,6 +2397,11 @@ func (s *MemoryStore) CommitOffset(ctx context.Context, commit OffsetCommit) err
 	if _, ok := s.streams[commit.Stream]; !ok {
 		return ErrStreamNotFound
 	}
+	s.commitOffsetLocked(commit)
+	return nil
+}
+
+func (s *MemoryStore) commitOffsetLocked(commit OffsetCommit) {
 	if s.offsets[commit.Stream] == nil {
 		s.offsets[commit.Stream] = map[string]uint64{}
 	}
@@ -2291,10 +2409,192 @@ func (s *MemoryStore) CommitOffset(ctx context.Context, commit OffsetCommit) err
 	if commit.Offset > s.offsets[commit.Stream][group] {
 		s.offsets[commit.Stream][group] = commit.Offset
 	}
+}
+
+func prepareOffsetAppendRequest(ctx context.Context, commit OffsetCommit, entries []AppendEntry) (OffsetCommit, []AppendEntry, string, error) {
+	if commit.Stream == "" || commit.ConsumerGroup == "" {
+		return OffsetCommit{}, nil, "", errf(ErrInvalidMessage, "stream and consumer group required")
+	}
+	tenant, err := resolveTenant(ctx, commit.TenantID)
+	if err != nil {
+		return OffsetCommit{}, nil, "", err
+	}
+	commit.TenantID = tenant
+	entries = append([]AppendEntry(nil), entries...)
+	for i := range entries {
+		tenant, err := resolveTenant(ctx, entries[i].Message.TenantID)
+		if err != nil {
+			return OffsetCommit{}, nil, "", err
+		}
+		entries[i].Message.TenantID = tenant
+	}
+	if commit.TransactionID == "" {
+		return commit, entries, "", nil
+	}
+	fingerprintInput := struct {
+		Offset  OffsetCommit  `json:"offset"`
+		Entries []AppendEntry `json:"entries"`
+	}{Offset: commit, Entries: entries}
+	fingerprintInput.Offset.TransactionID = ""
+	b, err := json.Marshal(fingerprintInput)
+	if err != nil {
+		return OffsetCommit{}, nil, "", err
+	}
+	digest := sha256.Sum256(b)
+	return commit, entries, hex.EncodeToString(digest[:]), nil
+}
+
+func cloneOffsetAppendTransaction(in OffsetAppendTransaction) OffsetAppendTransaction {
+	out := in
+	out.Messages = compactOffsetAppendMessages(in.Messages)
+	return out
+}
+
+func compactOffsetAppendMessages(messages []Message) []Message {
+	out := make([]Message, len(messages))
+	for i := range messages {
+		out[i] = compactOffsetAppendMessage(messages[i])
+	}
+	return out
+}
+
+func compactOffsetAppendMessage(message Message) Message {
+	return Message{
+		ID: message.ID, ParentID: message.ParentID, Topic: message.Topic, Queue: message.Queue,
+		Stream: message.Stream, Offset: message.Offset, Status: message.Status,
+		TenantID: message.TenantID, CreatedAt: message.CreatedAt,
+	}
+}
+
+func (s *MemoryStore) offsetAppendResultLocked(summaries []Message) []Message {
+	out := make([]Message, len(summaries))
+	for i, summary := range summaries {
+		if message := s.messages[summary.ID]; message != nil {
+			out[i] = cloneMessage(*message)
+			continue
+		}
+		if slot, ok := s.cold[summary.ID]; ok {
+			out[i] = decodeCold(summary.ID, slot)
+			continue
+		}
+		out[i] = cloneMessage(summary)
+	}
+	return out
+}
+
+func (s *MemoryStore) offsetAppendTransactionLocked(commit OffsetCommit, fingerprint string) (OffsetAppendTransaction, bool, error) {
+	if commit.TransactionID == "" {
+		return OffsetAppendTransaction{}, false, nil
+	}
+	record, ok := s.offsetTx[tenantScopedKey(commit.TenantID, commit.TransactionID)]
+	if !ok {
+		return OffsetAppendTransaction{}, false, nil
+	}
+	if record.Fingerprint != fingerprint {
+		return OffsetAppendTransaction{}, false, ErrTransactionConflict
+	}
+	result := cloneOffsetAppendTransaction(record)
+	result.Messages = s.offsetAppendResultLocked(record.Messages)
+	return result, true, nil
+}
+
+func (s *MemoryStore) lookupOffsetAppendTransaction(commit OffsetCommit, fingerprint string) (OffsetAppendTransaction, bool, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.offsetAppendTransactionLocked(commit, fingerprint)
+}
+
+func (s *MemoryStore) recordOffsetAppendTransactionLocked(commit OffsetCommit, transaction OffsetAppendTransaction) {
+	if commit.TransactionID == "" {
+		return
+	}
+	if s.offsetTx == nil {
+		s.offsetTx = make(map[string]OffsetAppendTransaction)
+	}
+	if len(s.offsetTx) >= offsetAppendTransactionsMax {
+		var oldestKey string
+		var oldestAt time.Time
+		for key, record := range s.offsetTx {
+			if oldestKey == "" || record.CreatedAt.Before(oldestAt) || (record.CreatedAt.Equal(oldestAt) && key < oldestKey) {
+				oldestKey, oldestAt = key, record.CreatedAt
+			}
+		}
+		delete(s.offsetTx, oldestKey)
+	}
+	transaction = cloneOffsetAppendTransaction(transaction)
+	s.offsetTx[tenantScopedKey(commit.TenantID, commit.TransactionID)] = transaction
+}
+
+const offsetAppendTransactionsMax = 4096
+
+// CommitOffsetAndAppend applies the checkpoint and produced batch under one
+// store lock. This is the in-memory atomicity primitive used by persistent
+// adapters after their combined WAL/database transaction is durable.
+func (s *MemoryStore) CommitOffsetAndAppend(ctx context.Context, commit OffsetCommit, entries []AppendEntry) ([]Message, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	commit, entries, fingerprint, err := prepareOffsetAppendRequest(ctx, commit, entries)
+	if err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.streams[commit.Stream]; !ok {
+		return nil, ErrStreamNotFound
+	}
+	if transaction, found, err := s.offsetAppendTransactionLocked(commit, fingerprint); err != nil {
+		return nil, err
+	} else if found {
+		return transaction.Messages, nil
+	}
+	if err := s.validateAtomicLocked(entries); err != nil {
+		return nil, err
+	}
+	out := make([]Message, 0, len(entries))
+	for _, entry := range entries {
+		stored, err := s.appendLockedCollect(entry.Message, entry.Destinations, true, false, false)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, stored...)
+	}
+	s.commitOffsetLocked(commit)
+	s.recordOffsetAppendTransactionLocked(commit, OffsetAppendTransaction{Fingerprint: fingerprint, Messages: out, CreatedAt: time.Now()})
+	return out, nil
+}
+
+// appendRecoveredOffsetAtomic applies a combined durable record during WAL
+// replay. The caller holds the store's durable write serialization lock.
+func (s *MemoryStore) appendRecoveredOffsetAtomic(entries []AppendEntry, commit OffsetCommit, transaction OffsetAppendTransaction) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if transaction.Fingerprint != "" {
+		if _, found, err := s.offsetAppendTransactionLocked(commit, transaction.Fingerprint); err != nil {
+			return err
+		} else if found {
+			return nil
+		}
+	}
+	for _, entry := range entries {
+		if _, err := s.appendLockedCollect(entry.Message, entry.Destinations, false, false, true); err != nil {
+			return err
+		}
+	}
+	s.commitOffsetLocked(commit)
+	if transaction.Fingerprint != "" {
+		s.recordOffsetAppendTransactionLocked(commit, transaction)
+	}
 	return nil
 }
 
 func (s *MemoryStore) ConsumerOffset(ctx context.Context, commit OffsetCommit) (uint64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	if commit.Stream == "" || commit.ConsumerGroup == "" {
+		return 0, errf(ErrInvalidMessage, "stream and consumer group required")
+	}
 	tenant, err := resolveTenant(ctx, commit.TenantID)
 	if err != nil {
 		return 0, err
@@ -2310,24 +2610,72 @@ func (s *MemoryStore) ConsumerOffset(ctx context.Context, commit OffsetCommit) (
 	return s.offsets[commit.Stream][offsetGroupKey(tenant, commit.ConsumerGroup)], nil
 }
 
-func offsetGroupKey(tenant, group string) string {
-	if tenant == "" {
-		return group
+// ConsumerOffsets returns committed offsets for a stream. If tenantID is
+// empty and the caller is unrestricted, tenant-qualified groups are returned
+// with a tenant\x00group key to keep same-named groups distinct.
+func (s *MemoryStore) ConsumerOffsets(ctx context.Context, stream, tenantID string) (map[string]uint64, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
-	return tenant + "\x00" + group
+	if stream == "" {
+		return nil, errf(ErrInvalidMessage, "stream required")
+	}
+	tenant, err := resolveTenant(ctx, tenantID)
+	if err != nil {
+		return nil, err
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if _, ok := s.streams[stream]; !ok {
+		return nil, ErrStreamNotFound
+	}
+	result := make(map[string]uint64)
+	for stored, offset := range s.offsets[stream] {
+		storedTenant, group, encoded := parseTenantScopedKey(stored)
+		if !encoded {
+			legacy := legacyOffsetCommit(OffsetCommit{ConsumerGroup: stored})
+			storedTenant, group = legacy.TenantID, legacy.ConsumerGroup
+		}
+		if !tenantAllowed(ctx, storedTenant) || (tenant != "" && storedTenant != tenant) {
+			continue
+		}
+		key := group
+		if tenant == "" {
+			key = displayOffsetGroup(storedTenant, group, stored)
+		}
+		result[key] = offset
+	}
+	return result, nil
 }
 
-// durableOffsetCommit folds the tenant into the persisted consumer-group key.
-// This preserves tenant isolation without changing the read-only BWL1 format.
-// BWL2 will carry tenant_id as an explicit field.
+func offsetGroupKey(tenant, group string) string {
+	return tenantScopedKey(tenant, group)
+}
+
+// durableOffsetCommit resolves the tenant before persistence. New WAL records
+// carry TenantID explicitly; legacy records are decoded through
+// legacyOffsetCommit during replay.
 func durableOffsetCommit(ctx context.Context, commit OffsetCommit) (OffsetCommit, error) {
 	tenant, err := resolveTenant(ctx, commit.TenantID)
 	if err != nil {
 		return OffsetCommit{}, err
 	}
-	commit.ConsumerGroup = offsetGroupKey(tenant, commit.ConsumerGroup)
-	commit.TenantID = ""
+	commit.TenantID = tenant
 	return commit, nil
+}
+
+// legacyOffsetCommit decodes offsets written before WAL records carried the
+// tenant as a separate field. The legacy delimiter format is inherently
+// ambiguous when either component contains NUL, so only old records can retain
+// that limitation.
+func legacyOffsetCommit(commit OffsetCommit) OffsetCommit {
+	if commit.TenantID == "" {
+		if tenant, group, ok := strings.Cut(commit.ConsumerGroup, "\x00"); ok {
+			commit.TenantID = tenant
+			commit.ConsumerGroup = group
+		}
+	}
+	return commit
 }
 
 func (s *MemoryStore) Stats(ctx context.Context) (StoreStats, error) {
@@ -2689,7 +3037,19 @@ func (s *MemoryStore) listIDsLocked(ids []string, limit int, dlqOnly bool) []Mes
 
 func (s *MemoryStore) resolveMoveIDsLocked(req MoveRequest) []string {
 	if len(req.MessageIDs) > 0 {
-		return append([]string(nil), req.MessageIDs...)
+		ids := make([]string, 0, len(req.MessageIDs))
+		seen := make(map[string]struct{}, len(req.MessageIDs))
+		for _, id := range req.MessageIDs {
+			if id == "" {
+				continue
+			}
+			if _, exists := seen[id]; exists {
+				continue
+			}
+			seen[id] = struct{}{}
+			ids = append(ids, id)
+		}
+		return ids
 	}
 	switch req.SourceType {
 	case DestinationQueue, DestinationDLQ:
@@ -2706,6 +3066,45 @@ func (s *MemoryStore) resolveMoveIDsLocked(req MoveRequest) []string {
 		}
 	}
 	return nil
+}
+
+func (s *MemoryStore) moveSourceMatchesLocked(req MoveRequest, message *Message) bool {
+	if message == nil || req.Source == "" {
+		return false
+	}
+	switch req.SourceType {
+	case DestinationQueue, DestinationDLQ:
+		return message.Queue == req.Source && !isTerminalQueueStatus(message.Status)
+	case DestinationTopic:
+		if topic := s.topics[req.Source]; topic == nil {
+			return false
+		}
+		return message.Topic == req.Source
+	case DestinationStream, DestinationArchive:
+		if stream := s.streams[req.Source]; stream == nil {
+			return false
+		}
+		return message.Stream == req.Source
+	default:
+		return false
+	}
+}
+
+func moveIsSelfTransfer(req MoveRequest) bool {
+	if req.Mode == MoveCopy || req.Mode == MoveReplay || req.Source == "" || req.Source != req.Destination {
+		return false
+	}
+	sourceQueue := req.SourceType == DestinationQueue || req.SourceType == DestinationDLQ
+	destinationQueue := req.DestinationType == DestinationQueue || req.DestinationType == DestinationDLQ
+	if sourceQueue && destinationQueue {
+		return true
+	}
+	if req.SourceType == DestinationTopic && req.DestinationType == DestinationTopic {
+		return true
+	}
+	sourceStream := req.SourceType == DestinationStream || req.SourceType == DestinationArchive
+	destinationStream := req.DestinationType == DestinationStream || req.DestinationType == DestinationArchive
+	return sourceStream && destinationStream
 }
 
 func (s *MemoryStore) removeFromSourceLocked(kind DestinationKind, source, id string) {
@@ -2895,6 +3294,14 @@ func (s *FileWALStore) StoreHealth() error {
 	return s.gc.healthError()
 }
 
+func (s *FileWALStore) Stats(ctx context.Context) (StoreStats, error) {
+	stats, err := s.MemoryStore.Stats(ctx)
+	if err == nil && s.gc != nil {
+		stats.WALGroupCommit = s.gc.stats()
+	}
+	return stats, err
+}
+
 // FileWALStoreConfig configures the FileWALStore.
 type FileWALStoreConfig struct {
 	Dir           string
@@ -2903,23 +3310,24 @@ type FileWALStoreConfig struct {
 }
 
 type walRecord struct {
-	Op        string        `json:"op"`
-	Message   Message       `json:"message,omitempty"`
-	Dests     []Destination `json:"dests,omitempty"`
-	Entries   []AppendEntry `json:"entries,omitempty"`
-	Queue     QueueConfig   `json:"queue,omitempty"`
-	Topic     TopicConfig   `json:"topic,omitempty"`
-	Stream    StreamConfig  `json:"stream,omitempty"`
-	Lease     LeaseRequest  `json:"lease,omitempty"`
-	Messages  []Message     `json:"messages,omitempty"`
-	Ack       AckRequest    `json:"ack,omitempty"`
-	Acks      []AckRequest  `json:"acks,omitempty"`
-	Nack      NackRequest   `json:"nack,omitempty"`
-	Move      MoveRequest   `json:"move,omitempty"`
-	QueueName string        `json:"queue_name,omitempty"`
-	Offset    OffsetCommit  `json:"offset,omitempty"`
-	At        time.Time     `json:"at"`
-	Checksum  string        `json:"checksum,omitempty"`
+	Op                string                  `json:"op"`
+	Message           Message                 `json:"message,omitempty"`
+	Dests             []Destination           `json:"dests,omitempty"`
+	Entries           []AppendEntry           `json:"entries,omitempty"`
+	Queue             QueueConfig             `json:"queue,omitempty"`
+	Topic             TopicConfig             `json:"topic,omitempty"`
+	Stream            StreamConfig            `json:"stream,omitempty"`
+	Lease             LeaseRequest            `json:"lease,omitempty"`
+	Messages          []Message               `json:"messages,omitempty"`
+	Ack               AckRequest              `json:"ack,omitempty"`
+	Acks              []AckRequest            `json:"acks,omitempty"`
+	Nack              NackRequest             `json:"nack,omitempty"`
+	Move              MoveRequest             `json:"move,omitempty"`
+	QueueName         string                  `json:"queue_name,omitempty"`
+	Offset            OffsetCommit            `json:"offset,omitempty"`
+	OffsetTransaction OffsetAppendTransaction `json:"offset_transaction,omitempty"`
+	At                time.Time               `json:"at"`
+	Checksum          string                  `json:"checksum,omitempty"`
 }
 
 func NewFileWALStore(dir string) (*FileWALStore, error) {
@@ -3119,7 +3527,13 @@ func (s *FileWALStore) applyRecovered(r walRecord) error {
 	case "update":
 		err = s.MemoryStore.Update(ctx, r.Message)
 	case "commit_offset":
+		err = s.MemoryStore.CommitOffset(ctx, legacyOffsetCommit(r.Offset))
+	case "commit_offset_tenant":
 		err = s.MemoryStore.CommitOffset(ctx, r.Offset)
+	case "commit_offset_append":
+		err = s.MemoryStore.appendRecoveredOffsetAtomic(r.Entries, r.Offset, r.OffsetTransaction)
+	case "commit_offset_append_txn":
+		err = s.MemoryStore.appendRecoveredOffsetAtomic(r.Entries, r.Offset, r.OffsetTransaction)
 	case "sweep_leases":
 		s.MemoryStore.applySweepLeases(r.Messages)
 		return nil
@@ -3505,10 +3919,51 @@ func (s *FileWALStore) CommitOffset(ctx context.Context, commit OffsetCommit) er
 	if err != nil {
 		return err
 	}
-	if err := s.write(walRecord{Op: "commit_offset", Offset: persisted}); err != nil {
+	if err := s.write(walRecord{Op: "commit_offset_tenant", Offset: persisted}); err != nil {
 		return err
 	}
 	return s.MemoryStore.CommitOffset(context.Background(), persisted)
+}
+
+func (s *FileWALStore) CommitOffsetAndAppend(ctx context.Context, commit OffsetCommit, entries []AppendEntry) ([]Message, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	commit, entries, fingerprint, err := prepareOffsetAppendRequest(ctx, commit, entries)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := s.MemoryStore.ConsumerOffset(ctx, commit); err != nil {
+		return nil, err
+	}
+	if transaction, found, err := s.MemoryStore.lookupOffsetAppendTransaction(commit, fingerprint); err != nil {
+		return nil, err
+	} else if found {
+		return transaction.Messages, nil
+	}
+	persistedOffset, err := durableOffsetCommit(ctx, commit)
+	if err != nil {
+		return nil, err
+	}
+	prepared, err := s.MemoryStore.prepareAppendAtomic(ctx, entries)
+	if err != nil {
+		return nil, err
+	}
+	persistedEntries := storedAppendEntries(prepared)
+	transaction := OffsetAppendTransaction{}
+	if fingerprint != "" {
+		transaction = OffsetAppendTransaction{Fingerprint: fingerprint, Messages: compactOffsetAppendMessages(prepared), CreatedAt: time.Now()}
+	}
+	op := "commit_offset_append"
+	if fingerprint != "" {
+		op = "commit_offset_append_txn"
+	}
+	if err := s.write(walRecord{Op: op, Offset: persistedOffset, Entries: persistedEntries, OffsetTransaction: transaction}); err != nil {
+		return nil, err
+	}
+	if err := s.MemoryStore.appendRecoveredOffsetAtomic(persistedEntries, persistedOffset, transaction); err != nil {
+		return nil, fmt.Errorf("apply durable offset and append: %w", err)
+	}
+	return prepared, nil
 }
 
 // SweepLeases implements WAL-first ordering: compute the deterministic

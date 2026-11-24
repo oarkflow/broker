@@ -638,6 +638,17 @@ func (s *ReplicatedStore) ConsumerOffset(ctx context.Context, commit OffsetCommi
 	return s.Store.ConsumerOffset(ctx, commit)
 }
 
+func (s *ReplicatedStore) ConsumerOffsets(ctx context.Context, stream, tenant string) (map[string]uint64, error) {
+	if err := s.checkReadable(); err != nil {
+		return nil, err
+	}
+	lister, ok := s.Store.(ConsumerOffsetLister)
+	if !ok {
+		return nil, ErrUnsupportedMode
+	}
+	return lister.ConsumerOffsets(ctx, stream, tenant)
+}
+
 func (s *ReplicatedStore) Stats(ctx context.Context) (StoreStats, error) {
 	if err := s.checkReadable(); err != nil {
 		return StoreStats{}, err
@@ -1014,7 +1025,69 @@ func (s *ReplicatedStore) CommitOffset(ctx context.Context, commit OffsetCommit)
 	if err != nil {
 		return err
 	}
-	return s.submit(ctx, cluster.BrokerCmdCommitOffset, persisted)
+	return s.submit(ctx, cluster.BrokerCmdCommitOffset, replicatedOffsetCommit{Version: 2, Commit: persisted})
+}
+
+func (s *ReplicatedStore) CommitOffsetAndAppend(ctx context.Context, commit OffsetCommit, entries []AppendEntry) ([]Message, error) {
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
+	if s.raftCtrl == nil || !s.raftCtrl.IsLeader() {
+		return nil, cluster.ErrNotLeader
+	}
+	commit, entries, fingerprint, err := prepareOffsetAppendRequest(ctx, commit, entries)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := s.Store.ConsumerOffset(ctx, commit); err != nil {
+		return nil, err
+	}
+	if commit.TransactionID != "" {
+		lookup, ok := s.Store.(interface {
+			lookupOffsetAppendTransaction(OffsetCommit, string) (OffsetAppendTransaction, bool, error)
+		})
+		if !ok {
+			return nil, fmt.Errorf("%w: backing store cannot check offset append transaction identity", ErrUnsupportedMode)
+		}
+		if transaction, found, err := lookup.lookupOffsetAppendTransaction(commit, fingerprint); err != nil {
+			return nil, err
+		} else if found {
+			return transaction.Messages, nil
+		}
+	}
+	persistedOffset, err := durableOffsetCommit(ctx, commit)
+	if err != nil {
+		return nil, err
+	}
+	preparer, ok := s.Store.(interface {
+		prepareAppendAtomic(context.Context, []AppendEntry) ([]Message, error)
+	})
+	if !ok {
+		return nil, fmt.Errorf("%w: backing store cannot prepare a replicated offset append", ErrUnsupportedMode)
+	}
+	prepared, err := preparer.prepareAppendAtomic(ctx, entries)
+	if err != nil {
+		return nil, err
+	}
+	transaction := OffsetAppendTransaction{}
+	if fingerprint != "" {
+		transaction = OffsetAppendTransaction{Fingerprint: fingerprint, Messages: compactOffsetAppendMessages(prepared), CreatedAt: time.Now()}
+	}
+	payload := replicatedOffsetAppend{Offset: persistedOffset, Entries: storedAppendEntries(prepared), Transaction: transaction}
+	if err := s.submitUnlocked(ctx, cluster.BrokerCmdCommitOffsetAppend, payload); err != nil {
+		return nil, err
+	}
+	return prepared, nil
+}
+
+type replicatedOffsetCommit struct {
+	Version int          `json:"version"`
+	Commit  OffsetCommit `json:"commit"`
+}
+
+type replicatedOffsetAppend struct {
+	Offset      OffsetCommit            `json:"offset"`
+	Entries     []AppendEntry           `json:"entries"`
+	Transaction OffsetAppendTransaction `json:"transaction,omitempty"`
 }
 
 func (s *ReplicatedStore) Ack(ctx context.Context, req AckRequest) error {
@@ -1286,11 +1359,37 @@ func (a *brokerStoreAdapter) ReplicateMove(ctx context.Context, payload json.Raw
 }
 
 func (a *brokerStoreAdapter) ReplicateCommitOffset(ctx context.Context, payload json.RawMessage) error {
+	var versioned replicatedOffsetCommit
+	if err := json.Unmarshal(payload, &versioned); err != nil {
+		return err
+	}
+	if versioned.Version == 2 {
+		return a.store.CommitOffset(ctx, versioned.Commit)
+	}
 	var commit OffsetCommit
 	if err := json.Unmarshal(payload, &commit); err != nil {
 		return err
 	}
-	return a.store.CommitOffset(ctx, commit)
+	return a.store.CommitOffset(ctx, legacyOffsetCommit(commit))
+}
+
+func (a *brokerStoreAdapter) ReplicateCommitOffsetAndAppend(ctx context.Context, payload json.RawMessage) error {
+	var command replicatedOffsetAppend
+	if err := json.Unmarshal(payload, &command); err != nil {
+		return err
+	}
+	if applier, ok := a.store.(interface {
+		appendRecoveredOffsetAtomic([]AppendEntry, OffsetCommit, OffsetAppendTransaction) error
+	}); ok {
+		return applier.appendRecoveredOffsetAtomic(command.Entries, command.Offset, command.Transaction)
+	}
+	if command.Offset.TransactionID == "" {
+		if applier, ok := a.store.(OffsetAppendStore); ok {
+			_, err := applier.CommitOffsetAndAppend(ctx, command.Offset, command.Entries)
+			return err
+		}
+	}
+	return fmt.Errorf("%w: backing store cannot apply a replicated offset append", ErrUnsupportedMode)
 }
 
 func (a *brokerStoreAdapter) ReplicateSnapshot() ([]byte, error) {

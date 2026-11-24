@@ -256,6 +256,9 @@ func (s *EncryptedMessageStore) CommitOffset(ctx context.Context, commit broker.
 func (s *EncryptedMessageStore) ConsumerOffset(ctx context.Context, commit broker.OffsetCommit) (uint64, error) {
 	return s.mem.ConsumerOffset(ctx, commit)
 }
+func (s *EncryptedMessageStore) ConsumerOffsets(ctx context.Context, stream, tenant string) (map[string]uint64, error) {
+	return s.mem.ConsumerOffsets(ctx, stream, tenant)
+}
 func (s *EncryptedMessageStore) Stats(ctx context.Context) (broker.StoreStats, error) {
 	return s.mem.Stats(ctx)
 }

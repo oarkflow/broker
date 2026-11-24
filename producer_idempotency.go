@@ -3,9 +3,21 @@ package broker
 import (
 	"errors"
 	"fmt"
+	"strconv"
 	"sync"
 	"time"
 )
+
+// tenantScopedKey creates an injective key for indexes scoped to a tenant.
+// Length-prefixing avoids collisions when tenants or user-provided keys contain
+// separators. All tenants, including the empty default tenant, use this form.
+func tenantScopedKey(tenantID, key string) string {
+	return "t" + strconv.Itoa(len(tenantID)) + ":" + tenantID + key
+}
+
+func producerStateKey(tenantID, producerID string) string {
+	return tenantScopedKey(tenantID, producerID)
+}
 
 var (
 	// ErrProducerFenced is returned when a publish has an epoch strictly less than the registered epoch.

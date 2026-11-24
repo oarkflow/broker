@@ -2,6 +2,8 @@ package broker
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"time"
 )
 
@@ -106,8 +108,12 @@ func (h taskHandle) Result(ctx context.Context, out any) error {
 const defaultTaskWait = 30 * time.Second
 
 func (h taskHandle) Wait(ctx context.Context) (TaskResult, error) {
-	if _, err := h.Info(ctx); err != nil {
+	info, err := h.Info(ctx)
+	if err != nil {
 		return TaskResult{}, err
+	}
+	if result, terminal := terminalTaskResult(info); terminal {
+		return result, result.Error
 	}
 	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
 		var cancel context.CancelFunc
@@ -116,13 +122,11 @@ func (h taskHandle) Wait(ctx context.Context) (TaskResult, error) {
 	}
 	ch := make(chan TaskResult, 1)
 	h.b.taskMu.Lock()
-	if t := h.b.tasks[h.id]; t != nil && (t.Status == TaskSucceeded || t.Status == TaskFailed || t.Status == TaskCancelled || t.Status == TaskDeadLettered) {
-		res := TaskResult{Task: cloneTask(*t), Payload: append([]byte(nil), t.Result...)}
-		if t.LastError != "" {
-			res.Error = &BrokerError{Code: "task_failed", Message: t.LastError}
+	if t := h.b.tasks[h.id]; t != nil {
+		if res, terminal := terminalTaskResult(*t); terminal {
+			h.b.taskMu.Unlock()
+			return res, res.Error
 		}
-		h.b.taskMu.Unlock()
-		return res, res.Error
 	}
 	h.b.taskWait[h.id] = append(h.b.taskWait[h.id], ch)
 	h.b.taskMu.Unlock()
@@ -130,55 +134,189 @@ func (h taskHandle) Wait(ctx context.Context) (TaskResult, error) {
 	case r := <-ch:
 		return r, r.Error
 	case <-ctx.Done():
+		h.b.removeTaskWaiter(h.id, ch)
 		return TaskResult{}, ctx.Err()
 	}
 }
+
+func (b *Broker) removeTaskWaiter(id string, waiter chan TaskResult) {
+	b.taskMu.Lock()
+	waiters := b.taskWait[id]
+	for i, ch := range waiters {
+		if ch != waiter {
+			continue
+		}
+		copy(waiters[i:], waiters[i+1:])
+		waiters[len(waiters)-1] = nil
+		waiters = waiters[:len(waiters)-1]
+		if len(waiters) == 0 {
+			delete(b.taskWait, id)
+		} else {
+			b.taskWait[id] = waiters
+		}
+		break
+	}
+	b.taskMu.Unlock()
+}
+
+func terminalTaskResult(task TaskInfo) (TaskResult, bool) {
+	if isTerminalTaskStatus(task.Status) {
+		result := TaskResult{Task: cloneTask(task), Payload: append([]byte(nil), task.Result...)}
+		if task.LastError != "" {
+			result.Error = &BrokerError{Code: "task_failed", Message: task.LastError}
+		}
+		return result, true
+	}
+	return TaskResult{}, false
+}
+
+func isTerminalTaskStatus(status TaskStatus) bool {
+	switch status {
+	case TaskSucceeded, TaskFailed, TaskCancelled, TaskDeadLettered:
+		return true
+	default:
+		return false
+	}
+}
+
 func (h taskHandle) Cancel(ctx context.Context, reason string) error {
-	if _, err := h.Info(ctx); err != nil {
+	info, err := h.Info(ctx)
+	if err != nil {
 		return err
 	}
 	h.b.taskMu.Lock()
-	t := h.b.tasks[h.id]
-	var ti TaskInfo
-	if t != nil {
-		t.Status = TaskCancelled
-		t.LastError = reason
-		t.UpdatedAt = time.Now()
-		t.FinishedAt = time.Now()
-		ti = cloneTask(*t)
+	current := h.b.tasks[h.id]
+	if current == nil {
+		current = &info
 	}
+	switch current.Status {
+	case TaskCancelled:
+		h.b.taskMu.Unlock()
+		return nil
+	case TaskSucceeded, TaskFailed, TaskDeadLettered:
+		status := current.Status
+		h.b.taskMu.Unlock()
+		return errf(ErrInvalidMessage, "task %s is already terminal with status %s", h.id, status)
+	}
+	next := cloneTask(*current)
+	next.Status = TaskCancelled
+	next.LastError = reason
+	next.UpdatedAt = time.Now()
+	next.FinishedAt = next.UpdatedAt
+	if err := h.b.persistTask(ctx, next); err != nil {
+		h.b.taskMu.Unlock()
+		return fmt.Errorf("persist task cancellation: %w", err)
+	}
+	h.b.tasks[h.id] = &next
 	h.b.taskMu.Unlock()
-	if ti.ID != "" {
-		h.b.persistTask(ctx, ti)
-	}
+	ti := cloneTask(next)
+	var cancelErrors []error
 	// Stop the work, not just the bookkeeping. Without this the handler kept
 	// running and later overwrote the cancellation with its own result.
 	h.b.cancelTaskRun(h.id)
-	if ti.ID != "" {
-		if msg, ok, _ := h.b.store.Get(ctx, ti.MessageID); ok {
+	if ti.MessageID != "" {
+		msg, ok, getErr := h.b.store.Get(ctx, ti.MessageID)
+		if getErr != nil {
+			cancelErrors = append(cancelErrors, fmt.Errorf("load task message for cancellation: %w", getErr))
+		} else if ok {
 			msg.Status = MessageCancelled
 			msg.LastError = reason
-			_ = h.b.store.Update(ctx, msg)
-			n := Notification{Type: "task.cancelled", Source: h.b.cfg.Name, Severity: SeverityWarn, MessageID: msg.ID, TaskID: h.id, Queue: msg.Queue, Consumer: msg.ConsumerID, ConsumerGroup: msg.ConsumerGroup, TenantID: msg.TenantID, TraceID: msg.TraceID, Timestamp: time.Now(), Data: map[string]any{"reason": reason}}
-			h.b.notify.Publish(n)
-			if msg.ConsumerID != "" {
-				h.b.emitConsumerNotification(msg.ConsumerID, n)
+			if err := h.b.store.Update(ctx, msg); err != nil {
+				cancelErrors = append(cancelErrors, fmt.Errorf("cancel task message: %w", err))
+			} else {
+				n := Notification{Type: "task.cancelled", Source: h.b.cfg.Name, Severity: SeverityWarn, MessageID: msg.ID, TaskID: h.id, Queue: msg.Queue, Consumer: msg.ConsumerID, ConsumerGroup: msg.ConsumerGroup, TenantID: msg.TenantID, TraceID: msg.TraceID, Timestamp: time.Now(), Data: map[string]any{"reason": reason}}
+				h.b.notify.Publish(n)
+				if msg.ConsumerID != "" {
+					h.b.emitConsumerNotification(msg.ConsumerID, n)
+				}
 			}
 		}
-		if h.b.cfg.Hooks.OnTaskCancelled != nil {
-			h.b.cfg.Hooks.OnTaskCancelled(ctx, TaskEvent{Task: ti, Error: errf(ErrCancelled, "%s", reason), Time: time.Now()})
-		}
+	}
+	if h.b.cfg.Hooks.OnTaskCancelled != nil {
+		h.b.cfg.Hooks.OnTaskCancelled(ctx, TaskEvent{Task: ti, Error: errf(ErrCancelled, "%s", reason), Time: time.Now()})
 	}
 	h.b.finishTaskWaiters(h.id)
-	return nil
+	return errors.Join(cancelErrors...)
 }
 func (h taskHandle) Retry(ctx context.Context) error {
 	t, err := h.Info(ctx)
 	if err != nil {
 		return err
 	}
-	_, err = h.b.store.Move(ctx, MoveRequest{SourceType: DestinationQueue, Source: t.Queue, DestinationType: DestinationQueue, Destination: t.Queue, MessageIDs: []string{t.MessageID}, Mode: MoveReplay, ResetAttempts: true, ResetError: true, Reason: "task retry"})
-	return err
+	h.b.taskMu.Lock()
+	current := h.b.tasks[h.id]
+	if current == nil {
+		restored := cloneTask(t)
+		current = &restored
+	}
+	if current.Status != TaskFailed && current.Status != TaskDeadLettered {
+		status := current.Status
+		h.b.taskMu.Unlock()
+		return errf(ErrInvalidMessage, "task %s is not in a retryable state: %s", h.id, status)
+	}
+	if current.MessageID == "" {
+		h.b.taskMu.Unlock()
+		return ErrMessageNotFound
+	}
+	msg, ok, err := h.b.store.Get(ctx, current.MessageID)
+	if err != nil {
+		h.b.taskMu.Unlock()
+		return err
+	}
+	if !ok {
+		h.b.taskMu.Unlock()
+		return ErrMessageNotFound
+	}
+	sourceType := DestinationQueue
+	if msg.Status == MessageDeadLettered {
+		sourceType = DestinationDLQ
+	}
+	mode := MoveReplay
+	preserveID := false
+	if sourceType == DestinationDLQ || msg.Queue != t.Queue {
+		mode = MoveReroute
+		preserveID = true
+	}
+	result, err := h.b.store.Move(ctx, MoveRequest{
+		SourceType: sourceType, Source: msg.Queue,
+		DestinationType: DestinationQueue, Destination: t.Queue,
+		MessageIDs: []string{msg.ID}, Mode: mode, PreserveID: preserveID,
+		ResetAttempts: true, ResetError: true, Reason: "task retry",
+	})
+	if err != nil {
+		h.b.taskMu.Unlock()
+		return err
+	}
+	if result.Moved == 0 && result.Copied == 0 && len(result.DestinationMessageIDs) == 0 {
+		h.b.taskMu.Unlock()
+		return ErrMessageNotFound
+	}
+
+	next := cloneTask(*current)
+	if len(result.DestinationMessageIDs) > 0 {
+		// Replay copies the message, so the task must follow the destination ID
+		// for cancellation, logs, and any later retry. Reroutes preserve their ID.
+		next.MessageID = result.DestinationMessageIDs[0]
+	}
+	next.Status = TaskQueued
+	if msg.AvailableAt.After(time.Now()) {
+		next.Status = TaskScheduled
+	}
+	next.Attempts = 0
+	next.LastError = ""
+	next.FinishedAt = time.Time{}
+	next.UpdatedAt = time.Now()
+	if err := h.b.persistTask(ctx, next); err != nil {
+		// The message move has committed. Keep the live task runnable so the
+		// consumer can recover it; the caller receives the persistence failure and
+		// the next task transition will try to restore durable state.
+		h.b.tasks[h.id] = &next
+		h.b.taskMu.Unlock()
+		return fmt.Errorf("task %s was requeued but status persistence failed: %w", h.id, err)
+	}
+	h.b.tasks[h.id] = &next
+	h.b.taskMu.Unlock()
+	return nil
 }
 func (h taskHandle) Replay(ctx context.Context) error { return h.Retry(ctx) }
 func (h taskHandle) Logs(ctx context.Context) ([]MessageHistory, error) {
@@ -258,6 +396,19 @@ func (p *Publisher) SubmitTask(ctx context.Context, name string, payload any, op
 	now := time.Now()
 	info := TaskInfo{ID: id, Name: name, Queue: queue, Status: TaskCreated, TenantID: o.TenantID, CreatedAt: now, UpdatedAt: now, Metadata: cloneMap(o.Metadata)}
 	p.b.taskMu.Lock()
+	if _, exists := p.b.tasks[id]; exists {
+		p.b.taskMu.Unlock()
+		return nil, ErrTaskAlreadyExists
+	}
+	if p.b.stateStore != nil {
+		if _, exists, err := p.b.stateStore.GetTask(ctx, id); err != nil {
+			p.b.taskMu.Unlock()
+			return nil, fmt.Errorf("check task %s before submit: %w", id, err)
+		} else if exists {
+			p.b.taskMu.Unlock()
+			return nil, ErrTaskAlreadyExists
+		}
+	}
 	// Store a separate allocation rather than &info. Keeping a pointer to the local
 	// meant the broker owned the same struct this function kept reading after
 	// unlocking, so a consumer that started the task concurrently raced this
@@ -269,7 +420,14 @@ func (p *Publisher) SubmitTask(ctx context.Context, name string, payload any, op
 		Metadata: cloneMap(info.Metadata),
 	}
 	p.b.taskMu.Unlock()
-	p.b.persistTask(ctx, info)
+	if err := p.b.persistTask(ctx, info); err != nil {
+		p.b.taskMu.Lock()
+		if current := p.b.tasks[id]; current != nil && current.Status == TaskCreated && current.CreatedAt.Equal(now) {
+			delete(p.b.tasks, id)
+		}
+		p.b.taskMu.Unlock()
+		return nil, fmt.Errorf("persist task %s before publish: %w", id, err)
+	}
 	if p.b.cfg.Hooks.OnTaskCreated != nil {
 		p.b.cfg.Hooks.OnTaskCreated(ctx, TaskEvent{Task: info, Time: now})
 	}
@@ -277,21 +435,33 @@ func (p *Publisher) SubmitTask(ctx context.Context, name string, payload any, op
 	res, err := p.Publish(ctx, name, payload, pubOpts...)
 	if err != nil {
 		p.b.recordPublisher(ctx, PublisherRecord{ID: id, Operation: "submit_task", Subject: name, Queue: queue, TaskID: id, Status: "failed", Error: err.Error(), CreatedAt: now, UpdatedAt: time.Now()})
-		p.b.failTask(ctx, id, err)
+		if taskErr := p.b.failTask(ctx, id, err); taskErr != nil {
+			return taskHandle{b: p.b, id: id}, errors.Join(err, fmt.Errorf("persist failed task state: %w", taskErr))
+		}
 		return nil, err
 	}
 	p.b.taskMu.Lock()
-	if t := p.b.tasks[id]; t != nil {
-		t.Status = TaskQueued
-		if o.Delay > 0 || !o.RunAt.IsZero() {
-			t.Status = TaskScheduled
-		}
-		t.MessageID = res.MessageID
-		t.UpdatedAt = time.Now()
-		info = cloneTask(*t)
+	current := p.b.tasks[id]
+	if current == nil {
+		p.b.taskMu.Unlock()
+		return taskHandle{b: p.b, id: id}, fmt.Errorf("task %s was published but its local state disappeared", id)
 	}
+	next := cloneTask(*current)
+	if next.Status == TaskCreated {
+		next.Status = TaskQueued
+		if o.Delay > 0 || !o.RunAt.IsZero() {
+			next.Status = TaskScheduled
+		}
+	}
+	next.MessageID = res.MessageID
+	next.UpdatedAt = time.Now()
+	if err := p.b.persistTask(ctx, next); err != nil {
+		p.b.taskMu.Unlock()
+		return taskHandle{b: p.b, id: id}, fmt.Errorf("task %s was published but status persistence failed: %w", id, err)
+	}
+	p.b.tasks[id] = &next
+	info = cloneTask(next)
 	p.b.taskMu.Unlock()
-	p.b.persistTask(ctx, info)
 	p.b.recordPublisher(ctx, PublisherRecord{ID: id, Operation: "submit_task", Subject: name, Queue: queue, MessageID: res.MessageID, TaskID: id, Status: "queued", CreatedAt: now, UpdatedAt: time.Now()})
 	if p.b.cfg.Hooks.OnTaskQueued != nil {
 		ti, _ := taskHandle{b: p.b, id: id}.Info(ctx)
@@ -302,6 +472,9 @@ func (p *Publisher) SubmitTask(ctx context.Context, name string, payload any, op
 func (p *Publisher) SubmitTaskAsync(ctx context.Context, name string, payload any, opts ...TaskOption) TaskFuture {
 	h, err := p.SubmitTask(ctx, name, payload, opts...)
 	if err != nil {
+		if h != nil {
+			return h
+		}
 		id := p.b.nextID("taskerr")
 		p.b.failTask(ctx, id, err)
 		return taskHandle{b: p.b, id: id}
@@ -346,14 +519,20 @@ func (b *Broker) RegisterTask(ctx context.Context, name string, handler TaskHand
 		// status changed to cancelled while the handler kept running, and on return
 		// it overwrote the cancellation with succeeded.
 		runCtx, cancel := context.WithCancel(ctx)
-		b.registerTaskCancel(tid, cancel)
+		if !b.registerTaskCancel(tid, cancel) {
+			cancel()
+			return nil
+		}
 		defer func() {
 			cancel()
 			b.clearTaskCancel(tid)
 		}()
+		if runCtx.Err() != nil || b.taskTerminal(tid) {
+			return nil
+		}
 		td := TaskDelivery{Delivery: d, Task: ti}
 		res, err := handler(runCtx, td)
-		if b.taskCancelled(tid) {
+		if b.taskTerminal(tid) {
 			// Cancelled: acknowledge the message so it is not retried, but record no
 			// result. Returning the handler's context error here made the consumer
 			// treat the cancellation as a failure and failTask overwrote the
@@ -371,16 +550,21 @@ func (b *Broker) RegisterTask(ctx context.Context, name string, handler TaskHand
 }
 
 // registerTaskCancel records the cancel function for a running task handler.
-func (b *Broker) registerTaskCancel(id string, cancel context.CancelFunc) {
+func (b *Broker) registerTaskCancel(id string, cancel context.CancelFunc) bool {
 	if id == "" {
-		return
+		return true
 	}
 	b.taskMu.Lock()
+	if t := b.tasks[id]; t != nil && (t.Status == TaskCancelled || t.Status == TaskSucceeded) {
+		b.taskMu.Unlock()
+		return false
+	}
 	if b.taskCancels == nil {
 		b.taskCancels = map[string]context.CancelFunc{}
 	}
 	b.taskCancels[id] = cancel
 	b.taskMu.Unlock()
+	return true
 }
 
 func (b *Broker) clearTaskCancel(id string) {
@@ -405,160 +589,234 @@ func (b *Broker) cancelTaskRun(id string) bool {
 	return true
 }
 
-// taskCancelled reports whether a task has been cancelled. Terminal transitions
-// consult this so a cancelled task cannot be overwritten by the result of work that
-// was already in flight when the cancel landed.
-func (b *Broker) taskCancelled(id string) bool {
+// taskTerminal reports whether a task has reached a terminal state. Handler
+// wrappers use it to avoid replacing a terminal task result with late work.
+func (b *Broker) taskTerminal(id string) bool {
 	b.taskMu.RLock()
 	defer b.taskMu.RUnlock()
 	t := b.tasks[id]
-	return t != nil && t.Status == TaskCancelled
+	return t != nil && isTerminalTaskStatus(t.Status)
 }
 
-func (b *Broker) startTask(ctx context.Context, id string) {
+func (b *Broker) hydrateTask(ctx context.Context, id string) error {
+	if id == "" {
+		return nil
+	}
+	b.taskMu.RLock()
+	current := b.tasks[id]
+	if current != nil {
+		tenant := current.TenantID
+		b.taskMu.RUnlock()
+		if !tenantAllowed(ctx, tenant) {
+			return ErrUnauthorized
+		}
+		return nil
+	}
+	b.taskMu.RUnlock()
+	if b.stateStore == nil {
+		return nil
+	}
+	restored, ok, err := b.stateStore.GetTask(ctx, id)
+	if err != nil || !ok {
+		return err
+	}
+	if !tenantAllowed(ctx, restored.TenantID) {
+		return ErrUnauthorized
+	}
 	b.taskMu.Lock()
-	t := b.tasks[id]
-	if t != nil && t.Status == TaskCancelled {
-		// Cancelled before the handler started. Leave it cancelled; resurrecting it
-		// here is what made a cancel-before-start report success.
+	if current = b.tasks[id]; current == nil {
+		copy := cloneTask(restored)
+		b.tasks[id] = &copy
+	} else if !tenantAllowed(ctx, current.TenantID) {
 		b.taskMu.Unlock()
-		return
-	}
-	if t != nil {
-		t.Status = TaskRunning
-		t.StartedAt = time.Now()
-		t.UpdatedAt = t.StartedAt
-	}
-	ti := TaskInfo{}
-	if t != nil {
-		ti = cloneTask(*t)
+		return ErrUnauthorized
 	}
 	b.taskMu.Unlock()
-	if t != nil {
-		b.persistTask(ctx, ti)
-		b.notify.Publish(Notification{Type: "task.started", Source: b.cfg.Name, Severity: SeverityInfo, MessageID: ti.MessageID, TaskID: ti.ID, Queue: ti.Queue, TenantID: ti.TenantID, Timestamp: time.Now(), Data: map[string]any{"name": ti.Name}})
-		if b.cfg.Hooks.OnTaskStarted != nil {
-			b.cfg.Hooks.OnTaskStarted(ctx, TaskEvent{Task: ti, Time: time.Now()})
-		}
-	}
+	return nil
 }
-func (b *Broker) updateTaskProgress(ctx context.Context, id string, p Progress) {
+
+func (b *Broker) startTask(ctx context.Context, id string) (bool, error) {
+	if err := b.hydrateTask(ctx, id); err != nil {
+		return false, err
+	}
 	b.taskMu.Lock()
 	t := b.tasks[id]
-	if t != nil {
-		t.Status = TaskProgressing
-		t.Progress = p
-		t.UpdatedAt = time.Now()
+	if t != nil && (t.Status == TaskCancelled || t.Status == TaskSucceeded) {
+		// Cancellation and success are final. Failed/dead-lettered tasks can be
+		// retried, including recovery when the message move committed before the
+		// task status write did.
+		b.taskMu.Unlock()
+		return false, nil
 	}
-	ti := TaskInfo{}
-	if t != nil {
-		ti = cloneTask(*t)
+	if t == nil {
+		b.taskMu.Unlock()
+		return true, nil
 	}
+	next := cloneTask(*t)
+	next.Status = TaskRunning
+	next.StartedAt = time.Now()
+	next.UpdatedAt = next.StartedAt
+	if err := b.persistTask(ctx, next); err != nil {
+		b.taskMu.Unlock()
+		return false, fmt.Errorf("persist task %s start: %w", id, err)
+	}
+	*t = next
 	b.taskMu.Unlock()
-	if t != nil {
-		b.persistTask(ctx, ti)
-		b.notify.Publish(Notification{Type: "task.progress", Source: b.cfg.Name, Severity: SeverityInfo, MessageID: ti.MessageID, TaskID: ti.ID, Queue: ti.Queue, TenantID: ti.TenantID, Timestamp: time.Now(), Data: map[string]any{"name": ti.Name, "percent": p.Percent, "message": p.Message}})
-		if b.cfg.Hooks.OnTaskProgress != nil {
-			b.cfg.Hooks.OnTaskProgress(ctx, TaskEvent{Task: ti, Time: time.Now()})
-		}
+	ti := cloneTask(next)
+	b.notify.Publish(Notification{Type: "task.started", Source: b.cfg.Name, Severity: SeverityInfo, MessageID: ti.MessageID, TaskID: ti.ID, Queue: ti.Queue, TenantID: ti.TenantID, Timestamp: time.Now(), Data: map[string]any{"name": ti.Name}})
+	if b.cfg.Hooks.OnTaskStarted != nil {
+		b.cfg.Hooks.OnTaskStarted(ctx, TaskEvent{Task: ti, Time: time.Now()})
 	}
+	return true, nil
 }
-func (b *Broker) retryTask(ctx context.Context, id string, err error) {
+func (b *Broker) updateTaskProgress(ctx context.Context, id string, p Progress) error {
+	if err := b.hydrateTask(ctx, id); err != nil {
+		return err
+	}
 	b.taskMu.Lock()
 	t := b.tasks[id]
-	if t != nil {
-		t.Status = TaskRetrying
-		t.Attempts++
-		t.LastError = err.Error()
-		t.UpdatedAt = time.Now()
+	if t == nil {
+		b.taskMu.Unlock()
+		return nil
 	}
-	ti := TaskInfo{}
-	if t != nil {
-		ti = cloneTask(*t)
+	next := cloneTask(*t)
+	next.Status = TaskProgressing
+	next.Progress = p
+	next.UpdatedAt = time.Now()
+	if err := b.persistTask(ctx, next); err != nil {
+		b.taskMu.Unlock()
+		return err
 	}
+	*t = next
 	b.taskMu.Unlock()
-	if t != nil {
-		b.persistTask(ctx, ti)
+	ti := cloneTask(next)
+	b.notify.Publish(Notification{Type: "task.progress", Source: b.cfg.Name, Severity: SeverityInfo, MessageID: ti.MessageID, TaskID: ti.ID, Queue: ti.Queue, TenantID: ti.TenantID, Timestamp: time.Now(), Data: map[string]any{"name": ti.Name, "percent": p.Percent, "message": p.Message}})
+	if b.cfg.Hooks.OnTaskProgress != nil {
+		b.cfg.Hooks.OnTaskProgress(ctx, TaskEvent{Task: ti, Time: time.Now()})
 	}
-	if t != nil && b.cfg.Hooks.OnTaskRetrying != nil {
-		b.cfg.Hooks.OnTaskRetrying(ctx, TaskEvent{Task: ti, Error: err, Time: time.Now()})
-	}
+	return nil
 }
-func (b *Broker) failTask(ctx context.Context, id string, err error) {
+func (b *Broker) retryTask(ctx context.Context, id string, err error) error {
+	if err := b.hydrateTask(ctx, id); err != nil {
+		return fmt.Errorf("load task %s before retry transition: %w", id, err)
+	}
 	b.taskMu.Lock()
-	t := b.tasks[id]
-	if t != nil && t.Status == TaskCancelled {
+	current := b.tasks[id]
+	if current == nil {
+		b.taskMu.Unlock()
+		return nil
+	}
+	if isTerminalTaskStatus(current.Status) {
+		b.taskMu.Unlock()
+		return nil
+	}
+	next := cloneTask(*current)
+	next.Status = TaskRetrying
+	next.Attempts++
+	next.LastError = err.Error()
+	next.UpdatedAt = time.Now()
+	if persistErr := b.persistTask(ctx, next); persistErr != nil {
+		b.taskMu.Unlock()
+		return fmt.Errorf("persist task %s retry transition: %w", id, persistErr)
+	}
+	*b.tasks[id] = next
+	b.taskMu.Unlock()
+	if b.cfg.Hooks.OnTaskRetrying != nil {
+		b.cfg.Hooks.OnTaskRetrying(ctx, TaskEvent{Task: next, Error: err, Time: time.Now()})
+	}
+	return nil
+}
+func (b *Broker) failTask(ctx context.Context, id string, err error) error {
+	if loadErr := b.hydrateTask(ctx, id); loadErr != nil {
+		return fmt.Errorf("load task %s before failure transition: %w", id, loadErr)
+	}
+	b.taskMu.Lock()
+	current := b.tasks[id]
+	if current != nil && isTerminalTaskStatus(current.Status) {
 		// A cancelled task stays cancelled. A failure arriving from work that was
 		// already in flight must not rewrite the operator's intent, and must not
 		// wake waiters with a terminal result either.
 		b.taskMu.Unlock()
-		return
+		return nil
 	}
-	if t == nil {
-		t = &TaskInfo{ID: id, Status: TaskFailed, CreatedAt: time.Now()}
-		b.tasks[id] = t
+	now := time.Now()
+	next := TaskInfo{ID: id, CreatedAt: now}
+	if current != nil {
+		next = cloneTask(*current)
 	}
-	t.Status = TaskFailed
-	t.LastError = err.Error()
-	t.UpdatedAt = time.Now()
-	t.FinishedAt = time.Now()
-	ti := cloneTask(*t)
+	next.Status = TaskFailed
+	next.LastError = err.Error()
+	next.UpdatedAt = now
+	next.FinishedAt = now
+	if persistErr := b.persistTask(ctx, next); persistErr != nil {
+		b.taskMu.Unlock()
+		return fmt.Errorf("persist task %s failure transition: %w", id, persistErr)
+	}
+	b.tasks[id] = &next
 	b.taskMu.Unlock()
-	b.persistTask(ctx, ti)
+	ti := cloneTask(next)
 	b.notify.Publish(Notification{Type: "task.failed", Source: b.cfg.Name, Severity: SeverityError, MessageID: ti.MessageID, TaskID: ti.ID, Queue: ti.Queue, TenantID: ti.TenantID, Timestamp: time.Now(), Data: map[string]any{"name": ti.Name, "error": err.Error()}})
 	if b.cfg.Hooks.OnTaskFailed != nil {
 		b.cfg.Hooks.OnTaskFailed(ctx, TaskEvent{Task: ti, Error: err, Time: time.Now()})
 	}
 	b.finishTaskWaiters(id)
+	return nil
 }
-func (b *Broker) completeTask(ctx context.Context, m Message, result []byte, err error) {
+func (b *Broker) completeTask(ctx context.Context, m Message, result []byte, err error) error {
 	if m.TaskID == "" {
 		m.TaskID = m.Headers["x-task-id"]
 	}
 	if m.TaskID == "" {
-		return
+		return nil
+	}
+	if err := b.hydrateTask(ctx, m.TaskID); err != nil {
+		return fmt.Errorf("load task %s before completion transition: %w", m.TaskID, err)
 	}
 	if err != nil {
-		b.failTask(ctx, m.TaskID, err)
-		return
+		return b.failTask(ctx, m.TaskID, err)
 	}
 	b.taskMu.Lock()
-	t := b.tasks[m.TaskID]
-	if t != nil && t.Status == TaskCancelled {
-		// The task was cancelled while the handler was running. Its result must not
-		// resurrect it as succeeded.
+	current := b.tasks[m.TaskID]
+	if current != nil && isTerminalTaskStatus(current.Status) {
+		// A terminal task result must not be replaced by work that was already in
+		// flight when the terminal transition landed.
 		b.taskMu.Unlock()
-		return
+		return nil
 	}
-	alreadySucceeded := false
-	if t != nil {
-		alreadySucceeded = t.Status == TaskSucceeded
-		t.Status = TaskSucceeded
-		if result != nil || len(t.Result) == 0 {
-			t.Result = append([]byte(nil), result...)
-		}
-		t.UpdatedAt = time.Now()
-		if t.FinishedAt.IsZero() {
-			t.FinishedAt = time.Now()
-		}
+	if current == nil {
+		b.taskMu.Unlock()
+		return nil
 	}
-	ti := TaskInfo{}
-	if t != nil {
-		ti = cloneTask(*t)
+	alreadySucceeded := current.Status == TaskSucceeded
+	if alreadySucceeded {
+		b.taskMu.Unlock()
+		return nil
 	}
+	now := time.Now()
+	next := cloneTask(*current)
+	next.Status = TaskSucceeded
+	if result != nil || len(next.Result) == 0 {
+		next.Result = append([]byte(nil), result...)
+	}
+	next.UpdatedAt = now
+	if next.FinishedAt.IsZero() {
+		next.FinishedAt = now
+	}
+	if persistErr := b.persistTask(ctx, next); persistErr != nil {
+		b.taskMu.Unlock()
+		return fmt.Errorf("persist task %s completion transition: %w", m.TaskID, persistErr)
+	}
+	b.tasks[m.TaskID] = &next
 	b.taskMu.Unlock()
-	if t != nil {
-		b.persistTask(ctx, ti)
-	}
-	if t != nil && !alreadySucceeded {
+	ti := cloneTask(next)
+	if !alreadySucceeded {
 		b.notify.Publish(Notification{Type: "task.succeeded", Source: b.cfg.Name, Severity: SeverityInfo, MessageID: ti.MessageID, TaskID: ti.ID, Queue: ti.Queue, TenantID: ti.TenantID, Timestamp: time.Now(), Data: map[string]any{"name": ti.Name}})
 		if b.cfg.Hooks.OnTaskSucceeded != nil {
 			b.cfg.Hooks.OnTaskSucceeded(ctx, TaskEvent{Task: ti, Time: time.Now()})
 		}
 	}
-	if !alreadySucceeded {
-		b.finishTaskWaiters(m.TaskID)
-	}
+	b.finishTaskWaiters(m.TaskID)
+	return nil
 }
 func (b *Broker) finishTaskWaiters(id string) {
 	b.taskMu.Lock()
@@ -586,8 +844,9 @@ func cloneTask(t TaskInfo) TaskInfo {
 	return t
 }
 
-func (b *Broker) persistTask(ctx context.Context, t TaskInfo) {
+func (b *Broker) persistTask(ctx context.Context, t TaskInfo) error {
 	if b != nil && b.stateStore != nil && t.ID != "" {
-		_ = b.stateStore.PutTask(ctx, t)
+		return b.stateStore.PutTask(ctx, t)
 	}
+	return nil
 }

@@ -8,7 +8,7 @@ go test ./...
 
 It provides two `database/sql` backed stores for the broker:
 
-- `StateStore`: persistent control-plane state for broker/task/consumer/publisher records.
+- `StateStore`: persistent control-plane state for broker/task/consumer/publisher records, MQTT persistent-session subscriptions, inbound QoS 2 and outbound QoS 1/2 state, tenant-scoped retained messages with ordered paging for subscription replay, and durable outbox entries.
 - `MessageStore`: persistent message data-plane for queues, topics, streams, leases, offsets, DLQ, and message movement.
 
 The package intentionally does **not** import a SQLite driver directly. Register the driver in your application or command binary:
@@ -24,9 +24,7 @@ import (
 )
 
 func main() {
-    msgStore, err := sqlitestore.OpenMessageStore("sqlite", "./broker-messages.sqlite")
-    if err != nil { panic(err) }
-    stateStore, err := sqlitestore.Open("sqlite", "./broker-state.sqlite")
+    msgStore, stateStore, err := sqlitestore.OpenStores("sqlite", "./broker.sqlite")
     if err != nil { panic(err) }
 
     b := broker.MustNew(broker.Config{
@@ -37,6 +35,57 @@ func main() {
     _ = b
 }
 ```
+
+`OpenStores` shares one `*sql.DB` between message and control-plane state; the
+message store owns and closes that connection pool. To keep them in separate
+files, use `OpenMessageStore` and `Open` independently.
+
+`NewDurableOutbox` uses the broker's `StateStore` automatically when it
+implements `broker.OutboxStateStore`, as this SQLite store does. Pending entries
+are restored after restart and dispatched at least once. If a crash happens
+after the message append succeeds but before the outbox status update is saved,
+the message may be appended again; consumers should be idempotent and use
+the broker’s deduplication facilities where they fit the workload. The default
+`broker.MemoryStateStore` only preserves entries while that process remains
+alive. SQLite state stores use expiring claim leases so multiple dispatchers
+can share the outbox. A worker whose claim expires can overlap with recovery if
+it already appended the message, so delivery remains at-least-once.
+Dispatch failures use exponential backoff with jitter. Once the retry limit is
+reached, the outbox persists a dead-letter phase; a failed DLQ write retries
+that phase without sending the original message again.
+Published and dead-lettered outbox rows remain available to `GetEntry` until
+`Prune(ctx, before, limit)` removes terminal records older than the cutoff.
+
+### Commit business data and an outbox row together
+
+Use the same `*sql.DB` for the application transaction and `StateStore`. The
+broker can use a different message store; the transaction covers the
+application row and outbox row, while broker dispatch starts after commit.
+
+```go
+payload, err := json.Marshal(map[string]string{"order_id": orderID}) // import encoding/json
+if err != nil { return err }
+
+tx, err := db.BeginTx(ctx, nil)
+if err != nil { return err }
+defer tx.Rollback()
+
+if _, err := tx.ExecContext(ctx,
+    `INSERT INTO orders(id, status) VALUES(?, ?)`, orderID, "created"); err != nil {
+    return err
+}
+
+_, err = outbox.EnqueueTx(ctx, stateStore.OutboxTransaction(tx), broker.Message{
+	Payload: payload,
+}, []broker.Destination{{Kind: broker.DestinationQueue, Name: "orders.created"}})
+if err != nil { return err }
+return tx.Commit()
+```
+
+The transaction belongs to the caller. `EnqueueTx` only inserts the outbox row;
+the normal outbox poller discovers it after commit. A rollback removes both the
+business write and the outbox row. Once dispatch starts, delivery is still
+at-least-once, so consumers must handle retries and duplicates.
 
 ## MessageStore durability model
 

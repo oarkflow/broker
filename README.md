@@ -188,6 +188,16 @@ With `durable`, `latency` or `throughput` profiles, `brokerd` refuses to run on
 the in-memory store. Use `-store=wal`, `-store=wal2`, `-store=sqlite`, or
 `-profile=lightweight`.
 
+For `SubscribeBatch`, profiles default to batch sizes of 32 (`durable`), 1
+(`latency`), 128 (`throughput`), and 16 (`lightweight`). An explicit
+`ConsumerConfig.BatchSize` overrides the selected profile. If `BatchWait` is
+set, it remains the maximum collection delay while the initial wait and
+adjustment speed follow the selected profile: latency starts at 50µs and
+backs off quickly, durable starts at 200µs, throughput starts at 1ms and
+adapts more conservatively to favor full batches, and lightweight starts at
+100µs. Each profile also sets a lower wait floor. A zero `BatchWait` still
+disables collection delay.
+
 ### Open the console
 
 With the broker running, open:
@@ -425,11 +435,17 @@ curl -s -X POST $BROKER/v1/tasks/$TID/retry    # re-queue its message
 ```
 
 `cancel` interrupts a running handler through its context, and the task stays
-`cancelled` — a late completion cannot overwrite it.
+`cancelled` — a late completion cannot overwrite it. If the task has not started,
+its message is acknowledged without invoking the handler. Remote workers receive
+the same cancellation signal, including when it arrives just before their task
+handler starts.
 
 `retry` re-queues the underlying message with attempts and error reset. It does
-**not** change the status of the task you asked about; that record stays
-terminal, and the replayed message runs as a new task when a worker picks it up.
+so under the same task ID. Its status returns to `queued` (or `scheduled` for a
+delayed task), then advances as a worker retries it; the same handle and `Wait`
+call observe the eventual result. Cancelling an already-cancelled task is
+idempotent. Cancelling a succeeded, failed, or dead-lettered task returns an
+invalid-state error and leaves its terminal result unchanged.
 
 Registering a task handler in Go:
 
@@ -719,6 +735,7 @@ go run ./complete distributed
 | Retry policy | Exponential backoff with jitter |
 | DLQ | Dead-letter queue with replay |
 | Idempotency | Publisher and consumer dedup |
+| Outbox dispatch | At-least-once dispatch; restart recovery with a persistent `OutboxStateStore` |
 | Delivery semantics | At-least-once queues with bounded idempotency helpers |
 | Circuit breaker | Automatic failure detection and recovery |
 | Rate limiting | Per-queue and per-topic token bucket |
@@ -738,11 +755,36 @@ go run ./complete distributed
 | WAL compaction | Experimental detached JSON-WAL utility; not active-store compaction |
 | Consumer priority | Weighted routing based on consumer capacity |
 | Consumer group rebalancing | Weighted, graceful drain |
-| Partitioning | Hash, round-robin, key-based routing |
+| Partitioning | Hash, round-robin, key-based routing, least-depth balancing for unkeyed publishes |
 | Multi-tenancy | Tenant-scoped core data paths; full control-plane isolation is pending |
 | Federation | Inter-broker message forwarding |
 | Shovel | Queue-to-queue message movement |
 | Graceful shutdown | HTTP connection draining |
+
+The outbox persists entries through the broker `StateStore` when that store
+implements `OutboxStateStore`; the contrib SQLite state store does. Failed
+dispatches retry with exponential backoff and jitter. If writing a failed entry
+to the DLQ also fails, the recorded dead-letter phase retries that write
+without republishing the original message. The default
+memory state store is process-local. A crash after the message append succeeds
+but before the outbox status update is saved can cause a duplicate append, so
+consumers should remain idempotent. This does not make an application database
+transaction atomic with broker publishing.
+SQLite and memory state stores assign each entry to one claim token until its
+lease expires. An expired claim can be recovered after worker failure; if the
+old worker already appended before expiry, recovery can still produce a
+duplicate. A stale worker cannot update the entry after another worker replaces
+its claim token.
+
+Completed outbox records stay available to `GetEntry` until explicitly pruned.
+Use `Prune(ctx, before, limit)` to remove published or dead-lettered records
+older than the chosen cutoff and bound storage growth. Pruning ends duplicate-ID
+protection for those records.
+
+For application data stored in the same SQL database as the SQLite state
+store, use `DurableOutbox.EnqueueTx` with the caller's open `*sql.Tx` via
+`StateStore.OutboxTransaction(tx)`. The business row and outbox row then commit
+or roll back together; broker dispatch begins after that transaction commits.
 
 ---
 
@@ -753,11 +795,44 @@ go run ./complete distributed
 | HTTP/JSON | TCP | 8090 | Pre-v1; daemon-integrated |
 | Native stream | TCP/TLS | configurable | Pre-v1; authenticated (token/mTLS) handshake, see below |
 | AMQP 0-9-1 | TCP/TLS | configurable | Experimental; conformance not established |
-| MQTT 3.1.1 | TCP/TLS | configurable | Experimental; persistent sessions remain incomplete |
+| MQTT 3.1.1 | TCP/TLS | configurable | Experimental; persistent subscriptions, inbound and outbound QoS 1/2 session recovery, Last Will, and retained-message replay are supported |
 | Native RPC | TCP/TLS | configurable | Experimental JSON/TCP; not gRPC |
 | SSE | HTTP(S) | configurable | Experimental event stream, separate from WebSocket |
 | WebSocket | RFC 6455 | configurable | Pre-v1; protobuf-independent JSON data plane |
 | gRPC | protobuf/HTTP2 | configurable | Pre-v1 versioned `broker.v1` API |
+
+For MQTT, persistent-session subscription metadata is saved through the
+broker's optional `MQTTSessionStore` state-store extension. The contrib SQLite
+state store implements it, and `brokerd -store sqlite` opens message and
+control-plane state on the same database. The default memory state store is
+process-local.
+Clients must complete CONNECT within `MQTTConfig.ConnectTimeout` (5 seconds by
+default). Nonzero client keep-alive values are capped at `MQTTConfig.KeepAlive`
+(60 seconds by default); a client keep-alive of zero disables inactivity
+monitoring. MQTT packet writes time out after `MQTTConfig.WriteTimeout` (10
+seconds by default).
+Tenant-scoped MQTT credentials are restricted to one tenant per connection;
+MQTT 3.1.1 has no field for selecting among multiple tenants.
+When ACL is enabled, `message:publish` gates client publishes and Last Wills,
+and `message:read` gates subscriptions.
+Retained publications are keyed by tenant and topic. The built-in memory and
+SQLite state stores retain them across MQTT reconnects; a custom state store
+without `MQTTRetainedStore` gets process-local retained state. Empty retained
+publishes remove the retained value while still being delivered live.
+Built-in retained stores page subscription replay in batches so each replay
+does not clone the full retained payload set at once.
+Outbound QoS 1 messages remain in the MQTT session until `PUBACK`; they resume
+with the same packet identifier after reconnect when the state store supports
+`MQTTSessionStore`. Outbound QoS 2 stores its PUBLISH/PUBREL phase and resumes
+the appropriate packet with the same packet identifier until `PUBCOMP`.
+The retained-state write and live message append use separate stores and are
+not one atomic transaction; a crash can leave the live append without its
+retained update.
+Queued offline deliveries survive only when the message store is durable.
+Inbound QoS 2 state is saved before `PUBREC`; replay uses a stable idempotency
+key and clears the session record before `PUBCOMP`. Duplicate suppression
+depends on the message store retaining that idempotency record until the
+handshake finishes, and this does not establish full MQTT conformance.
 
 `brokerd` supervises every enabled listener. Protocol listeners are opt-in by
 address; production mode requires TLS and authentication on every listener,
@@ -823,6 +898,11 @@ plaintext listeners require the explicit `--insecure-dev` flag.
 | `consumer:register/read/control/poll` | consumer management |
 | `task:read/write` | task management |
 | `notification:read` | notification/SSE access |
+
+ACL principals can set `RequestsPerSecond`, `Burst`, and `MaxConcurrent`. The
+rate bucket is shared across listeners and charges each request on long-lived
+protocol connections; the concurrency limit counts their open connections
+across MQTT, AMQP, gRPC, WebSocket, and BST1.
 
 ### TLS/mTLS
 
@@ -1072,6 +1152,16 @@ b.Subscribe(ctx, broker.ConsumerConfig{
 })
 ```
 
+`BatchWait` is the maximum collection delay. When positive, the subscription
+starts with a short wait, reduces it after full batches, and increases it after
+underfilled timeouts below the ceiling. `/metrics` reports the mean current
+wait across active batch consumers.
+
+The store scopes deduplication IDs, idempotency keys, producer sequence state,
+and stream consumer offsets by `TenantID`. Persisted snapshots retain these
+indexes. Older snapshots migrate on restore, and legacy WAL offset records are
+decoded during replay.
+
 ---
 
 ## Routing
@@ -1128,9 +1218,26 @@ msgs, _ := b.ReadStream(ctx, broker.StreamReadRequest{Stream: "audit.events", Co
 // Commit offset
 b.CommitOffset(ctx, broker.OffsetCommit{Stream: "audit.events", ConsumerGroup: "analytics", Offset: msgs[len(msgs)-1].Offset})
 
+// Atomically commit the input offset with produced output on stores that
+// support OffsetAppendStore (memory, SQLite, local WAL, and ReplicatedStore).
+_, err := b.CommitOffsetAndAppend(ctx,
+    broker.OffsetCommit{Stream: "audit.events", ConsumerGroup: "analytics", Offset: msgs[len(msgs)-1].Offset, TransactionID: "analytics-batch-0001"},
+    []broker.AppendEntry{{
+        Message: broker.Message{ID: "derived-1", Topic: "audit.enriched", Payload: []byte("...")},
+        Destinations: []broker.Destination{{Kind: broker.DestinationTopic, Name: "audit.enriched"}},
+    }},
+)
+
 // Check lag
 lag, _ := b.StreamLag(ctx, "audit.events", "analytics")
 ```
+
+Set `TransactionID` to a stable value when the caller may retry after a timeout.
+The store returns the prior result for the same input and reports
+`ErrTransactionConflict` if that ID is reused with different input. Stores
+retain the most recent 4096 transaction outcomes. Retry results resolve full
+messages while retained; after message cleanup, the transaction record returns
+the output metadata it kept.
 
 ---
 
@@ -1213,14 +1320,22 @@ b.FederationManager().AddLink(broker.FederationConfig{
 
 ```go
 b := broker.MustNew(broker.Config{
-    Partition: &broker.PartitionConfig{Partitions: 4, Strategy: broker.PartitionHash},
+    Partition: &broker.PartitionConfig{Partitions: 4, Strategy: broker.PartitionLeastDepth},
 })
 
-router := broker.NewPartitionRouter(broker.PartitionConfig{Partitions: 4, Strategy: broker.PartitionHash})
-partition := router.SelectPartition(broker.Message{Key: "user-123"})
-queue := fmt.Sprintf("events.p%d", partition)
-pub.Publish(ctx, "events.user", payload, broker.WithQueue(queue))
+// Unkeyed messages go to a shallow partition; keyed messages use stable hashing.
+_, err := b.PublishPartitioned(ctx, "events", payload)
+_, err = b.PublishPartitioned(ctx, "events", payload, broker.WithKey("user-123"))
+stats, err := b.TopicPartitionStats(ctx, "events", 4) // includes hot partitions and depth skew
 ```
+
+`PartitionReassignment` rules move queued messages between queues in a single
+store operation. Leased and scheduled messages are left in the source queue;
+`PreserveOffset` controls whether a message's existing offset is retained.
+Moves skip messages when a destination queue is at `MaxDepth`, leaving them
+available for a later reassignment pass. The move checks source membership
+under the store lock, so concurrent reassignment passes cannot move the same
+message twice.
 
 ---
 
@@ -1246,7 +1361,7 @@ pub.Publish(ctx, "invoice.created", payload, broker.WithSchema("invoice", "v2"))
 curl http://localhost:8090/metrics
 ```
 
-Metrics: `broker_messages_published_total`, `broker_messages_delivered_total`, `broker_messages_acked_total`, `broker_queue_depth{queue}`, `broker_topic_published_total{topic}`, latency histograms.
+Metrics: `broker_messages_published_total`, `broker_messages_delivered_total`, `broker_messages_acked_total`, `broker_publish_rate_limited_total`, `broker_publish_backpressured_total`, durable outbox dispatch attempts, failures, published entries, and dead-lettered entries (`broker_outbox_*`), consumer batch/message counts, collection time, and current adaptive wait (`broker_consumer_*`), `broker_queue_depth{queue}`, `broker_topic_published_total{topic}`, latency histograms, and WAL group-commit batches, request counts, maximum batch size, cumulative coalescing time, current adaptive coalescing wait, and errors (`broker_wal_group_commit_*`). The OTLP exporter includes matching rate-limit, queue-depth backpressure, and outbox counters.
 
 ### Tracing
 

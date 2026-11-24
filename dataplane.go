@@ -1081,18 +1081,43 @@ func (a AdminServer) leaseForConsumer(w http.ResponseWriter, r *http.Request, re
 		}
 		if len(msgs) > 0 || wait <= 0 || time.Now().After(deadline) {
 			if len(msgs) > 0 {
-				a.Broker.Consumers().AddStats(req.ConsumerID, int64(len(msgs)), 0, 0, 0, "")
 				group := firstNonEmpty(req.ConsumerGroup, req.ConsumerID)
 				notify := a.Broker.cfg.EnableNotifications || a.Broker.cfg.EnableConsumerEventTracking
-				for i := range msgs {
-					msgs[i].ConsumerID = req.ConsumerID
-					msgs[i].ConsumerGroup = group
-					msgs[i].Status = MessageProcessing
-					taskID := firstNonEmpty(msgs[i].TaskID, msgs[i].Headers["x-task-id"])
+				leased := msgs
+				active := make([]Message, 0, len(leased))
+				for i := range leased {
+					leased[i].ConsumerID = req.ConsumerID
+					leased[i].ConsumerGroup = group
+					leased[i].Status = MessageProcessing
+					taskID := firstNonEmpty(leased[i].TaskID, leased[i].Headers["x-task-id"])
 					if taskID != "" {
-						a.Broker.startTask(r.Context(), taskID)
+						run, err := a.Broker.startTask(r.Context(), taskID)
+						if err != nil {
+							for _, item := range leased {
+								_ = a.Broker.store.Nack(r.Context(), NackRequest{MessageID: item.ID, Queue: req.Queue, ConsumerID: req.ConsumerID, LeaseToken: item.LeaseToken, Action: NackRequeue})
+							}
+							WriteBrokerError(w, err)
+							return nil, false
+						}
+						if !run {
+							if err := a.Broker.store.Ack(r.Context(), AckRequest{MessageID: leased[i].ID, Queue: req.Queue, LeaseToken: leased[i].LeaseToken, ConsumerID: req.ConsumerID}); err != nil {
+								for _, item := range leased {
+									_ = a.Broker.store.Nack(r.Context(), NackRequest{MessageID: item.ID, Queue: req.Queue, ConsumerID: req.ConsumerID, LeaseToken: item.LeaseToken, Action: NackRequeue})
+								}
+								WriteBrokerError(w, err)
+								return nil, false
+							}
+							a.Broker.Consumers().AddStats(req.ConsumerID, 0, 1, 0, 0, "")
+							a.Broker.notify.Publish(Notification{Type: "message.acked", Source: firstNonEmpty(req.ConsumerID, "remote-consumer"), Severity: SeverityInfo, MessageID: leased[i].ID, TaskID: taskID, Queue: req.Queue, Consumer: req.ConsumerID, ConsumerGroup: group, TenantID: leased[i].TenantID, Timestamp: time.Now()})
+							continue
+						}
 					}
-					if notify {
+					active = append(active, leased[i])
+				}
+				msgs = active
+				if notify {
+					for i := range msgs {
+						taskID := firstNonEmpty(msgs[i].TaskID, msgs[i].Headers["x-task-id"])
 						a.Broker.emitConsumerNotification(req.ConsumerID, Notification{
 							Type: "message.leased", Source: a.Broker.cfg.Name, Severity: SeverityInfo,
 							MessageID: msgs[i].ID, TaskID: taskID, Topic: msgs[i].Topic, Queue: req.Queue,
@@ -1102,6 +1127,7 @@ func (a AdminServer) leaseForConsumer(w http.ResponseWriter, r *http.Request, re
 						})
 					}
 				}
+				a.Broker.Consumers().AddStats(req.ConsumerID, int64(len(msgs)), 0, 0, 0, "")
 			}
 			return msgs, true
 		}
@@ -1206,7 +1232,10 @@ func (a AdminServer) v1Message(w http.ResponseWriter, r *http.Request, tail stri
 		}
 		a.Broker.Consumers().AddStats(req.ConsumerID, 0, 1, 0, 0, "")
 		if hadMessage {
-			a.Broker.completeTask(r.Context(), m, nil, nil)
+			if err := a.Broker.completeTask(r.Context(), m, nil, nil); err != nil {
+				WriteBrokerError(w, fmt.Errorf("message %s was acknowledged but task completion could not be persisted: %w", id, err))
+				return
+			}
 			a.Broker.notify.Publish(Notification{Type: "message.acked", Source: firstNonEmpty(req.ConsumerID, "remote-consumer"), Severity: SeverityInfo, MessageID: id, TaskID: firstNonEmpty(m.TaskID, m.Headers["x-task-id"]), Topic: m.Topic, Queue: firstNonEmpty(req.Queue, m.Queue), Consumer: req.ConsumerID, ConsumerGroup: m.ConsumerGroup, TenantID: m.TenantID, Timestamp: time.Now()})
 		} else {
 			a.Broker.notify.Publish(Notification{Type: "message.acked", Source: firstNonEmpty(req.ConsumerID, "remote-consumer"), Severity: SeverityInfo, MessageID: id, Queue: req.Queue, Consumer: req.ConsumerID, Timestamp: time.Now()})
@@ -1249,7 +1278,18 @@ func (a AdminServer) v1Message(w http.ResponseWriter, r *http.Request, tail stri
 			if hadMessage {
 				tid := firstNonEmpty(m.TaskID, m.Headers["x-task-id"])
 				if tid != "" {
-					a.Broker.failTask(r.Context(), tid, errf(ErrPermanent, "%s", firstNonEmpty(req.Error, req.Reason)))
+					if taskErr := a.Broker.failTask(r.Context(), tid, errf(ErrPermanent, "%s", firstNonEmpty(req.Error, req.Reason))); taskErr != nil {
+						WriteBrokerError(w, fmt.Errorf("message %s was rejected but task failure could not be persisted: %w", id, taskErr))
+						return
+					}
+				}
+			}
+		} else if hadMessage {
+			tid := firstNonEmpty(m.TaskID, m.Headers["x-task-id"])
+			if tid != "" {
+				if taskErr := a.Broker.retryTask(r.Context(), tid, fmt.Errorf("%s", firstNonEmpty(req.Error, firstNonEmpty(req.Reason, "message requeued")))); taskErr != nil {
+					WriteBrokerError(w, fmt.Errorf("message %s was requeued but task retry state could not be persisted: %w", id, taskErr))
+					return
 				}
 			}
 		}
@@ -1297,12 +1337,18 @@ func (a AdminServer) v1Message(w http.ResponseWriter, r *http.Request, tail stri
 			m.TaskID = m.Headers["x-task-id"]
 			m.TaskName = m.Headers["x-task-name"]
 		}
-		_ = a.Broker.store.Update(r.Context(), m)
+		if err := a.Broker.store.Update(r.Context(), m); err != nil {
+			WriteBrokerError(w, err)
+			return
+		}
 		if req.Progress.UpdatedAt.IsZero() {
 			req.Progress.UpdatedAt = time.Now()
 		}
 		if m.TaskID != "" {
-			a.Broker.updateTaskProgress(r.Context(), m.TaskID, req.Progress)
+			if err := a.Broker.updateTaskProgress(r.Context(), m.TaskID, req.Progress); err != nil {
+				WriteBrokerError(w, err)
+				return
+			}
 		}
 		a.Broker.notify.Publish(Notification{Type: "message.progress", Source: firstNonEmpty(req.ConsumerID, "remote-consumer"), Severity: SeverityInfo, MessageID: id, TaskID: m.TaskID, Topic: m.Topic, Queue: firstNonEmpty(req.Queue, m.Queue), Consumer: req.ConsumerID, ConsumerGroup: m.ConsumerGroup, TenantID: m.TenantID, Timestamp: time.Now(), Data: map[string]any{"percent": req.Progress.Percent, "message": req.Progress.Message}})
 		writeBrokerJSON(w, map[string]bool{"ok": true})
@@ -1339,18 +1385,26 @@ func (a AdminServer) v1Message(w http.ResponseWriter, r *http.Request, tail stri
 		if req.Error != nil || op == "fail" {
 			resp.Status = ResponseError
 		}
+		if req.Ack || op == "complete" {
+			if err := a.Broker.store.Ack(r.Context(), AckRequest{MessageID: id, Queue: req.Queue, LeaseToken: req.LeaseToken, ConsumerID: req.ConsumerID}); err != nil {
+				WriteBrokerError(w, err)
+				return
+			}
+			a.Broker.Consumers().AddStats(req.ConsumerID, 0, 1, 0, 0, "")
+			var taskErr error
+			if req.Error != nil || op == "fail" {
+				taskErr = a.Broker.completeTask(r.Context(), m, nil, req.Error)
+			} else {
+				taskErr = a.Broker.completeTask(r.Context(), m, []byte(req.Payload), nil)
+			}
+			if taskErr != nil {
+				WriteBrokerError(w, fmt.Errorf("message %s was acknowledged but task state could not be persisted: %w", id, taskErr))
+				return
+			}
+		}
 		delivered := false
 		if corr != "" {
 			delivered = a.Broker.completeResponse(resp)
-		}
-		if req.Error != nil || op == "fail" {
-			a.Broker.completeTask(r.Context(), m, nil, req.Error)
-		} else {
-			a.Broker.completeTask(r.Context(), m, []byte(req.Payload), nil)
-		}
-		if req.Ack || op == "complete" {
-			_ = a.Broker.store.Ack(r.Context(), AckRequest{MessageID: id, Queue: req.Queue, LeaseToken: req.LeaseToken, ConsumerID: req.ConsumerID})
-			a.Broker.Consumers().AddStats(req.ConsumerID, 0, 1, 0, 0, "")
 		}
 		eventType := "message.responded"
 		severity := SeverityInfo

@@ -6,6 +6,7 @@ import (
 	"crypto/subtle"
 	"crypto/x509"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -159,18 +160,44 @@ func hasRestrictedTenantScope(ctx context.Context) bool {
 	return true
 }
 
+// ResolveTenant applies the authenticated principal's tenant scope. Storage
+// adapters outside this module can use it to enforce the same tenant default
+// and authorization rules as the built-in stores.
+func ResolveTenant(ctx context.Context, requested string) (string, error) {
+	return resolveTenant(ctx, requested)
+}
+
+// TenantAllowed reports whether a tenant identifier is visible to the principal
+// attached to ctx. It is intended for storage and protocol adapters.
+func TenantAllowed(ctx context.Context, tenant string) bool { return tenantAllowed(ctx, tenant) }
+
+// HasRestrictedTenantScope reports whether ctx is limited to one or more named
+// tenants rather than being unscoped or explicitly global.
+func HasRestrictedTenantScope(ctx context.Context) bool { return hasRestrictedTenantScope(ctx) }
+
 func visibleOffsetGroup(ctx context.Context, stored string) (string, bool) {
+	tenant, group, encoded := parseTenantScopedKey(stored)
 	p, scoped := scopedPrincipalFromContext(ctx)
 	if !scoped || len(p.Tenants) == 0 {
+		if encoded {
+			return displayOffsetGroup(tenant, group, stored), true
+		}
 		return stored, true
 	}
-	for _, tenant := range p.Tenants {
-		if tenant == "*" {
+	for _, allowed := range p.Tenants {
+		if allowed == "*" {
+			if encoded {
+				return displayOffsetGroup(tenant, group, stored), true
+			}
 			return stored, true
 		}
 	}
-	tenant, group, ok := strings.Cut(stored, "\x00")
-	if !ok || tenant == "" || group == "" {
+	if !encoded {
+		// Keep visibility compatible with un-migrated snapshots and callers
+		// holding an older tenant+NUL+group key.
+		tenant, group, encoded = strings.Cut(stored, "\x00")
+	}
+	if !encoded || tenant == "" || group == "" {
 		return "", false
 	}
 	for _, allowed := range p.Tenants {
@@ -178,10 +205,35 @@ func visibleOffsetGroup(ctx context.Context, stored string) (string, bool) {
 			if len(p.Tenants) == 1 {
 				return group, true
 			}
-			return stored, true
+			return displayOffsetGroup(tenant, group, stored), true
 		}
 	}
 	return "", false
+}
+
+func displayOffsetGroup(tenant, group, encoded string) string {
+	if strings.ContainsRune(tenant, '\x00') || strings.ContainsRune(group, '\x00') {
+		return encoded
+	}
+	if tenant == "" {
+		return group
+	}
+	return tenant + "\x00" + group
+}
+
+func parseTenantScopedKey(value string) (tenant, key string, ok bool) {
+	if len(value) < 3 || value[0] != 't' {
+		return "", "", false
+	}
+	length, rest, found := strings.Cut(value[1:], ":")
+	if !found {
+		return "", "", false
+	}
+	n, err := strconv.Atoi(length)
+	if err != nil || n < 0 || n > len(rest) {
+		return "", "", false
+	}
+	return rest[:n], rest[n:], true
 }
 
 type ACL struct {
@@ -359,11 +411,56 @@ func (a *ACL) Admit(principal AdminPrincipal) (func(), error) {
 	}, nil
 }
 
-// AdmitConnection admits a long-lived protocol connection (MQTT, AMQP, gRPC, WebSocket, BST1)
-// enforcing per-principal MaxConcurrent connection limits across all protocols.
-// The returned release function must be called once the connection terminates.
+// AdmitRate charges one application operation against the principal's shared
+// request token bucket without consuming a connection-concurrency slot. Use it
+// for messages carried over already-admitted long-lived protocol connections.
+func (a *ACL) AdmitRate(principal AdminPrincipal) error {
+	if a == nil || principal.RequestsPerSecond <= 0 {
+		return nil
+	}
+	a.quotaMu.Lock()
+	defer a.quotaMu.Unlock()
+	if a.quotas == nil {
+		a.quotas = make(map[string]*principalQuota)
+	}
+	quota := a.quotas[principal.Name]
+	if quota == nil {
+		burst := principal.Burst
+		if burst <= 0 {
+			burst = principal.RequestsPerSecond
+		}
+		quota = &principalQuota{tokens: float64(burst), last: time.Now()}
+		a.quotas[principal.Name] = quota
+	}
+	now := time.Now()
+	burst := principal.Burst
+	if burst <= 0 {
+		burst = principal.RequestsPerSecond
+	}
+	quota.tokens += now.Sub(quota.last).Seconds() * float64(principal.RequestsPerSecond)
+	if quota.tokens > float64(burst) {
+		quota.tokens = float64(burst)
+	}
+	quota.last = now
+	if quota.tokens < 1 {
+		retry := time.Duration((1-quota.tokens)/float64(principal.RequestsPerSecond)*float64(time.Second)) + time.Millisecond
+		return &RetryError{Class: RetryThrottled, Message: "principal request rate exceeded", RetryAfter: retry, Cause: ErrThrottled}
+	}
+	quota.tokens--
+	return nil
+}
+
+// AdmitConnection charges the principal's request bucket for opening the
+// connection and enforces MaxConcurrent across protocols. The returned release
+// function must be called once the connection terminates.
 func (a *ACL) AdmitConnection(principal AdminPrincipal) (func(), error) {
-	if a == nil || principal.MaxConcurrent <= 0 {
+	if a == nil {
+		return func() {}, nil
+	}
+	if err := a.AdmitRate(principal); err != nil {
+		return nil, err
+	}
+	if principal.MaxConcurrent <= 0 {
 		return func() {}, nil
 	}
 	a.quotaMu.Lock()

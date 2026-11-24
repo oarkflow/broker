@@ -2,6 +2,7 @@ package broker
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
 )
@@ -191,7 +192,7 @@ func (b *Broker) PublishRetryBuffer() *PublishRetryBuffer { return b.outbox }
 // ConsumerOffsetManager provides external consumer offset management.
 type ConsumerOffsetManager struct {
 	broker  *Broker
-	offsets map[string]map[string]uint64 // stream -> group -> offset
+	offsets map[string]map[string]map[string]uint64 // stream -> tenant -> group -> offset
 	mu      sync.RWMutex
 }
 
@@ -199,15 +200,20 @@ type ConsumerOffsetManager struct {
 func NewConsumerOffsetManager(b *Broker) *ConsumerOffsetManager {
 	return &ConsumerOffsetManager{
 		broker:  b,
-		offsets: make(map[string]map[string]uint64),
+		offsets: make(map[string]map[string]map[string]uint64),
 	}
 }
 
 // CommitOffset commits a consumer offset for a stream.
 func (om *ConsumerOffsetManager) CommitOffset(ctx context.Context, stream, group string, offset uint64) error {
-	err := om.broker.Store().CommitOffset(ctx, OffsetCommit{
+	tenant, err := resolveTenant(ctx, "")
+	if err != nil {
+		return err
+	}
+	err = om.broker.Store().CommitOffset(ctx, OffsetCommit{
 		Stream:        stream,
 		ConsumerGroup: group,
+		TenantID:      tenant,
 		Offset:        offset,
 	})
 	if err != nil {
@@ -215,36 +221,87 @@ func (om *ConsumerOffsetManager) CommitOffset(ctx context.Context, stream, group
 	}
 	om.mu.Lock()
 	if om.offsets[stream] == nil {
-		om.offsets[stream] = make(map[string]uint64)
+		om.offsets[stream] = make(map[string]map[string]uint64)
 	}
-	om.offsets[stream][group] = offset
+	if om.offsets[stream][tenant] == nil {
+		om.offsets[stream][tenant] = make(map[string]uint64)
+	}
+	// Store commits are monotonic. Keep the compatibility cache monotonic too,
+	// so a stale lower retry cannot make GetOffset report a regression.
+	if offset > om.offsets[stream][tenant][group] {
+		om.offsets[stream][tenant][group] = offset
+	}
 	om.mu.Unlock()
 	return nil
 }
 
-// GetOffset returns the committed offset for a stream and group.
+// GetOffset returns the cached unscoped offset for a stream and group. It has
+// no context and cannot select a tenant; use GetOffsetContext for an
+// authoritative tenant-aware read.
 func (om *ConsumerOffsetManager) GetOffset(stream, group string) (uint64, bool) {
 	om.mu.RLock()
 	defer om.mu.RUnlock()
-	if groups, ok := om.offsets[stream]; ok {
-		off, ok := groups[group]
+	if tenants, ok := om.offsets[stream]; ok {
+		// The legacy accessor has no context and therefore only exposes
+		// unscoped offsets. Tenant callers should use GetOffsetContext.
+		off, ok := tenants[""][group]
 		return off, ok
 	}
 	return 0, false
 }
 
-// GetAllOffsets returns all committed offsets for a stream.
+// GetOffsetContext reads the committed offset for the tenant resolved from ctx.
+// Unlike GetOffset, it reads through the store and remains correct across
+// process restarts and commits made outside this manager.
+func (om *ConsumerOffsetManager) GetOffsetContext(ctx context.Context, stream, group string) (uint64, error) {
+	return om.broker.Store().ConsumerOffset(ctx, OffsetCommit{
+		Stream:        stream,
+		ConsumerGroup: group,
+	})
+}
+
+// GetAllOffsets returns cached unscoped offsets for a stream. It has no
+// context and cannot select a tenant; use GetAllOffsetsContext for a
+// tenant-scoped cache view.
 func (om *ConsumerOffsetManager) GetAllOffsets(stream string) map[string]uint64 {
 	om.mu.RLock()
 	defer om.mu.RUnlock()
-	if groups, ok := om.offsets[stream]; ok {
+	if tenants, ok := om.offsets[stream]; ok {
+		groups := tenants[""]
 		result := make(map[string]uint64, len(groups))
-		for k, v := range groups {
-			result[k] = v
+		for group, v := range groups {
+			result[group] = v
 		}
 		return result
 	}
 	return nil
+}
+
+// GetAllOffsetsContext returns offsets for the tenant resolved from ctx. Stores
+// implementing ConsumerOffsetLister provide an authoritative durable listing;
+// other stores fall back to this manager's process-local cache.
+func (om *ConsumerOffsetManager) GetAllOffsetsContext(ctx context.Context, stream string) (map[string]uint64, error) {
+	if lister, ok := om.broker.Store().(ConsumerOffsetLister); ok {
+		result, err := lister.ConsumerOffsets(ctx, stream, "")
+		if !errors.Is(err, ErrUnsupportedMode) {
+			return result, err
+		}
+	}
+	tenant, err := resolveTenant(ctx, "")
+	if err != nil {
+		return nil, err
+	}
+	om.mu.RLock()
+	defer om.mu.RUnlock()
+	groups := om.offsets[stream][tenant]
+	if len(groups) == 0 {
+		return nil, nil
+	}
+	result := make(map[string]uint64)
+	for group, offset := range groups {
+		result[group] = offset
+	}
+	return result, nil
 }
 
 // Lag returns the consumer lag for a stream and group.
@@ -253,7 +310,15 @@ func (om *ConsumerOffsetManager) Lag(ctx context.Context, stream, group string) 
 	if err != nil {
 		return 0, err
 	}
-	committed, _ := om.GetOffset(stream, group)
+	// The manager cache is process-local and may be empty after a restart or
+	// stale when another consumer committed directly through the store.
+	committed, err := om.broker.Store().ConsumerOffset(ctx, OffsetCommit{
+		Stream:        stream,
+		ConsumerGroup: group,
+	})
+	if err != nil {
+		return 0, err
+	}
 	if head >= committed {
 		return head - committed, nil
 	}
