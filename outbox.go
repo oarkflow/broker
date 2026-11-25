@@ -320,12 +320,21 @@ func (o *DurableOutbox) Flush(ctx context.Context) error {
 	return o.flushPending(ctx)
 }
 
-func (o *DurableOutbox) flushPending(parent context.Context) error {
+func (o *DurableOutbox) flushPending(parent context.Context) (result error) {
 	o.dispatchMu.Lock()
 	defer o.dispatchMu.Unlock()
 	if claims, ok := o.store.(OutboxClaimStore); ok {
 		return o.flushClaimed(parent, claims)
 	}
+	var failures []error
+	report := func(err error) { failures = append(failures, err) }
+	defer func() {
+		// Append failures are retried per the outbox schedule, but Flush must
+		// not report success for work that failed.
+		if len(failures) > 0 {
+			result = errors.Join(append([]error{result}, failures...)...)
+		}
+	}()
 	if err := o.refreshDispatchable(parent); err != nil {
 		return err
 	}
@@ -365,7 +374,7 @@ func (o *DurableOutbox) flushPending(parent context.Context) error {
 		save := func(ctx context.Context, entry DurableOutboxEntry) error {
 			return o.persist(ctx, entry)
 		}
-		if err := o.dispatchEntry(parent, entry, save); err != nil {
+		if err := o.dispatchEntry(parent, entry, report, save); err != nil {
 			return errors.Join(err, o.restorePending(batch[i:]))
 		}
 		o.mu.Lock()
@@ -379,7 +388,16 @@ func (o *DurableOutbox) flushPending(parent context.Context) error {
 	return nil
 }
 
-func (o *DurableOutbox) flushClaimed(ctx context.Context, store OutboxClaimStore) error {
+func (o *DurableOutbox) flushClaimed(ctx context.Context, store OutboxClaimStore) (result error) {
+	var failures []error
+	report := func(err error) { failures = append(failures, err) }
+	defer func() {
+		// Append failures are retried per the outbox schedule, but Flush must
+		// not report success for work that failed.
+		if len(failures) > 0 {
+			result = errors.Join(append([]error{result}, failures...)...)
+		}
+	}()
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -401,7 +419,7 @@ func (o *DurableOutbox) flushClaimed(ctx context.Context, store OutboxClaimStore
 		save := func(ctx context.Context, entry DurableOutboxEntry) error {
 			return store.UpdateClaimedOutboxEntry(ctx, token, entry)
 		}
-		if err := o.dispatchEntry(ctx, &entry, save); err != nil {
+		if err := o.dispatchEntry(ctx, &entry, report, save); err != nil {
 			return errors.Join(
 				fmt.Errorf("durable outbox: dispatch %q: %w", entry.ID, err),
 				o.releaseUnprocessedClaims(ctx, store, token, entries[i+1:]),
@@ -453,9 +471,9 @@ func (o *DurableOutbox) releaseUnprocessedClaims(ctx context.Context, store Outb
 	return errors.Join(releaseErrors...)
 }
 
-func (o *DurableOutbox) dispatchEntry(ctx context.Context, entry *DurableOutboxEntry, save func(context.Context, DurableOutboxEntry) error) error {
+func (o *DurableOutbox) dispatchEntry(ctx context.Context, entry *DurableOutboxEntry, report func(error), save func(context.Context, DurableOutboxEntry) error) error {
 	if entry.DeadLetterPending {
-		return o.dispatchDeadLetter(ctx, entry, save)
+		return o.dispatchDeadLetter(ctx, entry, report, save)
 	}
 	entry.Attempts++
 	entry.UpdatedAt = time.Now()
@@ -489,6 +507,7 @@ func (o *DurableOutbox) dispatchEntry(ctx context.Context, entry *DurableOutboxE
 		metrics.RecordOutboxDispatchFailure()
 	}
 	entry.LastError = dispatchErr.Error()
+	report(fmt.Errorf("durable outbox: dispatch %q: %w", entry.ID, dispatchErr))
 	entry.PublishedAt = nil
 	if entry.Attempts >= entry.MaxAttempts {
 		if o.dlq == "" {
@@ -503,14 +522,14 @@ func (o *DurableOutbox) dispatchEntry(ctx context.Context, entry *DurableOutboxE
 		if err := save(ctx, *entry); err != nil {
 			return err
 		}
-		return o.dispatchDeadLetter(ctx, entry, save)
+		return o.dispatchDeadLetter(ctx, entry, report, save)
 	}
 	entry.Status = OutboxFailed
 	entry.NextAttemptAt = time.Now().Add(backoffDelay(o.retryPolicy, entry.Attempts))
 	return o.finishEntry(ctx, entry, save)
 }
 
-func (o *DurableOutbox) dispatchDeadLetter(ctx context.Context, entry *DurableOutboxEntry, save func(context.Context, DurableOutboxEntry) error) error {
+func (o *DurableOutbox) dispatchDeadLetter(ctx context.Context, entry *DurableOutboxEntry, report func(error), save func(context.Context, DurableOutboxEntry) error) error {
 	entry.DLQAttempts++
 	entry.UpdatedAt = time.Now()
 	if err := save(ctx, *entry); err != nil {
@@ -522,6 +541,7 @@ func (o *DurableOutbox) dispatchDeadLetter(ctx context.Context, entry *DurableOu
 	dlqMsg.DeadLetterReason = entry.LastError
 	if _, exists, err := o.broker.store.Get(ctx, dlqMsg.ID); err != nil {
 		entry.DLQError = err.Error()
+		report(fmt.Errorf("durable outbox: dead-letter %q: %w", entry.ID, err))
 		return o.failDeadLetter(ctx, entry, save)
 	} else if exists {
 		entry.Status = OutboxDeadLetter
@@ -542,6 +562,7 @@ func (o *DurableOutbox) dispatchDeadLetter(ctx context.Context, entry *DurableOu
 	cancel()
 	if err != nil {
 		entry.DLQError = err.Error()
+		report(fmt.Errorf("durable outbox: dead-letter %q: %w", entry.ID, err))
 		return o.failDeadLetter(ctx, entry, save)
 	}
 	entry.Status = OutboxDeadLetter

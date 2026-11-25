@@ -41,11 +41,16 @@ func legacyOutboxExample(ctx context.Context, _ string) error {
 			if err := worker.Start(); err != nil {
 				return err
 			}
+		}
+		for i := 0; i < 2; i++ {
 			if err := worker.Stop(); err != nil {
 				return err
 			}
 		}
-		fmt.Println("  Legacy worker copies inputs, rejects duplicate IDs, and can restart safely (in memory only)")
+		if err := expectError(worker.Start(), broker.ErrClosed); err != nil {
+			return err
+		}
+		fmt.Println("  Worker copies inputs, rejects duplicate IDs, and rejects restart after Stop (resume with a new worker)")
 		return withBroker(ctx, unavailableStore{Store: broker.NewMemoryStore()}, func(failed *broker.Broker) error {
 			worker, err := broker.NewDurableOutbox(broker.DurableOutboxConfig{Broker: failed})
 			if err != nil {

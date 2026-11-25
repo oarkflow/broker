@@ -1,6 +1,6 @@
 # Storage format status
 
-Atomic stream transactions use packed operation code 19, containing prepared
+Atomic stream transactions use packed operation code 22, containing prepared
 output entries, a tenant-scoped offset commit and the expected previous offset
 in one record. Older operation codes retain their meaning. See
 [stream transactions](STREAM_TRANSACTIONS.md) for the commit boundary and the

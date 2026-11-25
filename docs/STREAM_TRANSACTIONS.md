@@ -124,7 +124,7 @@ Transaction output IDs must be globally unique, as with ordinary publishing.
   or a cross-shard transaction coordinator.
 
 Take backups before enabling this feature. Packed WALs use the new
-`stream_transaction` operation code 19; codes 1–18 retain their existing meaning.
+`stream_transaction` operation code 22; codes 1–21 retain their existing meaning.
 Older binaries do not understand the new record. Downgrade by restoring a backup
 from before stream transactions were written, not by opening the new WAL with an
 older binary.

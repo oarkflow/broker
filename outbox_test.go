@@ -91,10 +91,10 @@ func TestLegacyOutboxRestartOwnershipAndFlushFailure(t *testing.T) {
 	}
 	message.Payload[0] = 'X'
 	dests[0].Name = "changed"
-	// Append failures are recorded on the entry and retried after the backoff
-	// delay; Flush only reports failures to persist outbox state.
-	if err := o.Flush(context.Background()); err != nil {
-		t.Fatalf("flush: %v", err)
+	// Append failures are returned and also recorded on the entry for retry
+	// after the backoff delay.
+	if err := o.Flush(context.Background()); !errors.Is(err, ErrStorageUnavailable) {
+		t.Fatalf("flush hid append failure: %v", err)
 	}
 	entry, _ := o.GetEntry("owned")
 	if entry.Status != OutboxFailed || entry.Attempts != 1 || entry.LastError != ErrStorageUnavailable.Error() {

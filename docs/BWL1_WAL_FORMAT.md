@@ -79,7 +79,11 @@ Decoding validates lengths, CRC, and HMAC before decrypting or allocating decode
  6 lease               15 purge_queue
  7 lease_batch         16 update
  8 update_batch        17 commit_offset
- 9 ack
+ 9 ack                 18 sweep_leases
+                       19 commit_offset_tenant
+                       20 commit_offset_append
+                       21 commit_offset_append_txn
+                       22 stream_transaction
 ```
 
 Each operation has a fixed, versioned field order. Unknown operation codes are rejected.

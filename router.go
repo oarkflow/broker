@@ -58,12 +58,10 @@ type Route struct {
 }
 
 type Router struct {
-	mu            sync.RWMutex
-	routes        []Route
-	exactRoutes   map[string][]int
-	patternRoutes []int
-	taskRouter    *TaskRouter
-	configLoader  *RoutingConfigLoader
+	mu           sync.RWMutex
+	table        *routeTable
+	taskRouter   *TaskRouter
+	configLoader *RoutingConfigLoader
 }
 
 func NewRouter() *Router {
@@ -89,38 +87,76 @@ func (r *Router) Add(route Route) {
 	route = cloneRoute(route)
 	route.compiledStrategy = r.buildStrategyForRoute(route)
 	r.mu.Lock()
-	r.routes = append(r.routes, route)
-	r.indexRoute(len(r.routes) - 1)
+	r.table = r.table.with(route)
 	r.mu.Unlock()
 }
 
-// indexRoute separates exact subjects from wildcard/catch-all routes. Only
-// whole tokens are wildcards: "orders.cr*eated" is a literal subject.
-// All index operations run under mu, alongside changes to routes.
-func (r *Router) indexRoute(i int) {
-	pattern := r.routes[i].Match
+// routeTable is an immutable routing snapshot. Mutations build a new table, so
+// a routing pass can read one consistent view without holding the router lock
+// while user conditions and strategies run.
+type routeTable struct {
+	routes   []Route
+	exact    map[string][]int
+	patterns []int
+}
+
+func newRouteTable(routes []Route) *routeTable {
+	t := &routeTable{routes: routes}
+	for i := range routes {
+		t.index(i)
+	}
+	return t
+}
+
+// with returns a new table that appends route; the receiver is unchanged.
+func (t *routeTable) with(route Route) *routeTable {
+	var routes []Route
+	if t != nil {
+		routes = t.routes
+	}
+	next := make([]Route, len(routes)+1)
+	copy(next, routes)
+	next[len(routes)] = route
+	return newRouteTable(next)
+}
+
+// index separates exact subjects from wildcard/catch-all routes. Only whole
+// tokens are wildcards: "orders.cr*eated" is a literal subject.
+func (t *routeTable) index(i int) {
+	pattern := t.routes[i].Match
 	if pattern == "" {
-		r.patternRoutes = append(r.patternRoutes, i)
+		t.patterns = append(t.patterns, i)
 		return
 	}
 	for _, token := range strings.Split(pattern, ".") {
 		if token == "*" || token == "#" {
-			r.patternRoutes = append(r.patternRoutes, i)
+			t.patterns = append(t.patterns, i)
 			return
 		}
 	}
-	if r.exactRoutes == nil {
-		r.exactRoutes = make(map[string][]int)
+	if t.exact == nil {
+		t.exact = make(map[string][]int)
 	}
-	r.exactRoutes[pattern] = append(r.exactRoutes[pattern], i)
+	t.exact[pattern] = append(t.exact[pattern], i)
 }
 
-func (r *Router) rebuildIndex() {
-	r.exactRoutes = nil
-	r.patternRoutes = nil
-	for i := range r.routes {
-		r.indexRoute(i)
+// candidates returns the routes that could match subject in registration order.
+func (t *routeTable) candidates(subject string) []Route {
+	if t == nil {
+		return nil
 	}
+	it := routeIndexIterator{exact: t.exact[subject], patterns: t.patterns}
+	out := make([]Route, 0, len(it.exact)+len(it.patterns))
+	for i, ok := it.next(); ok; i, ok = it.next() {
+		out = append(out, t.routes[i])
+	}
+	return out
+}
+
+func (r *Router) current() *routeTable {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.table
 }
 
 // Merge the two ordered index lists without allocating or reordering routes.
@@ -150,12 +186,17 @@ func (it *routeIndexIterator) next() (int, bool) {
 func (r *Router) Remove(name string) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	for i, route := range r.routes {
+	if r.table == nil {
+		return false
+	}
+	for i, route := range r.table.routes {
 		if route.Name != name {
 			continue
 		}
-		r.routes = append(r.routes[:i:i], r.routes[i+1:]...)
-		r.rebuildIndex()
+		kept := make([]Route, 0, len(r.table.routes)-1)
+		kept = append(kept, r.table.routes[:i]...)
+		kept = append(kept, r.table.routes[i+1:]...)
+		r.table = newRouteTable(kept)
 		return true
 	}
 	return false
@@ -166,45 +207,32 @@ func (r *Router) Remove(name string) bool {
 func (r *Router) RemovePrefix(prefix string) int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	kept := r.routes[:0]
+	if r.table == nil {
+		return 0
+	}
+	kept := make([]Route, 0, len(r.table.routes))
 	removed := 0
-	for _, route := range r.routes {
+	for _, route := range r.table.routes {
 		if strings.HasPrefix(route.Name, prefix) {
 			removed++
 			continue
 		}
 		kept = append(kept, route)
 	}
-	r.routes = kept
 	if removed > 0 {
-		r.rebuildIndex()
+		r.table = newRouteTable(kept)
 	}
 	return removed
 }
 
 func (r *Router) Routes() []Route {
-	return r.routeSnapshot()
-}
-
-func (r *Router) routeSnapshot() []Route {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	out := make([]Route, len(r.routes))
-	for i := range r.routes {
-		out[i] = cloneRoute(r.routes[i])
+	table := r.current()
+	if table == nil {
+		return []Route{}
 	}
-	return out
-}
-
-// routeSnapshotFor returns defensive copies of the routes that could match
-// subject, in registration order, using the exact/pattern index.
-func (r *Router) routeSnapshotFor(subject string) []Route {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	indexes := routeIndexIterator{exact: r.exactRoutes[subject], patterns: r.patternRoutes}
-	out := make([]Route, 0, len(r.exactRoutes[subject])+len(r.patternRoutes))
-	for i, ok := indexes.next(); ok; i, ok = indexes.next() {
-		out = append(out, cloneRoute(r.routes[i]))
+	out := make([]Route, len(table.routes))
+	for i := range table.routes {
+		out[i] = cloneRoute(table.routes[i])
 	}
 	return out
 }
@@ -241,13 +269,12 @@ func cloneRoutingRules(rules []RoutingRule) []RoutingRule {
 
 func (r *Router) Clear() {
 	r.mu.Lock()
-	r.routes = nil
-	r.exactRoutes = nil
-	r.patternRoutes = nil
+	r.table = nil
 	r.mu.Unlock()
 }
 
 func (r *Router) Route(ctx context.Context, msg Message) ([]Destination, []Route) {
+	table := r.current() // one consistent view for the whole nested traversal
 	dests := make([]Destination, 0, 4)
 	matched := make([]Route, 0, 2)
 	visitedRoutes := make(map[string]struct{})
@@ -264,7 +291,7 @@ func (r *Router) Route(ctx context.Context, msg Message) ([]Destination, []Route
 		if subject == "" {
 			subject = current.Queue
 		}
-		for _, route := range r.routeSnapshotFor(subject) {
+		for _, route := range table.candidates(subject) {
 			if route.Disabled || !route.Enabled {
 				continue
 			}
@@ -324,7 +351,7 @@ func (r *Router) RouteWithStrategy(ctx context.Context, msg Message, candidates 
 		subject = msg.Queue
 	}
 	matched := make([]Route, 0, 2)
-	for _, route := range r.routeSnapshotFor(subject) {
+	for _, route := range r.current().candidates(subject) {
 		if route.Disabled || !route.Enabled {
 			continue
 		}

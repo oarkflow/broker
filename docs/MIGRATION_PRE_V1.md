@@ -7,7 +7,7 @@
 an expected-offset comparison. Unsupported stores reject the operation rather
 than falling back to separate writes. See [stream transactions](STREAM_TRANSACTIONS.md).
 
-WAL operation code 19 (`stream_transaction`) is new; existing codes are unchanged.
+WAL operation code 22 (`stream_transaction`) is new; codes 1–21 retain their meaning.
 Back up before enabling the feature. Older binaries cannot read the new operation;
 restore a backup from before the feature was enabled when downgrading. Do not
 open upgraded WAL directories with older binaries.
