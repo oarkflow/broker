@@ -1,8 +1,8 @@
 # Default-deny ingress for the broker pods except on the ports brokerd
 # actually exposes (Dockerfile EXPOSE 8090 8091 1883 5672 50051). Port 8091
-# (native BST1) is deliberately NOT opened here: it is unauthenticated and
-# brokerd refuses to even start that listener unless --insecure-dev is set,
-# which this deployment does not set.
+# (native BST1) is deliberately NOT opened here. If enabled, it requires TLS
+# and token or mapped mTLS authentication; add a narrowly scoped ingress rule
+# before allowing trusted clients to reach it.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:

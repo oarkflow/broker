@@ -168,8 +168,17 @@ func (tm *TenantManager) CheckQuota(ctx context.Context, tenant string) error {
 }
 
 func (tm *TenantManager) CheckPublishQuota(ctx context.Context, tenant string, destinations []Destination) error {
+	return tm.CheckPublishBatchQuota(ctx, tenant, destinations, 1)
+}
+
+// CheckPublishBatchQuota checks tenant queue and message quotas for a batch
+// before it is appended. count is the number of messages charged to the tenant.
+func (tm *TenantManager) CheckPublishBatchQuota(ctx context.Context, tenant string, destinations []Destination, count int) error {
 	if !tm.config.Enabled || tenant == "" {
 		return nil
+	}
+	if count < 0 {
+		count = 0
 	}
 	t := tm.EnsureTenant(tenant)
 	principalCtx := context.WithValue(ctx, adminPrincipalKey{}, AdminPrincipal{Name: "tenant-quota", Tenants: []string{tenant}})
@@ -191,10 +200,10 @@ func (tm *TenantManager) CheckPublishQuota(ctx context.Context, tenant string, d
 			return errf(ErrBackpressure, "tenant %s queue quota exceeded: %d/%d", tenant, len(stats.Queues)+len(newQueues), t.Quotas.MaxQueues)
 		}
 	}
-	if t.Quotas.MaxMessages > 0 && stats.Messages >= t.Quotas.MaxMessages {
-		return errf(ErrBackpressure, "tenant %s message quota exceeded: %d/%d", tenant, stats.Messages, t.Quotas.MaxMessages)
+	if t.Quotas.MaxMessages > 0 && stats.Messages+count > t.Quotas.MaxMessages {
+		return errf(ErrBackpressure, "tenant %s message quota exceeded: %d/%d", tenant, stats.Messages+count, t.Quotas.MaxMessages)
 	}
-	if tm.limiter != nil && !tm.limiter.Allow("tenant:"+tenant) {
+	if tm.limiter != nil && !tm.limiter.AllowN("tenant:"+tenant, count) {
 		return errf(ErrRateLimited, "tenant %s publish rate exceeded", tenant)
 	}
 	return nil

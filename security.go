@@ -4,17 +4,51 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
+	"crypto/tls"
 	"crypto/x509"
+	"encoding/hex"
+	"fmt"
+	"net"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/oarkflow/broker/cluster"
 )
+
+func validateListenerSecurity(protocol string, allowInsecure, hasTLS, hasAuthentication bool, authenticationKind string) error {
+	if allowInsecure {
+		return nil
+	}
+	if !hasTLS {
+		return fmt.Errorf("%s: TLS is required outside insecure development mode", protocol)
+	}
+	if !hasAuthentication {
+		if authenticationKind == "" {
+			authenticationKind = "authentication"
+		}
+		return fmt.Errorf("%s: %s is required outside insecure development mode", protocol, authenticationKind)
+	}
+	return nil
+}
+
+func tlsConfigVerifiesClientCertificates(cfg *tls.Config) bool {
+	if cfg == nil || cfg.ClientCAs == nil {
+		return false
+	}
+	return cfg.ClientAuth == tls.VerifyClientCertIfGiven || cfg.ClientAuth == tls.RequireAndVerifyClientCert
+}
 
 const (
 	PermissionAdminAll      = "admin:*"
 	PermissionBrokerRead    = "broker:read"
+	PermissionStatsRead     = "stats:read"
+	PermissionMetricsRead   = "metrics:read"
+	PermissionClusterRead   = "cluster:read"
+	PermissionClusterWrite  = "cluster:write"
 	PermissionPublish       = "message:publish"
 	PermissionMessageRead   = "message:read"
 	PermissionMessageAck    = "message:ack"
@@ -126,14 +160,18 @@ func tenantAllowed(ctx context.Context, tenant string) bool {
 		return true
 	}
 	for _, allowed := range p.Tenants {
-		if allowed == "*" {
-			return true
-		}
-		if tenant != "" && (allowed == tenant || strings.HasPrefix(tenant, allowed+".") || strings.HasPrefix(tenant, allowed+":") || strings.HasPrefix(tenant, allowed+"/")) {
+		if tenantWithinScope(tenant, allowed) {
 			return true
 		}
 	}
 	return false
+}
+
+func tenantWithinScope(tenant, scope string) bool {
+	if scope == "*" {
+		return true
+	}
+	return tenant != "" && (scope == tenant || strings.HasPrefix(tenant, scope+".") || strings.HasPrefix(tenant, scope+":") || strings.HasPrefix(tenant, scope+"/"))
 }
 
 func restrictedTenant(ctx context.Context) (string, bool) {
@@ -237,10 +275,72 @@ func parseTenantScopedKey(value string) (tenant, key string, ok bool) {
 }
 
 type ACL struct {
-	mu      sync.RWMutex
-	Tokens  []AdminToken
-	quotaMu sync.Mutex
-	quotas  map[string]*principalQuota
+	mu                 sync.RWMutex
+	Tokens             []AdminToken
+	controllerQuorum   *cluster.ControllerQuorum
+	syncMu             sync.Mutex
+	refreshMu          sync.Mutex
+	controllerRevision uint64
+	controllerSynced   bool
+	quotaMu            sync.Mutex
+	quotas             map[string]*principalQuota
+}
+
+func (a *ACL) hasUsableTokenCredential() bool {
+	if a == nil {
+		return false
+	}
+	a.refreshControllerPrincipals()
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	now := time.Now()
+	for _, token := range a.Tokens {
+		if !token.Revoked && (token.tokenSet || token.Token != "") &&
+			(token.ExpiresAt.IsZero() || now.Before(token.ExpiresAt)) {
+			return true
+		}
+	}
+	return false
+}
+
+func (a *ACL) hasUsableCertificateCredential() bool {
+	if a == nil {
+		return false
+	}
+	a.refreshControllerPrincipals()
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	now := time.Now()
+	for _, token := range a.Tokens {
+		if token.Revoked || (!token.ExpiresAt.IsZero() && !now.Before(token.ExpiresAt)) {
+			continue
+		}
+		for _, identity := range token.CertificateIdentities {
+			if validACLIdentity(identity) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func validACLIdentity(identity string) bool {
+	prefix, value, ok := strings.Cut(strings.TrimSpace(identity), ":")
+	if !ok || value == "" || value != strings.TrimSpace(value) {
+		return false
+	}
+	switch prefix {
+	case "cn", "dns", "uri", "email":
+		return true
+	case "ip":
+		return net.ParseIP(value) != nil
+	default:
+		return false
+	}
+}
+
+func (a *ACL) hasUsableCredential(certificateAuth bool) bool {
+	return a.hasUsableTokenCredential() || (certificateAuth && a.hasUsableCertificateCredential())
 }
 
 type principalQuota struct {
@@ -264,6 +364,153 @@ func (a *ACL) AddToken(token AdminToken) {
 	a.mu.Lock()
 	a.addTokenLocked(token)
 	a.mu.Unlock()
+}
+
+// SetControllerQuorum makes locally applied controller ACL metadata the
+// authoritative credential set once the quorum has at least one principal.
+// Empty metadata preserves bootstrap credentials until they are replicated.
+func (a *ACL) SetControllerQuorum(controller *cluster.ControllerQuorum) {
+	if a == nil {
+		return
+	}
+	a.mu.Lock()
+	a.controllerQuorum = controller
+	a.controllerRevision = 0
+	a.controllerSynced = false
+	a.mu.Unlock()
+	a.refreshControllerPrincipals()
+}
+
+// SyncControllerQuorum seeds an empty controller ACL table from the configured
+// bootstrap ACL, or applies the existing replicated ACL table locally.
+func (a *ACL) SyncControllerQuorum(ctx context.Context) error {
+	if a == nil {
+		return nil
+	}
+	a.syncMu.Lock()
+	defer a.syncMu.Unlock()
+	a.mu.RLock()
+	controller := a.controllerQuorum
+	bootstrap := a.clusterPrincipalsLocked()
+	a.mu.RUnlock()
+	if controller == nil {
+		return nil
+	}
+	principals, revision, err := controller.ListACLPrincipalsLinearizableWithRevision(ctx)
+	if err != nil {
+		return err
+	}
+	known := make(map[string]struct{}, len(principals))
+	for _, principal := range principals {
+		known[principal.Name] = struct{}{}
+	}
+	for _, principal := range bootstrap {
+		if _, exists := known[principal.Name]; exists {
+			continue
+		}
+		if err := controller.PutACLPrincipal(ctx, principal, ""); err != nil {
+			return err
+		}
+		known[principal.Name] = struct{}{}
+	}
+	principals, revision, err = controller.ListACLPrincipalsLinearizableWithRevision(ctx)
+	if err != nil {
+		return err
+	}
+	a.refreshMu.Lock()
+	principals, revision = controller.ListACLPrincipalsWithRevision()
+	a.replaceControllerPrincipals(principals)
+	a.mu.Lock()
+	a.controllerRevision = revision
+	a.controllerSynced = true
+	a.mu.Unlock()
+	a.refreshMu.Unlock()
+	return nil
+}
+
+func (a *ACL) refreshControllerPrincipals() {
+	a.mu.RLock()
+	controller := a.controllerQuorum
+	lastRevision := a.controllerRevision
+	synced := a.controllerSynced
+	a.mu.RUnlock()
+	if controller == nil {
+		return
+	}
+	if synced && controller.ACLRevision() == lastRevision {
+		return
+	}
+	a.refreshMu.Lock()
+	defer a.refreshMu.Unlock()
+	a.mu.RLock()
+	controller = a.controllerQuorum
+	lastRevision = a.controllerRevision
+	synced = a.controllerSynced
+	a.mu.RUnlock()
+	if controller == nil {
+		return
+	}
+	if synced && controller.ACLRevision() == lastRevision {
+		return
+	}
+	principals, revision := controller.ListACLPrincipalsWithRevision()
+	if len(principals) > 0 {
+		a.replaceControllerPrincipals(principals)
+	}
+	a.mu.Lock()
+	a.controllerRevision = revision
+	a.controllerSynced = true
+	a.mu.Unlock()
+}
+
+func (a *ACL) replaceControllerPrincipals(principals []cluster.ACLPrincipal) {
+	tokens := make([]AdminToken, 0, len(principals))
+	now := time.Now()
+	for _, principal := range principals {
+		digest, err := hex.DecodeString(principal.TokenHash)
+		if principal.TokenHash != "" && (err != nil || len(digest) != sha256.Size) {
+			continue
+		}
+		token := AdminToken{
+			Name: principal.Name, Permissions: append([]string(nil), principal.Permissions...),
+			Tenants:               append([]string(nil), principal.Tenants...),
+			CertificateIdentities: append([]string(nil), principal.CertificateIdentities...),
+			RequestsPerSecond:     principal.RequestsPerSecond, Burst: principal.Burst,
+			MaxConcurrent: principal.MaxConcurrent, ExpiresAt: principal.ExpiresAt,
+			Revoked: principal.Revoked, tokenSet: principal.TokenHash != "",
+		}
+		copy(token.tokenHash[:], digest)
+		if !cluster.ACLPrincipalActive(principal, now) {
+			token.Revoked = true
+		}
+		tokens = append(tokens, token)
+	}
+	a.mu.Lock()
+	a.Tokens = tokens
+	a.mu.Unlock()
+}
+
+func (a *ACL) clusterPrincipalsLocked() []cluster.ACLPrincipal {
+	out := make([]cluster.ACLPrincipal, 0, len(a.Tokens))
+	for i, token := range a.Tokens {
+		name := token.Name
+		if name == "" {
+			name = fmt.Sprintf("credential-%d", i+1)
+		}
+		principal := cluster.ACLPrincipal{
+			Name: name, Permissions: append([]string(nil), token.Permissions...),
+			Tenants:               append([]string(nil), token.Tenants...),
+			CertificateIdentities: append([]string(nil), token.CertificateIdentities...),
+			RequestsPerSecond:     token.RequestsPerSecond, Burst: token.Burst,
+			MaxConcurrent: token.MaxConcurrent, ExpiresAt: token.ExpiresAt,
+			Revoked: token.Revoked,
+		}
+		if token.tokenSet {
+			principal.TokenHash = hex.EncodeToString(token.tokenHash[:])
+		}
+		out = append(out, principal)
+	}
+	return out
 }
 
 func (a *ACL) addTokenLocked(token AdminToken) {
@@ -299,6 +546,7 @@ func (a *ACL) Authenticate(raw string) (AdminPrincipal, bool) {
 	if a == nil || raw == "" {
 		return AdminPrincipal{}, false
 	}
+	a.refreshControllerPrincipals()
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	candidate := sha256.Sum256([]byte(raw))
@@ -322,12 +570,26 @@ func (a *ACL) Authenticate(raw string) (AdminPrincipal, bool) {
 	return AdminPrincipal{}, false
 }
 
+func authenticateAdminCredential(acl *ACL, raw string, cert *x509.Certificate) (AdminPrincipal, bool) {
+	if principal, ok := acl.AuthenticateCertificate(cert); ok {
+		return principal, true
+	}
+	return acl.Authenticate(raw)
+}
+
+func sameAdminPrincipal(a, b AdminPrincipal) bool {
+	return a.Name == b.Name && slices.Equal(a.Permissions, b.Permissions) &&
+		slices.Equal(a.Tenants, b.Tenants) && a.RequestsPerSecond == b.RequestsPerSecond &&
+		a.Burst == b.Burst && a.MaxConcurrent == b.MaxConcurrent
+}
+
 // AuthenticateCertificate maps a verified TLS client certificate to a named
 // ACL principal. Identity entries use cn:, dns:, uri:, email:, or ip: prefixes.
 func (a *ACL) AuthenticateCertificate(cert *x509.Certificate) (AdminPrincipal, bool) {
 	if a == nil || cert == nil {
 		return AdminPrincipal{}, false
 	}
+	a.refreshControllerPrincipals()
 	identities := certificateIdentities(cert)
 	a.mu.RLock()
 	defer a.mu.RUnlock()

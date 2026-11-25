@@ -28,6 +28,15 @@ const (
 	NodeFailed   NodeState = "failed"
 )
 
+func validNodeState(state NodeState) bool {
+	switch state {
+	case "", NodeJoining, NodeActive, NodeDraining, NodeLeft, NodeFailed:
+		return true
+	default:
+		return false
+	}
+}
+
 func (s RaftState) String() string {
 	switch s {
 	case StateFollower:
@@ -125,6 +134,7 @@ type InstallSnapshotResponse struct {
 // RaftMessage wraps all Raft RPC messages.
 type RaftMessage struct {
 	CorrelationID       uint64                   `json:"correlation_id,omitempty"`
+	GroupID             string                   `json:"group_id,omitempty"`
 	Type                MessageType              `json:"type"`
 	AppendEntries       *AppendEntriesRequest    `json:"append_entries,omitempty"`
 	AppendEntriesResp   *AppendEntriesResponse   `json:"append_entries_resp,omitempty"`
@@ -134,6 +144,8 @@ type RaftMessage struct {
 	InstallSnapshotResp *InstallSnapshotResponse `json:"install_snapshot_resp,omitempty"`
 	EtcdMessage         []byte                   `json:"etcd_message,omitempty"`
 }
+
+const MaxRaftGroupIDBytes = 512
 
 // EncodeMessage encodes a RaftMessage to bytes.
 func EncodeMessage(msg *RaftMessage) ([]byte, error) {
@@ -178,19 +190,23 @@ func DecodeUint64(b []byte) uint64 {
 
 // Common errors.
 var (
-	ErrNotLeader      = errors.New("cluster: not leader")
-	ErrLeaderLost     = errors.New("cluster: leader lost")
-	ErrNodeNotFound   = errors.New("cluster: node not found")
-	ErrPartitioned    = errors.New("cluster: node partitioned")
-	ErrSnapshotFailed = errors.New("cluster: snapshot failed")
-	ErrLogCorrupted   = errors.New("cluster: log corrupted")
-	ErrTermMismatch   = errors.New("cluster: term mismatch")
-	ErrQuorumLost     = errors.New("cluster: quorum lost")
-	ErrSplitBrain     = errors.New("cluster: split-brain detected")
-	ErrClosed         = errors.New("cluster: closed")
-	ErrStaleEpoch     = errors.New("cluster: stale leader epoch")
-	ErrQuorumNotMet   = errors.New("cluster: replication quorum not met")
-	ErrReplicaLagging = errors.New("cluster: replica lagging behind ISR threshold")
+	ErrNotLeader                 = errors.New("cluster: not leader")
+	ErrLeaderLost                = errors.New("cluster: leader lost")
+	ErrNodeNotFound              = errors.New("cluster: node not found")
+	ErrPartitioned               = errors.New("cluster: node partitioned")
+	ErrSnapshotFailed            = errors.New("cluster: snapshot failed")
+	ErrLogCorrupted              = errors.New("cluster: log corrupted")
+	ErrTermMismatch              = errors.New("cluster: term mismatch")
+	ErrQuorumLost                = errors.New("cluster: quorum lost")
+	ErrSplitBrain                = errors.New("cluster: split-brain detected")
+	ErrClosed                    = errors.New("cluster: closed")
+	ErrConfChangePending         = errors.New("cluster: joint configuration change is still pending")
+	ErrStaleEpoch                = errors.New("cluster: stale leader epoch")
+	ErrQuorumNotMet              = errors.New("cluster: replication quorum not met")
+	ErrReplicaLagging            = errors.New("cluster: replica lagging behind ISR threshold")
+	ErrUnknownReplica            = errors.New("cluster: replica is not assigned to the partition")
+	ErrReplicaProgressRegression = errors.New("cluster: replica progress cannot move backwards")
+	ErrReplicaProgressAhead      = errors.New("cluster: replica progress is ahead of the current leader")
 )
 
 // StateMachine defines the interface for the replicated state machine.
@@ -201,6 +217,12 @@ type StateMachine interface {
 	Snapshot() ([]byte, error)
 	// Restore restores the state machine from a snapshot.
 	Restore(snapshot []byte) error
+}
+
+// ResultStateMachine is an optional extension for commands whose committed
+// application produces a value that the proposing leader must return.
+type ResultStateMachine interface {
+	ApplyWithResult(entry *LogEntry) (any, error)
 }
 
 // Transport defines the interface for inter-node communication.

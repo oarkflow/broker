@@ -2,6 +2,7 @@ package amqp
 
 import (
 	"bufio"
+	"context"
 	"crypto/subtle"
 	"crypto/tls"
 	"errors"
@@ -36,6 +37,29 @@ type Connection struct {
 	closed          chan struct{}
 	closeOnce       sync.Once
 	release         func()
+}
+
+func (c *Connection) requestContext() context.Context {
+	ctx := c.server.ctx
+	if c.principal.Name == "" && len(c.principal.Permissions) == 0 && len(c.principal.Tenants) == 0 {
+		return ctx
+	}
+	return broker.WithAdminPrincipal(ctx, c.principal)
+}
+
+func amqpStaticPermissions() []string {
+	return []string{
+		broker.PermissionPublish,
+		broker.PermissionConsumerPoll,
+		broker.PermissionMessageRead,
+		broker.PermissionMessageAck,
+		broker.PermissionMessageNack,
+		broker.PermissionQueueRead,
+		broker.PermissionQueueWrite,
+		broker.PermissionQueueControl,
+		broker.PermissionQueuePurge,
+		broker.PermissionTopicWrite,
+	}
 }
 
 // Connection states.
@@ -247,10 +271,10 @@ func (c *Connection) handleStartOk(args []byte) error {
 
 func (c *Connection) advertisedMechanisms() string {
 	mechanisms := ""
-	if c.server.cfg.Username != "" || c.server.cfg.Password != "" || c.server.cfg.AllowInsecure {
+	if c.server.cfg.Username != "" || c.server.cfg.Password != "" || c.server.cfg.ACL != nil || c.server.cfg.AllowInsecure {
 		mechanisms = "PLAIN"
 	}
-	if tc, ok := c.netConn.(*tls.Conn); ok {
+	if tc, ok := c.netConn.(*tls.Conn); ok && c.server.cfg.ACL != nil {
 		state := tc.ConnectionState()
 		if len(state.PeerCertificates) > 0 && len(state.VerifiedChains) > 0 {
 			if mechanisms != "" {
@@ -283,6 +307,9 @@ func (c *Connection) authenticate(mechanism string, response []byte) error {
 				c.username = principal.Name
 				return nil
 			}
+			if c.server.cfg.Username == "" && c.server.cfg.Password == "" {
+				return errors.New("invalid AMQP credentials")
+			}
 		}
 		if c.server.cfg.Username == "" && c.server.cfg.Password == "" {
 			if !c.server.cfg.AllowInsecure && c.server.cfg.ACL == nil {
@@ -292,8 +319,14 @@ func (c *Connection) authenticate(mechanism string, response []byte) error {
 			return errors.New("invalid AMQP credentials")
 		}
 		c.username = username
+		if c.server.cfg.Username != "" || c.server.cfg.Password != "" {
+			c.principal = broker.AdminPrincipal{Name: username, Permissions: amqpStaticPermissions()}
+		}
 		return nil
 	case "EXTERNAL":
+		if c.server.cfg.ACL == nil {
+			return errors.New("EXTERNAL authentication requires ACL certificate mapping")
+		}
 		tc, ok := c.netConn.(*tls.Conn)
 		if !ok {
 			return errors.New("EXTERNAL authentication requires TLS")
@@ -302,20 +335,17 @@ func (c *Connection) authenticate(mechanism string, response []byte) error {
 		if len(state.PeerCertificates) == 0 || len(state.VerifiedChains) == 0 {
 			return errors.New("EXTERNAL authentication requires a verified client certificate")
 		}
-		if c.server.cfg.ACL != nil {
-			if principal, ok := c.server.cfg.ACL.AuthenticateCertificate(state.VerifiedChains[0][0]); ok {
-				c.principal = principal
-				release, err := c.server.cfg.ACL.AdmitConnection(principal)
-				if err != nil {
-					return err
-				}
-				c.release = release
-				c.username = principal.Name
-				return nil
+		if principal, ok := c.server.cfg.ACL.AuthenticateCertificate(state.VerifiedChains[0][0]); ok {
+			c.principal = principal
+			release, err := c.server.cfg.ACL.AdmitConnection(principal)
+			if err != nil {
+				return err
 			}
+			c.release = release
+			c.username = principal.Name
+			return nil
 		}
-		c.username = state.PeerCertificates[0].Subject.String()
-		return nil
+		return errors.New("client certificate is not mapped to an AMQP principal")
 	default:
 		return fmt.Errorf("unsupported AMQP authentication mechanism %q", mechanism)
 	}
@@ -660,5 +690,5 @@ func (r *argsReader) ReadTable() (table, error) {
 	if err != nil {
 		return nil, err
 	}
-	return DecodeTable(data)
+	return decodeTableEntries(data, 0)
 }

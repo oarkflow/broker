@@ -180,6 +180,24 @@ func (s *PartitionedBinaryWALStore) forEachShard(fn func(*BinaryFileWALStore) er
 func (s *PartitionedBinaryWALStore) DeclareQueue(ctx context.Context, cfg QueueConfig) error {
 	return s.forEachShard(func(sh *BinaryFileWALStore) error { return sh.DeclareQueue(ctx, cfg) })
 }
+func (s *PartitionedBinaryWALStore) LookupQueueConfig(ctx context.Context, name string) (QueueConfig, bool, error) {
+	var found QueueConfig
+	seen := false
+	for _, shard := range s.shards {
+		cfg, ok, err := shard.LookupQueueConfig(ctx, name)
+		if err != nil {
+			return QueueConfig{}, false, err
+		}
+		if !ok {
+			continue
+		}
+		if seen && cfg != found {
+			return QueueConfig{}, false, errf(ErrInvalidMessage, "queue configuration differs across WAL shards")
+		}
+		found, seen = cfg, true
+	}
+	return found, seen, nil
+}
 func (s *PartitionedBinaryWALStore) DeclareTopic(ctx context.Context, cfg TopicConfig) error {
 	return s.forEachShard(func(sh *BinaryFileWALStore) error { return sh.DeclareTopic(ctx, cfg) })
 }
@@ -556,6 +574,9 @@ func (s *PartitionedBinaryWALStore) StreamLagAllContext(ctx context.Context, str
 func (s *PartitionedBinaryWALStore) StreamHeadOffsetContext(ctx context.Context, stream, tenant string) (uint64, error) {
 	return s.shards[s.shardForStable("stream:"+stream)].StreamHeadOffsetContext(ctx, stream, tenant)
 }
+func (s *PartitionedBinaryWALStore) QueueReadyCount(ctx context.Context, queue string) (int, error) {
+	return s.shards[s.shardForStable("queue:"+queue)].QueueReadyCount(ctx, queue)
+}
 func (s *PartitionedBinaryWALStore) Stats(ctx context.Context) (StoreStats, error) {
 	result := StoreStats{Queues: map[string]int{}, Topics: map[string]int{}, Streams: map[string]int{}, Offsets: map[string]map[string]uint64{}, DLQ: map[string]int{}}
 	var mu sync.Mutex
@@ -620,6 +641,7 @@ func (s *PartitionedBinaryWALStore) ListTopic(ctx context.Context, name string, 
 	// messages.
 	var mu sync.Mutex
 	var all []Message
+	var topicFound bool
 	err := s.forEachShard(func(sh *BinaryFileWALStore) error {
 		msgs, err := sh.ListTopic(ctx, name, limit)
 		if err != nil {
@@ -629,6 +651,7 @@ func (s *PartitionedBinaryWALStore) ListTopic(ctx context.Context, name string, 
 			return err
 		}
 		mu.Lock()
+		topicFound = true
 		all = append(all, msgs...)
 		mu.Unlock()
 		return nil
@@ -636,7 +659,10 @@ func (s *PartitionedBinaryWALStore) ListTopic(ctx context.Context, name string, 
 	if err != nil {
 		return nil, err
 	}
-	sort.SliceStable(all, func(i, j int) bool { return all[i].CreatedAt.Before(all[j].CreatedAt) })
+	if !topicFound {
+		return nil, errf(ErrTopicNotFound, "topic %q not found", name)
+	}
+	sort.SliceStable(all, func(i, j int) bool { return topicMessageLess(all[i], all[j]) })
 	if len(all) > limit {
 		all = all[:limit]
 	}
@@ -645,31 +671,112 @@ func (s *PartitionedBinaryWALStore) ListTopic(ctx context.Context, name string, 
 
 // ReadTopic resumes a topic read across shards from the message id last seen.
 func (s *PartitionedBinaryWALStore) ReadTopic(ctx context.Context, name, afterID string, limit int) ([]Message, error) {
-	msgs, err := s.ListTopic(ctx, name, 0)
-	if err != nil {
+	if s == nil || len(s.shards) == 0 {
+		return nil, ErrClosed
+	}
+	if limit <= 0 {
+		limit = 100
+	}
+
+	var anchor *Message
+	anchorShard := -1
+	if afterID != "" {
+		message, found, err := s.Get(ctx, afterID)
+		if err != nil {
+			return nil, err
+		}
+		if !found {
+			return nil, ErrCursorExpired
+		}
+		shardIndex, err := s.lookupShard(ctx, afterID)
+		if err != nil {
+			return nil, ErrCursorExpired
+		}
+		shard := s.shards[shardIndex]
+		shard.mu.RLock()
+		topic := shard.topics[name]
+		belongsToTopic := false
+		if topic != nil {
+			for _, id := range topic.ids {
+				if id == afterID {
+					belongsToTopic = true
+					break
+				}
+			}
+		}
+		shard.mu.RUnlock()
+		if !belongsToTopic {
+			return nil, ErrInvalidMessage
+		}
+		anchor = &message
+		anchorShard = shardIndex
+	}
+
+	var mu sync.Mutex
+	var merged []Message
+	var topicFound bool
+	errs := make([]error, len(s.shards))
+	var wg sync.WaitGroup
+	for shardIndex, shard := range s.shards {
+		wg.Add(1)
+		go func(shardIndex int, shard *BinaryFileWALStore) {
+			defer wg.Done()
+			shard.mu.RLock()
+			_, exists := shard.topics[name]
+			shard.mu.RUnlock()
+			if !exists {
+				return
+			}
+			mu.Lock()
+			topicFound = true
+			mu.Unlock()
+
+			cursor := ""
+			if shardIndex == anchorShard {
+				cursor = afterID
+			}
+			local := make([]Message, 0, limit)
+			for len(local) < limit {
+				pageSize := limit - len(local)
+				page, err := shard.ReadTopic(ctx, name, cursor, pageSize)
+				if err != nil {
+					errs[shardIndex] = err
+					return
+				}
+				if len(page) == 0 {
+					break
+				}
+				for _, message := range page {
+					cursor = message.ID
+					if anchor != nil && !topicMessageLess(*anchor, message) {
+						continue
+					}
+					local = append(local, message)
+					if len(local) == limit {
+						break
+					}
+				}
+				if len(page) < pageSize {
+					break
+				}
+			}
+			mu.Lock()
+			merged = append(merged, local...)
+			mu.Unlock()
+		}(shardIndex, shard)
+	}
+	wg.Wait()
+	if err := errors.Join(errs...); err != nil {
 		return nil, err
 	}
-	if afterID == "" {
-		if limit > 0 && len(msgs) > limit {
-			return msgs[:limit], nil
-		}
-		return msgs, nil
+	if !topicFound {
+		return nil, ErrTopicNotFound
 	}
-	out := make([]Message, 0, len(msgs))
-	found := false
-	for _, m := range msgs {
-		if !found {
-			if m.ID == afterID {
-				found = true
-			}
-			continue
-		}
-		out = append(out, m)
-		if limit > 0 && len(out) >= limit {
-			break
-		}
+	sort.SliceStable(merged, func(i, j int) bool { return topicMessageLess(merged[i], merged[j]) })
+	if len(merged) > limit {
+		merged = merged[:limit]
 	}
-	return out, nil
+	return merged, nil
 }
 
 func (s *PartitionedBinaryWALStore) Close() error {

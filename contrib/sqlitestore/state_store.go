@@ -53,6 +53,10 @@ func NewStateStore(db *sql.DB) (*StateStore, error) {
 func (s *StateStore) init(ctx context.Context) error {
 	stmts := []string{
 		`CREATE TABLE IF NOT EXISTS fw_broker_states (name TEXT PRIMARY KEY, node_id TEXT, mode TEXT, state TEXT, updated_at INTEGER NOT NULL, metadata_json BLOB)`,
+		`CREATE TABLE IF NOT EXISTS fw_amqp_exchanges (name TEXT PRIMARY KEY, exchange_type TEXT NOT NULL, durable INTEGER NOT NULL CHECK(durable = 1))`,
+		`CREATE TABLE IF NOT EXISTS fw_amqp_exchange_bindings (id TEXT PRIMARY KEY, source TEXT NOT NULL, destination TEXT NOT NULL, destination_kind TEXT NOT NULL DEFAULT 'exchange', routing_key TEXT NOT NULL, tenant_id TEXT NOT NULL, headers_json TEXT NOT NULL DEFAULT '[]', headers_match_all INTEGER NOT NULL DEFAULT 1)`,
+		`CREATE INDEX IF NOT EXISTS idx_fw_amqp_exchange_bindings_source ON fw_amqp_exchange_bindings(source)`,
+		`CREATE INDEX IF NOT EXISTS idx_fw_amqp_exchange_bindings_destination ON fw_amqp_exchange_bindings(destination)`,
 		`CREATE TABLE IF NOT EXISTS fw_tasks (id TEXT PRIMARY KEY, status TEXT, updated_at INTEGER NOT NULL, data_json BLOB NOT NULL)`,
 		`CREATE INDEX IF NOT EXISTS idx_fw_tasks_status_updated ON fw_tasks(status, updated_at DESC)`,
 		`CREATE TABLE IF NOT EXISTS fw_consumers (id TEXT PRIMARY KEY, state TEXT, updated_at INTEGER NOT NULL, data_json BLOB NOT NULL)`,
@@ -63,6 +67,8 @@ func (s *StateStore) init(ctx context.Context) error {
 		`CREATE TABLE IF NOT EXISTS fw_publisher_records (id TEXT PRIMARY KEY, operation TEXT, status TEXT, updated_at INTEGER NOT NULL, data_json BLOB NOT NULL)`,
 		`CREATE INDEX IF NOT EXISTS idx_fw_publisher_records_updated ON fw_publisher_records(updated_at DESC)`,
 		`CREATE TABLE IF NOT EXISTS fw_mqtt_sessions (session_key TEXT PRIMARY KEY, client_id TEXT NOT NULL, updated_at INTEGER NOT NULL, data_json BLOB NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS fw_mqtt_wills (will_id TEXT PRIMARY KEY, created_at INTEGER NOT NULL, data_json BLOB NOT NULL)`,
+		`CREATE INDEX IF NOT EXISTS idx_fw_mqtt_wills_created ON fw_mqtt_wills(created_at, will_id)`,
 		`CREATE TABLE IF NOT EXISTS fw_mqtt_retained (tenant_id TEXT NOT NULL, topic TEXT NOT NULL, qos INTEGER NOT NULL, updated_at INTEGER NOT NULL, payload BLOB NOT NULL, PRIMARY KEY(tenant_id, topic))`,
 		`CREATE INDEX IF NOT EXISTS idx_fw_mqtt_retained_tenant_topic ON fw_mqtt_retained(tenant_id, topic)`,
 		`CREATE TABLE IF NOT EXISTS fw_outbox_entries (id TEXT PRIMARY KEY, status TEXT NOT NULL, claim_token TEXT NOT NULL DEFAULT '', lease_until INTEGER NOT NULL DEFAULT 0, next_attempt_at INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, data_json BLOB NOT NULL)`,
@@ -73,10 +79,182 @@ func (s *StateStore) init(ctx context.Context) error {
 			return err
 		}
 	}
+	if err := s.ensureAMQPBindingColumns(ctx); err != nil {
+		return err
+	}
 	if err := s.ensureOutboxStatusColumn(ctx); err != nil {
 		return err
 	}
 	_, err := s.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_fw_outbox_dispatchable ON fw_outbox_entries(status, lease_until, next_attempt_at, created_at, id)`)
+	return err
+}
+
+func (s *StateStore) ensureAMQPBindingColumns(ctx context.Context) error {
+	rows, err := s.db.QueryContext(ctx, `PRAGMA table_info(fw_amqp_exchange_bindings)`)
+	if err != nil {
+		return err
+	}
+	columns := make(map[string]bool)
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, kind string
+		var defaultValue sql.NullString
+		if err := rows.Scan(&cid, &name, &kind, &notNull, &defaultValue, &primaryKey); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		columns[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if !columns["destination_kind"] {
+		if _, err := s.db.ExecContext(ctx, `ALTER TABLE fw_amqp_exchange_bindings ADD COLUMN destination_kind TEXT NOT NULL DEFAULT 'exchange'`); err != nil {
+			return err
+		}
+	}
+	if !columns["headers_json"] {
+		if _, err := s.db.ExecContext(ctx, `ALTER TABLE fw_amqp_exchange_bindings ADD COLUMN headers_json TEXT NOT NULL DEFAULT '[]'`); err != nil {
+			return err
+		}
+	}
+	if !columns["headers_match_all"] {
+		if _, err := s.db.ExecContext(ctx, `ALTER TABLE fw_amqp_exchange_bindings ADD COLUMN headers_match_all INTEGER NOT NULL DEFAULT 1`); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *StateStore) PutAMQPExchange(ctx context.Context, exchange broker.AMQPExchangeRecord) error {
+	if exchange.Name == "" || exchange.Type == "" || !exchange.Durable {
+		return broker.ErrInvalidMessage
+	}
+	result, err := s.db.ExecContext(ctx, `INSERT INTO fw_amqp_exchanges(name, exchange_type, durable) VALUES(?,?,1) ON CONFLICT(name) DO NOTHING`, exchange.Name, exchange.Type)
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected != 0 {
+		return nil
+	}
+	existing, ok, err := s.GetAMQPExchange(ctx, exchange.Name)
+	if err != nil {
+		return err
+	}
+	if !ok || existing != exchange {
+		return broker.ErrInvalidMessage
+	}
+	return nil
+}
+
+func (s *StateStore) GetAMQPExchange(ctx context.Context, name string) (broker.AMQPExchangeRecord, bool, error) {
+	var exchange broker.AMQPExchangeRecord
+	err := s.db.QueryRowContext(ctx, `SELECT name, exchange_type, durable FROM fw_amqp_exchanges WHERE name=?`, name).Scan(&exchange.Name, &exchange.Type, &exchange.Durable)
+	if err == sql.ErrNoRows {
+		return broker.AMQPExchangeRecord{}, false, nil
+	}
+	if err != nil {
+		return broker.AMQPExchangeRecord{}, false, err
+	}
+	return exchange, true, nil
+}
+
+func (s *StateStore) ListAMQPExchanges(ctx context.Context) ([]broker.AMQPExchangeRecord, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT name, exchange_type, durable FROM fw_amqp_exchanges ORDER BY name`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var exchanges []broker.AMQPExchangeRecord
+	for rows.Next() {
+		var exchange broker.AMQPExchangeRecord
+		if err := rows.Scan(&exchange.Name, &exchange.Type, &exchange.Durable); err != nil {
+			return nil, err
+		}
+		exchanges = append(exchanges, exchange)
+	}
+	return exchanges, rows.Err()
+}
+
+func (s *StateStore) DeleteAMQPExchange(ctx context.Context, name string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM fw_amqp_exchange_bindings WHERE source=? OR (destination_kind='exchange' AND destination=?)`, name, name); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM fw_amqp_exchanges WHERE name=?`, name); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *StateStore) PutAMQPExchangeBinding(ctx context.Context, binding broker.AMQPExchangeBindingRecord) error {
+	if binding.ID == "" || binding.Source == "" || binding.Destination == "" {
+		return broker.ErrInvalidMessage
+	}
+	if binding.DestinationKind == "" {
+		binding.DestinationKind = broker.DestinationExchange
+	}
+	if binding.HeadersJSON == "" {
+		binding.HeadersJSON = "[]"
+	}
+	result, err := s.db.ExecContext(ctx, `INSERT INTO fw_amqp_exchange_bindings(id,source,destination,destination_kind,routing_key,tenant_id,headers_json,headers_match_all) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(id) DO NOTHING`, binding.ID, binding.Source, binding.Destination, string(binding.DestinationKind), binding.RoutingKey, binding.TenantID, binding.HeadersJSON, binding.HeadersMatchAll)
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected != 0 {
+		return nil
+	}
+	var existing broker.AMQPExchangeBindingRecord
+	var kind string
+	err = s.db.QueryRowContext(ctx, `SELECT id,source,destination,destination_kind,routing_key,tenant_id,headers_json,headers_match_all FROM fw_amqp_exchange_bindings WHERE id=?`, binding.ID).Scan(&existing.ID, &existing.Source, &existing.Destination, &kind, &existing.RoutingKey, &existing.TenantID, &existing.HeadersJSON, &existing.HeadersMatchAll)
+	if err != nil {
+		return err
+	}
+	existing.DestinationKind = broker.DestinationKind(kind)
+	if existing != binding {
+		return broker.ErrInvalidMessage
+	}
+	return nil
+}
+
+func (s *StateStore) ListAMQPExchangeBindings(ctx context.Context) ([]broker.AMQPExchangeBindingRecord, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id,source,destination,destination_kind,routing_key,tenant_id,headers_json,headers_match_all FROM fw_amqp_exchange_bindings ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var bindings []broker.AMQPExchangeBindingRecord
+	for rows.Next() {
+		var binding broker.AMQPExchangeBindingRecord
+		var kind string
+		if err := rows.Scan(&binding.ID, &binding.Source, &binding.Destination, &kind, &binding.RoutingKey, &binding.TenantID, &binding.HeadersJSON, &binding.HeadersMatchAll); err != nil {
+			return nil, err
+		}
+		binding.DestinationKind = broker.DestinationKind(kind)
+		bindings = append(bindings, binding)
+	}
+	return bindings, rows.Err()
+}
+
+func (s *StateStore) DeleteAMQPExchangeBinding(ctx context.Context, id string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM fw_amqp_exchange_bindings WHERE id=?`, id)
 	return err
 }
 
@@ -111,6 +289,61 @@ func (s *StateStore) GetMQTTSession(ctx context.Context, key string) (broker.MQT
 func (s *StateStore) DeleteMQTTSession(ctx context.Context, key string) error {
 	_, err := s.db.ExecContext(ctx, `DELETE FROM fw_mqtt_sessions WHERE session_key=?`, key)
 	return err
+}
+
+func (s *StateStore) PutMQTTWill(ctx context.Context, record broker.MQTTWillRecord) error {
+	if err := broker.ValidateMQTTWillRecord(record); err != nil {
+		return err
+	}
+	data, err := json.Marshal(record)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx, `INSERT INTO fw_mqtt_wills(will_id,created_at,data_json) VALUES(?,?,?) ON CONFLICT(will_id) DO UPDATE SET created_at=excluded.created_at,data_json=excluded.data_json`, record.ID, unixNanoOrZero(record.CreatedAt), data)
+	return err
+}
+
+func (s *StateStore) DeleteMQTTWill(ctx context.Context, id string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM fw_mqtt_wills WHERE will_id=?`, id)
+	return err
+}
+
+func (s *StateStore) ListMQTTWills(ctx context.Context, after string, limit int) ([]broker.MQTTWillRecord, string, error) {
+	if limit <= 0 || limit > 1000 {
+		return nil, "", broker.ErrInvalidMessage
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT will_id,data_json FROM fw_mqtt_wills WHERE will_id>? ORDER BY will_id LIMIT ?`, after, limit+1)
+	if err != nil {
+		return nil, "", err
+	}
+	defer rows.Close()
+	items := make([]broker.MQTTWillRecord, 0, limit+1)
+	for rows.Next() {
+		var id string
+		var data []byte
+		if err := rows.Scan(&id, &data); err != nil {
+			return nil, "", err
+		}
+		var record broker.MQTTWillRecord
+		if err := json.Unmarshal(data, &record); err != nil {
+			return nil, "", err
+		}
+		if record.ID != id {
+			return nil, "", broker.ErrInvalidMessage
+		}
+		if err := broker.ValidateMQTTWillRecord(record); err != nil {
+			return nil, "", err
+		}
+		items = append(items, record)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, "", err
+	}
+	if len(items) <= limit {
+		return items, "", nil
+	}
+	next := items[limit-1].ID
+	return items[:limit], next, nil
 }
 
 func (s *StateStore) PutMQTTRetained(ctx context.Context, message broker.MQTTRetainedMessage) error {
@@ -345,21 +578,7 @@ func (s *StateStore) PutOutboxEntry(ctx context.Context, entry broker.DurableOut
 // data plus outbox inserts. The transaction must use the same database as this
 // StateStore, and remains owned by the caller.
 func (s *StateStore) OutboxTransaction(tx *sql.Tx) broker.OutboxEntryTransaction {
-	return stateOutboxTx{tx: tx}
-}
-
-type stateOutboxTx struct{ tx *sql.Tx }
-
-func (t stateOutboxTx) InsertOutboxEntry(ctx context.Context, entry broker.DurableOutboxEntry) error {
-	if t.tx == nil || entry.ID == "" {
-		return broker.ErrInvalidMessage
-	}
-	b, err := json.Marshal(entry)
-	if err != nil {
-		return err
-	}
-	_, err = t.tx.ExecContext(ctx, `INSERT INTO fw_outbox_entries(id,status,claim_token,lease_until,next_attempt_at,created_at,updated_at,data_json) VALUES(?,?,?,?,?,?,?,?)`, entry.ID, string(entry.Status), entry.ClaimToken, unixNanoOrZero(entry.ClaimUntil), unixNanoOrZero(entry.NextAttemptAt), entry.CreatedAt.UnixNano(), entry.UpdatedAt.UnixNano(), b)
-	return err
+	return broker.NewSQLOutboxEntryTransaction(tx, broker.SQLBindQuestionMark)
 }
 
 func (s *StateStore) GetOutboxEntry(ctx context.Context, id string) (broker.DurableOutboxEntry, bool, error) {
@@ -703,6 +922,12 @@ func (s *StateStore) DeleteConsumer(ctx context.Context, id string) error {
 	return err
 }
 func (s *StateStore) AddConsumerEvent(ctx context.Context, id string, n broker.Notification) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if id == "" {
+		return nil
+	}
 	if n.Timestamp.IsZero() {
 		n.Timestamp = time.Now()
 	}
@@ -716,11 +941,22 @@ func (s *StateStore) AddConsumerEvent(ctx context.Context, id string, n broker.N
 func (s *StateStore) ConsumerEvents(ctx context.Context, id, after string, limit int) ([]broker.Notification, error) {
 	q := `SELECT data_json FROM fw_consumer_events WHERE consumer_id=?`
 	args := []any{id}
+	order := ` DESC`
+	reverse := true
 	if after != "" {
-		q += ` AND seq > COALESCE((SELECT seq FROM fw_consumer_events WHERE consumer_id=? AND event_id=? LIMIT 1),0)`
-		args = append(args, id, after)
+		var afterSeq int64
+		err := s.db.QueryRowContext(ctx, `SELECT seq FROM fw_consumer_events WHERE consumer_id=? AND event_id=? ORDER BY seq DESC LIMIT 1`, id, after).Scan(&afterSeq)
+		if err != nil && err != sql.ErrNoRows {
+			return nil, err
+		}
+		if err == nil {
+			q += ` AND seq>?`
+			args = append(args, afterSeq)
+			order = ` ASC`
+			reverse = false
+		}
 	}
-	q += ` ORDER BY seq DESC`
+	q += ` ORDER BY seq` + order
 	if limit > 0 {
 		q += ` LIMIT ?`
 		args = append(args, limit)
@@ -742,8 +978,10 @@ func (s *StateStore) ConsumerEvents(ctx context.Context, id, after string, limit
 		}
 		rev = append(rev, n)
 	}
-	for i, j := 0, len(rev)-1; i < j; i, j = i+1, j-1 {
-		rev[i], rev[j] = rev[j], rev[i]
+	if reverse {
+		for i, j := 0, len(rev)-1; i < j; i, j = i+1, j-1 {
+			rev[i], rev[j] = rev[j], rev[i]
+		}
 	}
 	return rev, rows.Err()
 }

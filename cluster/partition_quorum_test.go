@@ -158,6 +158,14 @@ func TestControllerQuorumMetadataReplication(t *testing.T) {
 	if len(nodes) != 1 || nodes[0].ID != "broker-1" {
 		t.Fatalf("unexpected nodes: %v", nodes)
 	}
+	for _, node := range []*NodeInfo{
+		{ID: "broker-2", Address: "127.0.0.1:9093", State: NodeActive},
+		{ID: "broker-3", Address: "127.0.0.1:9094", State: NodeActive},
+	} {
+		if err := quorum.RegisterNode(ctx, node); err != nil {
+			t.Fatalf("register node %s: %v", node.ID, err)
+		}
+	}
 
 	// 2. Assign partition
 	if err := quorum.AssignPartition(ctx, "payments", 0, []string{"broker-1", "broker-2", "broker-3"}, "broker-1"); err != nil {
@@ -172,9 +180,13 @@ func TestControllerQuorumMetadataReplication(t *testing.T) {
 		t.Fatalf("unexpected partition metadata: %+v", pm)
 	}
 
-	// 3. Advance epoch
-	if err := quorum.AdvanceEpoch(ctx, "payments", 0, "broker-2"); err != nil {
-		t.Fatalf("advance epoch: %v", err)
+	// 3. A metadata-only leader change is rejected; the partition Raft group
+	// must transfer first, then commit the expected leader and epoch.
+	if err := quorum.AdvanceEpoch(ctx, "payments", 0, "broker-2"); !errors.Is(err, ErrPartitionTransferRequired) {
+		t.Fatalf("expected leader transfer requirement, got %v", err)
+	}
+	if err := quorum.CommitPartitionLeaderTransfer(ctx, "payments", 0, "broker-1", 1, "broker-2"); err != nil {
+		t.Fatalf("commit transferred leader: %v", err)
 	}
 
 	pm, err = quorum.GetPartition("payments", 0)
@@ -197,7 +209,7 @@ func TestControllerQuorumMetadataReplication(t *testing.T) {
 		t.Fatalf("restore failed: %v", err)
 	}
 
-	if len(newMeta.Nodes) != 1 || len(newMeta.Partitions) != 1 {
+	if len(newMeta.Nodes) != 3 || len(newMeta.Partitions) != 1 {
 		t.Fatalf("restored metadata mismatch: %+v", newMeta)
 	}
 }

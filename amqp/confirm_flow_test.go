@@ -22,6 +22,9 @@ func setupTestAMQPChannel(t *testing.T) (*Channel, *Codec, func()) {
 	if err := b.Start(context.Background()); err != nil {
 		t.Fatal(err)
 	}
+	if err := b.DeclareQueue(context.Background(), broker.QueueConfig{Name: "amqp-test"}); err != nil {
+		t.Fatal(err)
+	}
 
 	server := NewServer(ServerConfig{Broker: b, AllowInsecure: true})
 
@@ -192,8 +195,8 @@ func TestAMQPPublisherConfirmsAndFlowNack(t *testing.T) {
 	// 2. Publish message while flow is active -> should receive Basic.Ack with deliveryTag=1
 	publishArgs := EncodeMethodArgs(
 		uint16(0),           // reserved-1
-		string("amqp-test"), // exchange
-		string("key.1"),     // routing-key
+		string(""),          // default exchange
+		string("amqp-test"), // routing-key
 		false,               // mandatory
 		false,               // immediate
 	)
@@ -234,8 +237,8 @@ func TestAMQPPublisherConfirmsAndFlowNack(t *testing.T) {
 
 	publishArgs2 := EncodeMethodArgs(
 		uint16(0),
+		string(""),
 		string("amqp-test"),
-		string("key.2"),
 		false,
 		false,
 	)

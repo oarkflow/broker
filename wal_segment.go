@@ -17,12 +17,13 @@ import (
 )
 
 const (
-	SegmentMagic          uint32 = 0x42574C32 // "BWL2"
-	SegmentVersion        byte   = 2
-	SegmentTrailerMagic   uint32 = 0x434C4F53 // "CLOS"
-	DefaultMaxSegmentSize        = 64 << 20   // 64 MiB
-	DefaultMaxSegments           = 10
-	DefaultCompactionInt         = 5 * time.Minute
+	SegmentMagic               uint32 = 0x42574C32 // "BWL2"
+	SegmentVersion             byte   = 2
+	SegmentTrailerMagic        uint32 = 0x434C4F53 // "CLOS"
+	DefaultMaxSegmentSize             = 64 << 20   // 64 MiB
+	DefaultMaxSegments                = 10
+	DefaultCompactionInt              = 5 * time.Minute
+	segmentedWALCheckpointFile        = "checkpoint.bwl2"
 )
 
 // SegmentMeta tracks metadata about a single WAL segment.
@@ -58,7 +59,17 @@ type SegmentedWALConfig struct {
 	Retention          time.Duration
 	Codec              FrameCodec
 	WALCodec           *WALRecordCodec
-	DisableCompactor   bool
+	// SegmentArchiver receives closed segment bytes before compaction removes
+	// the segment locally. Archive writes should be idempotent by filename.
+	SegmentArchiver  WALSegmentArchiver
+	DisableCompactor bool
+}
+
+// WALSegmentArchiver stores a pruned BWL2 segment in an external cold tier.
+// The reader is valid only until ArchiveSegment returns. The local segment is
+// retained if archival fails.
+type WALSegmentArchiver interface {
+	ArchiveSegment(context.Context, SegmentMeta, io.Reader) error
 }
 
 // SegmentedWALStore is a multi-segment, durable WAL store with manifest tracking,
@@ -101,6 +112,15 @@ func (s *SegmentedWALStore) Stats(ctx context.Context) (StoreStats, error) {
 		stats.WALGroupCommit = s.gc.stats()
 	}
 	return stats, err
+}
+
+// StorageUsage reports the partition store directory's logical size and
+// available capacity on its filesystem.
+func (s *SegmentedWALStore) StorageUsage(ctx context.Context) (StorageUsage, error) {
+	if s == nil || s.dir == "" {
+		return StorageUsage{}, ErrStorageUsageUnsupported
+	}
+	return MeasurePathStorageUsage(ctx, s.dir)
 }
 
 func (s *SegmentedWALStore) SetHealthCallback(fn func(error)) {
@@ -204,7 +224,30 @@ func (s *SegmentedWALStore) loadManifest() error {
 	if err != nil {
 		return err
 	}
-	return json.Unmarshal(data, &s.manifest)
+	if err := json.Unmarshal(data, &s.manifest); err != nil {
+		return err
+	}
+	if checkpoint := s.manifest.CheckpointFile; checkpoint != "" && (checkpoint != segmentedWALCheckpointFile || !filepath.IsLocal(checkpoint)) {
+		return fmt.Errorf("invalid checkpoint path %q in segmented WAL manifest", checkpoint)
+	}
+	for _, segment := range s.manifest.Segments {
+		if err := validateSegmentMetaPaths(segment); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateSegmentMetaPaths(segment SegmentMeta) error {
+	expectedFile := fmt.Sprintf("%020d.bwl2", segment.ID)
+	if segment.Filename != expectedFile {
+		return fmt.Errorf("invalid segment filename %q for segment %d", segment.Filename, segment.ID)
+	}
+	expectedIndex := fmt.Sprintf("%020d.idx", segment.ID)
+	if segment.IndexFile != "" && segment.IndexFile != expectedIndex {
+		return fmt.Errorf("invalid sparse index filename %q for segment %d", segment.IndexFile, segment.ID)
+	}
+	return nil
 }
 
 // syncSegmentMetaLocked writes meta into the manifest's Segments slice,
@@ -305,10 +348,28 @@ func (s *SegmentedWALStore) replaySegments() error {
 	// If checkpoint file exists, restore baseline memory state first
 	if s.manifest.CheckpointFile != "" {
 		chkPath := filepath.Join(s.dir, s.manifest.CheckpointFile)
-		if data, err := os.ReadFile(chkPath); err == nil {
-			var snap MemoryStoreSnapshot
-			if err := json.Unmarshal(data, &snap); err == nil {
-				s.MemoryStore.Restore(snap)
+		data, err := os.ReadFile(chkPath)
+		if err != nil {
+			return fmt.Errorf("read referenced checkpoint %q: %w", s.manifest.CheckpointFile, err)
+		}
+		plain, encrypted, err := s.walCodec.decryptCheckpoint(data)
+		if err != nil {
+			return fmt.Errorf("decode referenced checkpoint %q: %w", s.manifest.CheckpointFile, err)
+		}
+		var snap MemoryStoreSnapshot
+		if err := json.Unmarshal(plain, &snap); err != nil {
+			return fmt.Errorf("decode referenced checkpoint %q: %w", s.manifest.CheckpointFile, err)
+		}
+		if err := validateMemoryStoreSnapshot(snap); err != nil {
+			return fmt.Errorf("validate referenced checkpoint %q: %w", s.manifest.CheckpointFile, err)
+		}
+		s.MemoryStore.Restore(snap)
+		if !encrypted && s.walCodec.encryptionEnabled() {
+			// Older BWL2 versions wrote checkpoints as plaintext JSON even when
+			// WAL records were encrypted. Upgrade the referenced sidecar in place
+			// before opening the store for writes.
+			if err := s.writeCheckpointSnapshot(chkPath, s.MemoryStore.Snapshot()); err != nil {
+				return fmt.Errorf("encrypt legacy checkpoint %q: %w", s.manifest.CheckpointFile, err)
 			}
 		}
 	}
@@ -676,7 +737,10 @@ func (s *SegmentedWALStore) applyRecovered(r walRecord) {
 
 func (s *SegmentedWALStore) rotateSegmentLocked() error {
 	if s.gc != nil {
-		_ = s.gc.close()
+		if err := s.gc.close(); err != nil {
+			return fmt.Errorf("close active segment writer: %w", err)
+		}
+		s.gc = nil
 	}
 
 	if s.activeMeta != nil {
@@ -684,7 +748,9 @@ func (s *SegmentedWALStore) rotateSegmentLocked() error {
 		s.activeMeta.CleanClose = true
 		if s.activeIdx != nil {
 			idxPath := filepath.Join(s.dir, s.activeMeta.IndexFile)
-			_ = s.activeIdx.SaveToFile(idxPath)
+			if err := s.activeIdx.SaveToFile(idxPath); err != nil {
+				return fmt.Errorf("save active segment index: %w", err)
+			}
 		}
 		// Persist the closed segment's final metadata now, while s.activeMeta
 		// still refers to it — initActiveSegment below reassigns s.activeMeta
@@ -692,7 +758,10 @@ func (s *SegmentedWALStore) rotateSegmentLocked() error {
 		s.syncSegmentMetaLocked(*s.activeMeta)
 	}
 	if s.activeFile != nil {
-		_ = s.activeFile.Close()
+		if err := s.activeFile.Close(); err != nil {
+			return fmt.Errorf("close active segment: %w", err)
+		}
+		s.activeFile = nil
 	}
 
 	nextSegID := s.manifest.ActiveSegment + 1

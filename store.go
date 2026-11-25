@@ -52,6 +52,13 @@ type Store interface {
 	Close() error
 }
 
+// QueueConfigLookup exposes the effective queue declaration for partitioned
+// queue state machines that need to apply the same configuration on each Raft
+// replica before processing queue operations.
+type QueueConfigLookup interface {
+	LookupQueueConfig(context.Context, string) (QueueConfig, bool, error)
+}
+
 type AppendEntry struct {
 	Message      Message       `json:"message"`
 	Destinations []Destination `json:"destinations"`
@@ -69,6 +76,12 @@ type MinimalAtomicStore interface {
 // produced messages. Implementations must persist both effects as one unit.
 type OffsetAppendStore interface {
 	CommitOffsetAndAppend(context.Context, OffsetCommit, []AppendEntry) ([]Message, error)
+}
+
+// QueueReadyCounter reports messages that have not yet been leased from one
+// queue, without materializing the queue contents.
+type QueueReadyCounter interface {
+	QueueReadyCount(context.Context, string) (int, error)
 }
 
 // ConsumerOffsetLister is an optional extension for stores that can enumerate
@@ -96,6 +109,8 @@ type BatchUpdateStore interface {
 
 type LeaseRequest struct {
 	Queue             string
+	Partition         int
+	Partitioned       bool
 	ConsumerID        string
 	ConsumerGroup     string
 	Limit             int
@@ -110,10 +125,12 @@ type LeaseRequest struct {
 }
 
 type AckRequest struct {
-	MessageID  string `json:"message_id,omitempty"`
-	Queue      string `json:"queue,omitempty"`
-	LeaseToken string `json:"lease_token,omitempty"`
-	ConsumerID string `json:"consumer_id,omitempty"`
+	MessageID   string `json:"message_id,omitempty"`
+	Queue       string `json:"queue,omitempty"`
+	Partition   int    `json:"partition,omitempty"`
+	Partitioned bool   `json:"partitioned,omitempty"`
+	LeaseToken  string `json:"lease_token,omitempty"`
+	ConsumerID  string `json:"consumer_id,omitempty"`
 }
 
 type NackAction string
@@ -128,6 +145,8 @@ const (
 type NackRequest struct {
 	MessageID        string        `json:"message_id,omitempty"`
 	Queue            string        `json:"queue,omitempty"`
+	Partition        int           `json:"partition,omitempty"`
+	Partitioned      bool          `json:"partitioned,omitempty"`
 	LeaseToken       string        `json:"lease_token,omitempty"`
 	ConsumerID       string        `json:"consumer_id,omitempty"`
 	Action           NackAction    `json:"action,omitempty"`
@@ -164,6 +183,10 @@ type OffsetCommit struct {
 	ConsumerGroup string `json:"consumer_group"`
 	Offset        uint64 `json:"offset"`
 	TenantID      string `json:"tenant_id,omitempty"`
+	// Partitioned scopes the checkpoint to Partition of an assigned stream.
+	// It distinguishes partition zero from the legacy stream-wide offset.
+	Partitioned bool `json:"partitioned,omitempty"`
+	Partition   int  `json:"partition,omitempty"`
 	// TransactionID makes CommitOffsetAndAppend retries idempotent when set.
 	TransactionID string `json:"transaction_id,omitempty"`
 }
@@ -172,9 +195,19 @@ type OffsetCommit struct {
 // offset-plus-append operations. Entries are scoped by tenant and bounded by
 // the store; full messages are resolved from the message index when available.
 type OffsetAppendTransaction struct {
-	Fingerprint string    `json:"fingerprint"`
-	Messages    []Message `json:"messages,omitempty"`
-	CreatedAt   time.Time `json:"created_at"`
+	Fingerprint string                        `json:"fingerprint"`
+	Messages    []Message                     `json:"messages,omitempty"`
+	Outputs     []OffsetAppendOutputReference `json:"outputs,omitempty"`
+	CreatedAt   time.Time                     `json:"created_at"`
+}
+
+// OffsetAppendOutputReference preserves the assigned destination for one
+// transaction result so recovery can refresh stream offsets after commit.
+type OffsetAppendOutputReference struct {
+	Kind      DestinationKind `json:"kind"`
+	Name      string          `json:"name"`
+	Partition int             `json:"partition"`
+	MessageID string          `json:"message_id"`
 }
 
 type MoveRequest struct {
@@ -304,18 +337,20 @@ type memoryStream struct {
 }
 
 type MemoryStore struct {
-	mu          sync.RWMutex
-	queues      map[string]*memoryQueue
-	topics      map[string]*memoryTopic
-	streams     map[string]*memoryStream
-	messages    map[string]*Message
-	history     map[string][]MessageHistory
-	offsets     map[string]map[string]uint64
-	offsetTx    map[string]OffsetAppendTransaction
-	dedup       map[string]time.Time
-	idemp       map[string]string
-	producerSeq map[string]ProducerState
-	moveOps     map[string]MoveResult
+	mu                 sync.RWMutex
+	queues             map[string]*memoryQueue
+	queueReservations  map[string]map[string]int
+	reservedQueueDepth map[string]int
+	topics             map[string]*memoryTopic
+	streams            map[string]*memoryStream
+	messages           map[string]*Message
+	history            map[string][]MessageHistory
+	offsets            map[string]map[string]uint64
+	offsetTx           map[string]OffsetAppendTransaction
+	dedup              map[string]time.Time
+	idemp              map[string]string
+	producerSeq        map[string]ProducerState
+	moveOps            map[string]MoveResult
 	// moveOrder and moveOrderAt track move-result insertion so Cleanup can evict
 	// the oldest. moveOps alone cannot be pruned: its keys are caller-supplied
 	// operation ids, so nothing else in the store refers to them.
@@ -421,7 +456,7 @@ func (s *MemoryStore) nextSweepFull() bool {
 }
 
 func NewMemoryStore() *MemoryStore {
-	return &MemoryStore{queues: map[string]*memoryQueue{}, topics: map[string]*memoryTopic{}, streams: map[string]*memoryStream{}, messages: map[string]*Message{}, history: map[string][]MessageHistory{}, offsets: map[string]map[string]uint64{}, offsetTx: map[string]OffsetAppendTransaction{}, dedup: map[string]time.Time{}, idemp: map[string]string{}, producerSeq: map[string]ProducerState{}, moveOps: map[string]MoveResult{}, moveSeen: map[string]struct{}{}, rand: mathrand.New(mathrand.NewSource(time.Now().UnixNano())), historyLimit: 32, retainCompleted: true, completed: map[string]struct{}{}, completedLimit: 65536, compact: compactBacklogDefault}
+	return &MemoryStore{queues: map[string]*memoryQueue{}, queueReservations: map[string]map[string]int{}, reservedQueueDepth: map[string]int{}, topics: map[string]*memoryTopic{}, streams: map[string]*memoryStream{}, messages: map[string]*Message{}, history: map[string][]MessageHistory{}, offsets: map[string]map[string]uint64{}, offsetTx: map[string]OffsetAppendTransaction{}, dedup: map[string]time.Time{}, idemp: map[string]string{}, producerSeq: map[string]ProducerState{}, moveOps: map[string]MoveResult{}, moveSeen: map[string]struct{}{}, rand: mathrand.New(mathrand.NewSource(time.Now().UnixNano())), historyLimit: 32, retainCompleted: true, completed: map[string]struct{}{}, completedLimit: 65536, compact: compactBacklogDefault}
 }
 
 func (*MemoryStore) ConfirmationLevel() ConfirmLevel { return ConfirmEnqueued }
@@ -496,7 +531,11 @@ func (s *MemoryStore) DeclareQueue(ctx context.Context, cfg QueueConfig) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if q, ok := s.queues[cfg.Name]; ok {
-		q.cfg = mergeQueueConfig(q.cfg, cfg)
+		updated := mergeQueueConfig(q.cfg, cfg)
+		if reserved := s.reservedQueueDepth[cfg.Name]; reserved > 0 && updated.MaxDepth > 0 && q.depth+reserved > updated.MaxDepth {
+			return ErrBackpressure
+		}
+		q.cfg = updated
 		if q.state == "" {
 			q.state = QueueActive
 		}
@@ -510,6 +549,19 @@ func (s *MemoryStore) DeclareQueue(ctx context.Context, cfg QueueConfig) error {
 	}
 	s.queues[cfg.Name] = &memoryQueue{cfg: cfg, state: QueueActive, ready: make(chan struct{}, 1)}
 	return nil
+}
+
+func (s *MemoryStore) LookupQueueConfig(ctx context.Context, name string) (QueueConfig, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return QueueConfig{}, false, err
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	queue, ok := s.queues[name]
+	if !ok {
+		return QueueConfig{}, false, nil
+	}
+	return queue.cfg, true, nil
 }
 
 func (s *MemoryStore) DeclareTopic(ctx context.Context, cfg TopicConfig) error {
@@ -564,6 +616,9 @@ func (s *MemoryStore) DeclareStream(ctx context.Context, cfg StreamConfig) error
 func mergeQueueConfig(old, new QueueConfig) QueueConfig {
 	if new.Name != "" {
 		old.Name = new.Name
+	}
+	if new.Durable {
+		old.Durable = true
 	}
 	if new.Workers > 0 {
 		old.Workers = new.Workers
@@ -627,6 +682,9 @@ func (s *MemoryStore) appendLockedCollect(msg Message, dests []Destination, coll
 	if msg.ID == "" {
 		return nil, errf(ErrInvalidMessage, "message id required")
 	}
+	// Partitioned is delivery metadata returned by queue partition polling; it
+	// must never be accepted as persisted publisher input.
+	msg.Partitioned = false
 	if replay {
 		if existing := s.peekMsg(msg.ID); existing != nil {
 			if collect {
@@ -667,6 +725,9 @@ func (s *MemoryStore) appendLockedCollect(msg Message, dests []Destination, coll
 	if err := s.validateDestinationsLocked(msg, dests); err != nil {
 		return nil, err
 	}
+	if err := s.validateAppendMessageIDsLocked(msg, dests, nil); err != nil {
+		return nil, err
+	}
 	var out []Message
 	if collect {
 		out = make([]Message, 0, len(dests))
@@ -705,7 +766,7 @@ func (s *MemoryStore) appendLockedCollect(msg Message, dests []Destination, coll
 			}
 			q := s.queues[d.Name]
 			q.notifyReady()
-			if q.cfg.MaxDepth > 0 && q.depth >= q.cfg.MaxDepth {
+			if q.cfg.MaxDepth > 0 && q.depth+s.reservedQueueDepth[d.Name] >= q.cfg.MaxDepth {
 				if handled, err := s.applyBackpressureLocked(q, d.Name, &m); handled || err != nil {
 					if err != nil {
 						return out, err
@@ -833,6 +894,7 @@ func (s *MemoryStore) prepareAppendAtomic(ctx context.Context, entries []AppendE
 			return nil, err
 		}
 		entries[i].Message.TenantID = tenant
+		entries[i].Message.Partitioned = false
 	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -889,7 +951,7 @@ func (s *MemoryStore) prepareAppendAtomic(ctx context.Context, entries []AppendE
 				q := s.queues[dest.Name]
 				depth, seen := queueDepths[dest.Name]
 				if !seen && q != nil {
-					depth = q.depth
+					depth = q.depth + s.reservedQueueDepth[dest.Name]
 				}
 				if q != nil && q.cfg.MaxDepth > 0 && depth >= q.cfg.MaxDepth {
 					switch q.cfg.Backpressure {
@@ -964,6 +1026,13 @@ func (s *MemoryStore) appendAtomic(ctx context.Context, entries []AppendEntry, c
 func (s *MemoryStore) appendRecoveredAtomic(entries []AppendEntry) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.appendRecoveredAtomicLocked(entries)
+}
+
+func (s *MemoryStore) appendRecoveredAtomicLocked(entries []AppendEntry) error {
+	if err := s.validateRecoveredAtomicLocked(entries); err != nil {
+		return err
+	}
 	for _, entry := range entries {
 		if _, err := s.appendLockedCollect(entry.Message, entry.Destinations, false, false, true); err != nil {
 			return err
@@ -977,6 +1046,9 @@ func (s *MemoryStore) appendRecoveredAtomic(entries []AppendEntry) error {
 func (s *MemoryStore) appendRecoveredAtomicPending(entries []AppendEntry) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.validateRecoveredAtomicLocked(entries); err != nil {
+		return err
+	}
 	if s.pending == nil {
 		s.pending = make(map[string]struct{}, len(entries))
 	}
@@ -1010,6 +1082,7 @@ func (s *MemoryStore) validateAtomicLocked(entries []AppendEntry) error {
 		return ErrClosed
 	}
 	var seenDedup, seenIdemp map[string]struct{}
+	seenMessageIDs := make(map[string]struct{}, len(entries))
 	pendingProducers := make(map[string]ProducerState)
 	var pendingDepth map[string]int
 	now := time.Now()
@@ -1058,6 +1131,9 @@ func (s *MemoryStore) validateAtomicLocked(entries []AppendEntry) error {
 		if len(destinations) == 0 {
 			destinations = []Destination{{Kind: DestinationTopic, Name: entry.Message.Topic}}
 		}
+		if err := s.validateAppendMessageIDsLocked(entry.Message, destinations, seenMessageIDs); err != nil {
+			return err
+		}
 		if err := s.validateDestinationsLocked(entry.Message, destinations); err != nil {
 			return err
 		}
@@ -1073,9 +1149,40 @@ func (s *MemoryStore) validateAtomicLocked(entries []AppendEntry) error {
 				pendingDepth = make(map[string]int)
 			}
 			pendingDepth[d.Name]++
-			if q.depth+pendingDepth[d.Name] > q.cfg.MaxDepth && q.cfg.Backpressure != BackpressureDropOldest && q.cfg.Backpressure != BackpressureDLQ && q.cfg.Backpressure != BackpressureDropNewest {
+			if q.depth+s.reservedQueueDepth[d.Name]+pendingDepth[d.Name] > q.cfg.MaxDepth && q.cfg.Backpressure != BackpressureDropOldest && q.cfg.Backpressure != BackpressureDLQ && q.cfg.Backpressure != BackpressureDropNewest {
 				return ErrBackpressure
 			}
+		}
+	}
+	return nil
+}
+
+// validateAppendMessageIDsLocked checks every ID that appendLockedCollect will
+// install, including IDs generated for fan-out copies. The caller holds s.mu.
+func (s *MemoryStore) validateAppendMessageIDsLocked(msg Message, destinations []Destination, seen map[string]struct{}) error {
+	copyNo := 0
+	for _, destination := range destinations {
+		if destination.Name == "" {
+			continue
+		}
+		id := msg.ID
+		if copyNo > 0 {
+			id = msg.ID + ":copy:" + itoa(copyNo)
+		}
+		copyNo++
+		if seen != nil {
+			if _, duplicate := seen[id]; duplicate {
+				return ErrDuplicateMessage
+			}
+		}
+		if _, exists := s.messages[id]; exists {
+			return ErrDuplicateMessage
+		}
+		if _, exists := s.cold[id]; exists {
+			return ErrDuplicateMessage
+		}
+		if seen != nil {
+			seen[id] = struct{}{}
 		}
 	}
 	return nil
@@ -1544,6 +1651,15 @@ func (s *MemoryStore) Nack(ctx context.Context, req NackRequest) error {
 			return ErrLeaseLost
 		}
 	}
+	if req.Action == NackDLQ || req.Action == NackReject {
+		dlq := req.DLQ
+		if dlq == "" {
+			dlq = m.Queue + ".dlq"
+		}
+		if target := s.queues[dlq]; target != nil && target.cfg.MaxDepth > 0 && target.depth+s.reservedQueueDepth[dlq] >= target.cfg.MaxDepth {
+			return ErrBackpressure
+		}
+	}
 	if req.IncrementAttempt {
 		m.Attempts++
 	}
@@ -1697,21 +1813,46 @@ func (s *MemoryStore) ListQueue(ctx context.Context, name string, limit int) ([]
 	if !ok {
 		return nil, ErrQueueNotFound
 	}
-	messages := s.listQueueIDsLocked(q, name, 0)
-	out := messages[:0]
-	for _, message := range messages {
-		if tenantAllowed(ctx, message.TenantID) {
-			out = append(out, message)
-			if limit > 0 && len(out) >= limit {
-				break
-			}
+	if limit <= 0 || limit > q.depth {
+		limit = q.depth
+	}
+	out := make([]Message, 0, limit)
+	for _, id := range q.ids[q.head:] {
+		if len(out) >= limit {
+			break
 		}
+		message := s.peekMsg(id)
+		if message == nil || message.Queue != name || isTerminalQueueStatus(message.Status) || !tenantAllowed(ctx, message.TenantID) {
+			continue
+		}
+		out = append(out, cloneMessage(*message))
 	}
 	return out, nil
 }
 
 func (s *MemoryStore) ListDLQ(ctx context.Context, name string, limit int) ([]Message, error) {
 	return s.ListQueue(ctx, name, limit)
+}
+
+// QueueReadyCount counts tenant-visible, unleased messages without cloning
+// queue payloads. Scheduled and retry-scheduled messages remain ready in the
+// queue even when their availability time is in the future.
+func (s *MemoryStore) QueueReadyCount(ctx context.Context, name string) (int, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	q, ok := s.queues[name]
+	if !ok {
+		return 0, ErrQueueNotFound
+	}
+	count := 0
+	for _, id := range q.ids[q.head:] {
+		message := s.peekMsg(id)
+		if message == nil || message.Queue != name || !isLeaseableQueueStatus(message.Status) || !tenantAllowed(ctx, message.TenantID) {
+			continue
+		}
+		count++
+	}
+	return count, nil
 }
 
 // ListTopic returns the retained messages of a topic in publish order.
@@ -1763,11 +1904,32 @@ func (s *MemoryStore) ReadTopic(ctx context.Context, name, afterID string, limit
 	}
 	start := 0
 	if afterID != "" {
+		found := false
 		for i, id := range t.ids {
 			if id == afterID {
+				message, exists := s.peekMsgOK(id)
+				if !exists || message == nil || !tenantAllowed(ctx, message.TenantID) {
+					return nil, ErrCursorExpired
+				}
 				start = i + 1
+				found = true
 				break
 			}
+		}
+		if !found {
+			if message, exists := s.peekMsgOK(afterID); exists && message != nil && tenantAllowed(ctx, message.TenantID) {
+				for otherName, otherTopic := range s.topics {
+					if otherName == name {
+						continue
+					}
+					for _, id := range otherTopic.ids {
+						if id == afterID {
+							return nil, ErrInvalidMessage
+						}
+					}
+				}
+			}
+			return nil, ErrCursorExpired
 		}
 	}
 	out := make([]Message, 0, minInt(limit, len(t.ids)-start))
@@ -1812,7 +1974,7 @@ func (s *MemoryStore) moveLocked(ctx context.Context, req MoveRequest, plannedID
 			continue
 		}
 		if req.DestinationType == DestinationQueue || req.DestinationType == DestinationDLQ {
-			if destination := s.queues[req.Destination]; destination != nil && destination.cfg.MaxDepth > 0 && destination.depth >= destination.cfg.MaxDepth {
+			if destination := s.queues[req.Destination]; destination != nil && destination.cfg.MaxDepth > 0 && destination.depth+s.reservedQueueDepth[req.Destination] >= destination.cfg.MaxDepth {
 				// A move must not bypass the destination queue's admission cap.
 				// Skip instead of applying drop policies: the source remains intact
 				// so a later pass can retry once the destination has capacity.
@@ -2062,6 +2224,9 @@ func (s *MemoryStore) applyBackpressureLocked(q *memoryQueue, queue string, inco
 		if dlq == "" {
 			dlq = queue + ".dlq"
 		}
+		if target := s.queues[dlq]; target != nil && target.cfg.MaxDepth > 0 && target.depth+s.reservedQueueDepth[dlq] >= target.cfg.MaxDepth {
+			return false, ErrBackpressure
+		}
 		if _, ok := s.queues[dlq]; !ok {
 			s.queues[dlq] = &memoryQueue{cfg: QueueConfig{Name: dlq, VisibilityTimeout: q.cfg.VisibilityTimeout, RetryPolicy: q.cfg.RetryPolicy}, state: QueueActive, ready: make(chan struct{}, 1)}
 		}
@@ -2211,6 +2376,210 @@ func (s *MemoryStore) queueDepth(name string) int {
 		return q.depth
 	}
 	return 0
+}
+
+func (s *MemoryStore) reserveQueueCapacity(token string, entries []AppendEntry) error {
+	if token == "" {
+		return errf(ErrInvalidMessage, "queue capacity reservation token required")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	needed := make(map[string]int)
+	for name, count := range s.queueCapacityNeedsLocked(entries) {
+		q := s.queues[name]
+		if q == nil {
+			return ErrQueueNotFound
+		}
+		if q.cfg.MaxDepth > 0 {
+			needed[name] = count
+		}
+	}
+	if existing, ok := s.queueReservations[token]; ok {
+		if equalQueueReservations(existing, needed) {
+			return nil
+		}
+		return ErrTransactionConflict
+	}
+	for name, count := range needed {
+		q := s.queues[name]
+		if q.depth+s.reservedQueueDepth[name]+count > q.cfg.MaxDepth {
+			return ErrBackpressure
+		}
+	}
+	if len(needed) == 0 {
+		return nil
+	}
+	if s.queueReservations == nil {
+		s.queueReservations = make(map[string]map[string]int)
+	}
+	if s.reservedQueueDepth == nil {
+		s.reservedQueueDepth = make(map[string]int)
+	}
+	s.queueReservations[token] = needed
+	for name, count := range needed {
+		s.reservedQueueDepth[name] += count
+	}
+	return nil
+}
+
+// queueCapacityNeedsLocked counts only outputs that have not already been
+// recovered into the store. Raft can replay a committed transaction resolution
+// after the partition WAL has recovered its append; those entries need no new
+// queue slots and must remain idempotent.
+func (s *MemoryStore) queueCapacityNeedsLocked(entries []AppendEntry) map[string]int {
+	needed := make(map[string]int)
+	for _, entry := range entries {
+		if entry.Message.ID != "" && s.hasMsgLocked(entry.Message.ID) {
+			continue
+		}
+		destinations := entry.Destinations
+		if len(destinations) == 0 && entry.Message.Topic != "" {
+			destinations = []Destination{{Kind: DestinationTopic, Name: entry.Message.Topic}}
+		}
+		for _, destination := range destinations {
+			if destination.Kind == DestinationQueue || destination.Kind == DestinationDLQ {
+				needed[destination.Name]++
+			}
+		}
+	}
+	return needed
+}
+
+func equalQueueReservations(a, b map[string]int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for name, count := range a {
+		if b[name] != count {
+			return false
+		}
+	}
+	return true
+}
+
+func (s *MemoryStore) releaseQueueCapacity(token string) {
+	s.mu.Lock()
+	s.releaseQueueCapacityLocked(token)
+	s.mu.Unlock()
+}
+
+func (s *MemoryStore) releaseQueueCapacityLocked(token string) map[string]int {
+	reserved := s.queueReservations[token]
+	delete(s.queueReservations, token)
+	for name, count := range reserved {
+		remaining := s.reservedQueueDepth[name] - count
+		if remaining <= 0 {
+			delete(s.reservedQueueDepth, name)
+		} else {
+			s.reservedQueueDepth[name] = remaining
+		}
+	}
+	return reserved
+}
+
+func (s *MemoryStore) appendReservedAtomic(token string, entries []AppendEntry) error {
+	_, err := s.appendReservedAtomicCollect(token, entries)
+	return err
+}
+
+func (s *MemoryStore) appendReservedAtomicCollect(token string, entries []AppendEntry) ([]Message, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	needed := make(map[string]int)
+	for name, count := range s.queueCapacityNeedsLocked(entries) {
+		if q := s.queues[name]; q != nil && q.cfg.MaxDepth > 0 {
+			needed[name] = count
+		}
+	}
+	reserved, hadReservation := s.queueReservations[token]
+	if !equalQueueReservations(reserved, needed) {
+		return nil, fmt.Errorf("staged append does not match its queue capacity reservation")
+	}
+	if err := s.validateRecoveredAtomicLocked(entries); err != nil {
+		return nil, err
+	}
+	if hadReservation {
+		reserved = s.releaseQueueCapacityLocked(token)
+	}
+	// Recovered atomic appends use replay semantics: entries already applied
+	// before a crash return their stored messages, while missing entries are
+	// installed once and return their commit-time values.
+	results := make([]Message, 0, len(entries))
+	for _, entry := range entries {
+		stored, err := s.appendLockedCollect(entry.Message, entry.Destinations, true, false, true)
+		if err != nil {
+			if hadReservation {
+				s.queueReservations[token] = reserved
+				for name, count := range reserved {
+					s.reservedQueueDepth[name] += count
+				}
+			}
+			return nil, err
+		}
+		results = append(results, stored...)
+	}
+	return results, nil
+}
+
+func (s *MemoryStore) validateRecoveredAtomicLocked(entries []AppendEntry) error {
+	if s.closed {
+		return ErrClosed
+	}
+	seenMessageIDs := make(map[string]struct{}, len(entries))
+	for _, entry := range entries {
+		if entry.Message.ID != "" && s.hasMsgLocked(entry.Message.ID) {
+			continue
+		}
+		if entry.Message.ID == "" {
+			return errf(ErrInvalidMessage, "message id required")
+		}
+		destinations := entry.Destinations
+		if len(destinations) == 0 {
+			destinations = []Destination{{Kind: DestinationTopic, Name: entry.Message.Topic}}
+		}
+		if err := s.validateAppendMessageIDsLocked(entry.Message, destinations, seenMessageIDs); err != nil {
+			return err
+		}
+		if err := s.validateDestinationsLocked(entry.Message, destinations); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *MemoryStore) restoreQueueCapacityReservations(reservations map[string][]AppendEntry) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	queueReservations := make(map[string]map[string]int)
+	reservedQueueDepth := make(map[string]int)
+	for token, entries := range reservations {
+		if token == "" {
+			return fmt.Errorf("invalid empty queue capacity reservation token")
+		}
+		needed := s.queueCapacityNeedsLocked(entries)
+		for name, count := range needed {
+			q := s.queues[name]
+			if q == nil {
+				return fmt.Errorf("invalid queue capacity reservation for %q", name)
+			}
+			if q.cfg.MaxDepth <= 0 {
+				delete(needed, name)
+				continue
+			}
+			if q.depth+reservedQueueDepth[name]+count > q.cfg.MaxDepth {
+				return fmt.Errorf("invalid queue capacity reservation for %q", name)
+			}
+		}
+		if len(needed) > 0 {
+			queueReservations[token] = needed
+			for name, count := range needed {
+				reservedQueueDepth[name] += count
+			}
+		}
+	}
+	s.queueReservations = queueReservations
+	s.reservedQueueDepth = reservedQueueDepth
+	return nil
 }
 
 // QueueDepthReporter exposes the O(1) queue depth and limit needed to enforce
@@ -2447,6 +2816,7 @@ func prepareOffsetAppendRequest(ctx context.Context, commit OffsetCommit, entrie
 func cloneOffsetAppendTransaction(in OffsetAppendTransaction) OffsetAppendTransaction {
 	out := in
 	out.Messages = compactOffsetAppendMessages(in.Messages)
+	out.Outputs = append([]OffsetAppendOutputReference(nil), in.Outputs...)
 	return out
 }
 
@@ -2461,7 +2831,7 @@ func compactOffsetAppendMessages(messages []Message) []Message {
 func compactOffsetAppendMessage(message Message) Message {
 	return Message{
 		ID: message.ID, ParentID: message.ParentID, Topic: message.Topic, Queue: message.Queue,
-		Stream: message.Stream, Offset: message.Offset, Status: message.Status,
+		Stream: message.Stream, Partition: message.Partition, Offset: message.Offset, Status: message.Status,
 		TenantID: message.TenantID, CreatedAt: message.CreatedAt,
 	}
 }
@@ -2502,6 +2872,46 @@ func (s *MemoryStore) lookupOffsetAppendTransaction(commit OffsetCommit, fingerp
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.offsetAppendTransactionLocked(commit, fingerprint)
+}
+
+// updateOffsetAppendTransactionResult refreshes committed stream offsets in a
+// transaction's durable retry result. Callers replicate this mutation through
+// the partition state machine after output participants commit.
+func (s *MemoryStore) updateOffsetAppendTransactionResult(commit OffsetCommit, fingerprint string, messages []Message) error {
+	if commit.TransactionID == "" || fingerprint == "" {
+		return ErrTransactionConflict
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key := tenantScopedKey(commit.TenantID, commit.TransactionID)
+	transaction, ok := s.offsetTx[key]
+	if !ok || transaction.Fingerprint != fingerprint || validateOffsetAppendResult(transaction.Messages, messages) != nil {
+		return ErrTransactionConflict
+	}
+	for i, actual := range messages {
+		cached := transaction.Messages[i]
+		if cached.Stream != "" {
+			transaction.Messages[i].Offset = actual.Offset
+		}
+	}
+	s.offsetTx[key] = transaction
+	return nil
+}
+
+func validateOffsetAppendResult(prepared, actual []Message) error {
+	if len(prepared) != len(actual) {
+		return ErrTransactionConflict
+	}
+	for i, message := range actual {
+		prior := prepared[i]
+		if message.ID == "" || message.ID != prior.ID || message.Stream != prior.Stream || message.Partition != prior.Partition {
+			return ErrTransactionConflict
+		}
+		if prior.Stream != "" && message.Offset < prior.Offset {
+			return ErrTransactionConflict
+		}
+	}
+	return nil
 }
 
 func (s *MemoryStore) recordOffsetAppendTransactionLocked(commit OffsetCommit, transaction OffsetAppendTransaction) {

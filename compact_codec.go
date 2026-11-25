@@ -103,6 +103,7 @@ type CompactMessageCodec struct {
 	CompressThreshold int
 	MaxFrameSize      int
 	EncryptionKey     []byte
+	WALDecryptionKeys [][]byte
 	SigningKey        []byte
 }
 
@@ -116,6 +117,9 @@ func WithCompactMaxFrameSize(n int) CompactCodecOption {
 }
 func WithCompactEncryptionKey(key []byte) CompactCodecOption {
 	return func(c *CompactMessageCodec) { c.EncryptionKey = append([]byte(nil), key...) }
+}
+func WithCompactWALDecryptionKeys(keys [][]byte) CompactCodecOption {
+	return func(c *CompactMessageCodec) { c.WALDecryptionKeys = cloneByteSlices(keys) }
 }
 func WithCompactSigningKey(key []byte) CompactCodecOption {
 	return func(c *CompactMessageCodec) { c.SigningKey = append([]byte(nil), key...) }

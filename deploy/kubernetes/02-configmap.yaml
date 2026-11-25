@@ -26,8 +26,8 @@ data:
   BROKER_WAL_MAX_SEGMENTS: "10"
 
   # Protocol listeners. Native BST1 (-native-addr) is intentionally left
-  # disabled: main.go refuses to start it unless --insecure-dev is set,
-  # because it has no authentication layer. Do not enable it here.
+  # disabled. It supports token or mapped mTLS authentication, but enabling
+  # it also requires TLS and narrow NetworkPolicy exposure for trusted clients.
   BROKER_MQTT_ADDR: ":1883"
   BROKER_AMQP_ADDR: ":5672"
   BROKER_GRPC_ADDR: ":50051"

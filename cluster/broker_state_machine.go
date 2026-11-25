@@ -11,6 +11,7 @@ import (
 // DeclareQueueCommand mirrors broker.QueueConfig for replication.
 type DeclareQueueCommand struct {
 	Name              string        `json:"name"`
+	Durable           bool          `json:"durable,omitempty"`
 	Workers           int           `json:"workers"`
 	MaxInFlight       int           `json:"max_inflight"`
 	MaxDepth          int           `json:"max_depth"`
@@ -156,6 +157,12 @@ type snapshotBrokerStore interface {
 	ReplicateRestore([]byte) error
 }
 
+type transactionBrokerStore interface {
+	ReplicatePrepareTransaction(context.Context, json.RawMessage) error
+	ReplicateResolveTransaction(context.Context, json.RawMessage) error
+	ReplicateForgetTransaction(context.Context, json.RawMessage) error
+}
+
 // BrokerCommandType identifies the broker operation to replicate.
 type BrokerCommandType string
 
@@ -173,6 +180,9 @@ const (
 	BrokerCmdMove               BrokerCommandType = "move"
 	BrokerCmdCommitOffset       BrokerCommandType = "commit_offset"
 	BrokerCmdCommitOffsetAppend BrokerCommandType = "commit_offset_append"
+	BrokerCmdPrepareTransaction BrokerCommandType = "prepare_transaction"
+	BrokerCmdResolveTransaction BrokerCommandType = "resolve_transaction"
+	BrokerCmdForgetTransaction  BrokerCommandType = "forget_transaction"
 	BrokerCmdPauseQueue         BrokerCommandType = "pause_queue"
 	BrokerCmdResumeQueue        BrokerCommandType = "resume_queue"
 	BrokerCmdPurgeQueue         BrokerCommandType = "purge_queue"
@@ -243,6 +253,8 @@ func (sm *BrokerStateMachine) Apply(entry *LogEntry) error {
 		return sm.applyExtended(ctx, func(store extendedBrokerStore) error { return store.ReplicateCommitOffset(ctx, cmd.Payload) })
 	case BrokerCmdCommitOffsetAppend:
 		return sm.applyOffsetAppend(ctx, cmd.Payload)
+	case BrokerCmdPrepareTransaction, BrokerCmdResolveTransaction, BrokerCmdForgetTransaction:
+		return sm.applyTransaction(ctx, cmd.Type, cmd.Payload)
 	case BrokerCmdPauseQueue:
 		return sm.applyPauseQueue(ctx, cmd.Payload)
 	case BrokerCmdResumeQueue:
@@ -251,6 +263,48 @@ func (sm *BrokerStateMachine) Apply(entry *LogEntry) error {
 		return sm.applyPurgeQueue(ctx, cmd.Payload)
 	default:
 		return fmt.Errorf("broker sm: unknown command type: %s", cmd.Type)
+	}
+}
+
+// ApplyWithResult returns the actual mutation result for committed commands
+// that expose one. All replicas apply the same deterministic command; Raft
+// returns the proposing leader's local result to its waiting caller.
+func (sm *BrokerStateMachine) ApplyWithResult(entry *LogEntry) (any, error) {
+	if entry.Type != EntryNormal {
+		return nil, nil
+	}
+	var cmd BrokerCommand
+	if err := json.Unmarshal(entry.Data, &cmd); err != nil {
+		return nil, fmt.Errorf("broker sm: unmarshal command: %w", err)
+	}
+	if cmd.Type != BrokerCmdPurgeQueue {
+		return nil, sm.Apply(entry)
+	}
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	var name string
+	if err := json.Unmarshal(cmd.Payload, &name); err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return sm.store.ReplicatePurgeQueue(ctx, name)
+}
+
+func (sm *BrokerStateMachine) applyTransaction(ctx context.Context, command BrokerCommandType, payload json.RawMessage) error {
+	store, ok := sm.store.(transactionBrokerStore)
+	if !ok {
+		return fmt.Errorf("broker sm: backing store does not support durable transaction participants")
+	}
+	switch command {
+	case BrokerCmdPrepareTransaction:
+		return store.ReplicatePrepareTransaction(ctx, payload)
+	case BrokerCmdResolveTransaction:
+		return store.ReplicateResolveTransaction(ctx, payload)
+	case BrokerCmdForgetTransaction:
+		return store.ReplicateForgetTransaction(ctx, payload)
+	default:
+		return fmt.Errorf("broker sm: unknown transaction command type: %s", command)
 	}
 }
 

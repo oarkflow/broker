@@ -87,6 +87,32 @@ the normal outbox poller discovers it after commit. A rollback removes both the
 business write and the outbox row. Once dispatch starts, delivery is still
 at-least-once, so consumers must handle retries and duplicates.
 
+Other `database/sql` backends can use the same transaction helper without
+depending on this SQLite package. Implement `OutboxStateStore` for that
+backend, create the compatible `fw_outbox_entries` table, and pass the
+caller-owned `*sql.Tx` to `broker.NewSQLOutboxEntryTransaction`. Use
+`broker.SQLBindDollarNumbered` for PostgreSQL and
+`broker.SQLBindQuestionMark` for SQLite or MySQL. The helper inserts JSON text
+and Unix-nanosecond timestamps; the transaction and `OutboxStateStore` must
+use the same database. Choose a `data_json` type large enough for your maximum
+serialized entry (for MySQL, use `LONGTEXT` or `JSON` rather than the 64 KiB
+`TEXT` type).
+
+For example, the PostgreSQL table may use `TEXT` for `data_json`:
+
+```sql
+CREATE TABLE fw_outbox_entries (
+  id TEXT PRIMARY KEY,
+  status TEXT NOT NULL,
+  claim_token TEXT NOT NULL DEFAULT '',
+  lease_until BIGINT NOT NULL DEFAULT 0,
+  next_attempt_at BIGINT NOT NULL DEFAULT 0,
+  created_at BIGINT NOT NULL,
+  updated_at BIGINT NOT NULL,
+  data_json TEXT NOT NULL
+);
+```
+
 ## MessageStore durability model
 
 `MessageStore` uses the broker `MemoryStore` as the hot execution index and persists an atomic JSON snapshot after every mutating operation. It is simple, reliable, and excellent for embedded/single-node deployments that prefer SQLite operational tooling.

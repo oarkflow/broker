@@ -1,6 +1,7 @@
 package broker
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"crypto/tls"
@@ -39,7 +40,8 @@ type MQTTConfig struct {
 	ConnectTimeout time.Duration
 	// WriteTimeout limits how long a packet write may block. Default: 10s.
 	WriteTimeout time.Duration
-	// RequireAuth requires username/password authentication. Default: false.
+	// RequireAuth requires username/password or ACL authentication. Public
+	// production listeners reject startup when authentication is not enabled.
 	RequireAuth bool
 	// Username/Password for basic auth.
 	Username string
@@ -52,6 +54,9 @@ type MQTTConfig struct {
 	ClientCAFile string
 	// RequireClientCert requires client certificate verification (mTLS).
 	RequireClientCert bool
+	// AllowInsecure permits plaintext or unauthenticated development listeners.
+	// Production listeners require TLS and an authentication method.
+	AllowInsecure bool
 	// BrokerToken is the bearer token for MQTT CONNECT authentication.
 	// If set, the MQTT password field is validated against this token.
 	BrokerToken string
@@ -149,6 +154,9 @@ type mqttConn struct {
 	connected        atomic.Bool
 	gracefulClose    atomic.Bool
 	suppressWill     atomic.Bool
+	willHandled      atomic.Bool
+	willMu           sync.Mutex
+	willRecord       *MQTTWillRecord
 	subs             map[string]uint8 // topic -> qos
 	consumers        map[string]*Subscription
 	incomingQoS2     map[uint16]mqttPendingPublish
@@ -168,10 +176,26 @@ type mqttConn struct {
 }
 
 type mqttWill struct {
+	id      string
 	topic   string
 	payload []byte
 	qos     byte
 	retain  bool
+}
+
+func ValidateMQTTWillRecord(record MQTTWillRecord) error {
+	if record.ID == "" || len(record.ID) > 128 || record.SessionKey == "" ||
+		record.ClientID == "" || !validMQTTUTF8(record.ClientID) ||
+		!validMQTTTopicName(record.Topic) || len(record.Payload) > int(^uint16(0)) ||
+		record.QoS > 2 || record.CreatedAt.IsZero() {
+		return ErrInvalidMessage
+	}
+	for _, tenant := range record.Tenants {
+		if tenant == "" || len(tenant) > 256 || !validMQTTUTF8(tenant) {
+			return ErrInvalidMessage
+		}
+	}
+	return nil
 }
 
 type mqttSubscriptionRequest struct {
@@ -298,6 +322,25 @@ func (ms *MQTTServer) ListenAndServe() error {
 	if ms.ctx.Err() != nil {
 		return nil
 	}
+	if (ms.cfg.Username == "") != (ms.cfg.Password == "") {
+		return errors.New("mqtt: username and password must be configured together")
+	}
+	if (ms.cfg.TLSCertFile == "") != (ms.cfg.TLSKeyFile == "") {
+		return errors.New("mqtt: TLS certificate and key must be configured together")
+	}
+	hasTLS := ms.cfg.TLSCertFile != "" && ms.cfg.TLSKeyFile != ""
+	if ms.cfg.RequireClientCert && ms.cfg.ClientCAFile == "" {
+		return errors.New("mqtt: client CA is required when client certificates are mandatory")
+	}
+	certificateAuth := hasTLS && ms.cfg.RequireClientCert && ms.cfg.ClientCAFile != ""
+	hasAuthentication := ms.cfg.ACL.hasUsableCredential(certificateAuth) || ms.cfg.BrokerToken != "" ||
+		(ms.cfg.RequireAuth && ms.cfg.Username != "" && ms.cfg.Password != "")
+	if err := validateListenerSecurity("mqtt", ms.cfg.AllowInsecure, hasTLS, hasAuthentication, ""); err != nil {
+		return err
+	}
+	if err := ms.recoverPendingWills(ms.ctx); err != nil {
+		return fmt.Errorf("mqtt: recover pending Wills: %w", err)
+	}
 	var err error
 	var ln net.Listener
 	// Set up TLS if configured
@@ -369,18 +412,48 @@ func (ms *MQTTServer) ListenAndServe() error {
 
 // Stop shuts down the MQTT server.
 func (ms *MQTTServer) Stop() {
-	ms.cancel()
 	ms.mu.Lock()
 	if ms.ln != nil {
 		_ = ms.ln.Close()
 	}
+	connections := make([]*mqttConn, 0, len(ms.conns))
 	for id, c := range ms.conns {
 		c.suppressWill.Store(true)
+		connections = append(connections, c)
 		c.conn.Close()
-		c.signalClosed()
 		delete(ms.conns, id)
 	}
 	ms.mu.Unlock()
+
+	// A server shutdown closes each active network connection without receiving
+	// a client DISCONNECT. MQTT 3.1.1 therefore requires its Will to be
+	// published. Use a bounded context detached from the listener's lifetime so
+	// cancellation below cannot discard these publications.
+	willCtx, cancelWills := context.WithTimeout(context.Background(), 10*time.Second)
+	var willWG sync.WaitGroup
+	willSlots := make(chan struct{}, 16)
+	for _, c := range connections {
+		if !c.connected.Load() || c.will == nil || c.gracefulClose.Load() {
+			continue
+		}
+		select {
+		case willSlots <- struct{}{}:
+		case <-willCtx.Done():
+			log.Printf("[mqtt] shutdown timed out before publishing last will for %s: %v", c.clientID, willCtx.Err())
+			continue
+		}
+		willWG.Add(1)
+		go func(conn *mqttConn) {
+			defer willWG.Done()
+			defer func() { <-willSlots }()
+			if err := ms.publishWill(WithAdminPrincipal(willCtx, conn.principal), conn); err != nil {
+				log.Printf("[mqtt] publish last will during shutdown for %s: %v", conn.clientID, err)
+			}
+		}(c)
+	}
+	willWG.Wait()
+	cancelWills()
+	ms.cancel()
 	ms.wg.Wait()
 }
 
@@ -409,7 +482,7 @@ func (ms *MQTTServer) handleConn(conn net.Conn) {
 		mc.stopOnce.Do(func() { close(mc.stopping) })
 		ms.detachSubscriptions(mc)
 		if mc.connected.Load() && mc.will != nil && !mc.gracefulClose.Load() && !mc.suppressWill.Load() && ms.ctx.Err() == nil {
-			if err := ms.publishMQTT(mc, mc.will.topic, mc.will.payload, mc.will.qos, mc.will.retain); err != nil {
+			if err := ms.publishWill(ms.principalContext(mc), mc); err != nil {
 				log.Printf("[mqtt] publish last will for %s: %v", mc.clientID, err)
 			}
 		}
@@ -552,7 +625,7 @@ func (ms *MQTTServer) handleConn(conn net.Conn) {
 			if fixedHeader&0x0F != 0 || len(payload) != 0 {
 				return
 			}
-			mc.gracefulClose.Store(true)
+			ms.clearWill(mc)
 			return
 		default:
 			// This direction accepts only client-originated MQTT 3.1.1
@@ -703,7 +776,7 @@ func (ms *MQTTServer) handleConnect(mc *mqttConn, payload []byte) bool {
 				return false
 			}
 			mc.release = release
-		} else if ms.cfg.RequireAuth {
+		} else if ms.cfg.RequireAuth || !ms.cfg.AllowInsecure {
 			ms.sendConnack(mc, 0x05, false) // Connection Refused: not authorized
 			return false
 		}
@@ -766,13 +839,21 @@ func (ms *MQTTServer) handleConnect(mc *mqttConn, payload []byte) bool {
 	sessionPresent := false
 	if cleanSession {
 		old, found, err := ms.getSession(mc.sessionKey)
-		if err != nil || ms.deleteSession(mc.sessionKey) != nil {
+		if err != nil {
 			ms.sendConnack(mc, 0x03, false)
 			return false
 		}
 		if found {
 			for topicFilter := range old.Subscriptions {
-				_, _ = ms.broker.Store().PurgeQueue(ms.ctx, mqttSubscriptionQueue(mc.sessionKey, topicFilter))
+				if _, err := ms.broker.Store().PurgeQueue(ms.ctx, mqttSubscriptionQueue(mc.sessionKey, topicFilter)); err != nil {
+					log.Printf("[mqtt] purge clean-session queue %s: %v", topicFilter, err)
+					ms.sendConnack(mc, 0x03, false)
+					return false
+				}
+			}
+			if err := ms.deleteSession(mc.sessionKey); err != nil {
+				ms.sendConnack(mc, 0x03, false)
+				return false
 			}
 		}
 	} else {
@@ -829,6 +910,41 @@ func (ms *MQTTServer) handleConnect(mc *mqttConn, payload []byte) bool {
 		}
 	}
 
+	if mc.will != nil {
+		mc.will.id = randomHex(16)
+		record := MQTTWillRecord{
+			ID:                mc.will.id,
+			SessionKey:        mc.sessionKey,
+			ClientID:          mc.clientID,
+			PrincipalName:     mc.principal.Name,
+			Tenants:           append([]string(nil), mc.principal.Tenants...),
+			RequestsPerSecond: mc.principal.RequestsPerSecond,
+			Burst:             mc.principal.Burst,
+			MaxConcurrent:     mc.principal.MaxConcurrent,
+			Topic:             mc.will.topic,
+			Payload:           append([]byte(nil), mc.will.payload...),
+			QoS:               mc.will.qos,
+			Retain:            mc.will.retain,
+			CreatedAt:         time.Now().UTC(),
+		}
+		if err := ValidateMQTTWillRecord(record); err != nil {
+			ms.sendConnack(mc, 0x03, false)
+			return false
+		}
+		if store, ok := ms.broker.StateStore().(MQTTWillStore); ok {
+			if err := store.PutMQTTWill(ms.ctx, record); err != nil {
+				cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ms.ctx), 5*time.Second)
+				_ = store.DeleteMQTTWill(cleanupCtx, record.ID)
+				cleanupCancel()
+				ms.sendConnack(mc, 0x03, false)
+				return false
+			}
+		}
+		mc.willRecord = &record
+	}
+	// Mark the accepted connection before writing CONNACK so Stop can observe
+	// and publish its Will if the connection is closed during the handshake.
+	mc.connected.Store(true)
 	ms.sendConnack(mc, 0x00, sessionPresent) // Connection Accepted
 	return true
 }
@@ -882,13 +998,31 @@ func (ms *MQTTServer) handlePublish(mc *mqttConn, fixedHeader byte, payload []by
 	msgPayload := append([]byte(nil), payload[offset:]...)
 	retain := fixedHeader&0x01 != 0
 	if qos == 2 {
-		if _, exists := mc.incomingQoS2[pktID]; !exists {
+		pending, exists := mc.incomingQoS2[pktID]
+		if exists {
+			// A packet identifier stays occupied until PUBCOMP. Only an
+			// identical retransmission with DUP set belongs to the existing
+			// exchange; acknowledging a different PUBLISH here would silently
+			// discard its payload in favor of the old staged one.
+			if fixedHeader&0x08 == 0 || pending.Topic != topic || pending.Retain != retain || !bytes.Equal(pending.Payload, msgPayload) {
+				reject()
+				return
+			}
+		} else {
 			if len(mc.incomingQoS2) >= ms.cfg.MaxInflight {
+				// MQTT 3.1.1 has no receive-maximum negotiation. Leaving the
+				// connection open without PUBREC would strand this packet while
+				// the client waits for a response. Close it so a persistent
+				// session can retry after capacity becomes available.
+				reject()
 				return
 			}
 			pending, err := ms.beginQoS2(mc, pktID, topic, msgPayload, retain)
 			if err != nil {
 				log.Printf("[mqtt] persist qos2 publish: %v", err)
+				// Do not acknowledge a QoS 2 packet until its in-flight state
+				// is durable. Closing lets the client retry it on reconnect.
+				reject()
 				return
 			}
 			mc.incomingQoS2[pktID] = pending
@@ -906,9 +1040,172 @@ func (ms *MQTTServer) handlePublish(mc *mqttConn, fixedHeader byte, payload []by
 }
 
 func (ms *MQTTServer) publishMQTT(mc *mqttConn, topic string, msgPayload []byte, qos byte, retain bool) error {
+	return ms.publishMQTTWithContext(ms.principalContext(mc), topic, msgPayload, qos, retain, "")
+}
+
+func (ms *MQTTServer) publishWill(ctx context.Context, mc *mqttConn) error {
+	if mc == nil {
+		return nil
+	}
+	mc.willMu.Lock()
+	if mc.will == nil || mc.gracefulClose.Load() || !mc.willHandled.CompareAndSwap(false, true) {
+		mc.willMu.Unlock()
+		return nil
+	}
+	var record MQTTWillRecord
+	if mc.willRecord != nil {
+		record = cloneMQTTWillRecord(*mc.willRecord)
+	} else {
+		record = MQTTWillRecord{
+			ID:                mc.will.id,
+			SessionKey:        mc.sessionKey,
+			ClientID:          mc.clientID,
+			PrincipalName:     mc.principal.Name,
+			Tenants:           append([]string(nil), mc.principal.Tenants...),
+			RequestsPerSecond: mc.principal.RequestsPerSecond,
+			Burst:             mc.principal.Burst,
+			MaxConcurrent:     mc.principal.MaxConcurrent,
+			Topic:             mc.will.topic,
+			Payload:           append([]byte(nil), mc.will.payload...),
+			QoS:               mc.will.qos,
+			Retain:            mc.will.retain,
+			CreatedAt:         time.Now().UTC(),
+		}
+	}
+	mc.willMu.Unlock()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	base := context.WithoutCancel(ctx)
+	var willCtx context.Context
+	var cancel context.CancelFunc
+	if deadline, ok := ctx.Deadline(); ok {
+		willCtx, cancel = context.WithDeadline(base, deadline)
+	} else {
+		willCtx, cancel = context.WithTimeout(base, 10*time.Second)
+	}
+	defer cancel()
+	store, _ := ms.broker.StateStore().(MQTTWillStore)
+	return ms.publishStoredWill(willCtx, record, store)
+}
+
+func (ms *MQTTServer) clearWill(mc *mqttConn) {
+	if mc == nil {
+		return
+	}
+	mc.willMu.Lock()
+	mc.gracefulClose.Store(true)
+	mc.willHandled.Store(true)
+	var recordID string
+	if mc.willRecord != nil {
+		recordID = mc.willRecord.ID
+	}
+	mc.willMu.Unlock()
+	if recordID == "" {
+		return
+	}
+	store, ok := ms.broker.StateStore().(MQTTWillStore)
+	if !ok {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ms.ctx), 5*time.Second)
+	defer cancel()
+	if err := store.DeleteMQTTWill(ctx, recordID); err != nil {
+		log.Printf("[mqtt] remove Will after DISCONNECT for %s: %v", mc.clientID, err)
+	}
+}
+
+func (ms *MQTTServer) recoverPendingWills(ctx context.Context) error {
+	store, ok := ms.broker.StateStore().(MQTTWillStore)
+	if !ok {
+		return nil
+	}
+	after := ""
+	for {
+		records, next, err := store.ListMQTTWills(ctx, after, 128)
+		if err != nil {
+			return err
+		}
+		if len(records) > 128 {
+			return errors.New("MQTT Will store returned an oversized page")
+		}
+		previousID := after
+		for _, record := range records {
+			if err := ValidateMQTTWillRecord(record); err != nil || record.ID <= previousID {
+				return fmt.Errorf("MQTT Will store returned invalid or unordered record %q: %w", record.ID, errors.Join(err, ErrInvalidMessage))
+			}
+			previousID = record.ID
+			principal := AdminPrincipal{
+				Name: record.PrincipalName, Tenants: append([]string(nil), record.Tenants...),
+				RequestsPerSecond: record.RequestsPerSecond, Burst: record.Burst,
+				MaxConcurrent: record.MaxConcurrent,
+			}
+			publishCtx, cancel := context.WithTimeout(WithAdminPrincipal(ctx, principal), 10*time.Second)
+			err := ms.publishStoredWill(publishCtx, record, store)
+			cancel()
+			if err != nil {
+				return fmt.Errorf("recover MQTT Will %s for client %s: %w", record.ID, record.ClientID, err)
+			}
+		}
+		if next == "" {
+			return nil
+		}
+		if next <= after || len(records) == 0 || next != records[len(records)-1].ID {
+			return errors.New("MQTT Will store returned a non-advancing page cursor")
+		}
+		after = next
+	}
+}
+
+func (ms *MQTTServer) publishStoredWill(ctx context.Context, record MQTTWillRecord, store MQTTWillStore) error {
+	if err := retryMQTTWillOperation(ctx, func() error {
+		return ms.publishMQTTWithContext(ctx, record.Topic, record.Payload, record.QoS, record.Retain, record.ID)
+	}); err != nil {
+		return fmt.Errorf("publish MQTT Will %s: %w", record.ID, err)
+	}
+	if store == nil {
+		return nil
+	}
+	if err := retryMQTTWillOperation(ctx, func() error {
+		return store.DeleteMQTTWill(ctx, record.ID)
+	}); err != nil {
+		return fmt.Errorf("remove published MQTT Will %s: %w", record.ID, err)
+	}
+	return nil
+}
+
+func retryMQTTWillOperation(ctx context.Context, operation func() error) error {
+	delay := 100 * time.Millisecond
+	var lastErr error
+	for {
+		if err := ctx.Err(); err != nil {
+			return errors.Join(lastErr, err)
+		}
+		lastErr = operation()
+		if lastErr == nil {
+			return nil
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return errors.Join(lastErr, ctx.Err())
+		}
+		if delay < time.Second {
+			delay *= 2
+		}
+	}
+}
+
+func (ms *MQTTServer) publishMQTTWithContext(ctx context.Context, topic string, msgPayload []byte, qos byte, retain bool, willID string) error {
 	// Map MQTT topic to broker topic/queue
 	brokerTopic := strings.ReplaceAll(topic, "/", ".")
-	ctx := ms.principalContext(mc)
 	opts := []PublishOption{
 		WithType("mqtt"),
 		WithHeaders(map[string]string{"mqtt_topic": topic, "mqtt_qos": fmt.Sprintf("%d", qos), "mqtt_retain": fmt.Sprintf("%t", retain)}),
@@ -917,7 +1214,11 @@ func (ms *MQTTServer) publishMQTT(mc *mqttConn, topic string, msgPayload []byte,
 		opts = append(opts, WithQueue("mqtt."+brokerTopic))
 	}
 
-	if _, err := ms.broker.Publisher().Publish(ctx, brokerTopic, msgPayload, opts...); err != nil {
+	if willID != "" {
+		idempotencyID := "mqtt-will-" + willID
+		opts = append(opts, WithMessageID(idempotencyID), WithIdempotencyKey(idempotencyID))
+	}
+	if _, err := ms.broker.Publisher().Publish(ctx, brokerTopic, msgPayload, opts...); err != nil && !errors.Is(err, ErrDuplicateMessage) {
 		return err
 	}
 	if retain {
@@ -1784,7 +2085,21 @@ func validMQTTTopicFilter(filter string) bool {
 }
 
 func validMQTTUTF8(value string) bool {
-	return utf8.ValidString(value) && !strings.ContainsRune(value, '\x00')
+	if !utf8.ValidString(value) {
+		return false
+	}
+	for _, r := range value {
+		if r == 0 || (r >= 0x01 && r <= 0x1f) || (r >= 0x7f && r <= 0x9f) {
+			return false
+		}
+		// MQTT 3.1.1 recommends excluding Unicode noncharacters from encoded
+		// strings. Reject both the contiguous BMP range and the FFFE/FFFF code
+		// points at the end of every Unicode plane.
+		if (r >= 0xfdd0 && r <= 0xfdef) || r&0xffff == 0xfffe || r&0xffff == 0xffff {
+			return false
+		}
+	}
+	return true
 }
 
 func (ms *MQTTServer) handleUnsubscribe(mc *mqttConn, payload []byte) bool {
@@ -1963,6 +2278,9 @@ func (ms *MQTTServer) readPacketHeader(conn net.Conn) (byte, int, error) {
 		}
 		remaining += int(buf[0]&0x7F) * multiplier
 		if buf[0]&0x80 == 0 {
+			if i > 0 && remaining < 1<<(7*i) {
+				return 0, 0, ErrInvalidMessage
+			}
 			return fixedHeader, remaining, nil
 		}
 		if i == 3 {

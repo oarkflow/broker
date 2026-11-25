@@ -16,33 +16,37 @@ type PrometheusMetrics struct {
 	mu sync.RWMutex
 
 	// Counters
-	published                  atomic.Uint64
-	delivered                  atomic.Uint64
-	acked                      atomic.Uint64
-	nacked                     atomic.Uint64
-	deadLettered               atomic.Uint64
-	retried                    atomic.Uint64
-	moved                      atomic.Uint64
-	publishedBytes             atomic.Uint64
-	deliveredBytes             atomic.Uint64
-	storeFenced                atomic.Uint64
-	publishRateLimited         atomic.Uint64
-	publishBackpressured       atomic.Uint64
-	outboxDispatchAttempts     atomic.Uint64
-	outboxDispatchFailures     atomic.Uint64
-	outboxPublished            atomic.Uint64
-	outboxDeadLettered         atomic.Uint64
-	consumerBatches            atomic.Uint64
-	consumerBatchMessages      atomic.Uint64
-	consumerMaxBatchSize       atomic.Uint64
-	consumerBatchWaitNanos     atomic.Uint64
-	consumerBatchWaitCurrent   sync.Map // *Subscription -> adaptive wait in nanoseconds
-	walCommitBatches           atomic.Uint64
-	walCommitRequests          atomic.Uint64
-	walCommitMaxBatch          atomic.Uint64
-	walCommitCoalesceWaitNanos atomic.Uint64
-	walCommitCurrentWaitNanos  atomic.Uint64
-	walCommitErrors            atomic.Uint64
+	published                       atomic.Uint64
+	delivered                       atomic.Uint64
+	acked                           atomic.Uint64
+	nacked                          atomic.Uint64
+	deadLettered                    atomic.Uint64
+	retried                         atomic.Uint64
+	moved                           atomic.Uint64
+	publishedBytes                  atomic.Uint64
+	deliveredBytes                  atomic.Uint64
+	storeFenced                     atomic.Uint64
+	publishRateLimited              atomic.Uint64
+	publishBackpressured            atomic.Uint64
+	outboxDispatchAttempts          atomic.Uint64
+	outboxDispatchFailures          atomic.Uint64
+	outboxPublished                 atomic.Uint64
+	outboxDeadLettered              atomic.Uint64
+	partitionReassignmentsStarted   atomic.Uint64
+	partitionReassignmentsCompleted atomic.Uint64
+	partitionReassignmentErrors     atomic.Uint64
+	partitionReassignmentPending    atomic.Uint64
+	consumerBatches                 atomic.Uint64
+	consumerBatchMessages           atomic.Uint64
+	consumerMaxBatchSize            atomic.Uint64
+	consumerBatchWaitNanos          atomic.Uint64
+	consumerBatchWaitCurrent        sync.Map // *Subscription -> adaptive wait in nanoseconds
+	walCommitBatches                atomic.Uint64
+	walCommitRequests               atomic.Uint64
+	walCommitMaxBatch               atomic.Uint64
+	walCommitCoalesceWaitNanos      atomic.Uint64
+	walCommitCurrentWaitNanos       atomic.Uint64
+	walCommitErrors                 atomic.Uint64
 
 	// Per-queue counters
 	queueDepth  sync.Map // queue -> *atomic.Int64
@@ -198,6 +202,30 @@ func (m *PrometheusMetrics) RecordOutboxPublished() {
 // RecordOutboxDeadLettered records a successfully completed outbox DLQ append.
 func (m *PrometheusMetrics) RecordOutboxDeadLettered() {
 	m.outboxDeadLettered.Add(1)
+}
+
+// RecordPartitionReassignmentStarted records a durable reassignment started
+// by the automatic controller loop.
+func (m *PrometheusMetrics) RecordPartitionReassignmentStarted() {
+	m.partitionReassignmentsStarted.Add(1)
+}
+
+// RecordPartitionReassignmentCompleted records a durable reassignment that
+// reached its final cleanup phase.
+func (m *PrometheusMetrics) RecordPartitionReassignmentCompleted() {
+	m.partitionReassignmentsCompleted.Add(1)
+}
+
+// RecordPartitionReassignmentError records a failed automatic reassignment
+// attempt. The counter has no resource labels to keep cardinality bounded.
+func (m *PrometheusMetrics) RecordPartitionReassignmentError() {
+	m.partitionReassignmentErrors.Add(1)
+}
+
+// RecordPartitionReassignmentPending records an observation that remains
+// pending catch-up, leadership transfer, or Raft membership progress.
+func (m *PrometheusMetrics) RecordPartitionReassignmentPending() {
+	m.partitionReassignmentPending.Add(1)
 }
 
 // SetConsumerBatchWait updates the current adaptive wait for a batch consumer.
@@ -363,6 +391,22 @@ func (m *PrometheusMetrics) exposition() string {
 	b.WriteString("# HELP broker_outbox_dead_lettered_total Total durable outbox entries successfully routed to the dead-letter queue.\n")
 	b.WriteString("# TYPE broker_outbox_dead_lettered_total counter\n")
 	fmt.Fprintf(&b, "broker_outbox_dead_lettered_total %d\n", m.outboxDeadLettered.Load())
+
+	b.WriteString("# HELP broker_partition_reassignments_started_total Total automatic partition reassignments durably started.\n")
+	b.WriteString("# TYPE broker_partition_reassignments_started_total counter\n")
+	fmt.Fprintf(&b, "broker_partition_reassignments_started_total %d\n", m.partitionReassignmentsStarted.Load())
+
+	b.WriteString("# HELP broker_partition_reassignments_completed_total Total automatic partition reassignments completed.\n")
+	b.WriteString("# TYPE broker_partition_reassignments_completed_total counter\n")
+	fmt.Fprintf(&b, "broker_partition_reassignments_completed_total %d\n", m.partitionReassignmentsCompleted.Load())
+
+	b.WriteString("# HELP broker_partition_reassignment_errors_total Total failed automatic partition reassignment attempts.\n")
+	b.WriteString("# TYPE broker_partition_reassignment_errors_total counter\n")
+	fmt.Fprintf(&b, "broker_partition_reassignment_errors_total %d\n", m.partitionReassignmentErrors.Load())
+
+	b.WriteString("# HELP broker_partition_reassignment_pending_observations_total Automatic reassignment observations still waiting for catch-up or membership progress.\n")
+	b.WriteString("# TYPE broker_partition_reassignment_pending_observations_total counter\n")
+	fmt.Fprintf(&b, "broker_partition_reassignment_pending_observations_total %d\n", m.partitionReassignmentPending.Load())
 
 	b.WriteString("# HELP broker_consumer_batches_total Total batches submitted to batch consumers.\n")
 	b.WriteString("# TYPE broker_consumer_batches_total counter\n")

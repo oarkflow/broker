@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"time"
 )
 
@@ -51,6 +52,9 @@ func (p *Publisher) PublishOwned(ctx context.Context, msg Message, opts ...Publi
 		if fn != nil {
 			fn(&o)
 		}
+	}
+	if o.PartitionSet {
+		msg.Partition = o.Partition
 	}
 	if msg.ID == "" {
 		msg.ID = p.b.nextID("msg")
@@ -228,11 +232,6 @@ func (p *Publisher) publishItemsAligned(ctx context.Context, items []PublishBatc
 		if err == nil {
 			err = p.checkBackpressure(ctx, prep)
 		}
-		// Tenant quotas were only enforced on the single-message publish path, so
-		// a tenant could bypass its quota entirely by using /v1/publish/batch.
-		if err == nil && p.b.tenantMgr != nil {
-			err = p.b.tenantMgr.CheckPublishQuota(ctx, prep.msg.TenantID, prep.dests)
-		}
 		if err == nil {
 			err = validateConfirmation(prep.opts.ConfirmLevel, p.b.store)
 		}
@@ -246,6 +245,25 @@ func (p *Publisher) publishItemsAligned(ctx context.Context, items []PublishBatc
 		preps = append(preps, prep)
 		indices = append(indices, i)
 		entries = append(entries, AppendEntry{Message: prep.msg, Destinations: prep.dests})
+	}
+	quotaErrors := p.batchTenantQuotaErrors(ctx, entries)
+	if len(quotaErrors) > 0 {
+		keptPreps := make([]preparedPublish, 0, len(preps))
+		keptIndices := make([]int, 0, len(indices))
+		keptEntries := make([]AppendEntry, 0, len(entries))
+		for i, entry := range entries {
+			if quotaErr := quotaErrors[entry.Message.TenantID]; quotaErr != nil {
+				errs[indices[i]] = quotaErr
+				if first == nil {
+					first = quotaErr
+				}
+				continue
+			}
+			keptPreps = append(keptPreps, preps[i])
+			keptIndices = append(keptIndices, indices[i])
+			keptEntries = append(keptEntries, entry)
+		}
+		preps, indices, entries = keptPreps, keptIndices, keptEntries
 	}
 	if len(entries) == 0 {
 		return results, errs, first
@@ -302,6 +320,38 @@ func (p *Publisher) publishItemsAligned(ctx context.Context, items []PublishBatc
 	return results, errs, first
 }
 
+// batchTenantQuotaErrors reserves tenant quota for each tenant represented in
+// a batch, counting all messages before any store append can make them visible.
+func (p *Publisher) batchTenantQuotaErrors(ctx context.Context, entries []AppendEntry) map[string]error {
+	if p == nil || p.b == nil || p.b.tenantMgr == nil || len(entries) == 0 {
+		return nil
+	}
+	type tenantBatch struct {
+		count        int
+		destinations []Destination
+	}
+	batches := make(map[string]tenantBatch)
+	for _, entry := range entries {
+		batch := batches[entry.Message.TenantID]
+		batch.count++
+		batch.destinations = append(batch.destinations, entry.Destinations...)
+		batches[entry.Message.TenantID] = batch
+	}
+	tenants := make([]string, 0, len(batches))
+	for tenant := range batches {
+		tenants = append(tenants, tenant)
+	}
+	sort.Strings(tenants)
+	quotaErrors := make(map[string]error)
+	for _, tenant := range tenants {
+		batch := batches[tenant]
+		if err := p.b.tenantMgr.CheckPublishBatchQuota(ctx, tenant, batch.destinations, batch.count); err != nil {
+			quotaErrors[tenant] = err
+		}
+	}
+	return quotaErrors
+}
+
 func nonEmptyDestinationCount(msg Message, dests []Destination) int {
 	if len(dests) == 0 {
 		if msg.Topic == "" {
@@ -332,11 +382,6 @@ func (p *Publisher) publishItemsMinimal(ctx context.Context, items []PublishBatc
 		if err == nil {
 			err = p.checkBackpressure(ctx, prep)
 		}
-		// Tenant quotas were only enforced on the single-message publish path, so
-		// a tenant could bypass its quota entirely by using /v1/publish/batch.
-		if err == nil && p.b.tenantMgr != nil {
-			err = p.b.tenantMgr.CheckPublishQuota(ctx, prep.msg.TenantID, prep.dests)
-		}
 		if err != nil {
 			errs[i] = err
 			if first == nil {
@@ -346,6 +391,23 @@ func (p *Publisher) publishItemsMinimal(ctx context.Context, items []PublishBatc
 		}
 		entries = append(entries, AppendEntry{Message: prep.msg, Destinations: prep.dests})
 		indices = append(indices, i)
+	}
+	quotaErrors := p.batchTenantQuotaErrors(ctx, entries)
+	if len(quotaErrors) > 0 {
+		keptEntries := make([]AppendEntry, 0, len(entries))
+		keptIndices := make([]int, 0, len(indices))
+		for i, entry := range entries {
+			if quotaErr := quotaErrors[entry.Message.TenantID]; quotaErr != nil {
+				errs[indices[i]] = quotaErr
+				if first == nil {
+					first = quotaErr
+				}
+				continue
+			}
+			keptEntries = append(keptEntries, entry)
+			keptIndices = append(keptIndices, indices[i])
+		}
+		entries, indices = keptEntries, keptIndices
 	}
 	if len(entries) == 0 {
 		return errs, first
@@ -407,11 +469,6 @@ func (p *Publisher) publishMessagesMinimal(ctx context.Context, messages []Messa
 	now := time.Now()
 	for i := range messages {
 		entry, err := p.prepareOwnedMessage(ctx, messages[i], now)
-		// Tenant quotas were only enforced on the single-message publish path, so a
-		// tenant could bypass its quota by using the batch or frame endpoints.
-		if err == nil && p.b.tenantMgr != nil {
-			err = p.b.tenantMgr.CheckPublishQuota(ctx, entry.Message.TenantID, entry.Destinations)
-		}
 		if err != nil {
 			errs[i] = err
 			if first == nil {
@@ -421,6 +478,23 @@ func (p *Publisher) publishMessagesMinimal(ctx context.Context, messages []Messa
 		}
 		entries = append(entries, entry)
 		indices = append(indices, i)
+	}
+	quotaErrors := p.batchTenantQuotaErrors(ctx, entries)
+	if len(quotaErrors) > 0 {
+		keptEntries := make([]AppendEntry, 0, len(entries))
+		keptIndices := make([]int, 0, len(indices))
+		for i, entry := range entries {
+			if quotaErr := quotaErrors[entry.Message.TenantID]; quotaErr != nil {
+				errs[indices[i]] = quotaErr
+				if first == nil {
+					first = quotaErr
+				}
+				continue
+			}
+			keptEntries = append(keptEntries, entry)
+			keptIndices = append(keptIndices, indices[i])
+		}
+		entries, indices = keptEntries, keptIndices
 	}
 	if len(entries) == 0 {
 		return errs, first
@@ -499,6 +573,9 @@ func (p *Publisher) appendOneEntry(ctx context.Context, entry AppendEntry) error
 func (p *Publisher) prepareOwnedMessage(ctx context.Context, msg Message, now time.Time) (AppendEntry, error) {
 	if p == nil || p.b == nil {
 		return AppendEntry{}, ErrClosed
+	}
+	if msg.Partition < 0 {
+		return AppendEntry{}, errf(ErrInvalidMessage, "partition must be non-negative")
 	}
 	if p.b.State() == BrokerPaused {
 		return AppendEntry{}, ErrPaused
@@ -653,6 +730,9 @@ func (p *Publisher) preparePublish(ctx context.Context, topic string, payload an
 			fn(&o)
 		}
 	}
+	if o.Partition < 0 {
+		return preparedPublish{}, errf(ErrInvalidMessage, "partition must be non-negative")
+	}
 	resolvedTenant, err := resolveTenant(ctx, o.TenantID)
 	if err != nil {
 		return preparedPublish{}, err
@@ -688,7 +768,7 @@ func (p *Publisher) preparePublish(ctx context.Context, topic string, payload an
 		}
 		meta["_dedup_window_ns"] = fmt.Sprintf("%d", o.DeduplicationWindow.Nanoseconds())
 	}
-	msg := Message{ID: id, Topic: topic, Queue: o.Queue, Stream: o.Stream, Key: o.Key, RoutingKey: o.RoutingKey, Type: o.Type, ContentType: firstNonEmpty(o.ContentType, p.b.codec.ContentType()), Schema: o.Schema, SchemaVersion: o.SchemaVersion, Payload: body, Headers: cloneMap(o.Headers), Metadata: meta, TraceID: o.TraceID, CorrelationID: o.CorrelationID, CausationID: o.CausationID, IdempotencyKey: o.IdempotencyKey, DeduplicationID: o.DeduplicationID, Priority: o.Priority, CreatedAt: now, AvailableAt: available, TenantID: o.TenantID, ProducerID: o.ProducerID, ProducerEpoch: o.ProducerEpoch, ProducerSequence: o.ProducerSequence, Status: status, MaxAttempts: o.MaxAttempts}
+	msg := Message{ID: id, Topic: topic, Queue: o.Queue, Stream: o.Stream, Partition: o.Partition, Key: o.Key, RoutingKey: o.RoutingKey, Type: o.Type, ContentType: firstNonEmpty(o.ContentType, p.b.codec.ContentType()), Schema: o.Schema, SchemaVersion: o.SchemaVersion, Payload: body, Headers: cloneMap(o.Headers), Metadata: meta, TraceID: o.TraceID, CorrelationID: o.CorrelationID, CausationID: o.CausationID, IdempotencyKey: o.IdempotencyKey, DeduplicationID: o.DeduplicationID, Priority: o.Priority, CreatedAt: now, AvailableAt: available, TenantID: o.TenantID, ProducerID: o.ProducerID, ProducerEpoch: o.ProducerEpoch, ProducerSequence: o.ProducerSequence, Status: status, MaxAttempts: o.MaxAttempts}
 	if msg.Headers != nil {
 		msg.TaskID = msg.Headers["x-task-id"]
 		msg.TaskName = msg.Headers["x-task-name"]
@@ -736,11 +816,11 @@ func (p *Publisher) preparePublish(ctx context.Context, topic string, payload an
 		_ = routes
 		dests = append(dests, rd...)
 	}
-	if len(dests) == 0 && topic != "" {
-		dests = append(dests, Destination{Kind: DestinationTopic, Name: topic})
-	}
 	if o.RequireDestination && len(dests) == 0 {
 		return preparedPublish{}, ErrNoDestination
+	}
+	if len(dests) == 0 && topic != "" {
+		dests = append(dests, Destination{Kind: DestinationTopic, Name: topic})
 	}
 	return preparedPublish{msg: msg, dests: dests, event: ev, opts: o}, nil
 }
@@ -774,6 +854,8 @@ func (p *Publisher) publishResult(messageID string, stored []Message, dests []De
 	if level == ConfirmPersisted {
 		res.Durability = DurabilityLocalFsync
 		res.Replicas = 1
+	} else if level == ConfirmReplicated {
+		res.Durability = DurabilityQuorumFsync
 	}
 	if len(stored) > 0 {
 		res.Partition = stored[0].Partition
@@ -1089,16 +1171,19 @@ func (tx *publishTx) Commit(ctx context.Context) ([]PublishResult, error) {
 		if err := tx.p.checkBackpressure(ctx, prep); err != nil {
 			return nil, err
 		}
-		if tx.p.b.tenantMgr != nil {
-			if err := tx.p.b.tenantMgr.CheckPublishQuota(ctx, prep.msg.TenantID, prep.dests); err != nil {
-				return nil, err
-			}
-		}
 		if err := validateConfirmation(prep.opts.ConfirmLevel, tx.p.b.store); err != nil {
 			return nil, err
 		}
 		preps = append(preps, prep)
 		entries = append(entries, AppendEntry{Message: prep.msg, Destinations: prep.dests})
+	}
+	if quotaErrors := tx.p.batchTenantQuotaErrors(ctx, entries); len(quotaErrors) > 0 {
+		tenants := make([]string, 0, len(quotaErrors))
+		for tenant := range quotaErrors {
+			tenants = append(tenants, tenant)
+		}
+		sort.Strings(tenants)
+		return nil, quotaErrors[tenants[0]]
 	}
 	atomicStore, ok := tx.p.b.store.(AtomicStore)
 	if !ok {

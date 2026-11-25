@@ -19,16 +19,17 @@ import (
 )
 
 const (
-	NativeStreamMagic  uint32 = 0x42535431 // BST1
-	nativeVersion      byte   = 1
-	nativeOpProduce    byte   = 1
-	nativeOpFetch      byte   = 2
-	nativeOpCommit     byte   = 3
-	nativeOpOffset     byte   = 4
-	nativeOpPing       byte   = 5
-	nativeOpFetchRaw   byte   = 6
-	nativeResponseFlag byte   = 0x80
-	nativeHeaderSize          = 20
+	NativeStreamMagic            uint32 = 0x42535431 // BST1
+	NativeStreamNegotiationMagic uint32 = 0x42535432 // BST2 handshake negotiation envelope
+	nativeVersion                byte   = 1
+	nativeOpProduce              byte   = 1
+	nativeOpFetch                byte   = 2
+	nativeOpCommit               byte   = 3
+	nativeOpOffset               byte   = 4
+	nativeOpPing                 byte   = 5
+	nativeOpFetchRaw             byte   = 6
+	nativeResponseFlag           byte   = 0x80
+	nativeHeaderSize                    = 20
 
 	NativeAuthAnonymous byte = 0x00
 	NativeAuthToken     byte = 0x01
@@ -493,6 +494,10 @@ func (p *nativePartition) fetchRaw(offset uint64, maxRecords, maxBytes int) ([]b
 }
 
 func (s *NativeStreamServer) ListenAndServe(addr string) error {
+	certificateAuth := tlsConfigVerifiesClientCertificates(s.cfg.TLSConfig)
+	if err := validateListenerSecurity("native stream", s.cfg.InsecureDev, s.cfg.TLSConfig != nil, s.cfg.ACL.hasUsableCredential(certificateAuth), "ACL authentication"); err != nil {
+		return err
+	}
 	var ln net.Listener
 	var err error
 	if s.cfg.TLSConfig != nil {
@@ -518,10 +523,32 @@ func (s *NativeStreamServer) ListenAndServe(addr string) error {
 }
 
 func writeHandshakeResponse(w io.Writer, statusCode byte, principal string) error {
+	if len(principal) > int(^uint16(0)) {
+		return errors.New("native stream principal exceeds handshake limit")
+	}
 	var h [8]byte
 	binary.BigEndian.PutUint32(h[:4], NativeStreamMagic)
 	h[4] = nativeVersion
 	h[5] = statusCode
+	binary.BigEndian.PutUint16(h[6:8], uint16(len(principal)))
+	if _, err := w.Write(h[:]); err != nil {
+		return err
+	}
+	if len(principal) > 0 {
+		_, err := io.WriteString(w, principal)
+		return err
+	}
+	return nil
+}
+
+func writeNegotiationResponse(w io.Writer, statusCode, selectedVersion byte, principal string) error {
+	if len(principal) > int(^uint16(0)) {
+		return errors.New("native stream principal exceeds handshake limit")
+	}
+	var h [8]byte
+	binary.BigEndian.PutUint32(h[:4], NativeStreamNegotiationMagic)
+	h[4] = statusCode
+	h[5] = selectedVersion
 	binary.BigEndian.PutUint16(h[6:8], uint16(len(principal)))
 	if _, err := w.Write(h[:]); err != nil {
 		return err
@@ -539,18 +566,48 @@ func (s *NativeStreamServer) serveConn(c net.Conn) {
 	r := bufio.NewReaderSize(c, 1<<20)
 	w := bufio.NewWriterSize(c, 1<<20)
 
-	// Perform BST1 authenticated handshake
-	var h [8]byte
-	if _, err := io.ReadFull(r, h[:]); err != nil {
+	// Accept legacy BST1 clients while new clients negotiate a version through
+	// the BST2 handshake envelope. The selected data-frame version remains BST1
+	// until a later implementation adds another frame codec.
+	var magicBytes [4]byte
+	if _, err := io.ReadFull(r, magicBytes[:]); err != nil {
 		return
 	}
-	if binary.BigEndian.Uint32(h[:4]) != NativeStreamMagic || h[4] != nativeVersion {
+	magic := binary.BigEndian.Uint32(magicBytes[:])
+	negotiated := magic == NativeStreamNegotiationMagic
+	var authType byte
+	var tokenLen int
+	selectedVersion := nativeVersion
+	if magic == NativeStreamMagic {
+		var fields [4]byte
+		if _, err := io.ReadFull(r, fields[:]); err != nil {
+			return
+		}
+		if fields[0] != nativeVersion {
+			_ = writeHandshakeResponse(w, NativeStatusErrProtocol, "")
+			_ = w.Flush()
+			return
+		}
+		authType = fields[1]
+		tokenLen = int(binary.BigEndian.Uint16(fields[2:4]))
+	} else if negotiated {
+		var fields [5]byte
+		if _, err := io.ReadFull(r, fields[:]); err != nil {
+			return
+		}
+		minVersion, maxVersion := fields[0], fields[1]
+		authType = fields[2]
+		tokenLen = int(binary.BigEndian.Uint16(fields[3:5]))
+		if minVersion == 0 || maxVersion < minVersion || minVersion > nativeVersion || maxVersion < nativeVersion {
+			_ = writeNegotiationResponse(w, NativeStatusErrProtocol, 0, "")
+			_ = w.Flush()
+			return
+		}
+	} else {
 		_ = writeHandshakeResponse(w, NativeStatusErrProtocol, "")
 		_ = w.Flush()
 		return
 	}
-	authType := h[5]
-	tokenLen := int(binary.BigEndian.Uint16(h[6:8]))
 	token := ""
 	if tokenLen > 0 {
 		tokenBytes := make([]byte, tokenLen)
@@ -562,10 +619,16 @@ func (s *NativeStreamServer) serveConn(c net.Conn) {
 
 	var principal AdminPrincipal
 	statusCode := NativeStatusUnauthorized
+	writeResponse := func(status byte, principalName string) error {
+		if negotiated {
+			return writeNegotiationResponse(w, status, selectedVersion, principalName)
+		}
+		return writeHandshakeResponse(w, status, principalName)
+	}
 
 	switch authType {
 	case NativeAuthAnonymous:
-		if s.cfg.InsecureDev || s.cfg.ACL == nil {
+		if s.cfg.InsecureDev {
 			principal = AdminPrincipal{Name: "anonymous", Permissions: []string{PermissionAdminAll}}
 			statusCode = NativeStatusSuccess
 		}
@@ -592,7 +655,7 @@ func (s *NativeStreamServer) serveConn(c net.Conn) {
 	}
 
 	if statusCode != NativeStatusSuccess {
-		_ = writeHandshakeResponse(w, statusCode, "")
+		_ = writeResponse(statusCode, "")
 		_ = w.Flush()
 		return
 	}
@@ -602,7 +665,7 @@ func (s *NativeStreamServer) serveConn(c net.Conn) {
 		var err error
 		release, err = s.cfg.ACL.AdmitConnection(principal)
 		if err != nil {
-			_ = writeHandshakeResponse(w, NativeStatusThrottled, "")
+			_ = writeResponse(NativeStatusThrottled, "")
 			_ = w.Flush()
 			return
 		}
@@ -611,7 +674,7 @@ func (s *NativeStreamServer) serveConn(c net.Conn) {
 		defer release()
 	}
 
-	if err := writeHandshakeResponse(w, NativeStatusSuccess, principal.Name); err != nil {
+	if err := writeResponse(NativeStatusSuccess, principal.Name); err != nil {
 		return
 	}
 	if err := w.Flush(); err != nil {
@@ -957,21 +1020,49 @@ type NativeStreamClient struct {
 	mu        sync.Mutex
 	corr      uint64
 	max       int
+	version   byte
 	principal string
 }
 
-// NativeStreamDialOptions configures a BST1 client connection.
+// NativeStreamDialOptions configures a native stream connection. New clients
+// negotiate a version by default; LegacyHandshake is for older BST1-only
+// servers that predate the negotiation envelope.
 type NativeStreamDialOptions struct {
 	Timeout   time.Duration
 	Token     string
 	TLSConfig *tls.Config
 	AuthType  byte
+	// MinVersion and MaxVersion declare the frame-version range supported by
+	// the client. Zero defaults to the currently implemented version 1.
+	MinVersion byte
+	MaxVersion byte
+	// LegacyHandshake skips BST2 negotiation for older servers.
+	LegacyHandshake bool
 }
 
 // DialNativeStreamWithOptions connects to a BST1 server with explicit auth and TLS options.
 func DialNativeStreamWithOptions(addr string, opts NativeStreamDialOptions) (*NativeStreamClient, error) {
 	if opts.Timeout <= 0 {
 		opts.Timeout = 10 * time.Second
+	}
+	minVersion, maxVersion := opts.MinVersion, opts.MaxVersion
+	if minVersion == 0 {
+		minVersion = nativeVersion
+	}
+	if maxVersion == 0 {
+		maxVersion = nativeVersion
+	}
+	if minVersion == 0 || maxVersion < minVersion {
+		return nil, fmt.Errorf("invalid BST1 protocol version range")
+	}
+	if maxVersion > nativeVersion {
+		return nil, fmt.Errorf("native stream client only supports protocol versions through %d", nativeVersion)
+	}
+	if opts.LegacyHandshake && (minVersion > nativeVersion || maxVersion < nativeVersion) {
+		return nil, fmt.Errorf("legacy BST1 handshake can only use protocol version %d", nativeVersion)
+	}
+	if len(opts.Token) > int(^uint16(0)) {
+		return nil, fmt.Errorf("BST1 token exceeds handshake limit")
 	}
 	var c net.Conn
 	var err error
@@ -995,14 +1086,26 @@ func DialNativeStreamWithOptions(addr string, opts NativeStreamDialOptions) (*Na
 		authType = NativeAuthMTLS
 	}
 
-	var reqH [8]byte
-	binary.BigEndian.PutUint32(reqH[:4], NativeStreamMagic)
-	reqH[4] = nativeVersion
-	reqH[5] = authType
-	binary.BigEndian.PutUint16(reqH[6:8], uint16(len(opts.Token)))
-	if _, err := w.Write(reqH[:]); err != nil {
-		c.Close()
-		return nil, err
+	var reqH [9]byte
+	if opts.LegacyHandshake {
+		binary.BigEndian.PutUint32(reqH[:4], NativeStreamMagic)
+		reqH[4] = nativeVersion
+		reqH[5] = authType
+		binary.BigEndian.PutUint16(reqH[6:8], uint16(len(opts.Token)))
+		if _, err := w.Write(reqH[:8]); err != nil {
+			c.Close()
+			return nil, err
+		}
+	} else {
+		binary.BigEndian.PutUint32(reqH[:4], NativeStreamNegotiationMagic)
+		reqH[4] = minVersion
+		reqH[5] = maxVersion
+		reqH[6] = authType
+		binary.BigEndian.PutUint16(reqH[7:9], uint16(len(opts.Token)))
+		if _, err := w.Write(reqH[:]); err != nil {
+			c.Close()
+			return nil, err
+		}
 	}
 	if len(opts.Token) > 0 {
 		if _, err := io.WriteString(w, opts.Token); err != nil {
@@ -1020,11 +1123,29 @@ func DialNativeStreamWithOptions(addr string, opts NativeStreamDialOptions) (*Na
 		c.Close()
 		return nil, err
 	}
-	if binary.BigEndian.Uint32(respH[:4]) != NativeStreamMagic || respH[4] != nativeVersion {
-		c.Close()
-		return nil, errors.New("BST1 protocol error in handshake response")
+	var status, selectedVersion byte
+	if opts.LegacyHandshake {
+		if binary.BigEndian.Uint32(respH[:4]) != NativeStreamMagic || respH[4] != nativeVersion {
+			c.Close()
+			return nil, errors.New("BST1 protocol error in handshake response")
+		}
+		status, selectedVersion = respH[5], respH[4]
+	} else {
+		responseMagic := binary.BigEndian.Uint32(respH[:4])
+		if responseMagic == NativeStreamMagic {
+			c.Close()
+			return nil, errors.New("server does not support BST2 version negotiation; set LegacyHandshake to use BST1")
+		}
+		if responseMagic != NativeStreamNegotiationMagic {
+			c.Close()
+			return nil, errors.New("BST2 protocol error in negotiation response")
+		}
+		status, selectedVersion = respH[4], respH[5]
+		if status == NativeStatusSuccess && (selectedVersion != nativeVersion || selectedVersion < minVersion || selectedVersion > maxVersion) {
+			c.Close()
+			return nil, errors.New("server selected an unsupported version or one outside the requested range")
+		}
 	}
-	status := respH[5]
 	principalLen := int(binary.BigEndian.Uint16(respH[6:8]))
 	principal := ""
 	if principalLen > 0 {
@@ -1045,6 +1166,8 @@ func DialNativeStreamWithOptions(addr string, opts NativeStreamDialOptions) (*Na
 			return nil, ErrUnauthorized
 		case NativeStatusThrottled:
 			return nil, ErrThrottled
+		case NativeStatusErrProtocol:
+			return nil, errors.New("no compatible BST1 protocol version")
 		default:
 			return nil, fmt.Errorf("BST1 handshake failed with status code %d", status)
 		}
@@ -1055,6 +1178,7 @@ func DialNativeStreamWithOptions(addr string, opts NativeStreamDialOptions) (*Na
 		r:         r,
 		w:         w,
 		max:       128 << 20,
+		version:   selectedVersion,
 		principal: principal,
 	}, nil
 }
@@ -1069,6 +1193,15 @@ func (c *NativeStreamClient) Principal() string {
 	}
 	return c.principal
 }
+
+// ProtocolVersion reports the version selected during the handshake.
+func (c *NativeStreamClient) ProtocolVersion() byte {
+	if c == nil {
+		return 0
+	}
+	return c.version
+}
+
 func (c *NativeStreamClient) callOnChannel(chanID uint16, op byte, body []byte) ([]byte, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()

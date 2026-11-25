@@ -13,10 +13,14 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/oarkflow/broker/cluster"
 )
 
 type PollRequest struct {
 	Queue               string `json:"queue"`
+	Partition           int    `json:"partition,omitempty"`
+	Partitioned         bool   `json:"partitioned,omitempty"`
 	ConsumerID          string `json:"consumer_id"`
 	ConsumerGroup       string `json:"consumer_group"`
 	TenantID            string `json:"tenant_id,omitempty"`
@@ -46,6 +50,7 @@ type PublishHTTPPayload struct {
 	Key            string            `json:"key,omitempty"`
 	RoutingKey     string            `json:"routing_key,omitempty"`
 	Priority       int               `json:"priority,omitempty"`
+	Partition      int               `json:"partition,omitempty"`
 	TenantID       string            `json:"tenant_id,omitempty"`
 	CorrelationID  string            `json:"correlation_id,omitempty"`
 	TimeoutNS      int64             `json:"timeout_ns,omitempty"`
@@ -125,6 +130,7 @@ func (p PublishHTTPPayload) PublishOptions() []PublishOption {
 		WithKey(p.Key),
 		WithRoutingKey(p.RoutingKey),
 		WithPriority(p.Priority),
+		WithPartition(p.Partition),
 		WithTenantID(p.TenantID),
 		WithCorrelationID(p.CorrelationID),
 		WithCausationID(p.CausationID),
@@ -251,6 +257,9 @@ func (a AdminServer) dataPlane(w http.ResponseWriter, r *http.Request) {
 	case path == "/request":
 		a.v1Request(w, r)
 	case path == "/broker":
+		if rejectScopedControlPlane(w, r, "broker lifecycle") {
+			return
+		}
 		a.v1BrokerLifecycle(w, r)
 	case strings.HasPrefix(path, "/topics/"):
 		a.v1Topic(w, r, strings.TrimPrefix(path, "/topics/"))
@@ -732,7 +741,15 @@ func (a AdminServer) v1PublishBatch(w http.ResponseWriter, r *http.Request) {
 		}
 		items[i] = PublishBatchItem{Topic: m.Topic, Payload: payload, Options: m.PublishOptions()}
 	}
-	res, _ := a.Broker.Publisher().PublishItems(r.Context(), items)
+	res, err := a.Broker.Publisher().PublishItems(r.Context(), items)
+	if err != nil && len(res.Errors) == 0 {
+		WriteBrokerError(w, err)
+		return
+	}
+	if len(res.Errors) > 0 {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusMultiStatus)
+	}
 	writeBrokerJSON(w, res)
 }
 func (a AdminServer) v1Request(w http.ResponseWriter, r *http.Request) {
@@ -820,10 +837,40 @@ func (a AdminServer) v1BrokerLifecycle(w http.ResponseWriter, r *http.Request) {
 // v1Topic exposes topic retention. Topics had no read path over HTTP, so an operator
 // could see only counts, never what had actually been published.
 func (a AdminServer) v1Topic(w http.ResponseWriter, r *http.Request, tail string) {
+	parts := strings.Split(strings.Trim(tail, "/"), "/")
+	if len(parts) == 4 && parts[1] == "partitions" && parts[3] == "messages" {
+		name, err := sanitizeIdentifier(parts[0])
+		partition, parseErr := strconv.Atoi(parts[2])
+		if err != nil || parseErr != nil || partition < 0 {
+			WriteBrokerError(w, ErrInvalidMessage)
+			return
+		}
+		if r.Method != http.MethodGet {
+			methodBroker(w)
+			return
+		}
+		if a.Distributed == nil {
+			WriteBrokerError(w, ErrUnsupportedMode)
+			return
+		}
+		msgs, err := a.Distributed.ReadPartitionTopic(r.Context(), name, partition, r.URL.Query().Get("after"), queryLimit(r, 100))
+		if err != nil {
+			WriteBrokerError(w, err)
+			return
+		}
+		writeBrokerJSON(w, msgs)
+		return
+	}
 	name := strings.Trim(tail, "/")
-	if name == "" {
+	if name == "" || strings.Contains(name, "/") {
 		http.NotFound(w, r)
 		return
+	}
+	if validated, err := sanitizeIdentifier(name); err != nil {
+		WriteBrokerError(w, ErrInvalidMessage)
+		return
+	} else {
+		name = validated
 	}
 	if r.Method != http.MethodGet {
 		methodBroker(w)
@@ -844,6 +891,13 @@ func (a AdminServer) v1Consumer(w http.ResponseWriter, r *http.Request, tail str
 		return
 	}
 	id := parts[0]
+	if hasRestrictedTenantScope(r.Context()) {
+		info, ok := a.Broker.Consumers().Get(id)
+		if !ok || !tenantAllowed(r.Context(), info.TenantID) {
+			http.NotFound(w, r)
+			return
+		}
+	}
 	if len(parts) == 1 {
 		if r.Method == http.MethodGet {
 			if info, ok := a.Broker.Consumers().Get(id); ok {
@@ -1029,6 +1083,20 @@ func (a AdminServer) consumerBlocked(consumerID string) bool {
 // It returns the leased messages, or ok=false when it has already written the
 // response.
 func (a AdminServer) leaseForConsumer(w http.ResponseWriter, r *http.Request, req PollRequest) ([]Message, bool) {
+	if a.Distributed != nil {
+		assigned, err := a.Distributed.hasResourcePartitions(r.Context(), cluster.PartitionResourceQueue, req.Queue)
+		if err != nil {
+			WriteBrokerError(w, err)
+			return nil, false
+		}
+		if assigned && !req.Partitioned {
+			WriteBrokerError(w, fmt.Errorf("%w: queue %q requires a partition-specific poll", ErrUnsupportedMode, req.Queue))
+			return nil, false
+		}
+	} else if req.Partitioned {
+		WriteBrokerError(w, ErrUnsupportedMode)
+		return nil, false
+	}
 	tenant, err := resolveTenant(r.Context(), req.TenantID)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusForbidden)
@@ -1048,6 +1116,8 @@ func (a AdminServer) leaseForConsumer(w http.ResponseWriter, r *http.Request, re
 	}
 	leaseReq := LeaseRequest{
 		Queue:             req.Queue,
+		Partition:         req.Partition,
+		Partitioned:       req.Partitioned,
 		ConsumerID:        req.ConsumerID,
 		ConsumerGroup:     firstNonEmpty(req.ConsumerGroup, req.ConsumerID),
 		Limit:             req.Limit,
@@ -1094,15 +1164,15 @@ func (a AdminServer) leaseForConsumer(w http.ResponseWriter, r *http.Request, re
 						run, err := a.Broker.startTask(r.Context(), taskID)
 						if err != nil {
 							for _, item := range leased {
-								_ = a.Broker.store.Nack(r.Context(), NackRequest{MessageID: item.ID, Queue: req.Queue, ConsumerID: req.ConsumerID, LeaseToken: item.LeaseToken, Action: NackRequeue})
+								_ = a.Broker.store.Nack(r.Context(), NackRequest{MessageID: item.ID, Queue: req.Queue, Partition: req.Partition, Partitioned: req.Partitioned, ConsumerID: req.ConsumerID, LeaseToken: item.LeaseToken, Action: NackRequeue})
 							}
 							WriteBrokerError(w, err)
 							return nil, false
 						}
 						if !run {
-							if err := a.Broker.store.Ack(r.Context(), AckRequest{MessageID: leased[i].ID, Queue: req.Queue, LeaseToken: leased[i].LeaseToken, ConsumerID: req.ConsumerID}); err != nil {
+							if err := a.Broker.store.Ack(r.Context(), AckRequest{MessageID: leased[i].ID, Queue: req.Queue, Partition: req.Partition, Partitioned: req.Partitioned, LeaseToken: leased[i].LeaseToken, ConsumerID: req.ConsumerID}); err != nil {
 								for _, item := range leased {
-									_ = a.Broker.store.Nack(r.Context(), NackRequest{MessageID: item.ID, Queue: req.Queue, ConsumerID: req.ConsumerID, LeaseToken: item.LeaseToken, Action: NackRequeue})
+									_ = a.Broker.store.Nack(r.Context(), NackRequest{MessageID: item.ID, Queue: req.Queue, Partition: req.Partition, Partitioned: req.Partitioned, ConsumerID: req.ConsumerID, LeaseToken: item.LeaseToken, Action: NackRequeue})
 								}
 								WriteBrokerError(w, err)
 								return nil, false
@@ -1215,7 +1285,14 @@ func (a AdminServer) v1Message(w http.ResponseWriter, r *http.Request, tail stri
 		// endpoint and every in-process caller see. This path used to answer 403
 		// with bespoke text while /v1/ack/frame answered 409 with ErrLeaseLost, so
 		// the same logical failure was indistinguishable to a client.
-		m, hadMessage, _ := a.Broker.store.Get(r.Context(), id)
+		m, hadMessage, lookupErr := a.Broker.store.Get(r.Context(), id)
+		if req.Partitioned && a.Distributed != nil {
+			m, hadMessage, lookupErr = a.Distributed.GetPartitionQueueMessage(r.Context(), req.Queue, req.Partition, id)
+		}
+		if lookupErr != nil {
+			WriteBrokerError(w, lookupErr)
+			return
+		}
 		if hadMessage && m.LeaseToken != "" {
 			if req.LeaseToken == "" {
 				WriteBrokerError(w, errf(ErrLeaseLost, "lease token required for leased message %s", id))
@@ -1250,7 +1327,14 @@ func (a AdminServer) v1Message(w http.ResponseWriter, r *http.Request, tail stri
 		// endpoint and every in-process caller see. This path used to answer 403
 		// with bespoke text while /v1/ack/frame answered 409 with ErrLeaseLost, so
 		// the same logical failure was indistinguishable to a client.
-		m, hadMessage, _ := a.Broker.store.Get(r.Context(), id)
+		m, hadMessage, lookupErr := a.Broker.store.Get(r.Context(), id)
+		if req.Partitioned && a.Distributed != nil {
+			m, hadMessage, lookupErr = a.Distributed.GetPartitionQueueMessage(r.Context(), req.Queue, req.Partition, id)
+		}
+		if lookupErr != nil {
+			WriteBrokerError(w, lookupErr)
+			return
+		}
 		if hadMessage && m.LeaseToken != "" {
 			if req.LeaseToken == "" {
 				WriteBrokerError(w, errf(ErrLeaseLost, "lease token required for leased message %s", id))
@@ -1268,7 +1352,6 @@ func (a AdminServer) v1Message(w http.ResponseWriter, r *http.Request, tail stri
 			req.Action = NackReject
 		}
 		req.IncrementAttempt = true
-		m, hadMessage, _ = a.Broker.store.Get(r.Context(), id)
 		if err := a.Broker.store.Nack(r.Context(), req); err != nil {
 			WriteBrokerError(w, err)
 			return
@@ -1301,7 +1384,17 @@ func (a AdminServer) v1Message(w http.ResponseWriter, r *http.Request, tail stri
 		var req LeaseRequest
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		req.MessageID = id
-		m, _, _ := a.Broker.store.Get(r.Context(), id)
+		var m Message
+		if req.Partitioned && a.Distributed != nil {
+			var getErr error
+			m, _, getErr = a.Distributed.GetPartitionQueueMessage(r.Context(), req.Queue, req.Partition, id)
+			if getErr != nil {
+				WriteBrokerError(w, getErr)
+				return
+			}
+		} else {
+			m, _, _ = a.Broker.store.Get(r.Context(), id)
+		}
 		if err := a.Broker.store.ExtendLease(r.Context(), req); err != nil {
 			WriteBrokerError(w, err)
 			return

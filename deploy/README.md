@@ -21,40 +21,60 @@ of this writing):
   (`docs/RELEASE_GATES.md`), including a 72-hour soak test, fuzzing,
   independent security review, and more.
 
-**This Kubernetes/Helm tooling does not change any of that.** It gives you a
-way to run `brokerd` on Kubernetes with sane operational defaults (persistent
-storage, health probes, resource limits, a disruption budget, network
-policy). It does not make distributed mode production-safe, and it does not
-add clustering capability that the binary doesn't have.
+**This Kubernetes/Helm tooling does not change any of that.** The Helm chart
+now has opt-in wiring for the broker's experimental distributed mode. It does
+not make distributed mode production-safe or certify the resulting cluster.
 
-### Important: replicas != a cluster today
+### Clustered Helm mode is opt-in
 
-A `StatefulSet` was deliberately chosen over a `Deployment` because this is a
-stateful system with per-node WAL storage and because stable network identity
-(`broker-0`, `broker-1`, ... via the headless service) is the prerequisite for
-peer/Raft addressing. However, **`cmd/brokerd/main.go` currently exposes no
-CLI flags or environment variables for cluster membership, peer addresses, or
-Raft configuration.** The `cluster/` package in this repository has
-etcd-Raft foundations, but per `Tasks.md` ("P2 — production distributed
-broker") the controller quorum, replicated partitions, and request routing
-are still unimplemented/unwired into the `brokerd` binary.
+The Helm chart defaults to `cluster.enabled: false`; with that setting, each
+StatefulSet replica is a separate standalone broker. To opt into distributed
+mode, set `cluster.enabled: true`, keep `persistence.enabled: true`, use an odd
+`replicaCount` of at least three, and provide a `tls.existingSecret` containing
+`tls.crt`, `tls.key`, and `ca.crt`. The chart rejects clustered mode with
+ephemeral `emptyDir` storage because broker, Raft, and partition WALs all live
+under `/data`. It also requires a PodDisruptionBudget with integer
+`maxUnavailable` no greater than `floor(replicaCount/2)`, and hard topology
+spreading across the configured `topologyKey`; pods remain pending if enough
+eligible topology domains are unavailable. Set `image.digest` to the same
+`sha256:<64 lowercase hex characters>` digest for every replica; clustered
+mode rejects mutable tags so a rollout cannot mix image contents.
+The certificate must validate each pod's headless-service DNS name. The chart
+generates stable Raft IDs and peer addresses from StatefulSet ordinals and
+stores broker, Raft, and partition WAL data in separate directories on each
+persistent volume.
 
-Practically: setting `replicaCount: 3` (the chart default, matching the
-documented odd-sized-quorum operational guidance in `docs/OPERATIONS.md`)
-gives you **three independent standalone brokers**, each with its own WAL
-volume, identity, and token-authenticated API — not a coordinated cluster.
-The StatefulSet shape is future-proofing for when distributed mode is wired
-into the binary, and gives you per-replica stable storage/identity in the
-meantime. Don't rely on it for failover or shared state today.
+This configuration bootstraps a fixed-size initial cluster. Do not change
+`replicaCount` as a scaling mechanism: node additions and removals must follow
+the authenticated Raft membership workflow. The chart and cluster mode remain
+unvalidated against a live Kubernetes cluster and are not production-certified.
+The raw manifests under `deploy/kubernetes/` still describe standalone mode.
 
 ### Native BST1 stream (port 8091)
 
-`cmd/brokerd/main.go` will refuse to even start the native BST1 listener
-(`-native-addr`) unless `--insecure-dev`/`BROKER_INSECURE_DEV` is set,
-because that protocol has no authentication layer. Both the raw manifests
-and the Helm chart leave it disabled by default and do not expose port 8091
-on any Service or NetworkPolicy. Do not enable it outside an isolated
-development context.
+BST1 supports bearer-token authentication or a verified client certificate
+mapped by the broker ACL. In production, `brokerd` requires TLS and a usable
+ACL credential; anonymous access and token bypass require
+`--insecure-dev`/`BROKER_INSECURE_DEV`. The raw manifests and Helm chart leave
+the listener disabled by default. With the Helm chart, enabling it adds the
+native port to both Services. When `networkPolicy.enabled=true`, the chart
+continues to block BST1 until `networkPolicy.nativeIngressFrom` explicitly
+lists allowed peers. Configure production TLS and authentication, and restrict
+external access if `service.type` is NodePort or LoadBalancer. The raw manifests
+still require manual Service and NetworkPolicy changes. This listener and the
+deployment manifests remain pre-v1 and unvalidated against a live cluster.
+
+For example, permit BST1 only from a client namespace by adding this to a
+values file:
+
+```yaml
+networkPolicy:
+  enabled: true
+  nativeIngressFrom:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: broker-clients
+```
 
 ## Contents
 
@@ -127,10 +147,10 @@ kubectl -n broker rollout status statefulset/broker
 
 ## Installing with Helm
 
-Helm was not available in the environment this chart was authored in, so it
-has only been checked with `helm template` output review and YAML-syntax
-validation — **not** `helm install` against a live cluster or `helm lint`.
-Run both yourself before trusting it:
+Helm is not installed in the current authoring environment. The clustered-mode
+templates have only received source review; neither `helm lint` nor `helm
+template` has been run after these changes, and no live cluster validation has
+been performed. Run these before relying on the chart:
 
 ```bash
 helm lint deploy/helm/broker
@@ -151,11 +171,13 @@ post-install verification steps. Key `values.yaml` knobs:
 | Key | Purpose |
 |---|---|
 | `replicaCount` | Number of independent broker pods (default 3; see caveat above — not a real cluster yet) |
-| `image.repository` / `image.tag` | Your built image |
+| `image.repository` / `image.tag` / `image.digest` | Your built image; clustered mode requires the immutable SHA-256 digest |
 | `persistence.size` / `persistence.storageClassName` | WAL volume sizing |
 | `tls.enabled` / `tls.existingSecret` | TLS on/off, bring-your-own-secret |
 | `secrets.existingSecret` | Use an externally managed Secret instead of the chart's placeholder one |
-| `broker.listeners.*.enabled` | Toggle gRPC/MQTT/AMQP listeners |
+| `broker.listeners.*.enabled` | Toggle gRPC/MQTT/AMQP listeners; enabling native adds its port to both Services |
+| `service.ports.native` | BST1 Service port; must match `broker.listeners.native.addr` when enabled |
+| `networkPolicy.nativeIngressFrom` | Explicit NetworkPolicy peers allowed to reach BST1; empty keeps it blocked |
 | `broker.extraEnv` | Pass through extra env vars (e.g. `BROKER_OTLP_ENDPOINT`) |
 | `resources` | CPU/memory requests and limits |
 

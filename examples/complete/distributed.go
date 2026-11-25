@@ -2,8 +2,15 @@ package main
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"flag"
 	"fmt"
+	"math/big"
 	"net"
 	"os"
 	"path/filepath"
@@ -36,6 +43,10 @@ func runDistributed(args []string) error {
 	for i, address := range addresses {
 		peers[uint64(i+1)] = strings.TrimSpace(address)
 	}
+	peerTLS, err := localPeerTLS(peers)
+	if err != nil {
+		return fmt.Errorf("configure local Raft peer TLS: %w", err)
+	}
 
 	root := *dataDir
 	remove := false
@@ -67,7 +78,7 @@ func runDistributed(args []string) error {
 			broker.Config{Name: fmt.Sprintf("complete-node-%d", id), NodeID: address, Store: broker.NewMemoryStore(), PollInterval: 2 * time.Millisecond},
 			broker.DistributedConfig{
 				UseEtcdRaft: true, RaftNodeID: id, RaftPeers: peers,
-				ListenAddr: address, WALDir: filepath.Join(root, fmt.Sprintf("node-%d", id)),
+				ListenAddr: address, WALDir: filepath.Join(root, fmt.Sprintf("node-%d", id)), TLSConfig: peerTLS,
 				SubmitTimeout: 5 * time.Second, AllowStaleReads: true,
 				SnapshotEntries: 4, SnapshotCatchUpEntries: 2,
 			},
@@ -131,6 +142,78 @@ func runDistributed(args []string) error {
 	sort.Strings(states)
 	fmt.Printf("distributed complete: leader=%s message=%s replicas=%d states=%v data=%s\n", leader.Leader(), result.MessageID, len(nodes), states, root)
 	return nil
+}
+
+// localPeerTLS creates an ephemeral CA and a peer certificate whose SANs cover
+// the configured addresses. The example uses the same certificate on each
+// local node; production clusters should issue a distinct certificate per node.
+func localPeerTLS(peers map[uint64]string) (*tls.Config, error) {
+	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return nil, fmt.Errorf("generate local CA key: %w", err)
+	}
+	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	if err != nil {
+		return nil, fmt.Errorf("generate local CA serial: %w", err)
+	}
+	now := time.Now()
+	caTemplate := &x509.Certificate{
+		SerialNumber: serial,
+		Subject:      pkix.Name{CommonName: "broker complete example CA"},
+		NotBefore:    now.Add(-time.Minute), NotAfter: now.Add(time.Hour),
+		IsCA: true, BasicConstraintsValid: true,
+		KeyUsage: x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
+	}
+	caDER, err := x509.CreateCertificate(rand.Reader, caTemplate, caTemplate, &caKey.PublicKey, caKey)
+	if err != nil {
+		return nil, fmt.Errorf("create local CA certificate: %w", err)
+	}
+	caCert, err := x509.ParseCertificate(caDER)
+	if err != nil {
+		return nil, fmt.Errorf("parse local CA certificate: %w", err)
+	}
+
+	peerKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return nil, fmt.Errorf("generate local peer key: %w", err)
+	}
+	serial, err = rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	if err != nil {
+		return nil, fmt.Errorf("generate local peer serial: %w", err)
+	}
+	peerTemplate := &x509.Certificate{
+		SerialNumber: serial,
+		Subject:      pkix.Name{CommonName: "broker complete example peer"},
+		NotBefore:    now.Add(-time.Minute), NotAfter: now.Add(time.Hour),
+		KeyUsage:    x509.KeyUsageDigitalSignature,
+		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
+	}
+	for _, address := range peers {
+		host, _, err := net.SplitHostPort(address)
+		if err != nil {
+			return nil, fmt.Errorf("parse peer address %q: %w", address, err)
+		}
+		if ip := net.ParseIP(host); ip != nil {
+			peerTemplate.IPAddresses = append(peerTemplate.IPAddresses, ip)
+		} else {
+			peerTemplate.DNSNames = append(peerTemplate.DNSNames, host)
+		}
+	}
+	peerDER, err := x509.CreateCertificate(rand.Reader, peerTemplate, caCert, &peerKey.PublicKey, caKey)
+	if err != nil {
+		return nil, fmt.Errorf("create local peer certificate: %w", err)
+	}
+	cert := tls.Certificate{Certificate: [][]byte{peerDER, caDER}, PrivateKey: peerKey}
+	cert.Leaf, err = x509.ParseCertificate(peerDER)
+	if err != nil {
+		return nil, fmt.Errorf("parse local peer certificate: %w", err)
+	}
+	roots := x509.NewCertPool()
+	roots.AddCert(caCert)
+	return &tls.Config{
+		Certificates: []tls.Certificate{cert}, RootCAs: roots, ClientCAs: roots,
+		ClientAuth: tls.RequireAndVerifyClientCert, MinVersion: tls.VersionTLS12,
+	}, nil
 }
 
 func freeLoopbackAddresses(count int) ([]string, error) {

@@ -3,11 +3,13 @@ package cluster
 import (
 	"bufio"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -23,21 +25,25 @@ const (
 
 // TCPTransport implements the Transport interface using TCP.
 type TCPTransport struct {
-	mu              sync.RWMutex
-	addr            string
-	nodeID          string
-	listener        net.Listener
-	conns           map[string]*nodeConn
-	connsMu         sync.RWMutex
-	handler         func(from string, msg *RaftMessage)
-	stopCh          chan struct{}
-	wg              sync.WaitGroup
-	TLSConfig       *tls.Config
-	requestID       uint64 // atomic counter
-	dialMu          sync.Mutex
-	pendingMu       sync.Mutex
-	pendingRequests map[uint64]chan *RaftMessage
-	closed          atomic.Bool
+	mu               sync.RWMutex
+	addr             string
+	nodeID           string
+	listener         net.Listener
+	conns            map[string]*nodeConn
+	connsMu          sync.RWMutex
+	handler          func(from string, msg *RaftMessage)
+	stopCh           chan struct{}
+	wg               sync.WaitGroup
+	TLSConfig        *tls.Config
+	peerIdentityMu   sync.RWMutex
+	peerIdentities   map[string]struct{}
+	peerIdentityRefs map[string]int
+	strictPeerIDs    bool
+	requestID        uint64 // atomic counter
+	dialMu           sync.Mutex
+	pendingMu        sync.Mutex
+	pendingRequests  map[uint64]chan *RaftMessage
+	closed           atomic.Bool
 
 	HandshakeTimeout time.Duration
 	ReadTimeout      time.Duration
@@ -58,6 +64,45 @@ type nodeConn struct {
 	bytesRecv    atomic.Uint64
 }
 
+const maxPeerIdentityBytes = 1024
+
+func readLineLimited(reader *bufio.Reader, maxBytes int) ([]byte, error) {
+	if maxBytes <= 0 {
+		return nil, fmt.Errorf("line limit must be positive")
+	}
+	capacity := maxBytes
+	if capacity > 4096 {
+		capacity = 4096
+	}
+	line := make([]byte, 0, capacity)
+	for {
+		fragment, err := reader.ReadSlice('\n')
+		if len(line)+len(fragment) > maxBytes {
+			return nil, fmt.Errorf("line exceeds %d byte limit", maxBytes)
+		}
+		line = append(line, fragment...)
+		if err == nil {
+			return line, nil
+		}
+		if err != bufio.ErrBufferFull {
+			return nil, err
+		}
+	}
+}
+
+func readPeerIdentity(reader *bufio.Reader) (string, error) {
+	line, err := readLineLimited(reader, maxPeerIdentityBytes)
+	if err != nil {
+		return "", err
+	}
+	identity := strings.TrimSuffix(string(line), "\n")
+	identity = strings.TrimSuffix(identity, "\r")
+	if identity == "" {
+		return "", fmt.Errorf("peer identity is empty")
+	}
+	return identity, nil
+}
+
 // NewTCPTransport creates a new TCP transport.
 func NewTCPTransport() *TCPTransport {
 	return &TCPTransport{
@@ -69,6 +114,199 @@ func NewTCPTransport() *TCPTransport {
 		WriteTimeout:     defaultWriteTimeout,
 		WriteBufLimit:    defaultWriteBufLimit,
 	}
+}
+
+// ConfigurePeerIdentities binds the transport handshake identity to the
+// advertised TLS certificate name for each configured peer. It must be called
+// before Listen and is intended for authenticated Raft transports. An empty
+// peer list is valid for a single-node controller that may add authenticated
+// remote groups later.
+func (t *TCPTransport) ConfigurePeerIdentities(localID string, peerIDs []string) error {
+	if t.TLSConfig == nil {
+		return fmt.Errorf("TLS is required for strict peer identity validation")
+	}
+	if t.TLSConfig.InsecureSkipVerify {
+		return fmt.Errorf("insecure TLS verification is not allowed for peer identity validation")
+	}
+	if t.TLSConfig.ClientAuth != tls.RequireAndVerifyClientCert || t.TLSConfig.ClientCAs == nil {
+		return fmt.Errorf("mutual TLS with a configured client CA is required for peer identity validation")
+	}
+	if len(t.TLSConfig.Certificates) == 0 {
+		return fmt.Errorf("a local TLS certificate is required for peer identity validation")
+	}
+	if localID == "" {
+		return fmt.Errorf("local peer identity is required")
+	}
+	if _, _, err := net.SplitHostPort(localID); err != nil {
+		return fmt.Errorf("local peer identity %q must be host:port: %w", localID, err)
+	}
+	localHost, _, _ := net.SplitHostPort(localID)
+	leaf := t.TLSConfig.Certificates[0].Leaf
+	if leaf == nil {
+		certificate := t.TLSConfig.Certificates[0].Certificate
+		if len(certificate) == 0 {
+			return fmt.Errorf("local TLS certificate chain is empty")
+		}
+		var err error
+		leaf, err = x509.ParseCertificate(certificate[0])
+		if err != nil {
+			return fmt.Errorf("parse local TLS certificate: %w", err)
+		}
+	}
+	if err := leaf.VerifyHostname(localHost); err != nil {
+		return fmt.Errorf("local TLS certificate does not match peer identity %q: %w", localID, err)
+	}
+	if t.closed.Load() || t.listener != nil {
+		return ErrClosed
+	}
+	identities := make(map[string]struct{}, len(peerIDs))
+	for _, peerID := range peerIDs {
+		peerID = strings.TrimSpace(peerID)
+		if peerID == "" || peerID == localID {
+			return fmt.Errorf("peer identity %q is empty or matches local identity", peerID)
+		}
+		if _, _, err := net.SplitHostPort(peerID); err != nil {
+			return fmt.Errorf("peer identity %q must be host:port: %w", peerID, err)
+		}
+		if _, exists := identities[peerID]; exists {
+			return fmt.Errorf("duplicate peer identity %q", peerID)
+		}
+		identities[peerID] = struct{}{}
+	}
+	t.peerIdentityMu.Lock()
+	t.nodeID = localID
+	t.peerIdentities = identities
+	t.peerIdentityRefs = make(map[string]int)
+	t.strictPeerIDs = true
+	t.peerIdentityMu.Unlock()
+	return nil
+}
+
+// AllowPeerIdentity adds a peer admitted by a committed membership change.
+func (t *TCPTransport) AllowPeerIdentity(peerID string) error {
+	if err := t.ValidatePeerIdentity(peerID); err != nil {
+		return err
+	}
+	peerID = strings.TrimSpace(peerID)
+	t.peerIdentityMu.Lock()
+	defer t.peerIdentityMu.Unlock()
+	if !t.strictPeerIDs {
+		return fmt.Errorf("strict peer identity validation is not configured")
+	}
+	t.peerIdentities[peerID] = struct{}{}
+	return nil
+}
+
+// RetainPeerIdentity records that one Raft group still needs an authenticated
+// peer identity. The corresponding ReleasePeerIdentity removes it only after
+// the final group releases it.
+func (t *TCPTransport) RetainPeerIdentity(peerID string) error {
+	if err := t.ValidatePeerIdentity(peerID); err != nil {
+		return err
+	}
+	peerID = strings.TrimSpace(peerID)
+	t.peerIdentityMu.Lock()
+	defer t.peerIdentityMu.Unlock()
+	if !t.strictPeerIDs {
+		return nil
+	}
+	if t.peerIdentityRefs == nil {
+		t.peerIdentityRefs = make(map[string]int)
+	}
+	t.peerIdentityRefs[peerID]++
+	t.peerIdentities[peerID] = struct{}{}
+	return nil
+}
+
+// ReleasePeerIdentity releases one group's claim on a peer identity.
+func (t *TCPTransport) ReleasePeerIdentity(peerID string) {
+	peerID = strings.TrimSpace(peerID)
+	t.peerIdentityMu.Lock()
+	if refs := t.peerIdentityRefs[peerID]; refs > 1 {
+		t.peerIdentityRefs[peerID] = refs - 1
+		t.peerIdentityMu.Unlock()
+		return
+	} else if refs == 1 {
+		delete(t.peerIdentityRefs, peerID)
+	}
+	if t.strictPeerIDs {
+		delete(t.peerIdentities, peerID)
+	}
+	t.peerIdentityMu.Unlock()
+	t.removeConn(peerID)
+}
+
+// ValidatePeerIdentity validates an address before a membership change commits.
+func (t *TCPTransport) ValidatePeerIdentity(peerID string) error {
+	peerID = strings.TrimSpace(peerID)
+	if peerID == "" {
+		return fmt.Errorf("peer identity is required")
+	}
+	if _, _, err := net.SplitHostPort(peerID); err != nil {
+		return fmt.Errorf("peer identity %q must be host:port: %w", peerID, err)
+	}
+	t.peerIdentityMu.RLock()
+	strict, localID := t.strictPeerIDs, t.nodeID
+	t.peerIdentityMu.RUnlock()
+	if strict && peerID == localID {
+		return fmt.Errorf("peer identity %q matches local identity", peerID)
+	}
+	return nil
+}
+
+// RemovePeerIdentity removes the transport identity for a removed member.
+func (t *TCPTransport) RemovePeerIdentity(peerID string) {
+	t.peerIdentityMu.Lock()
+	delete(t.peerIdentities, peerID)
+	t.peerIdentityMu.Unlock()
+	t.removeConn(peerID)
+}
+
+func (t *TCPTransport) strictPeerIdentityEnabled() bool {
+	t.peerIdentityMu.RLock()
+	defer t.peerIdentityMu.RUnlock()
+	return t.strictPeerIDs
+}
+
+// PeerIdentityValidationEnabled reports whether peer connections require
+// membership allowlisting and certificate SAN identity checks.
+func (t *TCPTransport) PeerIdentityValidationEnabled() bool {
+	return t.strictPeerIdentityEnabled()
+}
+
+func (t *TCPTransport) peerIdentityAllowed(peerID string) bool {
+	t.peerIdentityMu.RLock()
+	defer t.peerIdentityMu.RUnlock()
+	if !t.strictPeerIDs {
+		return true
+	}
+	_, ok := t.peerIdentities[peerID]
+	return ok
+}
+
+func (t *TCPTransport) validatePeerCertificate(conn net.Conn, peerID string) error {
+	if !t.strictPeerIdentityEnabled() {
+		return nil
+	}
+	if !t.peerIdentityAllowed(peerID) {
+		return fmt.Errorf("peer identity %q is not in the configured membership", peerID)
+	}
+	tlsConn, ok := conn.(*tls.Conn)
+	if !ok {
+		return fmt.Errorf("peer identity validation requires TLS")
+	}
+	state := tlsConn.ConnectionState()
+	if len(state.PeerCertificates) == 0 {
+		return fmt.Errorf("peer %q did not present a certificate", peerID)
+	}
+	host, _, err := net.SplitHostPort(peerID)
+	if err != nil {
+		return fmt.Errorf("invalid peer identity %q: %w", peerID, err)
+	}
+	if err := state.PeerCertificates[0].VerifyHostname(host); err != nil {
+		return fmt.Errorf("peer certificate does not match identity %q: %w", peerID, err)
+	}
+	return nil
 }
 
 // Listen starts listening for incoming connections.
@@ -132,16 +370,15 @@ func (t *TCPTransport) handleConn(conn net.Conn) {
 
 	// First message should be a handshake with node ID
 	conn.SetReadDeadline(time.Now().Add(t.HandshakeTimeout))
-	nodeIDBytes, err := reader.ReadBytes('\n')
+	nodeID, err := readPeerIdentity(reader)
 	if err != nil {
 		log.Printf("[transport] handshake read error: %v", err)
 		return
 	}
 	conn.SetReadDeadline(time.Time{})
-
-	nodeID := string(nodeIDBytes)
-	if len(nodeID) > 0 && nodeID[len(nodeID)-1] == '\n' {
-		nodeID = nodeID[:len(nodeID)-1]
+	if err := t.validatePeerCertificate(conn, nodeID); err != nil {
+		log.Printf("[transport] rejected peer handshake from %q: %v", nodeID, err)
+		return
 	}
 
 	nc := &nodeConn{
@@ -190,7 +427,11 @@ func (t *TCPTransport) readLoop(nc *nodeConn, nodeID string) {
 		}
 
 		nc.conn.SetReadDeadline(time.Now().Add(t.ReadTimeout))
-		line, err := nc.reader.ReadBytes('\n')
+		maxBytes := int(t.WriteBufLimit)
+		if maxBytes <= 0 {
+			maxBytes = defaultWriteBufLimit
+		}
+		line, err := readLineLimited(nc.reader, maxBytes)
 		if err != nil {
 			if err != io.EOF {
 				log.Printf("[transport] read error from %s: %v", nodeID, err)
@@ -496,6 +737,9 @@ func (t *TCPTransport) getConn(nodeID string) (*nodeConn, error) {
 
 // dial creates a new connection to a node.
 func (t *TCPTransport) dial(nodeID string) (*nodeConn, error) {
+	if t.strictPeerIdentityEnabled() && !t.peerIdentityAllowed(nodeID) {
+		return nil, fmt.Errorf("peer address %q is not in the configured membership", nodeID)
+	}
 	dialer := &net.Dialer{Timeout: t.HandshakeTimeout}
 
 	var conn net.Conn
@@ -508,6 +752,10 @@ func (t *TCPTransport) dial(nodeID string) (*nodeConn, error) {
 	}
 	if err != nil {
 		return nil, fmt.Errorf("dial %s: %w", nodeID, err)
+	}
+	if err := t.validatePeerCertificate(conn, nodeID); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("verify peer %q: %w", nodeID, err)
 	}
 
 	reader := bufio.NewReaderSize(conn, 64*1024)
@@ -523,10 +771,14 @@ func (t *TCPTransport) dial(nodeID string) (*nodeConn, error) {
 
 	// Read response
 	conn.SetReadDeadline(time.Now().Add(t.HandshakeTimeout))
-	_, err = reader.ReadBytes('\n')
+	remoteIdentity, err := readPeerIdentity(reader)
 	if err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("handshake failed: %w", err)
+	}
+	if t.strictPeerIdentityEnabled() && remoteIdentity != nodeID {
+		conn.Close()
+		return nil, fmt.Errorf("peer at %q claimed identity %q", nodeID, remoteIdentity)
 	}
 	conn.SetReadDeadline(time.Time{})
 

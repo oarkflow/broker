@@ -39,8 +39,10 @@ When `-data` is omitted the example uses and removes a temporary directory.
 
 The distributed flow starts three real TCP Raft transports, waits for leader
 election, replicates a queue declaration and message, and waits until every
-node has applied the message. It binds loopback without TLS solely to keep the
-example self-contained; use TLS and fixed addresses for deployments.
+node has applied the message. It generates an ephemeral CA and peer certificate
+for the configured addresses and requires mutual TLS. The same temporary
+certificate is used by each local node; production clusters should issue a
+distinct certificate per node.
 
 ```bash
 go run ./complete distributed

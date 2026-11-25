@@ -49,3 +49,10 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- include "broker.secretName" . -}}
 {{- end -}}
 {{- end -}}
+
+{{- define "broker.clusterPeers" -}}
+{{- $root := . -}}
+{{- range $ordinal := until (int .Values.replicaCount) -}}
+{{- if $ordinal }},{{ end -}}{{ add $ordinal 1 }}={{ include "broker.fullname" $root }}-{{ $ordinal }}.{{ include "broker.fullname" $root }}-headless.{{ include "broker.namespace" $root }}.svc.{{ $root.Values.cluster.clusterDomain }}:{{ $root.Values.cluster.peerPort }}
+{{- end -}}
+{{- end -}}

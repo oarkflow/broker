@@ -85,12 +85,13 @@ func WithResponseStatus(v ResponseStatus) ResponseOption {
 func WithEndStream(v bool) ResponseOption { return func(o *ResponseOptions) { o.EndStream = v } }
 
 type ackHandle struct {
-	b        *Broker
-	msg      Message
-	queue    string
-	consumer string
-	settleMu sync.Mutex
-	settled  bool
+	b          *Broker
+	msg        Message
+	queue      string
+	consumer   string
+	settleMu   sync.Mutex
+	settled    bool
+	taskResult []byte
 }
 
 func (a *ackHandle) Ack(ctx context.Context) error {
@@ -104,6 +105,7 @@ func (a *ackHandle) Ack(ctx context.Context) error {
 		a.settleMu.Unlock()
 		return err
 	}
+	taskResult := append([]byte(nil), a.taskResult...)
 	a.settled = true
 	a.settleMu.Unlock()
 	a.b.releaseDispatchAssignment(a.msg.ID)
@@ -111,7 +113,7 @@ func (a *ackHandle) Ack(ctx context.Context) error {
 		a.b.cfg.Hooks.OnAck(ctx, MessageEvent{Message: a.msg, Consumer: a.consumer, Queue: a.queue, Time: time.Now()})
 	}
 	a.b.notify.Publish(Notification{Type: "message.acked", Source: a.consumer, Severity: SeverityInfo, MessageID: a.msg.ID, Queue: a.queue, TenantID: a.msg.TenantID, Timestamp: time.Now()})
-	if err := a.b.completeTask(ctx, a.msg, nil, nil); err != nil {
+	if err := a.b.completeTask(ctx, a.msg, taskResult, nil); err != nil {
 		return fmt.Errorf("message %s was acknowledged but task completion could not be persisted: %w", a.msg.ID, err)
 	}
 	return nil
@@ -184,6 +186,13 @@ func (a *ackHandle) Respond(ctx context.Context, response any, opts ...ResponseO
 	body, err := a.b.codec.Marshal(response)
 	if err != nil {
 		return err
+	}
+	if a.msg.TaskID != "" || a.msg.Headers["x-task-id"] != "" {
+		a.settleMu.Lock()
+		if !a.settled {
+			a.taskResult = append([]byte(nil), body...)
+		}
+		a.settleMu.Unlock()
 	}
 	if o.EndStream {
 		if o.Headers == nil {

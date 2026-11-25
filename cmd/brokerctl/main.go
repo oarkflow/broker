@@ -8,10 +8,14 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
+
+const maxBrokerctlResponseBytes int64 = 64 << 20
 
 func main() {
 	addr := flag.String("addr", env("BROKER_ADDR", "http://127.0.0.1:8090"), "broker HTTP address")
@@ -21,7 +25,7 @@ func main() {
 		usage()
 		os.Exit(2)
 	}
-	client := &http.Client{Timeout: 10 * time.Second}
+	client := &http.Client{Timeout: 30 * time.Second}
 	cmd := flag.Arg(0)
 	var err error
 	switch cmd {
@@ -114,13 +118,60 @@ func main() {
 			err = request(client, *addr, *token, http.MethodGet, "/v1/sagas/"+flag.Arg(1), nil)
 		}
 	case "cluster":
-		err = request(client, *addr, *token, http.MethodGet, "/cluster/status", nil)
+		err = clusterCommand(client, *addr, *token, flag.Args()[1:])
 	default:
 		usage()
 		os.Exit(2)
 	}
 	if err != nil {
 		die(err.Error())
+	}
+}
+
+func clusterCommand(client *http.Client, addr, token string, args []string) error {
+	if len(args) == 0 || args[0] == "status" {
+		return request(client, addr, token, http.MethodGet, "/cluster/status", nil)
+	}
+	switch args[0] {
+	case "nodes":
+		if len(args) != 1 {
+			return fmt.Errorf("cluster nodes takes no arguments")
+		}
+		return request(client, addr, token, http.MethodGet, "/cluster/nodes", nil)
+	case "upgrade-plan":
+		if len(args) != 2 {
+			return fmt.Errorf("cluster upgrade-plan requires target version")
+		}
+		path := "/cluster/upgrade-plan?target_version=" + url.QueryEscape(args[1])
+		return request(client, addr, token, http.MethodGet, path, nil)
+	case "removal-plan", "drain-start", "drain-complete":
+		if len(args) != 2 {
+			return fmt.Errorf("cluster %s requires peer ID", args[0])
+		}
+		peerID, err := strconv.ParseUint(args[1], 10, 64)
+		if err != nil || peerID == 0 {
+			return fmt.Errorf("cluster %s requires a positive numeric peer ID", args[0])
+		}
+		path := "/cluster/nodes/" + strconv.FormatUint(peerID, 10)
+		switch args[0] {
+		case "removal-plan":
+			return request(client, addr, token, http.MethodGet, path+"/removal-plan", nil)
+		case "drain-start":
+			return request(client, addr, token, http.MethodPost, path+"/drain", map[string]any{})
+		default:
+			return request(client, addr, token, http.MethodPost, path+"/drain/complete", map[string]any{})
+		}
+	case "leadership-transfer":
+		if len(args) != 2 {
+			return fmt.Errorf("cluster leadership-transfer requires peer ID")
+		}
+		peerID, err := strconv.ParseUint(args[1], 10, 64)
+		if err != nil || peerID == 0 {
+			return fmt.Errorf("cluster leadership-transfer requires a positive numeric peer ID")
+		}
+		return request(client, addr, token, http.MethodPost, "/cluster/leadership", map[string]uint64{"peer_id": peerID})
+	default:
+		return fmt.Errorf("unknown cluster command %q", args[0])
 	}
 }
 
@@ -231,7 +282,13 @@ func request(client *http.Client, addr, token, method, path string, body any) er
 		return err
 	}
 	defer resp.Body.Close()
-	out, _ := io.ReadAll(resp.Body)
+	out, err := io.ReadAll(io.LimitReader(resp.Body, maxBrokerctlResponseBytes+1))
+	if err != nil {
+		return fmt.Errorf("read broker response: %w", err)
+	}
+	if int64(len(out)) > maxBrokerctlResponseBytes {
+		return fmt.Errorf("broker response exceeds %d bytes", maxBrokerctlResponseBytes)
+	}
 	if resp.StatusCode >= 300 {
 		return fmt.Errorf("%s: %s", resp.Status, strings.TrimSpace(string(out)))
 	}
@@ -264,7 +321,7 @@ func usage() {
   move -from-type queue -from <name> -to-type queue -to <name> [-mode move] [-ids id1,id2]
   consumers [id|ban <id> [reason]|unban <id>]
   sagas [id]
-  cluster`)
+  cluster [status|nodes|upgrade-plan <target-version>|removal-plan <peer-id>|drain-start <peer-id>|drain-complete <peer-id>|leadership-transfer <peer-id>]`)
 }
 
 func die(msg string) {

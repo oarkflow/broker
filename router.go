@@ -82,6 +82,7 @@ func (r *Router) Add(route Route) {
 	if route.Strategy == "" {
 		route.Strategy = routeModeToStrategy(route.Mode)
 	}
+	route = cloneRoute(route)
 	r.mu.Lock()
 	r.routes = append(r.routes, route)
 	r.mu.Unlock()
@@ -123,9 +124,47 @@ func (r *Router) RemovePrefix(prefix string) int {
 }
 
 func (r *Router) Routes() []Route {
+	return r.routeSnapshot()
+}
+
+func (r *Router) routeSnapshot() []Route {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	return append([]Route(nil), r.routes...)
+	out := make([]Route, len(r.routes))
+	for i := range r.routes {
+		out[i] = cloneRoute(r.routes[i])
+	}
+	return out
+}
+
+func cloneRoute(route Route) Route {
+	route.Headers = cloneMap(route.Headers)
+	route.To = append([]Destination(nil), route.To...)
+	route.CopyTo = append([]Destination(nil), route.CopyTo...)
+	route.Capabilities = append([]string(nil), route.Capabilities...)
+	route.Rules = cloneRoutingRules(route.Rules)
+	if route.StrategyConfig != nil {
+		config := *route.StrategyConfig
+		config.Capabilities = append([]string(nil), config.Capabilities...)
+		config.Rules = cloneRoutingRules(config.Rules)
+		config.Metadata = cloneMap(config.Metadata)
+		route.StrategyConfig = &config
+	}
+	return route
+}
+
+func cloneRoutingRules(rules []RoutingRule) []RoutingRule {
+	if len(rules) == 0 {
+		return nil
+	}
+	out := make([]RoutingRule, len(rules))
+	copy(out, rules)
+	for i := range out {
+		out[i].MatchHeaders = cloneMap(out[i].MatchHeaders)
+		out[i].TargetConsumers = append([]string(nil), out[i].TargetConsumers...)
+		out[i].Metadata = cloneMap(out[i].Metadata)
+	}
+	return out
 }
 
 func (r *Router) Clear() {
@@ -135,54 +174,76 @@ func (r *Router) Clear() {
 }
 
 func (r *Router) Route(ctx context.Context, msg Message) ([]Destination, []Route) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
+	routes := r.routeSnapshot()
 	dests := make([]Destination, 0, 4)
 	matched := make([]Route, 0, 2)
-	subject := msg.RoutingKey
-	if subject == "" {
-		subject = msg.Topic
+	visitedRoutes := make(map[string]struct{})
+	path := make(map[string]struct{})
+	if msg.Topic != "" {
+		path[msg.Topic] = struct{}{}
 	}
-	if subject == "" {
-		subject = msg.Queue
-	}
-	for _, route := range r.routes {
-		if route.Disabled || !route.Enabled {
-			continue
+	var routeInto func(Message)
+	routeInto = func(current Message) {
+		subject := msg.RoutingKey
+		if subject == "" {
+			subject = current.Topic
 		}
-		if route.Match != "" && !TopicMatch(route.Match, subject) {
-			continue
+		if subject == "" {
+			subject = current.Queue
 		}
-		if route.TenantID != "" && route.TenantID != msg.TenantID {
-			continue
-		}
-		if route.PriorityMin != 0 && msg.Priority < route.PriorityMin {
-			continue
-		}
-		ok := true
-		for k, v := range route.Headers {
-			if msg.Headers[k] != v {
-				ok = false
-				break
+		for _, route := range routes {
+			if route.Disabled || !route.Enabled {
+				continue
+			}
+			if route.Match != "" && !TopicMatch(route.Match, subject) {
+				continue
+			}
+			if route.TenantID != "" && !tenantWithinScope(current.TenantID, route.TenantID) {
+				continue
+			}
+			if route.PriorityMin != 0 && current.Priority < route.PriorityMin {
+				continue
+			}
+			ok := true
+			for k, v := range route.Headers {
+				if current.Headers[k] != v {
+					ok = false
+					break
+				}
+			}
+			if !ok {
+				continue
+			}
+			if route.Condition != nil && !route.Condition(cloneMessage(current)) {
+				continue
+			}
+			if _, seen := visitedRoutes[route.Name]; !seen {
+				matched = append(matched, cloneRoute(route))
+				visitedRoutes[route.Name] = struct{}{}
+			}
+			for _, destination := range append(append([]Destination(nil), route.To...), route.CopyTo...) {
+				if destination.Kind != DestinationExchange || destination.Name == "" {
+					dests = append(dests, destination)
+					continue
+				}
+				if _, seen := path[destination.Name]; seen {
+					continue
+				}
+				path[destination.Name] = struct{}{}
+				nested := current
+				nested.Topic = destination.Name
+				routeInto(nested)
+				delete(path, destination.Name)
 			}
 		}
-		if !ok {
-			continue
-		}
-		if route.Condition != nil && !route.Condition(msg) {
-			continue
-		}
-		matched = append(matched, route)
-		dests = append(dests, route.To...)
-		dests = append(dests, route.CopyTo...)
 	}
+	routeInto(msg)
 	return dedupeDestinations(dests), matched
 }
 
 // RouteWithStrategy selects consumers using the strategy assigned to the matched route.
 func (r *Router) RouteWithStrategy(ctx context.Context, msg Message, candidates []ConsumerCandidate) ([]ConsumerCandidate, []Route, error) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
+	routes := r.routeSnapshot()
 	subject := msg.RoutingKey
 	if subject == "" {
 		subject = msg.Topic
@@ -191,14 +252,14 @@ func (r *Router) RouteWithStrategy(ctx context.Context, msg Message, candidates 
 		subject = msg.Queue
 	}
 	matched := make([]Route, 0, 2)
-	for _, route := range r.routes {
+	for _, route := range routes {
 		if route.Disabled || !route.Enabled {
 			continue
 		}
 		if route.Match != "" && !TopicMatch(route.Match, subject) {
 			continue
 		}
-		if route.TenantID != "" && route.TenantID != msg.TenantID {
+		if route.TenantID != "" && !tenantWithinScope(msg.TenantID, route.TenantID) {
 			continue
 		}
 		if route.PriorityMin != 0 && msg.Priority < route.PriorityMin {
@@ -214,10 +275,10 @@ func (r *Router) RouteWithStrategy(ctx context.Context, msg Message, candidates 
 		if !ok {
 			continue
 		}
-		if route.Condition != nil && !route.Condition(msg) {
+		if route.Condition != nil && !route.Condition(cloneMessage(msg)) {
 			continue
 		}
-		matched = append(matched, route)
+		matched = append(matched, cloneRoute(route))
 	}
 	if len(matched) == 0 {
 		return candidates, nil, nil

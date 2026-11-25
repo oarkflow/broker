@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -36,6 +37,76 @@ type Notification struct {
 	TraceID       string         `json:"trace_id,omitempty"`
 	Timestamp     time.Time      `json:"timestamp"`
 	Data          map[string]any `json:"data,omitempty"`
+}
+
+func cloneNotification(n Notification) Notification {
+	if n.Data != nil {
+		cloned := cloneNotificationValue(reflect.ValueOf(n.Data))
+		n.Data = cloned.Interface().(map[string]any)
+	}
+	return n
+}
+
+// cloneNotificationValue copies JSON-shaped notification data so producer,
+// history, and subscriber mutations cannot alias one another. Notification
+// payloads are JSON values by contract, so cyclic values are unsupported.
+func cloneNotificationValue(value reflect.Value) reflect.Value {
+	if !value.IsValid() {
+		return value
+	}
+	switch value.Kind() {
+	case reflect.Interface:
+		if value.IsNil() {
+			return reflect.Zero(value.Type())
+		}
+		cloned := cloneNotificationValue(value.Elem())
+		out := reflect.New(value.Type()).Elem()
+		out.Set(cloned)
+		return out
+	case reflect.Map:
+		if value.IsNil() {
+			return reflect.Zero(value.Type())
+		}
+		out := reflect.MakeMapWithSize(value.Type(), value.Len())
+		iter := value.MapRange()
+		for iter.Next() {
+			out.SetMapIndex(iter.Key(), cloneNotificationValue(iter.Value()))
+		}
+		return out
+	case reflect.Slice:
+		if value.IsNil() {
+			return reflect.Zero(value.Type())
+		}
+		out := reflect.MakeSlice(value.Type(), value.Len(), value.Len())
+		for i := 0; i < value.Len(); i++ {
+			out.Index(i).Set(cloneNotificationValue(value.Index(i)))
+		}
+		return out
+	case reflect.Array:
+		out := reflect.New(value.Type()).Elem()
+		for i := 0; i < value.Len(); i++ {
+			out.Index(i).Set(cloneNotificationValue(value.Index(i)))
+		}
+		return out
+	case reflect.Pointer:
+		if value.IsNil() {
+			return reflect.Zero(value.Type())
+		}
+		out := reflect.New(value.Type().Elem())
+		out.Elem().Set(cloneNotificationValue(value.Elem()))
+		return out
+	case reflect.Struct:
+		out := reflect.New(value.Type()).Elem()
+		out.Set(value)
+		for i := 0; i < value.NumField(); i++ {
+			if value.Type().Field(i).PkgPath == "" && out.Field(i).CanSet() {
+				out.Field(i).Set(cloneNotificationValue(value.Field(i)))
+			}
+		}
+		return out
+	default:
+		return value
+	}
 }
 
 type Callback interface {
@@ -92,6 +163,7 @@ func (b *NotificationBus) Publish(n Notification) {
 	if n.ID == "" {
 		n.ID = n.Type + "-" + newIDFromTime()
 	}
+	n = cloneNotification(n)
 	if b.cap > 0 {
 		b.historyMu.Lock()
 		b.history = append(b.history, n)
@@ -109,14 +181,15 @@ func (b *NotificationBus) Publish(n Notification) {
 	b.subMu.RUnlock()
 	for _, cb := range subs {
 		cb := cb
+		delivery := cloneNotification(n)
 		select {
 		case b.workers <- struct{}{}:
 			go func() {
 				defer func() { <-b.workers }()
-				_ = cb.HandleNotification(context.Background(), n)
+				_ = cb.HandleNotification(context.Background(), delivery)
 			}()
 		default:
-			_ = cb.HandleNotification(context.Background(), n)
+			_ = cb.HandleNotification(context.Background(), delivery)
 		}
 	}
 }
@@ -130,7 +203,9 @@ func (b *NotificationBus) History(limit int) []Notification {
 		limit = len(b.history)
 	}
 	out := make([]Notification, limit)
-	copy(out, b.history[len(b.history)-limit:])
+	for i, n := range b.history[len(b.history)-limit:] {
+		out[i] = cloneNotification(n)
+	}
 	return out
 }
 func (b *NotificationBus) Enabled() bool { return b != nil && b.enabled.Load() && !b.closed.Load() }

@@ -67,6 +67,7 @@ type BinaryMessageCodec struct {
 	CompressThreshold int
 	MaxFrameSize      int
 	EncryptionKey     []byte
+	WALDecryptionKeys [][]byte
 	SigningKey        []byte
 }
 
@@ -100,6 +101,9 @@ func WithFrameMaxSize(n int) BinaryMessageCodecOption {
 }
 func WithFrameEncryptionKey(key []byte) BinaryMessageCodecOption {
 	return func(c *BinaryMessageCodec) { c.EncryptionKey = append([]byte(nil), key...) }
+}
+func WithFrameWALDecryptionKeys(keys [][]byte) BinaryMessageCodecOption {
+	return func(c *BinaryMessageCodec) { c.WALDecryptionKeys = cloneByteSlices(keys) }
 }
 func WithFrameSigningKey(key []byte) BinaryMessageCodecOption {
 	return func(c *BinaryMessageCodec) { c.SigningKey = append([]byte(nil), key...) }

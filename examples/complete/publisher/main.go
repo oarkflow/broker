@@ -28,15 +28,31 @@ func run(ctx context.Context, url, token string) error {
 	c := client.New(client.Config{BrokerURL: url, Token: token, PollWait: time.Second})
 	for {
 		consumers, err := c.Consumers(ctx)
-		if err == nil && len(consumers) > 0 {
-			break
+		if err == nil {
+			for _, consumer := range consumers {
+				if consumer.ConsumerID != "complete-consumer" {
+					continue
+				}
+				ready := false
+				for _, subscription := range consumer.Subscriptions {
+					if subscription.Type == "topic" && subscription.Name == "complete.events" {
+						ready = true
+						break
+					}
+				}
+				if ready {
+					goto consumerReady
+				}
+			}
 		}
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("wait for consumer registration: %w", ctx.Err())
+			return fmt.Errorf("wait for consumer subscriptions: %w", ctx.Err())
 		case <-time.After(100 * time.Millisecond):
 		}
 	}
+
+consumerReady:
 	queueResult, err := c.Publish(ctx, "", map[string]any{"kind": "queue", "value": 1}, client.WithQueue("complete.jobs"))
 	if err != nil {
 		return fmt.Errorf("publish queue: %w", err)

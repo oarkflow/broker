@@ -1,6 +1,7 @@
 package broker
 
 import (
+	"fmt"
 	"strings"
 	"time"
 )
@@ -50,12 +51,61 @@ type MemoryStoreSnapshot struct {
 	MoveOps   map[string]MoveResult              `json:"move_ops,omitempty"`
 }
 
+const currentMemoryStoreSnapshotVersion = 4
+
+func validateMemoryStoreSnapshot(snap MemoryStoreSnapshot) error {
+	if snap.Version < 1 || snap.Version > currentMemoryStoreSnapshotVersion || snap.CreatedAt.IsZero() {
+		return fmt.Errorf("invalid memory store snapshot version or creation time")
+	}
+	if snap.Queues == nil || snap.Topics == nil || snap.Streams == nil || snap.Messages == nil ||
+		snap.History == nil || snap.Offsets == nil || snap.Dedup == nil || snap.Idemp == nil {
+		return fmt.Errorf("memory store snapshot is missing required maps")
+	}
+	for name, queue := range snap.Queues {
+		if name == "" || queue.Config.Name != name {
+			return fmt.Errorf("memory store snapshot queue key %q does not match configured name %q", name, queue.Config.Name)
+		}
+		if queue.Head < 0 || queue.Head > len(queue.IDs) || queue.Depth < 0 || queue.Depth > len(queue.IDs)-queue.Head {
+			return fmt.Errorf("memory store snapshot queue %q has invalid head/depth counters", name)
+		}
+		if !validSnapshotQueueState(queue.State) {
+			return fmt.Errorf("memory store snapshot queue %q has invalid state %q", name, queue.State)
+		}
+	}
+	for name, topic := range snap.Topics {
+		if name == "" || topic.Config.Name != name || !validSnapshotQueueState(topic.State) {
+			return fmt.Errorf("memory store snapshot topic %q has invalid name or state", name)
+		}
+	}
+	for name, stream := range snap.Streams {
+		if name == "" || stream.Config.Name != name {
+			return fmt.Errorf("memory store snapshot stream key %q does not match configured name %q", name, stream.Config.Name)
+		}
+	}
+	for id, message := range snap.Messages {
+		if id == "" || message.ID != id {
+			return fmt.Errorf("memory store snapshot message key %q does not match message ID %q", id, message.ID)
+		}
+	}
+	return nil
+}
+
+func validSnapshotQueueState(state QueueState) bool {
+	switch state {
+	case "", QueueDeclared, QueueCreated, QueueActive, QueuePaused, QueueDraining,
+		QueueFull, QueueBlocked, QueueDeleted, QueuePurged, QueueArchived:
+		return true
+	default:
+		return false
+	}
+}
+
 // Snapshot returns a consistent deep-copy image of the store.
 func (s *MemoryStore) Snapshot() MemoryStoreSnapshot {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	snap := MemoryStoreSnapshot{
-		Version:   4,
+		Version:   currentMemoryStoreSnapshotVersion,
 		CreatedAt: time.Now(),
 		Queues:    make(map[string]MemoryQueueSnapshot, len(s.queues)),
 		Topics:    make(map[string]MemoryTopicSnapshot, len(s.topics)),
@@ -128,6 +178,8 @@ func (s *MemoryStore) RestoreExact(snap MemoryStoreSnapshot) {
 func (s *MemoryStore) restoreSnapshot(snap MemoryStoreSnapshot, recoverInflight bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.queueReservations = map[string]map[string]int{}
+	s.reservedQueueDepth = map[string]int{}
 	if snap.Version < 3 {
 		migrateLegacyTenantIndexes(&snap)
 	}

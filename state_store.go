@@ -55,7 +55,10 @@ type ConsumerStateStore interface {
 	GetConsumer(context.Context, string) (ConsumerInfo, bool, error)
 	ListConsumers(context.Context) ([]ConsumerInfo, error)
 	DeleteConsumer(context.Context, string) error
+	// AddConsumerEvent ignores an empty consumer ID and fills a missing timestamp.
 	AddConsumerEvent(context.Context, string, Notification) error
+	// ConsumerEvents returns the most recent page when after is empty or unknown.
+	// For a known cursor, it returns the next page in event order.
 	ConsumerEvents(context.Context, string, string, int) ([]Notification, error)
 }
 
@@ -77,6 +80,7 @@ type OutboxStateStore interface {
 
 // OutboxClaimStore atomically leases dispatchable entries to one dispatcher.
 // Claim leases allow another dispatcher to recover work after a worker dies.
+// Claims require a nonempty token, positive limit, and positive lease duration.
 type OutboxClaimStore interface {
 	ClaimOutboxEntries(context.Context, string, int, time.Duration) ([]DurableOutboxEntry, error)
 	UpdateClaimedOutboxEntry(context.Context, string, DurableOutboxEntry) error
@@ -94,6 +98,33 @@ type MQTTSessionStore interface {
 	PutMQTTSession(context.Context, MQTTSession) error
 	GetMQTTSession(context.Context, string) (MQTTSession, bool, error)
 	DeleteMQTTSession(context.Context, string) error
+}
+
+// MQTTWillRecord is the durable work needed to publish one accepted MQTT
+// CONNECT Will after an unexpected disconnect or server restart. Principal
+// fields contain authorization scope and quota metadata but never credentials.
+type MQTTWillRecord struct {
+	ID                string    `json:"id"`
+	SessionKey        string    `json:"session_key"`
+	ClientID          string    `json:"client_id"`
+	PrincipalName     string    `json:"principal_name,omitempty"`
+	Tenants           []string  `json:"tenants,omitempty"`
+	RequestsPerSecond int       `json:"requests_per_second,omitempty"`
+	Burst             int       `json:"burst,omitempty"`
+	MaxConcurrent     int       `json:"max_concurrent,omitempty"`
+	Topic             string    `json:"topic"`
+	Payload           []byte    `json:"payload"`
+	QoS               byte      `json:"qos"`
+	Retain            bool      `json:"retain,omitempty"`
+	CreatedAt         time.Time `json:"created_at"`
+}
+
+// MQTTWillStore persists CONNECT Wills independently of optional session
+// persistence. List pages are ordered by ID and return the next ID cursor.
+type MQTTWillStore interface {
+	PutMQTTWill(context.Context, MQTTWillRecord) error
+	DeleteMQTTWill(context.Context, string) error
+	ListMQTTWills(context.Context, string, int) ([]MQTTWillRecord, string, error)
 }
 
 // MQTTRetainedMessage is one MQTT retained publication, scoped by tenant and
@@ -120,6 +151,48 @@ type MQTTRetainedStore interface {
 // requiring replay callers to load every retained payload at once.
 type MQTTRetainedPagedStore interface {
 	ListMQTTRetainedPage(context.Context, string, string, string, int) ([]MQTTRetainedMessage, error)
+}
+
+// AMQPExchangeRecord stores the properties of a durable AMQP exchange.
+type AMQPExchangeRecord struct {
+	Name    string `json:"name"`
+	Type    string `json:"type"`
+	Durable bool   `json:"durable"`
+}
+
+// AMQPExchangeBindingRecord stores a durable exchange-to-exchange binding.
+type AMQPExchangeBindingRecord struct {
+	ID              string          `json:"id"`
+	Source          string          `json:"source"`
+	Destination     string          `json:"destination"`
+	DestinationKind DestinationKind `json:"destination_kind"`
+	RoutingKey      string          `json:"routing_key,omitempty"`
+	TenantID        string          `json:"tenant_id,omitempty"`
+	HeadersJSON     string          `json:"headers_json,omitempty"`
+	HeadersMatchAll bool            `json:"headers_match_all,omitempty"`
+}
+
+type AMQPHeaderMatch struct {
+	Name     string `json:"name"`
+	Value    string `json:"value,omitempty"`
+	HasValue bool   `json:"has_value,omitempty"`
+}
+
+// AMQPExchangeStore persists durable AMQP exchanges. It is optional so
+// existing StateStore implementations remain source-compatible.
+type AMQPExchangeStore interface {
+	PutAMQPExchange(context.Context, AMQPExchangeRecord) error
+	GetAMQPExchange(context.Context, string) (AMQPExchangeRecord, bool, error)
+	ListAMQPExchanges(context.Context) ([]AMQPExchangeRecord, error)
+	DeleteAMQPExchange(context.Context, string) error
+}
+
+// AMQPExchangeBindingStore persists bindings from durable AMQP exchanges to
+// durable exchanges or queues.
+type AMQPExchangeBindingStore interface {
+	PutAMQPExchangeBinding(context.Context, AMQPExchangeBindingRecord) error
+	ListAMQPExchangeBindings(context.Context) ([]AMQPExchangeBindingRecord, error)
+	DeleteAMQPExchangeBinding(context.Context, string) error
 }
 
 // OutboxEntryTransaction inserts an outbox entry into a caller-owned
@@ -152,7 +225,10 @@ type MemoryStateStore struct {
 	publishers    map[string]PublisherRecord
 	outbox        map[string]DurableOutboxEntry
 	mqtt          map[string]MQTTSession
+	mqttWills     map[string]MQTTWillRecord
 	retained      map[string]MQTTRetainedMessage
+	amqpExchanges map[string]AMQPExchangeRecord
+	amqpBindings  map[string]AMQPExchangeBindingRecord
 	retainedOrder []mqttRetainedOrderKey
 	eventCap      int
 	closed        bool
@@ -164,7 +240,7 @@ type mqttRetainedOrderKey struct {
 }
 
 func NewMemoryStateStore() *MemoryStateStore {
-	return &MemoryStateStore{brokers: map[string]BrokerStateRecord{}, tasks: map[string]TaskInfo{}, consumers: map[string]ConsumerInfo{}, events: map[string][]Notification{}, publishers: map[string]PublisherRecord{}, outbox: map[string]DurableOutboxEntry{}, mqtt: map[string]MQTTSession{}, retained: map[string]MQTTRetainedMessage{}, eventCap: 512}
+	return &MemoryStateStore{brokers: map[string]BrokerStateRecord{}, tasks: map[string]TaskInfo{}, consumers: map[string]ConsumerInfo{}, events: map[string][]Notification{}, publishers: map[string]PublisherRecord{}, outbox: map[string]DurableOutboxEntry{}, mqtt: map[string]MQTTSession{}, mqttWills: map[string]MQTTWillRecord{}, retained: map[string]MQTTRetainedMessage{}, amqpExchanges: map[string]AMQPExchangeRecord{}, amqpBindings: map[string]AMQPExchangeBindingRecord{}, eventCap: 512}
 }
 
 func mqttRetainedKey(tenantID, topic string) string { return tenantScopedKey(tenantID, topic) }
@@ -194,6 +270,9 @@ func (s *MemoryStateStore) PutMQTTRetained(ctx context.Context, message MQTTReta
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if s.closed {
 		return ErrClosed
 	}
@@ -216,12 +295,18 @@ func (s *MemoryStateStore) PutMQTTRetained(ctx context.Context, message MQTTReta
 }
 
 func (s *MemoryStateStore) GetMQTTRetained(ctx context.Context, tenant, topic string) (MQTTRetainedMessage, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return MQTTRetainedMessage{}, false, err
+	}
 	resolved, err := resolveTenant(ctx, tenant)
 	if err != nil {
 		return MQTTRetainedMessage{}, false, err
 	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	if err := ctx.Err(); err != nil {
+		return MQTTRetainedMessage{}, false, err
+	}
 	if s.closed {
 		return MQTTRetainedMessage{}, false, ErrClosed
 	}
@@ -233,12 +318,18 @@ func (s *MemoryStateStore) GetMQTTRetained(ctx context.Context, tenant, topic st
 }
 
 func (s *MemoryStateStore) ListMQTTRetained(ctx context.Context, tenant string) ([]MQTTRetainedMessage, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	resolved, err := resolveTenant(ctx, tenant)
 	if err != nil {
 		return nil, err
 	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if s.closed {
 		return nil, ErrClosed
 	}
@@ -268,6 +359,9 @@ func (s *MemoryStateStore) ListMQTTRetainedPage(ctx context.Context, tenant, aft
 	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if s.closed {
 		return nil, ErrClosed
 	}
@@ -296,12 +390,18 @@ func (s *MemoryStateStore) ListMQTTRetainedPage(ctx context.Context, tenant, aft
 }
 
 func (s *MemoryStateStore) DeleteMQTTRetained(ctx context.Context, tenant, topic string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	resolved, err := resolveTenant(ctx, tenant)
 	if err != nil {
 		return err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if s.closed {
 		return ErrClosed
 	}
@@ -332,6 +432,9 @@ func (s *MemoryStateStore) PutMQTTSession(ctx context.Context, session MQTTSessi
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if s.closed {
 		return ErrClosed
 	}
@@ -345,6 +448,9 @@ func (s *MemoryStateStore) GetMQTTSession(ctx context.Context, key string) (MQTT
 	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	if err := ctx.Err(); err != nil {
+		return MQTTSession{}, false, err
+	}
 	if s.closed {
 		return MQTTSession{}, false, ErrClosed
 	}
@@ -358,11 +464,96 @@ func (s *MemoryStateStore) DeleteMQTTSession(ctx context.Context, key string) er
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if s.closed {
 		return ErrClosed
 	}
 	delete(s.mqtt, key)
 	return nil
+}
+
+func (s *MemoryStateStore) PutMQTTWill(ctx context.Context, record MQTTWillRecord) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := ValidateMQTTWillRecord(record); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if s.closed {
+		return ErrClosed
+	}
+	if s.mqttWills == nil {
+		s.mqttWills = make(map[string]MQTTWillRecord)
+	}
+	s.mqttWills[record.ID] = cloneMQTTWillRecord(record)
+	return nil
+}
+
+func (s *MemoryStateStore) DeleteMQTTWill(ctx context.Context, id string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if s.closed {
+		return ErrClosed
+	}
+	delete(s.mqttWills, id)
+	return nil
+}
+
+func (s *MemoryStateStore) ListMQTTWills(ctx context.Context, after string, limit int) ([]MQTTWillRecord, string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, "", err
+	}
+	if limit <= 0 || limit > 1000 {
+		return nil, "", ErrInvalidMessage
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if err := ctx.Err(); err != nil {
+		return nil, "", err
+	}
+	if s.closed {
+		return nil, "", ErrClosed
+	}
+	ids := make([]string, 0, len(s.mqttWills))
+	for id := range s.mqttWills {
+		if id > after {
+			ids = append(ids, id)
+		}
+	}
+	sort.Strings(ids)
+	if len(ids) > limit {
+		next := ids[limit-1]
+		ids = ids[:limit]
+		out := make([]MQTTWillRecord, len(ids))
+		for i, id := range ids {
+			out[i] = cloneMQTTWillRecord(s.mqttWills[id])
+		}
+		return out, next, nil
+	}
+	out := make([]MQTTWillRecord, len(ids))
+	for i, id := range ids {
+		out[i] = cloneMQTTWillRecord(s.mqttWills[id])
+	}
+	return out, "", nil
+}
+
+func cloneMQTTWillRecord(record MQTTWillRecord) MQTTWillRecord {
+	record.Tenants = append([]string(nil), record.Tenants...)
+	record.Payload = append([]byte(nil), record.Payload...)
+	return record
 }
 
 func cloneMQTTSession(session MQTTSession) MQTTSession {
@@ -409,6 +600,9 @@ func (s *MemoryStateStore) PutOutboxEntry(ctx context.Context, entry DurableOutb
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if s.closed {
 		return ErrClosed
 	}
@@ -422,6 +616,12 @@ func (s *MemoryStateStore) GetOutboxEntry(ctx context.Context, id string) (Durab
 	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	if err := ctx.Err(); err != nil {
+		return DurableOutboxEntry{}, false, err
+	}
+	if s.closed {
+		return DurableOutboxEntry{}, false, ErrClosed
+	}
 	entry, ok := s.outbox[id]
 	return cloneOutboxEntry(entry), ok, nil
 }
@@ -432,6 +632,12 @@ func (s *MemoryStateStore) ListOutboxEntries(ctx context.Context, limit int) ([]
 	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if s.closed {
+		return nil, ErrClosed
+	}
 	out := make([]DurableOutboxEntry, 0, len(s.outbox))
 	for _, entry := range s.outbox {
 		out = append(out, cloneOutboxEntry(entry))
@@ -470,11 +676,14 @@ func (s *MemoryStateStore) ClaimOutboxEntries(ctx context.Context, token string,
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if token == "" || lease <= 0 {
+	if token == "" || limit <= 0 || lease <= 0 {
 		return nil, ErrInvalidMessage
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if s.closed {
 		return nil, ErrClosed
 	}
@@ -520,6 +729,9 @@ func (s *MemoryStateStore) UpdateClaimedOutboxEntry(ctx context.Context, token s
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if s.closed {
 		return ErrClosed
 	}
@@ -540,6 +752,9 @@ func (s *MemoryStateStore) PruneCompletedOutboxEntries(ctx context.Context, befo
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if s.closed {
 		return nil, ErrClosed
 	}
@@ -571,6 +786,9 @@ func (s *MemoryStateStore) PruneCompletedOutboxEntries(ctx context.Context, befo
 }
 
 func (s *MemoryStateStore) PutBrokerState(ctx context.Context, rec BrokerStateRecord) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if rec.Name == "" {
 		rec.Name = "broker"
 	}
@@ -579,6 +797,9 @@ func (s *MemoryStateStore) PutBrokerState(ctx context.Context, rec BrokerStateRe
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if s.closed {
 		return ErrClosed
 	}
@@ -587,15 +808,174 @@ func (s *MemoryStateStore) PutBrokerState(ctx context.Context, rec BrokerStateRe
 	return nil
 }
 func (s *MemoryStateStore) GetBrokerState(ctx context.Context, name string) (BrokerStateRecord, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return BrokerStateRecord{}, false, err
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	if err := ctx.Err(); err != nil {
+		return BrokerStateRecord{}, false, err
+	}
+	if s.closed {
+		return BrokerStateRecord{}, false, ErrClosed
+	}
 	rec, ok := s.brokers[name]
 	rec.Metadata = cloneMap(rec.Metadata)
 	return rec, ok, nil
 }
-func (s *MemoryStateStore) PutTask(ctx context.Context, t TaskInfo) error {
+
+func (s *MemoryStateStore) PutAMQPExchange(ctx context.Context, exchange AMQPExchangeRecord) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if exchange.Name == "" || exchange.Type == "" || !exchange.Durable {
+		return ErrInvalidMessage
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if s.closed {
+		return ErrClosed
+	}
+	if existing, ok := s.amqpExchanges[exchange.Name]; ok && existing != exchange {
+		return ErrInvalidMessage
+	}
+	s.amqpExchanges[exchange.Name] = exchange
+	return nil
+}
+
+func (s *MemoryStateStore) GetAMQPExchange(ctx context.Context, name string) (AMQPExchangeRecord, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return AMQPExchangeRecord{}, false, err
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if err := ctx.Err(); err != nil {
+		return AMQPExchangeRecord{}, false, err
+	}
+	if s.closed {
+		return AMQPExchangeRecord{}, false, ErrClosed
+	}
+	exchange, ok := s.amqpExchanges[name]
+	return exchange, ok, nil
+}
+
+func (s *MemoryStateStore) ListAMQPExchanges(ctx context.Context) ([]AMQPExchangeRecord, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if s.closed {
+		return nil, ErrClosed
+	}
+	exchanges := make([]AMQPExchangeRecord, 0, len(s.amqpExchanges))
+	for _, exchange := range s.amqpExchanges {
+		exchanges = append(exchanges, exchange)
+	}
+	sort.Slice(exchanges, func(i, j int) bool { return exchanges[i].Name < exchanges[j].Name })
+	return exchanges, nil
+}
+
+func (s *MemoryStateStore) DeleteAMQPExchange(ctx context.Context, name string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if s.closed {
+		return ErrClosed
+	}
+	delete(s.amqpExchanges, name)
+	for id, binding := range s.amqpBindings {
+		if binding.Source == name || (binding.DestinationKind == DestinationExchange && binding.Destination == name) {
+			delete(s.amqpBindings, id)
+		}
+	}
+	return nil
+}
+
+func (s *MemoryStateStore) PutAMQPExchangeBinding(ctx context.Context, binding AMQPExchangeBindingRecord) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if binding.ID == "" || binding.Source == "" || binding.Destination == "" {
+		return ErrInvalidMessage
+	}
+	if binding.DestinationKind == "" {
+		binding.DestinationKind = DestinationExchange
+	}
+	if binding.HeadersJSON == "" {
+		binding.HeadersJSON = "[]"
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if s.closed {
+		return ErrClosed
+	}
+	if existing, ok := s.amqpBindings[binding.ID]; ok && existing != binding {
+		return ErrInvalidMessage
+	}
+	s.amqpBindings[binding.ID] = binding
+	return nil
+}
+
+func (s *MemoryStateStore) ListAMQPExchangeBindings(ctx context.Context) ([]AMQPExchangeBindingRecord, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if s.closed {
+		return nil, ErrClosed
+	}
+	bindings := make([]AMQPExchangeBindingRecord, 0, len(s.amqpBindings))
+	for _, binding := range s.amqpBindings {
+		bindings = append(bindings, binding)
+	}
+	sort.Slice(bindings, func(i, j int) bool { return bindings[i].ID < bindings[j].ID })
+	return bindings, nil
+}
+
+func (s *MemoryStateStore) DeleteAMQPExchangeBinding(ctx context.Context, id string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if s.closed {
+		return ErrClosed
+	}
+	delete(s.amqpBindings, id)
+	return nil
+}
+
+func (s *MemoryStateStore) PutTask(ctx context.Context, t TaskInfo) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if s.closed {
 		return ErrClosed
 	}
@@ -603,14 +983,32 @@ func (s *MemoryStateStore) PutTask(ctx context.Context, t TaskInfo) error {
 	return nil
 }
 func (s *MemoryStateStore) GetTask(ctx context.Context, id string) (TaskInfo, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return TaskInfo{}, false, err
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	if err := ctx.Err(); err != nil {
+		return TaskInfo{}, false, err
+	}
+	if s.closed {
+		return TaskInfo{}, false, ErrClosed
+	}
 	t, ok := s.tasks[id]
 	return cloneTask(t), ok, nil
 }
 func (s *MemoryStateStore) ListTasks(ctx context.Context, st TaskStatus, limit int) ([]TaskInfo, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if s.closed {
+		return nil, ErrClosed
+	}
 	out := make([]TaskInfo, 0, len(s.tasks))
 	for _, t := range s.tasks {
 		if st == "" || t.Status == st {
@@ -624,14 +1022,29 @@ func (s *MemoryStateStore) ListTasks(ctx context.Context, st TaskStatus, limit i
 	return out, nil
 }
 func (s *MemoryStateStore) DeleteTask(ctx context.Context, id string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if s.closed {
+		return ErrClosed
+	}
 	delete(s.tasks, id)
 	return nil
 }
 func (s *MemoryStateStore) PutConsumer(ctx context.Context, c ConsumerInfo) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if s.closed {
 		return ErrClosed
 	}
@@ -639,14 +1052,32 @@ func (s *MemoryStateStore) PutConsumer(ctx context.Context, c ConsumerInfo) erro
 	return nil
 }
 func (s *MemoryStateStore) GetConsumer(ctx context.Context, id string) (ConsumerInfo, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return ConsumerInfo{}, false, err
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	if err := ctx.Err(); err != nil {
+		return ConsumerInfo{}, false, err
+	}
+	if s.closed {
+		return ConsumerInfo{}, false, ErrClosed
+	}
 	c, ok := s.consumers[id]
 	return cloneConsumerInfo(c), ok, nil
 }
 func (s *MemoryStateStore) ListConsumers(ctx context.Context) ([]ConsumerInfo, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if s.closed {
+		return nil, ErrClosed
+	}
 	out := make([]ConsumerInfo, 0, len(s.consumers))
 	for _, c := range s.consumers {
 		out = append(out, cloneConsumerInfo(c))
@@ -655,22 +1086,40 @@ func (s *MemoryStateStore) ListConsumers(ctx context.Context) ([]ConsumerInfo, e
 	return out, nil
 }
 func (s *MemoryStateStore) DeleteConsumer(ctx context.Context, id string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if s.closed {
+		return ErrClosed
+	}
 	delete(s.consumers, id)
 	delete(s.events, id)
 	return nil
 }
 func (s *MemoryStateStore) AddConsumerEvent(ctx context.Context, id string, n Notification) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if id == "" {
 		return nil
 	}
+	if n.Timestamp.IsZero() {
+		n.Timestamp = time.Now()
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if s.closed {
 		return ErrClosed
 	}
-	evs := append(s.events[id], n)
+	evs := append(s.events[id], cloneNotification(n))
 	if s.eventCap > 0 && len(evs) > s.eventCap {
 		evs = evs[len(evs)-s.eventCap:]
 	}
@@ -678,27 +1127,49 @@ func (s *MemoryStateStore) AddConsumerEvent(ctx context.Context, id string, n No
 	return nil
 }
 func (s *MemoryStateStore) ConsumerEvents(ctx context.Context, id, after string, limit int) ([]Notification, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if s.closed {
+		return nil, ErrClosed
+	}
 	evs := s.events[id]
 	start := 0
+	foundCursor := false
 	if after != "" {
 		for i, n := range evs {
 			if n.ID == after {
 				start = i + 1
+				foundCursor = true
 				break
 			}
 		}
-	} else if limit > 0 && limit < len(evs) {
+	}
+	if after == "" && limit > 0 && limit < len(evs) {
 		start = len(evs) - limit
 	}
-	out := append([]Notification(nil), evs[start:]...)
+	out := make([]Notification, len(evs)-start)
+	for i, event := range evs[start:] {
+		out[i] = cloneNotification(event)
+	}
 	if limit > 0 && len(out) > limit {
-		out = out[len(out)-limit:]
+		if foundCursor {
+			out = out[:limit]
+		} else {
+			out = out[len(out)-limit:]
+		}
 	}
 	return out, nil
 }
 func (s *MemoryStateStore) PutPublisherRecord(ctx context.Context, rec PublisherRecord) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if rec.ID == "" {
 		rec.ID = newIDFromTime()
 	}
@@ -710,6 +1181,9 @@ func (s *MemoryStateStore) PutPublisherRecord(ctx context.Context, rec Publisher
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if s.closed {
 		return ErrClosed
 	}
@@ -718,15 +1192,33 @@ func (s *MemoryStateStore) PutPublisherRecord(ctx context.Context, rec Publisher
 	return nil
 }
 func (s *MemoryStateStore) GetPublisherRecord(ctx context.Context, id string) (PublisherRecord, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return PublisherRecord{}, false, err
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	if err := ctx.Err(); err != nil {
+		return PublisherRecord{}, false, err
+	}
+	if s.closed {
+		return PublisherRecord{}, false, ErrClosed
+	}
 	rec, ok := s.publishers[id]
 	rec.Metadata = cloneMap(rec.Metadata)
 	return rec, ok, nil
 }
 func (s *MemoryStateStore) ListPublisherRecords(ctx context.Context, limit int) ([]PublisherRecord, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if s.closed {
+		return nil, ErrClosed
+	}
 	out := make([]PublisherRecord, 0, len(s.publishers))
 	for _, rec := range s.publishers {
 		rec.Metadata = cloneMap(rec.Metadata)

@@ -184,6 +184,404 @@ deliberate startup failure, not a warning.
 Every flag also has an environment variable equivalent (`BROKER_ADDR`,
 `BROKER_TOKEN`, `BROKER_WAL`, and so on).
 
+### Experimental distributed mode
+
+`brokerd -cluster` starts the existing etcd/raft distributed broker. It requires
+at least three nodes (an odd-sized peer set), a durable message WAL, a separate
+Raft WAL directory, and mutual TLS on peer connections. Give every node the same
+complete peer map and a certificate signed by the configured peer CA, with the
+node addresses covered by certificate SANs. The shared `-require-client-cert`
+setting also requires client certificates on TLS-enabled client listeners. For
+example, the node with ID `1`:
+
+```bash
+/tmp/brokerd \
+  -cluster \
+  -cluster-node-id 1 \
+  -cluster-listen 10.0.0.11:7000 \
+  -cluster-peers '1=10.0.0.11:7000,2=10.0.0.12:7000,3=10.0.0.13:7000' \
+  -cluster-wal /var/lib/oarkflow/raft \
+  -wal /var/lib/oarkflow/messages -store wal2 \
+  -token "$BROKER_TOKEN" \
+  -tls-cert node-1.pem -tls-key node-1-key.pem \
+  -client-ca cluster-ca.pem -require-client-cert
+```
+
+Use unique message and Raft directories on each node; never share either
+directory between nodes. Cluster mode is still pre-v1 and experimental. The
+etcd/raft library path shares a log between broker data and controller metadata
+and exposes `DistributedBroker.ControllerQuorum()`. `brokerd` exposes
+authenticated controller placement and partition route APIs. Topic and stream
+partitions can run as independent Raft groups. Before changing a replica set,
+`GET /cluster/partitions/{name}/{partition}/reassignment-plan` and
+`pkg/client.Client.PlanPartitionReassignment` provide a read-only preflight
+showing target nodes, learner/catch-up steps, leader transfer, removals, and
+blockers, including missing advertised client addresses.
+`GET /cluster/nodes/{peer_id}/removal-plan` and
+`pkg/client.Client.PlanRaftNodeRemoval` list every partition still assigned to
+that controller peer's logical node and report controller leadership, pending
+joint changes, and whether this broker can propose removal. The node must have
+no assignments and be marked `left` before voter removal; `left` is terminal,
+and its metadata record stays until the Raft peer is removed so another logical
+node cannot claim the same address during the drain. The removal guard requires
+leadership to move first. `POST /cluster/nodes/{peer_id}/drain` and
+`pkg/client.Client.BeginRaftNodeDrain` mark the logical node `draining`, which
+blocks new assignments while existing partitions are moved. Once assignments
+are gone, `POST /cluster/nodes/{peer_id}/drain/complete` and
+`pkg/client.Client.CompleteRaftNodeDrain` commit `left`; the controller state
+machine checks assignments again when applying that transition. Operator-
+requested reassignment remains an explicit step; the opt-in daemon sweep can
+replace replicas after a node enters `draining`, `failed`, or `left`.
+`GET /cluster/upgrade-plan?target_version=<tag>` and
+`pkg/client.Client.PlanClusterUpgrade` report the broker-version inventory,
+control-plane blockers, and a deterministic order with learners and follower
+voters before the controller leader. Stable `vMAJOR.MINOR.PATCH` downgrade
+targets are blocked; non-release version strings are left for manual ordering.
+`state_preflight_ready` only means the state preflight passed, including fresh
+live progress for every assigned partition replica; `compatibility_verified`
+remains false, and the response lists the storage, protocol, health, and backup
+checks operators must complete before rollout.
+Library users that implement durable transaction participants can provide a
+`cluster.TransactionParticipantResolver` through
+`DistributedConfig.TransactionResolver`. The distributed broker then sweeps
+recovery records on the controller leader every five seconds by default, and
+joins the recovery loop before closing local partition stores during shutdown.
+Partition state machines can durably stage atomic appends and stream offsets;
+`NewPartitionAppendTransactionParticipant` and
+`NewPartitionOffsetTransactionParticipant` create participants, and
+`DistributedBroker.TransactionParticipantResolver` resolves their durable
+decisions. Prepare requests carry a digest of their original payload; the
+partition leader reuses the durable staged result on retry and rejects a
+changed payload for the same transaction participant. The prepare endpoint
+also verifies that the coordinator record is undecided, unexpired, and includes
+that participant. After execution, append participants expose their prepared
+output messages through `broker.PartitionTransactionResult`. Callers must still
+perform normal broker authorization, schema, rate, and tenant-quota checks
+before creating append participants. Proposals route to the assigned partition
+leader's registered HTTPS `ClientAddress` using the broker's mTLS client
+certificate. The receiving admin API maps that certificate to a principal with
+`cluster:write`; configure the node certificate identity with
+`-client-cert-identities` and grant it `-client-cert-permissions cluster:write`.
+The built-in resolver participates in the distributed broker's leader-only
+recovery loop. `Broker.CommitOffsetAndAppend` orchestrates this path for one
+assigned destination per output entry; it rejects fanout,
+archive/dead-letter destinations, unassigned destinations, and output to the
+source checkpoint partition.
+Read-only plans do not execute reassignment. The opt-in daemon sweep advances
+the durable catch-up and metadata switch-over protocol for replicas on nodes
+marked `draining`, `failed`, or `left`; it does not initiate node drains or
+complete controller-peer removal. Full cluster failure certification,
+distributed consumer-offset coverage, and release validation remain open. Do
+not treat this as a production-ready high-availability cluster.
+Partition reconciliation closes a stale local partition group after the local
+peer has been removed from that group's Raft membership; while the peer remains
+a voter or learner, reconciliation keeps the group and reports the pending
+safe-removal requirement.
+The library now provides `cluster.RaftMultiplexer` and `cluster.RaftGroupHost`
+for independent etcd/raft controllers. In etcd/raft mode,
+`DistributedBroker.AddRaftGroup` also registers application state machines on
+the broker's authenticated shared listener, with one durable namespace per
+group. Groups can be added or removed while the listener runs. The broker data
+plane routes topic and stream appends to assigned partition groups. The library
+rejects multi-node etcd/raft controllers or application groups unless mutual
+TLS peer identity validation is enabled.
+`DistributedBroker.ReconcilePartitionGroups` can provision missing local groups
+from a quorum-confirmed, consistent topology snapshot when node registry
+addresses match authenticated controller peers. Its state-machine factory must
+choose whether each local copy bootstraps or joins existing durable history.
+Set `DistributedConfig.PartitionStoreFactory` and pass a nil state-machine
+factory to have reconciliation open, adapt, own, and close one isolated
+snapshot-capable broker store per local partition. For durable local state,
+`NewSegmentedWALPartitionStoreFactory(root, cfg)` supplies stable BWL2
+directories keyed by a hash of the resource kind, name, and partition; keep
+`root` separate from the broker-wide message store directory.
+`brokerd -cluster` configures this factory automatically and retries local
+partition reconciliation every five seconds by default. Set the separate
+store root with `-cluster-partition-wal` and the retry interval with
+`-cluster-reconcile-interval`; each broker reconciles after assignments exist.
+Automatic replacement of replicas on nodes marked `draining`, `failed`, or
+`left`, and healthy replica moves when one node has at least two more assigned
+replicas than an eligible target, are opt-in through
+`-cluster-auto-reassign-interval` (or
+`BROKER_CLUSTER_AUTO_REASSIGN_INTERVAL`). Each broker advances only the
+partition groups it currently leads, using the durable learner catch-up,
+in-sync replica, leadership transfer, and cleanup steps. Healthy balancing
+keeps the current partition leader in place and moves one non-leader replica at
+a time. Fresh complete per-partition workload snapshots can also trigger one
+move per sweep when the projected source/target workload gap improves by at
+least 100 message/lease units and 20%; complete Raft progress snapshots prefer recent,
+in-sync targets with lower lag. Missing, stale, or partial signals disable
+telemetry-based moves for that sweep. The default interval is zero, which leaves
+reassignment operator-driven. When every store reports its partition size,
+disk balancing also moves a non-leader replica only if its source is at least
+ten utilization points fuller, projected source/target utilization skew
+improves, and the target retains a 20% reserve over the incoming partition
+size.
+It refuses to change an existing group's membership and reports local groups
+that metadata has unassigned. Existing groups must have the assigned voter set
+and leader, match the configured replication factor, and must not have a joint
+membership change pending; reconciliation does not move existing messages.
+With a managed partition store, topic and stream appends route through the
+assigned Raft group, and atomic appends are accepted only when all entries
+target that same partition. Set `WithPartition(n)` on `Publisher.Publish` or
+`pkg/client.Client.Publish` to target a nonzero partition; the HTTP
+`/v1/publish` payload also accepts `partition`. `ListTopic` and `ReadTopic` use each local partition group's
+linearizable ReadIndex and merge messages in stable creation-time order.
+`ReadTopic` scans with bounded pages, so a small result limit does not load all
+retained topic data. `GET /v1/topics/{topic}/partitions/{partition}/messages`
+reads one partition, and `pkg/client.Client.ReadPartitionTopic` resolves its
+advertised leader endpoint and requests it. The client sends credentials only
+when that endpoint's origin is in its configured broker URLs.
+`pkg/client.Client.ListTopic` fans out a bounded first-page read across all
+assigned partitions and merges the results. `pkg/client.Client.ReadTopicPage`
+continues from an opaque per-partition cursor, rotates the round-robin starting
+partition between pages, and advances only through messages returned on that
+page. Stream assignments use `resource_kind: "stream"`; a same-named topic has
+a separate group identity. `pkg/client.Client.ReadStreamPage` uses a separate
+local offset per assigned partition and can read from advertised leader
+endpoints via `GET /v1/streams/{stream}/partitions/{partition}/messages`. The
+partition-scoped offset APIs use
+`/v1/streams/{stream}/partitions/{partition}/commit` and `/offset`, with
+`pkg/client.Client.CommitPartitionStreamOffset` and
+`PartitionStreamOffset`. Atomic checkpoint plus append is available through
+`POST /v1/streams/{stream}/partitions/{partition}/commit-and-append` and
+`pkg/client.Client.CommitPartitionStreamOffsetAndAppend` when every output
+targets that same assigned stream partition; pass a transaction ID to dedupe
+retries. `Broker.CommitOffsetAndAppend` also coordinates a partitioned source
+checkpoint with outputs across assigned topic, stream, and queue partitions
+through the controller quorum. This path requires a transaction ID and exactly
+one assigned topic, stream, or queue destination per output entry; archive and
+dead-letter destinations are unsupported. It rejects output to the source
+checkpoint partition or any mix of assigned and unassigned destinations. Its
+source-partition outcome cache returns full messages while retained and compact
+metadata after output cleanup. Prepared appends to bounded assigned queues
+reserve capacity in the partition state machine. Normal appends account for
+those reservations, abort releases them, commit consumes them atomically, and
+partition snapshots rebuild reservations from staged transactions. A prepare
+that cannot reserve every required slot is rejected and the coordinator aborts.
+The coordinator deadline uses `DistributedConfig.TransactionTimeout` (30 seconds
+by default).
+Legacy scalar consumer-group offsets and stream lag/head-offset
+reports remain unsupported for assigned streams. Per-partition lag reports are
+available at `/v1/streams/{stream}/partitions/{partition}/lag`. The aggregate
+`GET /v1/streams/{stream}/lag?consumer_group={group}` endpoint gathers reports
+from assigned partition leaders and returns total lag plus each partition's
+local head and committed offsets; it requires a globally scoped principal.
+Partial results return HTTP `207 Multi-Status` with successful partition reports
+and a failure map; `total_lag` sums the successful reports. The Go client's
+`StreamLagAssigned` calls this endpoint, validates its partition reports and
+aggregate total, and returns partial data alongside an error.
+Queue assignments use
+`resource_kind: "queue"`; enqueue, lease, ack, nack, and lease extension run in
+the assigned queue Raft group. `pkg/client.Client.PollPartition` resolves the
+leader and returns partition metadata that its Ack/Nack/Extend methods reuse.
+Queue configuration is synchronized into each partition group before queue
+operations. Partition-local listing, pause/resume, and purge use
+`/queues/{queue}/partitions/{partition}/...` and the corresponding Go client
+methods. `pkg/client.Client.PollAssignedQueue` discovers assignments, rotates
+the initial per-partition lease budget, then redistributes unused capacity to
+partitions that filled their share. Follow-up polls do not wait, aggregate
+leases stay within the requested limit, and partial successful leases are
+returned alongside errors from failed partitions. `ListAssignedQueue` fetches a bounded share from each partition and
+sorts the selected results by creation time; it is not a cursor-based global
+FIFO page. The server-side `GET /queues/{queue}/assigned/messages?limit={n}`
+endpoint performs the same bounded fan-out over authenticated broker identities
+and returns completed and failed partitions with the message sample; partial
+results use HTTP `207 Multi-Status`;
+`ListAssignedQueueDetailed` exposes that report through the Go client. The
+endpoint rejects tenant-scoped credentials because it aggregates globally.
+`POST /queues/{queue}/assigned/{pause|resume|purge}` coordinates all assigned
+partitions through one durable transaction and returns its transaction ID,
+completed and failed partitions, and exact per-partition purge counts. Every
+partition prepares before the coordinator records commit; HTTP `207 Multi-Status`
+reports a failed operation. After commit, partition effects can become visible
+at slightly different times while participant resolution catches up. Purge
+counts come from each partition leader's committed state-machine apply result.
+`PauseAssignedQueue`, `ResumeAssignedQueue`, and
+`PurgeAssignedQueue` use these server-side routes. Assigned, partition, and
+scalar pause/resume/purge routes reject tenant-scoped credentials because they
+change shared queue state. Scalar APIs return
+`unsupported_mode` instead of reading or changing the broker-wide queue.
+Replication factor defaults to three. Never share one partition store across groups:
+restoring one group's snapshot replaces that store's state.
+
+The `cluster.ControllerQuorum` library API, available from
+`DistributedBroker.ControllerQuorum()`, can persist two-phase transaction
+participant sets, prepare votes, commit/abort decisions, deadlines, and
+participant resolution markers. `ExecuteTransaction` sequences participant
+preparation, the durable decision, and recovery; participants must stage work
+by transaction ID and make prepare/commit/abort idempotent. Participants prepare
+in ID order and commit in reverse order; a failed commit stops later dependent
+effects until recovery retries it. `ExecuteTransactionWithFingerprint` also
+binds a request digest to the transaction ID so changed-input retries fail
+before participant preparation. `RecoverTransactions`
+can also be called after restart to abort expired undecided transactions and
+retry durable decisions through the participants. The coordinator shares the
+etcd/raft log and powers multi-partition `Broker.CommitOffsetAndAppend` for
+assigned output partitions. That broker path requires a transaction ID, one
+assigned destination per output, and outputs distinct from the source
+checkpoint partition; mixed assigned/unassigned outputs remain unsupported.
+The controller decision is durable and recovery retries participant resolution,
+but each partition applies that decision independently, so readers can briefly
+observe outputs from only some participants after commit while recovery is
+finishing. The source checkpoint participant resolves last, preventing the
+checkpoint from advancing before output participants have committed.
+
+The authenticated controller API exposes coordinator records through
+`GET /cluster/transactions?id={id}` and cursor-based pages through
+`GET /cluster/transactions?after={cursor}&limit={n}`. The Go client provides
+`GetClusterTransaction` and `ListClusterTransactionsPage`. To limit retained
+history, `POST /cluster/transactions/prune` accepts an explicit `before`
+timestamp and optional `limit`; it deletes only decided transactions whose
+participants are all resolved. Use globally unique transaction IDs for at
+least as long as records are retained: after a record is pruned, reusing its ID
+starts a new coordinator transaction.
+
+`GET /cluster/status` reports the current leader, term, commit/applied indexes,
+joint voter groups, per-peer replication lag when served by the leader, and
+bounded controller metadata and transaction recovery counts. It also reports
+`local_partition_progress`: snapshots from partition groups led by the broker
+serving the request, with per-replica match index, lag, recent activity, and
+ISR eligibility. Query each broker to see its locally led partitions; followers
+do not claim to know the leader's full peer progress. The authenticated daemon
+admin API also exposes controller placement metadata:
+
+- `GET /cluster/partitions` and `GET /cluster/partitions/{name}/{partition}`
+  read assignments; pass `resource_kind=stream` for stream resources (topic is
+  the default).
+- `POST /cluster/partitions` assigns replicas and a leader using `name`,
+  `resource_kind` (`topic`, `stream`, or `queue`), `partition`, `replicas`,
+  and `leader`.
+  Set `auto_assign: true` to choose active replicas and a leader. Set
+  `metadata.failure_domain` when registering nodes to spread replicas across
+  racks or zones. Distinct configured domains are preferred before reusing a
+  domain; missing labels leave those nodes unconstrained. A node's failure
+  domain must be valid UTF-8 without control characters and at most 256 bytes.
+  Set optional `metadata.capacity_weight` to a decimal value from 1 through
+  1000 (default 1) to describe relative node capacity; higher weights receive
+  proportionally more partitions when balancing normalized replica/leader
+  counts. This is an operator-supplied weight, not a live disk or workload
+  measurement.
+  It cannot change while the node hosts an assigned replica; reassign its
+  partitions first. Assignments serialize at the controller quorum and retries
+  return an existing assignment unchanged.
+  Legacy `topic` assignments remain supported and default to kind `topic`.
+- `GET /cluster/partitions/{name}/{partition}/placement-plan` previews the
+  deterministic load-aware initial assignment. It considers registered active
+  nodes authenticated as distinct Raft voters with advertised client addresses,
+  prefers distinct `metadata.failure_domain` values, then balances replica
+  counts relative to `metadata.capacity_weight`, prefers candidates with known,
+  recent Raft progress and lower controller-log lag. When every active
+  candidate is reachable through the configured broker mTLS client and each
+  assigned partition has a complete leader progress report, it also prefers
+  replicas with lower maximum observed partition lag and recent activity.
+  Replicated partition-store message and lease counts provide additional
+  tie-breakers when every candidate reports them. The default `brokerd`
+  partition WAL root reports logical bytes used and filesystem capacity
+  available; custom stores can implement `StorageUsageReporter` or set
+  `DistributedConfig.PartitionStoragePath`. After replica health and lag, the
+  planner prefers candidates with more available bytes. The plan reports
+  whether live lag, workload, and disk capacity signals were used, plus
+  per-node measurements with observation timestamps; workload and disk
+  counters may be cached for up to one second, while Raft progress is fetched
+  for each plan. Partial or unavailable
+  telemetry is discarded. Placement does not
+  move existing partitions. The internal signal request uses broker mTLS and
+  the remote certificate principal needs `cluster:read`; if it cannot collect
+  every active candidate's report, the plan identifies the omitted live signal
+  and falls back to controller progress. Explicit distributed assignments
+  also require client addresses on every replica so any replica can become a
+  reachable leader.
+- `PUT /cluster/partitions/{topic}/{partition}/isr` updates the `isr` list.
+- `POST /cluster/partitions/{topic}/{partition}/epoch` advances the fencing
+  epoch and optionally changes the `leader`; stream routes use the same paths
+  with `resource_kind=stream`.
+- `GET /cluster/metadata/nodes` lists the replicated logical node registry;
+  `POST` registers or updates a node using `id`, `address`, optional `state`,
+  optional `client_address` (an HTTP(S) base URL), and optional `metadata`.
+  Omitting `metadata` on update preserves existing labels; send an empty object
+  to clear them when policy permits. The endpoint
+  `DELETE /cluster/metadata/nodes/{id}` removes a node that has no partition
+  assignments and no Raft membership. The `brokerd -cluster` controller leader
+  registers current controller Raft peers, including learners added after
+  startup, as `joining`
+  nodes, preserving existing lifecycle states and reusing an existing logical
+  ID when its address is already registered.
+  Operators must mark a node `active` before assigning replicas to it.
+  Distributed partition assignment also requires a `client_address` on every
+  replica; an assigned node cannot clear its client address.
+  Partition route responses include the assigned leader's
+  `leader_client_address` when registered; `pkg/client.Client.PartitionLeaderURL`
+  validates and returns it. Valid states are `joining`, `active`,
+  `draining`, `left`, and `failed`; omitted state defaults to `joining` for a
+  new node and preserves the current state when updating one. These records do
+  not add or remove Raft voters. Assignments cannot add registered draining or
+  failed nodes, and only active registered Raft voters can receive a replica or
+  leader assignment; learners and existing placements remain unchanged until
+  an explicit safe reassignment protocol is available.
+
+These routes replicate controller metadata. Partition writes and partition
+read endpoints route to the assigned group leader; the Go client validates the
+advertised client origin before forwarding credentials. Reads require
+`cluster:read` or `admin:*`; writes require
+`cluster:write` or `admin:*`. Tenant-scoped credentials cannot read or mutate
+global cluster metadata. Partition reads use a quorum-confirmed Raft ReadIndex.
+Followers forward the barrier to the known leader and wait for local
+application; a node with no known leader returns a retryable leader hint rather
+than serving stale state.
+Successful etcd/raft-backed publishes report `confirmed: replicated` and
+`durability: quorum_fsync`; local WAL-only publishes report `local_fsync`.
+
+The daemon admin API can also propose a Raft membership addition:
+
+```bash
+curl -X POST "$BROKER/cluster/nodes" \
+  -H "Authorization: Bearer $BROKER_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"address":"10.0.0.14:7000"}'
+```
+
+The response includes the assigned `peer_id` and adds the node as a non-voting
+learner. Start it with the complete peer map, its assigned ID, and
+`-cluster-join-existing` (or `BROKER_CLUSTER_JOIN_EXISTING=true`) so it does not
+bootstrap an independent cluster. When `/cluster/status` reports zero lag for
+that peer, the leader automatically promotes it to a voter. Operators can also
+request the same guarded, idempotent promotion explicitly:
+
+```bash
+curl -X POST "$BROKER/cluster/nodes/4/promote" \
+  -H "Authorization: Bearer $BROKER_TOKEN"
+```
+
+The membership endpoints require `cluster:write` or `admin:*`; tenant-scoped
+credentials cannot change cluster membership. Mutations must reach the current
+leader; follower errors include a retryable leader hint. Promotion and voter
+removal use etcd/raft's joint-consensus transition, and removed-peer transport
+identities remain enabled until the automatic leave entry commits. A second
+change is rejected while that transition is pending. Promotion is gated on
+replication catch-up. Drain start and completion are available, while automatic
+reassignment and cluster certification remain open. The Go client exposes
+`AddRaftLearner`, `PromoteRaftLearner`, `TransferControllerLeadership`, and
+`RemoveRaftNode` alongside the drain operations. Before
+removing a leader, transfer leadership to a caught-up voter:
+
+```bash
+curl -X POST "$BROKER/cluster/leadership" \
+  -H "Authorization: Bearer $BROKER_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"peer_id":2}'
+```
+
+This waits until the target reports itself as leader; a lagging target is
+rejected. Then remove the old leader with `DELETE /cluster/nodes/{peer_id}` and
+the same permission. For library-created ops servers, health/readiness probes
+stay available without credentials, while metrics, stats, and cluster state
+require `OpsConfig.AuthorizeOpsRead`. Membership changes require the separate
+`OpsConfig.AuthorizeClusterMutation` callback. These routes add or remove Raft
+voters or transfer leadership. A controller voter cannot be removed while its
+registered logical node remains assigned to any partition; move those
+assignments first.
+
 With `durable`, `latency` or `throughput` profiles, `brokerd` refuses to run on
 the in-memory store. Use `-store=wal`, `-store=wal2`, `-store=sqlite`, or
 `-profile=lightweight`.
@@ -541,7 +939,7 @@ Other endpoints:
 
 ```bash
 curl -s $BROKER/healthz      # unauthenticated probe, always allowed
-curl -s $BROKER/readyz       # unauthenticated probe, always allowed
+curl -s $BROKER/readyz       # unauthenticated probe; returns 503 when not ready
 curl -s $BROKER/queues
 curl -s $BROKER/topics
 curl -s $BROKER/streams
@@ -551,6 +949,11 @@ curl -s "$BROKER/audit?limit=20"
 curl -s "$BROKER/lag?stream=audit"   # the stream name is required; bare /lag returns 400
                                       # and an unknown stream returns 404
 ```
+
+`/healthz` is a liveness probe. `/readyz` checks broker/store health and, in
+cluster mode, requires a quorum-confirmed partition topology, all locally
+assigned partition groups to be running with replica membership and leader
+matching metadata, and no stale local partition groups.
 
 There is no `/queues/{name}` detail route — queue counters come from `/stats`,
 and queued messages from `/queues/{name}/messages`.
@@ -586,6 +989,10 @@ export BROKER_TOKEN=your-secret-token     # omit under --insecure-dev
 /tmp/brokerctl dlq-replay -queue orders.dlq
 
 /tmp/brokerctl cluster
+/tmp/brokerctl cluster nodes
+/tmp/brokerctl cluster upgrade-plan v1.2.3
+/tmp/brokerctl cluster removal-plan 3
+/tmp/brokerctl cluster leadership-transfer 3
 /tmp/brokerctl tui                       # interactive terminal UI
 ```
 
@@ -806,6 +1213,17 @@ broker's optional `MQTTSessionStore` state-store extension. The contrib SQLite
 state store implements it, and `brokerd -store sqlite` opens message and
 control-plane state on the same database. The default memory state store is
 process-local.
+Accepted CONNECT Wills are persisted through the optional `MQTTWillStore`
+extension; the built-in memory and SQLite state stores implement it. Pending
+Wills are replayed before the MQTT listener accepts clients, and graceful
+DISCONNECT removes the pending Will. Transient publish and record-delete
+failures retry with bounded exponential backoff; stable publish idempotency
+keys prevent duplicates when the message store retains idempotency records.
+SQLite preserves pending Wills across process restart; memory state only
+survives an MQTT server restart while its `MemoryStateStore` remains alive.
+`MQTTServer.ListenAndServe` requires TLS and an authentication mechanism in
+production mode. Plaintext or unauthenticated development listeners require
+`MQTTConfig.AllowInsecure`; `brokerd` enables it only with `--insecure-dev`.
 Clients must complete CONNECT within `MQTTConfig.ConnectTimeout` (5 seconds by
 default). Nonzero client keep-alive values are capped at `MQTTConfig.KeepAlive`
 (60 seconds by default); a client keep-alive of zero disables inactivity
@@ -836,8 +1254,9 @@ handshake finishes, and this does not establish full MQTT conformance.
 
 `brokerd` supervises every enabled listener. Protocol listeners are opt-in by
 address; production mode requires TLS and authentication on every listener,
-including the native BST1 stream, which enforces a token or mTLS handshake
-unless `--insecure-dev` is set.
+including MQTT, Native RPC, and the native BST1 stream. These listeners enforce
+their authentication requirements unless `--insecure-dev` is set. The RFC 6455
+handler also fails closed when its production ACL is missing.
 
 ---
 
@@ -856,7 +1275,7 @@ unless `--insecure-dev` is set.
 
 | Transport | TLS | mTLS | How to Enable |
 |-----------|-----|------|---------------|
-| HTTP Admin | ✅ | ✅ | `-tls-cert`, `-tls-key`, `-client-ca`, `-require-client-cert` |
+| HTTP Admin | ✅ | ✅ | `-tls-cert`, `-tls-key`, `-client-ca`, `-require-client-cert`; map identities with `-client-cert-identities` |
 | MQTT | ✅ | ✅ | `MQTTConfig.TLSCertFile`, etc. |
 | Native JSON/TCP RPC | ✅ | ✅ | `NativeRPCConfig.TLSCertFile`, etc.; this is not gRPC |
 | AMQP | ✅ | ✅ | `ListenTLS()`, `EXTERNAL` auth |
@@ -866,6 +1285,8 @@ unless `--insecure-dev` is set.
 
 At-rest encryption remains opt-in. `brokerd` rejects plaintext production mode;
 plaintext listeners require the explicit `--insecure-dev` flag.
+The library MQTT and Native RPC listeners also enforce TLS and authentication
+unless their explicit `AllowInsecure` option is enabled.
 
 ---
 
@@ -877,16 +1298,26 @@ plaintext listeners require the explicit `--insecure-dev` flag.
 |--------|----------|-----|
 | Bearer token | HTTP | `Authorization: Bearer <token>` |
 | ACL tokens | HTTP | Named tokens with 28+ permissions |
+| mTLS certificate | HTTP, Native RPC, gRPC | Verified certificate identity mapped with `-client-cert-identities`; permissions set with `-client-cert-permissions` |
 | MQTT password | MQTT | `BrokerToken` in `MQTTConfig` |
 | AMQP PLAIN | AMQP | Username/password |
 | AMQP EXTERNAL | AMQP | Client certificate (mTLS) |
+
+AMQP PLAIN can also use the shared ACL token set. When ACL authentication is
+configured, an invalid ACL token is rejected rather than accepted as a fallback.
+Mapped AMQP principals are checked against message, queue, and topic permissions;
+their tenant scope also applies to broker store operations.
 
 ### Authorization (HTTP)
 
 | Permission | Description |
 |------------|-------------|
 | `admin:*` | All admin/API actions |
-| `broker:read` | health/ready/stats |
+| `broker:read` | broker summary/read operations |
+| `stats:read` | detailed store statistics |
+| `metrics:read` | global Prometheus metrics |
+| `cluster:read` | cluster topology and controller metadata |
+| `cluster:write` | cluster membership and controller metadata changes |
 | `message:publish` | publish messages |
 | `message:ack/nack` | ack/nack messages |
 | `message:move` | move/copy/replay |
@@ -898,6 +1329,9 @@ plaintext listeners require the explicit `--insecure-dev` flag.
 | `consumer:register/read/control/poll` | consumer management |
 | `task:read/write` | task management |
 | `notification:read` | notification/SSE access |
+
+GET and HEAD requests to `/healthz` and `/readyz` are unauthenticated probes;
+readiness responses do not include internal failure details.
 
 ACL principals can set `RequestsPerSecond`, `Burst`, and `MaxConcurrent`. The
 rate bucket is shared across listeners and charges each request on long-lived
@@ -912,8 +1346,16 @@ brokerd -addr :8443 -tls-cert server.crt -tls-key server.key
 
 # mTLS
 brokerd -addr :8443 -tls-cert server.crt -tls-key server.key \
-  -client-ca ca.crt -require-client-cert
+  -client-ca ca.crt -require-client-cert \
+  -client-cert-identities 'cn:operator' \
+  -client-cert-permissions 'admin:*'
 ```
+
+Certificate identities use `cn:`, `dns:`, `uri:`, `email:`, or `ip:` prefixes.
+Mapped certificates default to `broker:read`; grant broader permissions only
+when the client requires them. Set `BROKER_CLIENT_CERT_IDENTITIES` and
+`BROKER_CLIENT_CERT_PERMISSIONS` to configure the same mapping through the
+environment.
 
 ---
 
@@ -926,7 +1368,7 @@ brokerd -addr :8443 -tls-cert server.crt -tls-key server.key \
 | `BROKER_ADDR` | `:8090` | Listen address |
 | `BROKER_WAL` | - | WAL directory (empty = memory) |
 | `BROKER_WAL_FORMAT` | `binary` | `binary` or `json` |
-| `BROKER_TOKEN` | - | Admin token (required unless `--insecure-dev`) |
+| `BROKER_TOKEN` | - | Admin token; production may instead require mTLS and map client certificate identities |
 | `BROKER_READ_TOKEN` | - | Read-only token |
 | `BROKER_WORKER_TOKEN` | - | Worker token |
 | `BROKER_PUBLISHER_TOKEN` | - | Publisher token |
@@ -934,6 +1376,8 @@ brokerd -addr :8443 -tls-cert server.crt -tls-key server.key \
 | `BROKER_TLS_KEY` | - | TLS key |
 | `BROKER_CLIENT_CA` | - | Client CA for mTLS |
 | `BROKER_REQUIRE_CLIENT_CERT` | `false` | Require mTLS |
+| `BROKER_CLIENT_CERT_IDENTITIES` | - | Comma-separated verified certificate identities mapped to an ACL principal |
+| `BROKER_CLIENT_CERT_PERMISSIONS` | `broker:read` | Comma-separated ACL permissions for mapped certificates |
 | `BROKER_MAX_BODY` | `1048576` | Max request body (bytes) |
 | `BROKER_FRAME_SIGNING_KEY` | - | HMAC signing key |
 | `BROKER_FRAME_ENCRYPTION_KEY` | - | AES encryption key (hex) |
@@ -1351,6 +1795,13 @@ b := broker.MustNew(broker.Config{SchemaRegistry: registry})
 pub.Publish(ctx, "invoice.created", payload, broker.WithSchema("invoice", "v2"))
 ```
 
+When `NewDistributed` uses etcd/raft and no custom `SchemaRegistry` is
+configured, schema definitions are stored in the controller quorum and
+publish-time validation reads committed versions linearly. Register, list, read,
+and deprecate definitions through the authenticated
+`/cluster/metadata/schemas` endpoints. A custom `SchemaRegistry` remains in
+control when supplied in `broker.Config`.
+
 ---
 
 ## Observability
@@ -1361,7 +1812,7 @@ pub.Publish(ctx, "invoice.created", payload, broker.WithSchema("invoice", "v2"))
 curl http://localhost:8090/metrics
 ```
 
-Metrics: `broker_messages_published_total`, `broker_messages_delivered_total`, `broker_messages_acked_total`, `broker_publish_rate_limited_total`, `broker_publish_backpressured_total`, durable outbox dispatch attempts, failures, published entries, and dead-lettered entries (`broker_outbox_*`), consumer batch/message counts, collection time, and current adaptive wait (`broker_consumer_*`), `broker_queue_depth{queue}`, `broker_topic_published_total{topic}`, latency histograms, and WAL group-commit batches, request counts, maximum batch size, cumulative coalescing time, current adaptive coalescing wait, and errors (`broker_wal_group_commit_*`). The OTLP exporter includes matching rate-limit, queue-depth backpressure, and outbox counters.
+Metrics: `broker_messages_published_total`, `broker_messages_delivered_total`, `broker_messages_acked_total`, `broker_publish_rate_limited_total`, `broker_publish_backpressured_total`, durable outbox dispatch attempts, failures, published entries, and dead-lettered entries (`broker_outbox_*`), automatic partition reassignment starts, completions, failures, and pending observations (`broker_partition_reassignment_*`), consumer batch/message counts, collection time, and current adaptive wait (`broker_consumer_*`), `broker_queue_depth{queue}`, `broker_topic_published_total{topic}`, latency histograms, and WAL group-commit batches, request counts, maximum batch size, cumulative coalescing time, current adaptive coalescing wait, and errors (`broker_wal_group_commit_*`). The OTLP exporter includes matching rate-limit, queue-depth backpressure, outbox, and partition-reassignment counters.
 
 ### Tracing
 
@@ -1466,6 +1917,10 @@ Apache License 2.0. See [LICENSE](LICENSE) for the full text.
 
 For Kafka-equivalent append/fetch workloads use the native stream listener rather than queue leasing:
 
+The command below uses `--insecure-dev` and is for isolated local development
+only. Shared deployments must configure TLS plus a bearer token or mapped mTLS
+identity; production startup rejects the listener without them.
+
 ```bash
 brokerd -wal .broker-data/queue -native-addr :8091 \
   -native-dir .broker-data/native-stream -native-partitions 8 \
@@ -1480,3 +1935,10 @@ enforcement (anonymous/auto-admin access) and must only be used for local
 development.
 
 The `native-bench` command uses persistent TCP clients, compact record batches, partition offsets and restart-safe segmented logs. See `NATIVE_STREAM_PERFORMANCE.md` and `scripts/benchmark_native_vs_kafka.sh`.
+
+New Go clients negotiate the highest common BST1 frame version through the
+BST2 handshake envelope; this release supports frame version 1. The server
+still accepts legacy BST1 clients. A new client connecting to an older
+BST1-only server fails explicitly; set `NativeStreamDialOptions.LegacyHandshake`
+for a controlled migration. This does not yet provide rolling-upgrade
+or interoperability certification.

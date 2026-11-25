@@ -34,14 +34,14 @@ func mqttPublishPayload(topic string, packetID uint16, payload string) []byte {
 }
 
 func TestMQTTPublishUsesFixedHeaderQoS(t *testing.T) {
-	b := MustNew(Config{Store: NewMemoryStore()})
+	b := MustNew(Config{Store: NewMemoryStore(), StateStore: NewMemoryStateStore()})
 	if err := b.Start(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	defer b.Stop(context.Background())
 	server := NewMQTTServer(b, MQTTConfig{})
 	conn := &mqttBufferConn{}
-	client := &mqttConn{conn: conn, incomingQoS2: make(map[uint16]mqttPendingPublish)}
+	client := &mqttConn{conn: conn, incomingQoS2: make(map[uint16]mqttPendingPublish), closed: make(chan struct{})}
 
 	server.handlePublish(client, MQTTPublish|0x02, mqttPublishPayload("a/b", 7, "one"))
 	if got := conn.Bytes(); !bytes.Equal(got, []byte{MQTTPuback, 2, 0, 7}) {
@@ -62,6 +62,10 @@ func TestMQTTQoS2PublishesOnlyAfterPUBRELAndIsIdempotent(t *testing.T) {
 	server := NewMQTTServer(b, MQTTConfig{MaxInflight: 2})
 	conn := &mqttBufferConn{}
 	client := &mqttConn{conn: conn, incomingQoS2: make(map[uint16]mqttPendingPublish)}
+	if !server.handleConnect(client, encodeConnectPayload("qos2-client", false)) {
+		t.Fatal("handleConnect failed")
+	}
+	conn.Reset()
 
 	server.handlePublish(client, MQTTPublish|0x04, mqttPublishPayload("qos/two", 9, "two"))
 	if got := conn.Bytes(); !bytes.Equal(got, []byte{MQTTPubrec, 2, 0, 9}) {

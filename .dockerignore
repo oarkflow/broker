@@ -1,6 +1,7 @@
 .git
 .github
 .broker-data
+dist
 benchmark-results
 coverage*
 *.prof

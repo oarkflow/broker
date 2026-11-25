@@ -11,11 +11,17 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/oarkflow/broker/cluster"
 	fw "github.com/oarkflow/broker/pkg/pool"
 )
 
 type Broker struct {
 	cfg                 Config
+	lifecycleMu         sync.Mutex
+	lifecycleStarting   bool
+	lifecycleStarted    bool
+	lifecycleStopping   bool
+	lifecycleStopped    bool
 	store               Store
 	stateStore          StateStore
 	router              *Router
@@ -66,6 +72,7 @@ type Broker struct {
 	messageReplay         *MessageReplay
 	logCompaction         *StreamLogCompaction
 	partitionRouter       *PartitionRouter
+	distributedPartitions *DistributedBroker
 	partitionOrdering     *PartitionOrdering
 	partitionReassignment *PartitionReassignment
 	mqttServer            *MQTTServer
@@ -253,8 +260,24 @@ func MustNew(cfg Config) *Broker {
 }
 
 func (b *Broker) Start(ctx context.Context) error {
+	alreadyStarted, err := b.beginStart()
+	if err != nil {
+		return err
+	}
+	if alreadyStarted {
+		return nil
+	}
+	startSucceeded := false
+	defer func() { b.endStart(startSucceeded) }()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	b.startedAt = time.Now()
 	b.setState(ctx, BrokerStarting, nil)
+	if err := b.restorePersistedConsumers(ctx); err != nil {
+		b.setState(ctx, BrokerFailed, err)
+		return err
+	}
 	if b.ownPool {
 		if err := b.pool.Start(); err != nil {
 			b.setState(ctx, BrokerFailed, err)
@@ -278,10 +301,88 @@ func (b *Broker) Start(ctx context.Context) error {
 			b.otlpExporter.Run(b.ctx)
 		}()
 	}
+	startSucceeded = true
+	return nil
+}
+
+func (b *Broker) beginStart() (alreadyStarted bool, err error) {
+	b.lifecycleMu.Lock()
+	defer b.lifecycleMu.Unlock()
+	if b.lifecycleStopped || b.lifecycleStopping || b.State() == BrokerStopping || b.State() == BrokerStopped {
+		return false, ErrStopped
+	}
+	if b.lifecycleStarted {
+		return true, nil
+	}
+	if b.lifecycleStarting {
+		return false, ErrClosed
+	}
+	b.lifecycleStarting = true
+	return false, nil
+}
+
+func (b *Broker) endStart(succeeded bool) {
+	b.lifecycleMu.Lock()
+	b.lifecycleStarting = false
+	if succeeded {
+		b.lifecycleStarted = true
+	}
+	b.lifecycleMu.Unlock()
+}
+
+func (b *Broker) beginStop() (alreadyStopped bool, err error) {
+	b.lifecycleMu.Lock()
+	defer b.lifecycleMu.Unlock()
+	if b.lifecycleStopped || b.State() == BrokerStopped {
+		return true, nil
+	}
+	if b.lifecycleStarting || b.lifecycleStopping {
+		return false, ErrClosed
+	}
+	b.lifecycleStopping = true
+	return false, nil
+}
+
+func (b *Broker) endStop(succeeded bool) {
+	b.lifecycleMu.Lock()
+	b.lifecycleStopping = false
+	if succeeded {
+		b.lifecycleStopped = true
+	}
+	b.lifecycleMu.Unlock()
+}
+
+func (b *Broker) restorePersistedConsumers(ctx context.Context) error {
+	if b.stateStore == nil {
+		return nil
+	}
+	consumers, err := b.stateStore.ListConsumers(ctx)
+	if err != nil {
+		return fmt.Errorf("restore persisted consumers: %w", err)
+	}
+	for _, stored := range consumers {
+		if err := b.Consumers().RestoreContext(ctx, stored); err != nil {
+			return fmt.Errorf("restore consumer %q: %w", stored.ConsumerID, err)
+		}
+		if _, err := b.Consumers().SetStateContextWithPersist(ctx, stored.ConsumerID, ConsumerDisconnected, "broker restarted", func(info ConsumerInfo) error {
+			return b.persistConsumer(ctx, info)
+		}); err != nil {
+			return fmt.Errorf("mark restored consumer %q disconnected: %w", stored.ConsumerID, err)
+		}
+	}
 	return nil
 }
 
 func (b *Broker) Stop(ctx context.Context) error {
+	alreadyStopped, err := b.beginStop()
+	if err != nil {
+		return err
+	}
+	if alreadyStopped {
+		return nil
+	}
+	stopSucceeded := false
+	defer func() { b.endStop(stopSucceeded) }()
 	b.setState(ctx, BrokerStopping, nil)
 	b.cancel()
 	if b.healthMonitor != nil {
@@ -351,6 +452,7 @@ func (b *Broker) Stop(ctx context.Context) error {
 	}
 	b.notify.Close()
 	b.setState(ctx, BrokerStopped, nil)
+	stopSucceeded = true
 	return firstErr
 }
 
@@ -370,6 +472,7 @@ func (b *Broker) State() BrokerState {
 }
 func (b *Broker) Store() Store                          { return b.store }
 func (b *Broker) StateStore() StateStore                { return b.stateStore }
+func (b *Broker) MaxMessageSize() int                   { return b.cfg.MaxMessageSize }
 func (b *Broker) Router() *Router                       { return b.router }
 func (b *Broker) Notifications() *NotificationBus       { return b.notify }
 func (b *Broker) Cluster() *Cluster                     { return b.cluster }
@@ -464,11 +567,12 @@ func (b *Broker) sweepRemoteConsumers(now time.Time) {
 			continue
 		}
 		if !c.LastHeartbeat.IsZero() && now.Sub(c.LastHeartbeat) > b.cfg.RemoteConsumerTimeout {
-			info, ok := b.Consumers().SetState(c.ConsumerID, ConsumerDisconnected, "heartbeat timeout")
-			if !ok {
+			info, err := b.Consumers().SetStateContextWithPersist(b.ctx, c.ConsumerID, ConsumerDisconnected, "heartbeat timeout", func(info ConsumerInfo) error {
+				return b.persistConsumer(b.ctx, info)
+			})
+			if err != nil {
 				continue
 			}
-			b.persistConsumer(b.ctx, info)
 			if b.cfg.Hooks.OnConsumerStopped != nil {
 				b.cfg.Hooks.OnConsumerStopped(b.ctx, ConsumerEvent{Consumer: c.ConsumerID, Group: c.Group, State: ConsumerDisconnected, Time: now})
 			}
@@ -516,7 +620,9 @@ func (b *Broker) DeclareQueue(ctx context.Context, cfg QueueConfig) error {
 	}
 	err := b.store.DeclareQueue(ctx, cfg)
 	if err == nil && cfg.DLQ != "" {
-		_ = b.store.DeclareQueue(ctx, QueueConfig{Name: cfg.DLQ, VisibilityTimeout: cfg.VisibilityTimeout, RetryPolicy: cfg.RetryPolicy})
+		if dlqErr := b.store.DeclareQueue(ctx, QueueConfig{Name: cfg.DLQ, VisibilityTimeout: cfg.VisibilityTimeout, RetryPolicy: cfg.RetryPolicy}); dlqErr != nil {
+			return fmt.Errorf("declare queue dead-letter queue %q: %w", cfg.DLQ, dlqErr)
+		}
 	}
 	if err == nil {
 		b.noteQueueDepthLimit(cfg)
@@ -561,12 +667,22 @@ func (b *Broker) QueueMaxDepth(name string) int {
 // read back, replayed or backfilled, so topic retention grew with nothing able to
 // consume it.
 func (b *Broker) ListTopic(ctx context.Context, name string, limit int) ([]Message, error) {
+	if b.distributedPartitions != nil {
+		if messages, handled, err := b.distributedPartitions.listPartitionedTopic(ctx, name, limit); handled || err != nil {
+			return messages, err
+		}
+	}
 	return b.store.ListTopic(ctx, name, limit)
 }
 
 // ReadTopic returns retained topic messages published after afterID, so a reader can
 // resume from where it stopped instead of restarting from the oldest message.
 func (b *Broker) ReadTopic(ctx context.Context, name, afterID string, limit int) ([]Message, error) {
+	if b.distributedPartitions != nil {
+		if messages, handled, err := b.distributedPartitions.readPartitionedTopic(ctx, name, afterID, limit); handled || err != nil {
+			return messages, err
+		}
+	}
 	return b.store.ReadTopic(ctx, name, afterID, limit)
 }
 
@@ -578,6 +694,9 @@ func (b *Broker) DeclareStream(ctx context.Context, cfg StreamConfig) error {
 }
 
 func (b *Broker) PauseQueue(ctx context.Context, name string) error {
+	if err := b.rejectPartitionedQueueOperation(ctx, name, "pause"); err != nil {
+		return err
+	}
 	err := b.store.PauseQueue(ctx, name)
 	if err == nil {
 		b.notify.Publish(Notification{Type: "queue.paused", Source: b.cfg.Name, Severity: SeverityInfo, Queue: name, Timestamp: time.Now()})
@@ -586,6 +705,9 @@ func (b *Broker) PauseQueue(ctx context.Context, name string) error {
 }
 
 func (b *Broker) ResumeQueue(ctx context.Context, name string) error {
+	if err := b.rejectPartitionedQueueOperation(ctx, name, "resume"); err != nil {
+		return err
+	}
 	err := b.store.ResumeQueue(ctx, name)
 	if err == nil {
 		b.notify.Publish(Notification{Type: "queue.resumed", Source: b.cfg.Name, Severity: SeverityInfo, Queue: name, Timestamp: time.Now()})
@@ -594,6 +716,9 @@ func (b *Broker) ResumeQueue(ctx context.Context, name string) error {
 }
 
 func (b *Broker) PurgeQueue(ctx context.Context, name string) (int, error) {
+	if err := b.rejectPartitionedQueueOperation(ctx, name, "purge"); err != nil {
+		return 0, err
+	}
 	n, err := b.store.PurgeQueue(ctx, name)
 	if err == nil {
 		b.notify.Publish(Notification{Type: "queue.purged", Source: b.cfg.Name, Severity: SeverityWarn, Queue: name, Timestamp: time.Now(), Data: map[string]any{"purged": n}})
@@ -601,11 +726,101 @@ func (b *Broker) PurgeQueue(ctx context.Context, name string) (int, error) {
 	return n, err
 }
 
+func (b *Broker) rejectPartitionedQueueOperation(ctx context.Context, queue, operation string) error {
+	if b.distributedPartitions == nil {
+		return nil
+	}
+	assigned, err := b.distributedPartitions.hasResourcePartitions(ctx, cluster.PartitionResourceQueue, queue)
+	if err != nil {
+		return err
+	}
+	if assigned {
+		return fmt.Errorf("%w: %s on partitioned queue %q requires a partition-specific operation", ErrUnsupportedMode, operation, queue)
+	}
+	return nil
+}
+
+func (b *Broker) ListPartitionQueue(ctx context.Context, queue string, partition, limit int) ([]Message, error) {
+	if b.distributedPartitions == nil {
+		return nil, ErrUnsupportedMode
+	}
+	return b.distributedPartitions.ListPartitionQueue(ctx, queue, partition, limit)
+}
+
+// ListAssignedQueue returns a bounded best-effort sample across assigned
+// partitions. Per-partition successes and failures are included in the result.
+func (b *Broker) ListAssignedQueue(ctx context.Context, queue string, limit int) (*AssignedQueueMessages, error) {
+	if b.distributedPartitions == nil {
+		return nil, ErrUnsupportedMode
+	}
+	return b.distributedPartitions.ListAssignedQueue(ctx, queue, limit)
+}
+
+// ApplyAssignedQueueControl applies pause, resume, and purge through the
+// durable multi-partition transaction coordinator.
+func (b *Broker) ApplyAssignedQueueControl(ctx context.Context, queue, action string) (*QueuePartitionOperationResult, error) {
+	if b.distributedPartitions == nil {
+		return nil, ErrUnsupportedMode
+	}
+	return b.distributedPartitions.ApplyAssignedQueueControl(ctx, queue, action)
+}
+
+func (b *Broker) PausePartitionQueue(ctx context.Context, queue string, partition int) error {
+	if b.distributedPartitions == nil {
+		return ErrUnsupportedMode
+	}
+	return b.distributedPartitions.PausePartitionQueue(ctx, queue, partition)
+}
+
+func (b *Broker) ResumePartitionQueue(ctx context.Context, queue string, partition int) error {
+	if b.distributedPartitions == nil {
+		return ErrUnsupportedMode
+	}
+	return b.distributedPartitions.ResumePartitionQueue(ctx, queue, partition)
+}
+
+func (b *Broker) PurgePartitionQueue(ctx context.Context, queue string, partition int) (int, error) {
+	if b.distributedPartitions == nil {
+		return 0, ErrUnsupportedMode
+	}
+	return b.distributedPartitions.PurgePartitionQueue(ctx, queue, partition)
+}
+
 func (b *Broker) ReadStream(ctx context.Context, req StreamReadRequest) ([]Message, error) {
+	if b.distributedPartitions != nil {
+		if messages, handled, err := b.distributedPartitions.readPartitionedStream(ctx, req); handled || err != nil {
+			return messages, err
+		}
+	}
 	return b.store.ReadStream(ctx, req)
 }
 
+func (b *Broker) rejectPartitionedStreamOffsetOperation(ctx context.Context, stream, operation string) error {
+	if b.distributedPartitions == nil {
+		return nil
+	}
+	assigned, err := b.distributedPartitions.hasResourcePartitions(ctx, cluster.PartitionResourceStream, stream)
+	if err != nil {
+		return err
+	}
+	if assigned {
+		return fmt.Errorf("%w: %s on partitioned stream %q requires per-partition offset support", ErrUnsupportedMode, operation, stream)
+	}
+	return nil
+}
+
 func (b *Broker) CommitOffset(ctx context.Context, commit OffsetCommit) error {
+	if commit.Partitioned && commit.Partition < 0 {
+		return errf(ErrInvalidMessage, "stream partition must be non-negative")
+	}
+	if commit.Partitioned && b.distributedPartitions == nil {
+		return fmt.Errorf("%w: partition-scoped offsets require distributed stream partitions", ErrUnsupportedMode)
+	}
+	if !commit.Partitioned {
+		if err := b.rejectPartitionedStreamOffsetOperation(ctx, commit.Stream, "offset commit"); err != nil {
+			return err
+		}
+	}
 	tenant, err := resolveTenant(ctx, commit.TenantID)
 	if err != nil {
 		return err
@@ -628,17 +843,138 @@ func (b *Broker) CommitOffset(ctx context.Context, commit OffsetCommit) error {
 // retry resolves full messages while they remain in the store; after message
 // cleanup, it returns the retained message metadata.
 func (b *Broker) CommitOffsetAndAppend(ctx context.Context, commit OffsetCommit, entries []AppendEntry) ([]Message, error) {
+	if b.State() == BrokerPaused {
+		return nil, ErrPaused
+	}
+	if commit.Partitioned && commit.Partition < 0 {
+		return nil, errf(ErrInvalidMessage, "stream partition must be non-negative")
+	}
+	if commit.Partitioned && b.distributedPartitions == nil {
+		return nil, fmt.Errorf("%w: partition-scoped offsets require distributed stream partitions", ErrUnsupportedMode)
+	}
+	if !commit.Partitioned {
+		if err := b.rejectPartitionedStreamOffsetOperation(ctx, commit.Stream, "offset-plus-append transaction"); err != nil {
+			return nil, err
+		}
+	}
+	var distributedPlan distributedOffsetAppendPlan
 	tenant, err := resolveTenant(ctx, commit.TenantID)
 	if err != nil {
 		return nil, err
 	}
 	commit.TenantID = tenant
+	preparedEntries := make([]AppendEntry, len(entries))
+	for i, entry := range entries {
+		if entry.Message.TenantID == "" {
+			entry.Message.TenantID = tenant
+		}
+		entryTenant, tenantErr := resolveTenant(ctx, entry.Message.TenantID)
+		if tenantErr != nil {
+			return nil, tenantErr
+		}
+		entry.Message.TenantID = entryTenant
+		destinations := entry.Destinations
+		if len(destinations) == 0 {
+			switch {
+			case entry.Message.Queue != "":
+				destinations = []Destination{{Kind: DestinationQueue, Name: entry.Message.Queue}}
+			case entry.Message.Stream != "":
+				destinations = []Destination{{Kind: DestinationStream, Name: entry.Message.Stream}}
+			case entry.Message.Topic != "":
+				destinations = []Destination{{Kind: DestinationTopic, Name: entry.Message.Topic}}
+			}
+		}
+		entry.Destinations = destinations
+		preparedEntries[i] = entry
+	}
+	var requestFingerprint string
+	commit, preparedEntries, requestFingerprint, err = prepareOffsetAppendRequest(ctx, commit, preparedEntries)
+	if err != nil {
+		return nil, err
+	}
+	if b.distributedPartitions != nil && commit.Partitioned && commit.TransactionID != "" {
+		cached, found, err := b.distributedPartitions.lookupPartitionOffsetAppendOutcome(ctx, commit, requestFingerprint)
+		if err != nil {
+			return nil, err
+		}
+		if found {
+			b.notify.Publish(Notification{Type: "stream.offset_committed", Source: b.cfg.Name, Severity: SeverityInfo, Stream: commit.Stream, TenantID: tenant, Timestamp: time.Now(), Data: map[string]any{"group": commit.ConsumerGroup, "offset": commit.Offset}})
+			return cached.Messages, nil
+		}
+	}
+	if b.distributedPartitions != nil {
+		distributedPlan, err = b.distributedPartitions.planOffsetAppendTransaction(ctx, commit, preparedEntries)
+		if err != nil {
+			return nil, err
+		}
+		if distributedPlan.multiPartition {
+			if !commit.Partitioned || commit.TransactionID == "" {
+				return nil, fmt.Errorf("%w: multi-partition offset-plus-append requires a partitioned checkpoint and transaction ID", ErrInvalidMessage)
+			}
+		} else {
+			for _, entry := range preparedEntries {
+				for _, destination := range entry.Destinations {
+					var kind cluster.PartitionResourceKind
+					switch destination.Kind {
+					case DestinationTopic:
+						kind = cluster.PartitionResourceTopic
+					case DestinationStream, DestinationArchive:
+						kind = cluster.PartitionResourceStream
+					case DestinationQueue, DestinationDLQ:
+						kind = cluster.PartitionResourceQueue
+					default:
+						continue
+					}
+					assigned, err := b.distributedPartitions.hasResourcePartitions(ctx, kind, destination.Name)
+					if err != nil {
+						return nil, err
+					}
+					if assigned && !(commit.Partitioned && kind == cluster.PartitionResourceStream && destination.Name == commit.Stream) {
+						return nil, fmt.Errorf("%w: offset-plus-append transaction spans an assigned partition resource", ErrUnsupportedMode)
+					}
+				}
+			}
+		}
+	}
 	store, ok := b.store.(OffsetAppendStore)
 	if !ok {
 		return nil, ErrUnsupportedMode
 	}
 	publisher := &Publisher{b: b}
-	stored, err := store.CommitOffsetAndAppend(ctx, commit, entries)
+	tenantCounts := make(map[string]int)
+	tenantDestinations := make(map[string][]Destination)
+	for _, entry := range preparedEntries {
+		if len(entry.Message.Payload) > b.cfg.MaxMessageSize {
+			return nil, ErrMessageTooLarge
+		}
+		if b.cfg.SchemaRegistry != nil {
+			if err := b.cfg.SchemaRegistry.Validate(ctx, entry.Message); err != nil {
+				return nil, err
+			}
+		}
+		if err := publisher.checkBackpressure(ctx, preparedPublish{msg: entry.Message, dests: entry.Destinations}); err != nil {
+			return nil, err
+		}
+		tenantCounts[entry.Message.TenantID]++
+		tenantDestinations[entry.Message.TenantID] = append(tenantDestinations[entry.Message.TenantID], entry.Destinations...)
+	}
+	if b.tenantMgr != nil {
+		for entryTenant, count := range tenantCounts {
+			if err := b.tenantMgr.CheckPublishBatchQuota(ctx, entryTenant, tenantDestinations[entryTenant], count); err != nil {
+				return nil, err
+			}
+		}
+	}
+	if distributedPlan.multiPartition {
+		stored, err := b.distributedPartitions.commitDistributedOffsetAppend(ctx, commit, preparedEntries, distributedPlan)
+		if err != nil {
+			publisher.recordBackpressureError(err, uint64(len(entries)))
+			return nil, err
+		}
+		b.notify.Publish(Notification{Type: "stream.offset_committed", Source: b.cfg.Name, Severity: SeverityInfo, Stream: commit.Stream, TenantID: tenant, Timestamp: time.Now(), Data: map[string]any{"group": commit.ConsumerGroup, "offset": commit.Offset}})
+		return stored, nil
+	}
+	stored, err := store.CommitOffsetAndAppend(ctx, commit, preparedEntries)
 	if err != nil {
 		publisher.recordBackpressureError(err, uint64(len(entries)))
 		return nil, err
@@ -648,11 +984,25 @@ func (b *Broker) CommitOffsetAndAppend(ctx context.Context, commit OffsetCommit,
 }
 
 func (b *Broker) ConsumerOffset(ctx context.Context, commit OffsetCommit) (uint64, error) {
+	if commit.Partitioned && commit.Partition < 0 {
+		return 0, errf(ErrInvalidMessage, "stream partition must be non-negative")
+	}
+	if commit.Partitioned && b.distributedPartitions == nil {
+		return 0, fmt.Errorf("%w: partition-scoped offsets require distributed stream partitions", ErrUnsupportedMode)
+	}
+	if !commit.Partitioned {
+		if err := b.rejectPartitionedStreamOffsetOperation(ctx, commit.Stream, "consumer offset lookup"); err != nil {
+			return 0, err
+		}
+	}
 	return b.store.ConsumerOffset(ctx, commit)
 }
 
 // StreamLag returns the consumer lag (messages behind) for a given stream and consumer group.
 func (b *Broker) StreamLag(ctx context.Context, stream, consumerGroup string) (uint64, error) {
+	if err := b.rejectPartitionedStreamOffsetOperation(ctx, stream, "stream lag lookup"); err != nil {
+		return 0, err
+	}
 	if store, ok := b.store.(streamLagStore); ok {
 		return store.StreamLagContext(ctx, stream, consumerGroup, "")
 	}
@@ -661,6 +1011,9 @@ func (b *Broker) StreamLag(ctx context.Context, stream, consumerGroup string) (u
 
 // StreamLagAll returns consumer lag for all consumer groups on a stream.
 func (b *Broker) StreamLagAll(ctx context.Context, stream string) (map[string]uint64, error) {
+	if err := b.rejectPartitionedStreamOffsetOperation(ctx, stream, "stream lag lookup"); err != nil {
+		return nil, err
+	}
 	if store, ok := b.store.(streamLagStore); ok {
 		return store.StreamLagAllContext(ctx, stream, "")
 	}
@@ -669,6 +1022,9 @@ func (b *Broker) StreamLagAll(ctx context.Context, stream string) (map[string]ui
 
 // StreamHeadOffset returns the latest offset for a stream.
 func (b *Broker) StreamHeadOffset(ctx context.Context, stream string) (uint64, error) {
+	if err := b.rejectPartitionedStreamOffsetOperation(ctx, stream, "stream head offset lookup"); err != nil {
+		return 0, err
+	}
 	if store, ok := b.store.(streamLagStore); ok {
 		return store.StreamHeadOffsetContext(ctx, stream, "")
 	}
@@ -686,6 +1042,22 @@ type StreamConsumerLag struct {
 	Stream      string            `json:"stream"`
 	HeadOffset  uint64            `json:"head_offset"`
 	ConsumerLag map[string]uint64 `json:"consumer_lag"`
+}
+
+type PartitionStreamLag struct {
+	Stream          string `json:"stream"`
+	Partition       int    `json:"partition"`
+	ConsumerGroup   string `json:"consumer_group"`
+	HeadOffset      uint64 `json:"head_offset"`
+	CommittedOffset uint64 `json:"committed_offset"`
+	Lag             uint64 `json:"lag"`
+}
+
+func (b *Broker) PartitionStreamLag(ctx context.Context, stream string, partition int, consumerGroup string) (PartitionStreamLag, error) {
+	if b.distributedPartitions == nil {
+		return PartitionStreamLag{}, ErrUnsupportedMode
+	}
+	return b.distributedPartitions.PartitionStreamLag(ctx, stream, partition, consumerGroup)
 }
 
 // StreamLagReport returns a full lag report for a stream.

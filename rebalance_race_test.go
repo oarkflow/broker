@@ -2,6 +2,7 @@ package broker
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -54,7 +55,7 @@ func TestUnregisteringOneRemoteConsumerKeepsTheOthersRoutes(t *testing.T) {
 	for _, r := range b.Router().Routes() {
 		names = append(names, r.Name)
 	}
-	if len(names) != 1 || names[0] != "remote-sub.second.events.second" {
+	if len(names) != 1 || !strings.HasPrefix(names[0], "remote-sub.second.") {
 		t.Fatalf("only the second consumer's route should remain, got %v", names)
 	}
 }

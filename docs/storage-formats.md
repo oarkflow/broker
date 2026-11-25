@@ -60,6 +60,14 @@ Rotation, retention, and compaction:
   segment files it just pruned. If the process is killed in between, the
   pruned files become harmless, manifest-unreferenced orphans; the next open
   of the store removes them automatically.
+- Applications can set `SegmentedWALConfig.SegmentArchiver` to stream each
+  pruned segment to a cold-storage implementation before the manifest is
+  changed. If archival fails, compaction leaves the old manifest and segment
+  files intact. A crash after archive success but before manifest update can
+  cause the same segment to be archived again, so archive writes should be
+  idempotent by `SegmentMeta.Filename`. Segment bytes are archived as stored
+  (including WAL encryption when configured); the sparse index is regenerated
+  as needed and is not archived.
 - A segment referenced by the manifest with no file on disk is treated as a
   hard failure on open (`ErrStorageUnavailable`), not silently skipped — by
   construction this should only happen from external deletion or filesystem
@@ -78,18 +86,56 @@ go run ./broker-wal -dir ../data
 ```
 
 This reports per-segment record/byte counts and any problems (missing files,
-invalid magic, corrupt records) without modifying anything. Unlike BWL1, a
+invalid magic, corrupt records, and the referenced checkpoint's encryption,
+JSON, and required snapshot structure) without modifying anything. Unlike BWL1, a
 BWL2 store self-heals a torn tail in its own active segment automatically the
 next time it is opened, so there is no separate `-repair-tail` for BWL2.
 
-Not yet implemented: encryption-key rotation (BWL2 inherits the WAL codec's
-single configured key, same as BWL1), and an operator tool to quarantine a
-single corrupted closed segment and resume from a known-good checkpoint
-instead of failing the whole store closed.
+When a WAL encryption key is configured, compaction checkpoints are also
+AES-GCM encrypted and authenticated. Legacy plaintext checkpoints are accepted
+for recovery and atomically rewritten with encryption during store open.
+Missing, unreadable, undecryptable, or malformed checkpoints referenced by the
+manifest fail store open closed rather than silently dropping the checkpoint
+and replaying only the retained tail. Sparse indexes and the manifest contain
+offset and topology metadata, not message payloads.
+
+For BWL1 key rotation, stop `brokerd`, then run `broker-wal -path <wal-file>
+-rotate-key -encryption-key <new-hex-key> -decryption-keys <old-hex-key>[,...]`.
+For a plaintext BWL1 file, omit `-decryption-keys` to enable encryption. The
+tool verifies the source, rewrites each record with the new key, verifies the
+replacement, writes a synced `.key-rotation-*.bak`, then atomically replaces
+the source file. It also converts legacy framed records to native BWL1 records.
+The backup remains encrypted or plaintext as the original was, so retain its
+old keys if you may need to restore it.
+
+For BWL2 key rotation, stop `brokerd`, then run `broker-wal -dir <store-dir>
+-rotate-key -encryption-key <new-hex-key> -decryption-keys <old-hex-key>[,...]`.
+The new key is the primary encryption key; the bounded decryption keyring (up
+to 16 previous keys) lets recovery read existing records and checkpoints. The
+tool opens and replays the store, writes an encrypted checkpoint and a fresh
+active segment with the new primary key, persists that manifest, then removes
+older segments. If the command succeeds, the old keys are no longer needed for
+that store. In a clustered deployment, stop every broker and rotate each BWL2
+directory separately, including the broker WAL and every local partition WAL
+directory under `-cluster-partition-wal`. For the partition-WAL root, add
+`-recursive` to discover and rotate each child directory containing a
+`manifest.json`; rotate the broker WAL separately. If a recursive run stops
+partway, keep both keys configured and rerun it to finish the remaining stores.
+Each rotated directory is verified again with only the new key before it is
+reported complete.
+Remove old keys from configuration only after every store that may contain data
+encrypted with them has been rotated. Keep the old keys until the last rotation
+completes and retain backups before rotating.
+`brokerd` accepts the same previous-key list through
+`BROKER_WAL_DECRYPTION_KEYS` (new writes use `BROKER_FRAME_ENCRYPTION_KEY`).
+
+An operator tool to quarantine a single corrupted closed segment and resume
+from a known-good checkpoint is still not implemented; recovery fails the
+whole store closed in that case.
 
 ## BST2
 
-BST2 remains reserved for a future authenticated, version-negotiated native
-stream protocol. No implementation may advertise or emit BST2 until its format
-and conformance tests are committed. BST1 remains the implemented native stream
-format described in `native-protocols.md`.
+BST2 is currently used only as the native stream handshake envelope for
+version negotiation. The selected data-frame format remains BST1 version 1;
+there is no BST2 frame codec or conformance certification yet. See
+`native-protocols.md` for the negotiated handshake and legacy-client behavior.

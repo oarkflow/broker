@@ -4,10 +4,69 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
 )
+
+func TestBinaryWALKeyRotationPreservesBackupAndRecords(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	oldKey := []byte("old-bwl1-test-key-material-0000001")
+	newKey := []byte("new-bwl1-test-key-material-0000002")
+	oldCodec, err := NewWALRecordCodec(WALCodecConfig{EncryptionKey: oldKey})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := NewBinaryFileWALStoreWithWALCodec(dir, NewBinaryMessageCodec(), oldCodec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DeclareQueue(ctx, QueueConfig{Name: "key-rotation-q"}); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 5; i++ {
+		id := fmt.Sprintf("bwl1-key-rotation-%d", i)
+		if _, err := store.Append(ctx, Message{ID: id, Payload: []byte(id)}, []Destination{{Kind: DestinationQueue, Name: "key-rotation-q"}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	newCodec, err := NewWALRecordCodec(WALCodecConfig{EncryptionKey: newKey, DecryptionKeys: [][]byte{oldKey}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "broker.wal.fwb")
+	report, backup, err := RotateBinaryWALEncryptionKey(path, oldCodec, newCodec, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !report.Valid() || report.Records < 6 {
+		t.Fatalf("rotated BWL1 report = %+v", report)
+	}
+	if info, err := os.Stat(backup); err != nil || !info.Mode().IsRegular() {
+		t.Fatalf("rotation backup %q: info=%v err=%v", backup, info, err)
+	}
+	verified, err := VerifyBinaryWAL(path, newCodec, nil)
+	if err != nil || !verified.Valid() || verified.Records != report.Records {
+		t.Fatalf("verify rotated BWL1 WAL: report=%+v err=%v", verified, err)
+	}
+	recovered, err := NewBinaryFileWALStoreWithWALCodec(dir, NewBinaryMessageCodec(), newCodec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer recovered.Close()
+	for i := 0; i < 5; i++ {
+		id := fmt.Sprintf("bwl1-key-rotation-%d", i)
+		message, found, err := recovered.Get(ctx, id)
+		if err != nil || !found || string(message.Payload) != id {
+			t.Fatalf("recovered %q: message=%+v found=%t err=%v", id, message, found, err)
+		}
+	}
+}
 
 func TestVerifyAndRepairBinaryWALTailPreservesOriginal(t *testing.T) {
 	dir := t.TempDir()

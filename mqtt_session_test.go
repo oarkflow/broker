@@ -39,7 +39,7 @@ func encodeSubscribePayload(packetID uint16, topic string, qos byte) []byte {
 }
 
 func TestMQTTPersistentSessionLifecycle(t *testing.T) {
-	b := MustNew(Config{Store: NewMemoryStore()})
+	b := MustNew(Config{Store: NewMemoryStore(), StateStore: NewMemoryStateStore()})
 	if err := b.Start(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -49,7 +49,7 @@ func TestMQTTPersistentSessionLifecycle(t *testing.T) {
 
 	// 1. Initial connect with CleanSession = false -> SessionPresent should be false (0x00)
 	conn1 := &mqttBufferConn{}
-	mc1 := &mqttConn{conn: conn1, incomingQoS2: make(map[uint16]mqttPendingPublish)}
+	mc1 := &mqttConn{conn: conn1, incomingQoS2: make(map[uint16]mqttPendingPublish), closed: make(chan struct{})}
 	payload1 := encodeConnectPayload("client-p1", false)
 	if !server.handleConnect(mc1, payload1) {
 		t.Fatal("handleConnect failed on conn1")
@@ -69,8 +69,9 @@ func TestMQTTPersistentSessionLifecycle(t *testing.T) {
 	}
 
 	// Check server session state
+	sessionKey := mqttSessionKey("anonymous", "client-p1")
 	server.sessionsMu.Lock()
-	sess, ok := server.sessions["client-p1"]
+	sess, ok := server.sessions[sessionKey]
 	server.sessionsMu.Unlock()
 	if !ok || sess.Subscriptions["sensors/temp"] != 1 {
 		t.Fatalf("session not properly saved in server: %+v", sess)
@@ -78,7 +79,10 @@ func TestMQTTPersistentSessionLifecycle(t *testing.T) {
 
 	// 3. Reconnect with CleanSession = false -> SessionPresent should be true (0x01)
 	conn2 := &mqttBufferConn{}
-	mc2 := &mqttConn{conn: conn2, incomingQoS2: make(map[uint16]mqttPendingPublish)}
+	// Model the old connection's completed teardown before reconnecting; the
+	// server waits for connection cleanup before replacing a live client ID.
+	mc1.signalClosed()
+	mc2 := &mqttConn{conn: conn2, incomingQoS2: make(map[uint16]mqttPendingPublish), closed: make(chan struct{})}
 	payload2 := encodeConnectPayload("client-p1", false)
 	if !server.handleConnect(mc2, payload2) {
 		t.Fatal("handleConnect failed on conn2")
@@ -96,7 +100,8 @@ func TestMQTTPersistentSessionLifecycle(t *testing.T) {
 
 	// 4. Connect with CleanSession = true -> SessionPresent should be false (0x00) and session wiped
 	conn3 := &mqttBufferConn{}
-	mc3 := &mqttConn{conn: conn3, incomingQoS2: make(map[uint16]mqttPendingPublish)}
+	mc2.signalClosed()
+	mc3 := &mqttConn{conn: conn3, incomingQoS2: make(map[uint16]mqttPendingPublish), closed: make(chan struct{})}
 	payload3 := encodeConnectPayload("client-p1", true)
 	if !server.handleConnect(mc3, payload3) {
 		t.Fatal("handleConnect failed on conn3")
@@ -108,7 +113,7 @@ func TestMQTTPersistentSessionLifecycle(t *testing.T) {
 	}
 
 	server.sessionsMu.Lock()
-	_, ok = server.sessions["client-p1"]
+	_, ok = server.sessions[sessionKey]
 	server.sessionsMu.Unlock()
 	if ok {
 		t.Fatal("session was not deleted on CleanSession=true")

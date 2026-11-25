@@ -92,13 +92,11 @@ func (w *Worker) HandleTopic(t string, h Handler) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.topicHandlers[t] = h
-	w.pollQueues["sub."+w.client.cfg.ConsumerID+"."+sanitize(t)] = struct{}{}
 }
 func (w *Worker) HandlePattern(p string, h Handler) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.patternHandlers[p] = h
-	w.pollQueues["sub."+w.client.cfg.ConsumerID+"."+sanitize(p)] = struct{}{}
 }
 func (w *Worker) HandleTask(n string, h TaskHandler) { w.HandleTaskQueue(n, "", h) }
 func (w *Worker) HandleTaskQueue(n, queue string, h TaskHandler) {
@@ -145,22 +143,34 @@ func (w *Worker) Run(ctx context.Context) error {
 		return err
 	}
 	for _, q := range queues {
-		_, _ = w.client.Subscribe(ctx, broker.RemoteSubscription{Type: "queue", Name: q, Queue: q, AutoCreate: true})
+		if _, err := w.client.Subscribe(ctx, broker.RemoteSubscription{Type: "queue", Name: q, Queue: q, AutoCreate: true}); err != nil {
+			return fmt.Errorf("subscribe consumer to queue %q: %w", q, err)
+		}
 	}
 	for _, t := range topics {
-		_, _ = w.client.Subscribe(ctx, broker.RemoteSubscription{Type: "topic", Name: t, AutoCreate: true})
+		if err := w.subscribeAndPoll(ctx, broker.RemoteSubscription{Type: "topic", Name: t, AutoCreate: true}); err != nil {
+			return fmt.Errorf("subscribe consumer to topic %q: %w", t, err)
+		}
 	}
 	for _, p := range patterns {
-		_, _ = w.client.Subscribe(ctx, broker.RemoteSubscription{Type: "pattern", Name: p, Pattern: p, AutoCreate: true})
+		if err := w.subscribeAndPoll(ctx, broker.RemoteSubscription{Type: "pattern", Name: p, Pattern: p, AutoCreate: true}); err != nil {
+			return fmt.Errorf("subscribe consumer to pattern %q: %w", p, err)
+		}
 	}
 	for _, t := range tasks {
-		_, _ = w.client.Subscribe(ctx, broker.RemoteSubscription{Type: "task", Name: t, Queue: firstNonEmpty(taskQueues[t], "tasks."+t), AutoCreate: true})
+		if _, err := w.client.Subscribe(ctx, broker.RemoteSubscription{Type: "task", Name: t, Queue: firstNonEmpty(taskQueues[t], "tasks."+t), AutoCreate: true}); err != nil {
+			return fmt.Errorf("subscribe consumer to task %q: %w", t, err)
+		}
 	}
 	for _, r := range requests {
-		_, _ = w.client.Subscribe(ctx, broker.RemoteSubscription{Type: "request", Name: r, Queue: firstNonEmpty(requestQueues[r], "request."+sanitize(r)), AutoCreate: true})
+		if _, err := w.client.Subscribe(ctx, broker.RemoteSubscription{Type: "request", Name: r, Queue: firstNonEmpty(requestQueues[r], "request."+sanitize(r)), AutoCreate: true}); err != nil {
+			return fmt.Errorf("subscribe consumer to request %q: %w", r, err)
+		}
 	}
 	for _, c := range commands {
-		_, _ = w.client.Subscribe(ctx, broker.RemoteSubscription{Type: "command", Name: c, Queue: firstNonEmpty(commandQueues[c], "command."+sanitize(c)), AutoCreate: true})
+		if _, err := w.client.Subscribe(ctx, broker.RemoteSubscription{Type: "command", Name: c, Queue: firstNonEmpty(commandQueues[c], "command."+sanitize(c)), AutoCreate: true}); err != nil {
+			return fmt.Errorf("subscribe consumer to command %q: %w", c, err)
+		}
 	}
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -189,6 +199,27 @@ func (w *Worker) Run(ctx context.Context) error {
 	}
 	return ctx.Err()
 }
+
+func (w *Worker) subscribeAndPoll(ctx context.Context, requested broker.RemoteSubscription) error {
+	info, err := w.client.Subscribe(ctx, requested)
+	if err != nil {
+		return err
+	}
+	return w.addSubscriptionPollQueue(info, requested)
+}
+
+func (w *Worker) addSubscriptionPollQueue(info broker.ConsumerInfo, requested broker.RemoteSubscription) error {
+	for _, subscription := range info.Subscriptions {
+		if subscription.Type == requested.Type && subscription.Name == requested.Name && subscription.Queue != "" {
+			w.mu.Lock()
+			w.pollQueues[subscription.Queue] = struct{}{}
+			w.mu.Unlock()
+			return nil
+		}
+	}
+	return fmt.Errorf("broker returned no queue for %s subscription %q", requested.Type, requested.Name)
+}
+
 func (w *Worker) heartbeatLoop(ctx context.Context) {
 	t := time.NewTicker(w.client.cfg.HeartbeatInterval)
 	defer t.Stop()

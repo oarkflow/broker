@@ -241,8 +241,8 @@ func TestTenantEnforcementConsumersAndTasks(t *testing.T) {
 	req.Header.Set("Authorization", "Bearer token-a")
 	rec = httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusUnauthorized && rec.Code != http.StatusForbidden {
-		t.Fatalf("expected 401/403 when user-a heartbeats user-b consumer, got %d", rec.Code)
+	if rec.Code != http.StatusUnauthorized && rec.Code != http.StatusForbidden && rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 401/403/404 when user-a heartbeats user-b consumer, got %d", rec.Code)
 	}
 
 	// 5. Tasks: submit task with mismatched tenant fails

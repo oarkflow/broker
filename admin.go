@@ -5,20 +5,26 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
+	"github.com/oarkflow/broker/cluster"
 	"github.com/oarkflow/broker/console"
 )
 
 type AdminServer struct {
-	Broker *Broker
+	Broker      *Broker
+	Distributed *DistributedBroker
 
 	// Token is a convenience single-token credential with admin:* access.
 	// For production, prefer ACL with named tokens and narrow permissions.
@@ -75,6 +81,30 @@ func (a AdminServer) Handler() http.Handler {
 	mux.HandleFunc("/events", a.wrap(a.events))
 	mux.HandleFunc("/routes", a.wrap(a.routes))
 	mux.HandleFunc("/cluster/status", a.wrap(a.clusterStatus))
+	mux.HandleFunc("/cluster/upgrade-plan", a.wrap(a.clusterUpgradePlan))
+	mux.HandleFunc(internalPlacementSignalsPath, a.wrap(a.internalPlacementSignals))
+	mux.HandleFunc(internalPartitionProposalPath, a.wrap(a.internalPartitionPropose))
+	mux.HandleFunc(internalPartitionPreparePath, a.wrap(a.internalPartitionPrepare))
+	mux.HandleFunc(internalPartitionOutcomePath, a.wrap(a.internalPartitionOutcome))
+	mux.HandleFunc(internalPartitionStagedPath, a.wrap(a.internalPartitionStaged))
+	mux.HandleFunc(internalPartitionResultPath, a.wrap(a.internalPartitionResult))
+	mux.HandleFunc(internalPartitionPurgeResultPath, a.wrap(a.internalPartitionPurgeResult))
+	mux.HandleFunc(internalPartitionLagPath, a.wrap(a.internalPartitionLag))
+	mux.HandleFunc(internalPartitionQueueListPath, a.wrap(a.internalPartitionQueueList))
+	mux.HandleFunc(internalPartitionQueueControlPath, a.wrap(a.internalPartitionQueueControl))
+	mux.HandleFunc("/cluster/transactions", a.wrap(a.clusterTransaction))
+	mux.HandleFunc("/cluster/transactions/prune", a.wrap(a.clusterTransaction))
+	mux.HandleFunc("/cluster/leadership", a.wrap(a.clusterLeadership))
+	mux.HandleFunc("/cluster/nodes", a.wrap(a.clusterNodes))
+	mux.HandleFunc("/cluster/nodes/", a.wrap(a.clusterNode))
+	mux.HandleFunc("/cluster/metadata/nodes", a.wrap(a.clusterMetadataNodes))
+	mux.HandleFunc("/cluster/metadata/nodes/", a.wrap(a.clusterMetadataNode))
+	mux.HandleFunc("/cluster/metadata/schemas", a.wrap(a.clusterMetadataSchemas))
+	mux.HandleFunc("/cluster/metadata/schemas/", a.wrap(a.clusterMetadataSchema))
+	mux.HandleFunc("/cluster/metadata/acls", a.wrap(a.clusterMetadataACLs))
+	mux.HandleFunc("/cluster/metadata/acls/", a.wrap(a.clusterMetadataACL))
+	mux.HandleFunc("/cluster/partitions", a.wrap(a.clusterPartitions))
+	mux.HandleFunc("/cluster/partitions/", a.wrap(a.clusterPartition))
 	// The console is mounted behind wrap, so it requires the same bearer token and
 	// passes the same ACL checks as every other admin route. It is a static app and
 	// reads no broker state server-side; all data is fetched by the browser from the
@@ -138,13 +168,17 @@ func (a AdminServer) HTTPServer(addr string) *http.Server {
 	if a.TLSCertFile != "" || a.TLSKeyFile != "" || a.ClientCAFile != "" || a.RequireClientCert {
 		srv.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12}
 		if a.ClientCAFile != "" {
+			// Keep a non-nil, empty pool on load/parse errors. A nil ClientCAs
+			// can select system roots for client-certificate verification, which
+			// would silently broaden trust after a misconfiguration.
+			pool := x509.NewCertPool()
 			pem, err := os.ReadFile(a.ClientCAFile)
-			if err == nil {
-				pool := x509.NewCertPool()
-				if pool.AppendCertsFromPEM(pem) {
-					srv.TLSConfig.ClientCAs = pool
-				}
+			if err != nil {
+				log.Printf("[http] unable to read client CA file %q; client certificate verification will reject all clients: %v", a.ClientCAFile, err)
+			} else if !pool.AppendCertsFromPEM(pem) {
+				log.Printf("[http] client CA file %q contains no valid certificates; client certificate verification will reject all clients", a.ClientCAFile)
 			}
+			srv.TLSConfig.ClientCAs = pool
 		}
 		if a.RequireClientCert {
 			srv.TLSConfig.ClientAuth = tls.RequireAndVerifyClientCert
@@ -181,6 +215,14 @@ func (a AdminServer) wrap(next http.HandlerFunc) http.HandlerFunc {
 		// Handle preflight
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		if r.URL.Path == "/healthz" || r.URL.Path == "/readyz" {
+			if r.Method != http.MethodGet && r.Method != http.MethodHead {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			next(w, r)
 			return
 		}
 		audit := a.Audit
@@ -238,21 +280,16 @@ func warnInsecureDevOnce() {
 }
 
 func (a AdminServer) authenticate(r *http.Request) (AdminPrincipal, bool) {
-	// Health probes can be unauthenticated. readyz reveals only binary readiness.
-	if r.URL.Path == "/healthz" || r.URL.Path == "/readyz" {
-		return AdminPrincipal{Name: "probe", Permissions: []string{PermissionBrokerRead}}, true
-	}
 	if a.InsecureDev {
 		warnInsecureDevOnce()
 		return AdminPrincipal{Name: "insecure-dev", Permissions: []string{PermissionAdminAll}}, true
 	}
 	acl := a.effectiveACL()
+	var cert *x509.Certificate
 	if r.TLS != nil && len(r.TLS.VerifiedChains) > 0 && len(r.TLS.VerifiedChains[0]) > 0 {
-		if principal, ok := acl.AuthenticateCertificate(r.TLS.VerifiedChains[0][0]); ok {
-			return principal, true
-		}
+		cert = r.TLS.VerifiedChains[0][0]
 	}
-	return acl.Authenticate(bearerToken(r))
+	return authenticateAdminCredential(acl, bearerToken(r), cert)
 }
 
 func (a AdminServer) effectiveACL() *ACL {
@@ -281,22 +318,31 @@ func (r *statusRecorder) WriteHeader(code int) {
 func (a AdminServer) health(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte("ok\n")) }
 func (a AdminServer) ready(w http.ResponseWriter, r *http.Request) {
 	if a.Broker == nil || a.Broker.State() != BrokerRunning {
-		http.Error(w, "not ready", 503)
+		http.Error(w, "not ready", http.StatusServiceUnavailable)
 		return
 	}
 	if a.Broker.IsStoreFenced() {
-		http.Error(w, "storage fenced: storage unavailable", http.StatusServiceUnavailable)
+		http.Error(w, "not ready", http.StatusServiceUnavailable)
 		return
 	}
 	if check := a.Broker.checkStore(r.Context()); check.Status == "fail" {
-		http.Error(w, "not ready: "+check.Detail, http.StatusServiceUnavailable)
+		http.Error(w, "not ready", http.StatusServiceUnavailable)
 		return
+	}
+	if a.Distributed != nil {
+		if err := a.Distributed.PartitionReadiness(r.Context()); err != nil {
+			http.Error(w, "not ready", http.StatusServiceUnavailable)
+			return
+		}
 	}
 	_, _ = w.Write([]byte("ready\n"))
 }
 func (a AdminServer) stats(w http.ResponseWriter, r *http.Request) {
 	st, err := a.Broker.store.Stats(r.Context())
 	if hasRestrictedTenantScope(r.Context()) {
+		// WAL group-commit timing and batch counters are process-wide. Returning
+		// them here would expose activity from other tenants through /stats.
+		st.WALGroupCommit = WALGroupCommitStats{}
 		filteredQueues := make(map[string]int)
 		for k, v := range st.Queues {
 			if tenantAllowed(r.Context(), k) {
@@ -386,6 +432,9 @@ func (a AdminServer) audit(w http.ResponseWriter, r *http.Request) {
 	writeBrokerJSON(w, history)
 }
 func (a AdminServer) topics(w http.ResponseWriter, r *http.Request) {
+	if rejectScopedControlPlane(w, r, "global topic configuration") {
+		return
+	}
 	if r.Method == http.MethodPost {
 		var cfg TopicConfig
 		if json.NewDecoder(r.Body).Decode(&cfg) != nil {
@@ -399,6 +448,9 @@ func (a AdminServer) topics(w http.ResponseWriter, r *http.Request) {
 	writeBrokerJSON(w, st.Topics)
 }
 func (a AdminServer) queues(w http.ResponseWriter, r *http.Request) {
+	if rejectScopedControlPlane(w, r, "global queue configuration") {
+		return
+	}
 	if r.Method == http.MethodPost {
 		var cfg QueueConfig
 		if json.NewDecoder(r.Body).Decode(&cfg) != nil {
@@ -425,9 +477,117 @@ func (a AdminServer) queue(w http.ResponseWriter, r *http.Request) {
 	} else {
 		name = validated
 	}
+	if len(parts) == 3 && parts[1] == "assigned" && parts[2] == "messages" {
+		if r.Method != http.MethodGet {
+			methodBroker(w)
+			return
+		}
+		if rejectScopedControlPlane(w, r, "assigned queue listings") {
+			return
+		}
+		if a.Distributed == nil {
+			WriteBrokerError(w, ErrUnsupportedMode)
+			return
+		}
+		report, err := a.Distributed.ListAssignedQueue(r.Context(), name, queryLimit(r, 100))
+		if report == nil {
+			WriteBrokerError(w, err)
+			return
+		}
+		status := http.StatusOK
+		if len(report.Failures) > 0 {
+			status = http.StatusMultiStatus
+		}
+		writeBrokerJSONStatus(w, status, report)
+		return
+	}
+	if len(parts) == 3 && parts[1] == "assigned" && (parts[2] == "pause" || parts[2] == "resume" || parts[2] == "purge") {
+		if r.Method != http.MethodPost {
+			methodBroker(w)
+			return
+		}
+		if rejectScopedControlPlane(w, r, "assigned queue controls") {
+			return
+		}
+		if a.Distributed == nil {
+			WriteBrokerError(w, ErrUnsupportedMode)
+			return
+		}
+		result, err := a.Distributed.ApplyAssignedQueueControl(r.Context(), name, parts[2])
+		if result == nil {
+			WriteBrokerError(w, err)
+			return
+		}
+		status := http.StatusOK
+		if len(result.Failures) > 0 {
+			status = http.StatusMultiStatus
+		}
+		writeBrokerJSONStatus(w, status, result)
+		return
+	}
+	if len(parts) == 4 && parts[1] == "partitions" {
+		partition, parseErr := strconv.Atoi(parts[2])
+		if parseErr != nil || partition < 0 {
+			WriteBrokerError(w, ErrInvalidMessage)
+			return
+		}
+		if parts[3] != "messages" && rejectScopedControlPlane(w, r, "partition queue controls") {
+			return
+		}
+		switch parts[3] {
+		case "messages":
+			if r.Method != http.MethodGet {
+				methodBroker(w)
+				return
+			}
+			messages, err := a.Broker.ListPartitionQueue(r.Context(), name, partition, queryLimit(r, 100))
+			if err != nil {
+				WriteBrokerError(w, err)
+				return
+			}
+			writeBrokerJSON(w, messages)
+		case "pause":
+			if r.Method != http.MethodPost {
+				methodBroker(w)
+				return
+			}
+			writeBrokerErr(w, a.Broker.PausePartitionQueue(r.Context(), name, partition))
+		case "resume":
+			if r.Method != http.MethodPost {
+				methodBroker(w)
+				return
+			}
+			writeBrokerErr(w, a.Broker.ResumePartitionQueue(r.Context(), name, partition))
+		case "purge":
+			if r.Method != http.MethodPost {
+				methodBroker(w)
+				return
+			}
+			purged, err := a.Broker.PurgePartitionQueue(r.Context(), name, partition)
+			if err != nil {
+				WriteBrokerError(w, err)
+				return
+			}
+			writeBrokerJSON(w, map[string]any{"ok": true, "purged": purged, "partition": partition})
+		default:
+			http.NotFound(w, r)
+		}
+		return
+	}
 	if len(parts) == 2 {
 		switch parts[1] {
 		case "messages":
+			if a.Distributed != nil {
+				assigned, err := a.Distributed.hasResourcePartitions(r.Context(), cluster.PartitionResourceQueue, name)
+				if err != nil {
+					WriteBrokerError(w, err)
+					return
+				}
+				if assigned {
+					WriteBrokerError(w, fmt.Errorf("%w: partitioned queue messages must be read through partition-specific consumers", ErrUnsupportedMode))
+					return
+				}
+			}
 			msgs, err := a.Broker.store.ListQueue(r.Context(), name, queryLimit(r, 100))
 			if err != nil {
 				http.Error(w, err.Error(), 404)
@@ -471,6 +631,9 @@ func (a AdminServer) queue(w http.ResponseWriter, r *http.Request) {
 				methodBroker(w)
 				return
 			}
+			if rejectScopedControlPlane(w, r, "global queue controls") {
+				return
+			}
 			writeBrokerErr(w, a.Broker.PauseQueue(r.Context(), name))
 			return
 		case "resume":
@@ -478,11 +641,17 @@ func (a AdminServer) queue(w http.ResponseWriter, r *http.Request) {
 				methodBroker(w)
 				return
 			}
+			if rejectScopedControlPlane(w, r, "global queue controls") {
+				return
+			}
 			writeBrokerErr(w, a.Broker.ResumeQueue(r.Context(), name))
 			return
 		case "purge":
 			if r.Method != http.MethodPost {
 				methodBroker(w)
+				return
+			}
+			if rejectScopedControlPlane(w, r, "global queue controls") {
 				return
 			}
 			n, err := a.Broker.PurgeQueue(r.Context(), name)
@@ -539,6 +708,9 @@ func (a AdminServer) ackBatch(w http.ResponseWriter, r *http.Request) {
 	writeBrokerJSON(w, map[string]any{"acked": acked, "errors": errs})
 }
 func (a AdminServer) streams(w http.ResponseWriter, r *http.Request) {
+	if rejectScopedControlPlane(w, r, "global stream configuration") {
+		return
+	}
 	if r.Method == http.MethodPost {
 		var cfg StreamConfig
 		if json.NewDecoder(r.Body).Decode(&cfg) != nil {
@@ -565,13 +737,172 @@ func (a AdminServer) stream(w http.ResponseWriter, r *http.Request) {
 	} else {
 		name = validated
 	}
+	if len(parts) == 4 && parts[1] == "partitions" && parts[3] == "lag" {
+		partition, parseErr := strconv.Atoi(parts[2])
+		if parseErr != nil || partition < 0 {
+			WriteBrokerError(w, ErrInvalidMessage)
+			return
+		}
+		if r.Method != http.MethodGet {
+			methodBroker(w)
+			return
+		}
+		if rejectScopedControlPlane(w, r, "partition stream lag reports") {
+			return
+		}
+		group := firstNonEmpty(r.URL.Query().Get("consumer_group"), r.URL.Query().Get("group"))
+		report, err := a.Broker.PartitionStreamLag(r.Context(), name, partition, group)
+		if err != nil {
+			WriteBrokerError(w, err)
+			return
+		}
+		writeBrokerJSON(w, report)
+		return
+	}
+	if len(parts) == 2 && parts[1] == "lag" {
+		if r.Method != http.MethodGet {
+			methodBroker(w)
+			return
+		}
+		if rejectScopedControlPlane(w, r, "global stream lag reports") {
+			return
+		}
+		if a.Distributed != nil {
+			report, err := a.Distributed.StreamLagAssigned(r.Context(), name, firstNonEmpty(r.URL.Query().Get("consumer_group"), r.URL.Query().Get("group")))
+			if report != nil {
+				status := http.StatusOK
+				if len(report.Failures) > 0 || report.Error != "" {
+					status = http.StatusMultiStatus
+				}
+				writeBrokerJSONStatus(w, status, report)
+				return
+			}
+			if err != nil && !errors.Is(err, errNoAssignedStreamPartitions) {
+				WriteBrokerError(w, err)
+				return
+			}
+			if err == nil && report == nil {
+				WriteBrokerError(w, ErrBrokerUnavailable)
+				return
+			}
+		}
+		report, err := a.Broker.StreamLagReport(r.Context(), name)
+		if err != nil {
+			WriteBrokerError(w, err)
+			return
+		}
+		writeBrokerJSON(w, report)
+		return
+	}
+	if len(parts) == 4 && parts[1] == "partitions" && parts[3] == "messages" {
+		partition, parseErr := strconv.Atoi(parts[2])
+		if parseErr != nil || partition < 0 {
+			WriteBrokerError(w, ErrInvalidMessage)
+			return
+		}
+		if r.Method != http.MethodGet {
+			methodBroker(w)
+			return
+		}
+		if a.Distributed == nil {
+			WriteBrokerError(w, ErrUnsupportedMode)
+			return
+		}
+		afterRaw := r.URL.Query().Get("after_offset")
+		if afterRaw == "" {
+			afterRaw = r.URL.Query().Get("after")
+		}
+		after, err := strconv.ParseUint(afterRaw, 10, 64)
+		if afterRaw != "" && err != nil {
+			WriteBrokerError(w, errf(ErrInvalidMessage, "invalid stream partition offset"))
+			return
+		}
+		messages, err := a.Distributed.ReadPartitionStream(r.Context(), name, partition, after, queryLimit(r, 100))
+		if err != nil {
+			WriteBrokerError(w, err)
+			return
+		}
+		writeBrokerJSON(w, messages)
+		return
+	}
+	if len(parts) == 4 && parts[1] == "partitions" && parts[3] == "commit-and-append" {
+		partition, parseErr := strconv.Atoi(parts[2])
+		if parseErr != nil || partition < 0 {
+			WriteBrokerError(w, ErrInvalidMessage)
+			return
+		}
+		if r.Method != http.MethodPost {
+			methodBroker(w)
+			return
+		}
+		var req struct {
+			ConsumerGroup string        `json:"consumer_group"`
+			Offset        uint64        `json:"offset"`
+			TenantID      string        `json:"tenant_id,omitempty"`
+			TransactionID string        `json:"transaction_id,omitempty"`
+			Entries       []AppendEntry `json:"entries"`
+		}
+		if json.NewDecoder(r.Body).Decode(&req) != nil {
+			http.Error(w, "invalid json", 400)
+			return
+		}
+		if len(req.Entries) > 0 {
+			acl := a.effectiveACL()
+			principal := principalFromContext(r.Context())
+			if !acl.Authorize(principal, PermissionPublish) {
+				http.Error(w, "forbidden", http.StatusForbidden)
+				return
+			}
+		}
+		commit := OffsetCommit{Stream: name, ConsumerGroup: req.ConsumerGroup, Offset: req.Offset, TenantID: req.TenantID, TransactionID: req.TransactionID, Partition: partition, Partitioned: true}
+		messages, err := a.Broker.CommitOffsetAndAppend(r.Context(), commit, req.Entries)
+		if err != nil {
+			WriteBrokerError(w, err)
+			return
+		}
+		writeBrokerJSON(w, messages)
+		return
+	}
+	if len(parts) == 4 && parts[1] == "partitions" && (parts[3] == "commit" || parts[3] == "offset") {
+		partition, parseErr := strconv.Atoi(parts[2])
+		if parseErr != nil || partition < 0 {
+			WriteBrokerError(w, ErrInvalidMessage)
+			return
+		}
+		if parts[3] == "commit" {
+			if r.Method != http.MethodPost {
+				methodBroker(w)
+				return
+			}
+			var req OffsetCommit
+			if json.NewDecoder(r.Body).Decode(&req) != nil {
+				http.Error(w, "invalid json", 400)
+				return
+			}
+			req.Stream, req.Partition, req.Partitioned = name, partition, true
+			writeBrokerErr(w, a.Broker.CommitOffset(r.Context(), req))
+			return
+		}
+		if r.Method != http.MethodGet {
+			methodBroker(w)
+			return
+		}
+		group := firstNonEmpty(r.URL.Query().Get("group"), r.URL.Query().Get("consumer_group"))
+		off, err := a.Broker.ConsumerOffset(r.Context(), OffsetCommit{Stream: name, ConsumerGroup: group, Partition: partition, Partitioned: true})
+		if err != nil {
+			WriteBrokerError(w, err)
+			return
+		}
+		writeBrokerJSON(w, map[string]any{"stream": name, "group": group, "partition": partition, "offset": off})
+		return
+	}
 	if len(parts) == 1 || (len(parts) == 2 && parts[1] == "messages") {
 		afterRaw := firstNonEmpty(r.URL.Query().Get("after"), r.URL.Query().Get("after_offset"))
 		after, _ := strconv.ParseUint(afterRaw, 10, 64)
 		group := firstNonEmpty(r.URL.Query().Get("group"), r.URL.Query().Get("consumer_group"))
 		msgs, err := a.Broker.ReadStream(r.Context(), StreamReadRequest{Stream: name, ConsumerGroup: group, AfterOffset: after, Limit: queryLimit(r, 100)})
 		if err != nil {
-			http.Error(w, err.Error(), 404)
+			WriteBrokerError(w, err)
 			return
 		}
 		writeBrokerJSON(w, msgs)
@@ -595,7 +926,7 @@ func (a AdminServer) stream(w http.ResponseWriter, r *http.Request) {
 		group := firstNonEmpty(r.URL.Query().Get("group"), r.URL.Query().Get("consumer_group"))
 		off, err := a.Broker.ConsumerOffset(r.Context(), OffsetCommit{Stream: name, ConsumerGroup: group})
 		if err != nil {
-			http.Error(w, err.Error(), 404)
+			WriteBrokerError(w, err)
 			return
 		}
 		writeBrokerJSON(w, map[string]any{"stream": name, "group": group, "offset": off})
@@ -604,6 +935,9 @@ func (a AdminServer) stream(w http.ResponseWriter, r *http.Request) {
 	http.NotFound(w, r)
 }
 func (a AdminServer) dlq(w http.ResponseWriter, r *http.Request) {
+	if rejectScopedControlPlane(w, r, "global dead-letter queues") {
+		return
+	}
 	st, _ := a.Broker.store.Stats(r.Context())
 	writeBrokerJSON(w, st.DLQ)
 }
@@ -795,12 +1129,22 @@ func (a AdminServer) publishBatch(w http.ResponseWriter, r *http.Request) {
 		}
 		batchItems[i] = PublishBatchItem{Topic: req.Topic, Payload: []byte(req.Payload), Options: opts}
 	}
-	results, publishErrs, _ := pub.publishItemsAligned(r.Context(), batchItems)
+	results, publishErrs, firstErr := pub.publishItemsAligned(r.Context(), batchItems)
 	errs := make([]string, len(publishErrs))
+	failed := false
 	for i, err := range publishErrs {
 		if err != nil {
+			failed = true
 			errs[i] = err.Error()
 		}
+	}
+	if firstErr != nil && !failed {
+		WriteBrokerError(w, firstErr)
+		return
+	}
+	if failed {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusMultiStatus)
 	}
 	writeBrokerJSON(w, map[string]any{"results": results, "errors": errs})
 }
@@ -909,7 +1253,13 @@ func queryLimit(r *http.Request, d int) int {
 	return d
 }
 func writeBrokerJSON(w http.ResponseWriter, v any) {
+	writeBrokerJSONStatus(w, http.StatusOK, v)
+}
+func writeBrokerJSONStatus(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
+	if status != http.StatusOK {
+		w.WriteHeader(status)
+	}
 	_ = json.NewEncoder(w).Encode(v)
 }
 func writeSSE(w http.ResponseWriter, n Notification) {
@@ -951,6 +1301,282 @@ func sanitizeIdentifier(s string) (string, error) {
 	return s, nil
 }
 
+func (a AdminServer) clusterPartitions(w http.ResponseWriter, r *http.Request) {
+	if rejectScopedControlPlane(w, r, "cluster partitions") {
+		return
+	}
+	if a.Distributed == nil || a.Distributed.ControllerQuorum() == nil {
+		WriteBrokerError(w, ErrUnsupportedMode)
+		return
+	}
+	cq := a.Distributed.ControllerQuorum()
+	switch r.Method {
+	case http.MethodGet:
+		partitions, err := cq.ListPartitionsLinearizable(r.Context())
+		if err != nil {
+			a.writeControllerError(w, err)
+			return
+		}
+		writeBrokerJSON(w, partitions)
+	case http.MethodPost:
+		var body struct {
+			Topic        string                        `json:"topic,omitempty"`
+			Name         string                        `json:"name,omitempty"`
+			ResourceKind cluster.PartitionResourceKind `json:"resource_kind,omitempty"`
+			Partition    int                           `json:"partition"`
+			Replicas     []string                      `json:"replicas"`
+			Leader       string                        `json:"leader"`
+			AutoAssign   bool                          `json:"auto_assign,omitempty"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			WriteBrokerError(w, err)
+			return
+		}
+		name := firstNonEmpty(body.Name, body.Topic)
+		kind := body.ResourceKind
+		if kind == "" {
+			kind = cluster.PartitionResourceTopic
+		}
+		var err error
+		var partition *cluster.PartitionMetadata
+		if body.AutoAssign {
+			if len(body.Replicas) != 0 || body.Leader != "" {
+				WriteBrokerError(w, fmt.Errorf("auto_assign cannot be combined with explicit replicas or leader"))
+				return
+			}
+			partition, err = a.Distributed.AssignResourcePartitionBalanced(r.Context(), kind, name, body.Partition)
+		} else {
+			err = a.Distributed.AssignResourcePartition(r.Context(), kind, name, body.Partition, body.Replicas, body.Leader)
+			if err == nil {
+				partition, err = cq.GetResourcePartitionLinearizable(r.Context(), kind, name, body.Partition)
+			}
+		}
+		if err != nil {
+			a.writeControllerError(w, err)
+			return
+		}
+		writeBrokerJSON(w, partition)
+	default:
+		w.Header().Set("Allow", "GET, POST")
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (a AdminServer) clusterPartition(w http.ResponseWriter, r *http.Request) {
+	if rejectScopedControlPlane(w, r, "cluster partitions") {
+		return
+	}
+	if a.Distributed == nil || a.Distributed.ControllerQuorum() == nil {
+		WriteBrokerError(w, ErrUnsupportedMode)
+		return
+	}
+	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/cluster/partitions/"), "/")
+	if len(parts) < 2 || len(parts) > 3 || parts[0] == "" {
+		WriteBrokerError(w, ErrInvalidMessage)
+		return
+	}
+	partitionID, err := strconv.Atoi(parts[1])
+	if err != nil || partitionID < 0 {
+		WriteBrokerError(w, ErrInvalidMessage)
+		return
+	}
+	action := ""
+	kind := cluster.PartitionResourceKind(r.URL.Query().Get("resource_kind"))
+	if kind == "" {
+		kind = cluster.PartitionResourceTopic
+	}
+	if kind != cluster.PartitionResourceTopic && kind != cluster.PartitionResourceStream && kind != cluster.PartitionResourceQueue {
+		WriteBrokerError(w, ErrInvalidMessage)
+		return
+	}
+	if len(parts) == 3 {
+		action = parts[2]
+	}
+	cq := a.Distributed.ControllerQuorum()
+	switch {
+	case r.Method == http.MethodGet && action == "":
+		partition, err := cq.GetResourcePartitionLinearizable(r.Context(), kind, parts[0], partitionID)
+		if err != nil {
+			a.writeControllerError(w, err)
+			return
+		}
+		writeBrokerJSON(w, partition)
+	case r.Method == http.MethodPut && action == "isr":
+		var body struct {
+			ISR []string `json:"isr"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			WriteBrokerError(w, err)
+			return
+		}
+		if _, err := a.Distributed.UpdateResourcePartitionISR(r.Context(), kind, parts[0], partitionID, body.ISR); err != nil {
+			a.writeControllerError(w, err)
+			return
+		}
+		writeBrokerJSON(w, map[string]any{"status": "updated", "name": parts[0], "resource_kind": kind, "partition": partitionID})
+	case r.Method == http.MethodGet && action == "isr":
+		partitionGroupID := (cluster.PartitionGroupID{Topic: parts[0], Partition: partitionID, Kind: kind}).Canonical()
+		group, ok := a.Distributed.PartitionGroup(partitionGroupID)
+		if !ok {
+			WriteBrokerError(w, ErrBrokerUnavailable)
+			return
+		}
+		if !group.IsLeader() {
+			WriteBrokerError(w, ErrNotLeader)
+			return
+		}
+		writeBrokerJSON(w, map[string]any{
+			"id":           partitionGroupID,
+			"leader_id":    group.LeaderID(),
+			"leader_epoch": group.LeaderEpoch(),
+			"isr":          group.ISR(),
+			"replicas":     group.Replicas(),
+		})
+	case r.Method == http.MethodGet && action == "route":
+		route, err := a.Distributed.PartitionResourceRoute(r.Context(), kind, parts[0], partitionID)
+		if err != nil {
+			a.writeControllerError(w, err)
+			return
+		}
+		writeBrokerJSON(w, route)
+	case r.Method == http.MethodGet && action == "reassignment-plan":
+		replicas := strings.Split(r.URL.Query().Get("replicas"), ",")
+		if len(replicas) == 1 && replicas[0] == "" {
+			replicas = nil
+		}
+		for i := range replicas {
+			replicas[i] = strings.TrimSpace(replicas[i])
+		}
+		plan, err := a.Distributed.PlanResourcePartitionReassignment(r.Context(), kind, parts[0], partitionID, replicas, r.URL.Query().Get("leader"))
+		if err != nil {
+			a.writeControllerError(w, err)
+			return
+		}
+		writeBrokerJSON(w, plan)
+	case r.Method == http.MethodPost && action == "reassign":
+		var body struct {
+			Replicas []string `json:"replicas"`
+			Leader   string   `json:"leader,omitempty"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			WriteBrokerError(w, err)
+			return
+		}
+		progress, err := a.Distributed.ReassignResourcePartition(r.Context(), kind, parts[0], partitionID, body.Replicas, body.Leader)
+		if err != nil {
+			a.writeControllerError(w, err)
+			return
+		}
+		writeBrokerJSON(w, progress)
+	case r.Method == http.MethodPost && action == "cancel-reassignment":
+		progress, err := a.Distributed.CancelResourcePartitionReassignment(r.Context(), kind, parts[0], partitionID)
+		if err != nil {
+			a.writeControllerError(w, err)
+			return
+		}
+		writeBrokerJSON(w, progress)
+	case r.Method == http.MethodGet && action == "placement-plan":
+		plan, err := a.Distributed.PlanResourcePartitionPlacement(r.Context(), kind, parts[0], partitionID)
+		if err != nil {
+			a.writeControllerError(w, err)
+			return
+		}
+		writeBrokerJSON(w, plan)
+	case r.Method == http.MethodPost && action == "epoch":
+		var body struct {
+			Leader string `json:"leader,omitempty"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			WriteBrokerError(w, err)
+			return
+		}
+		var partition *cluster.PartitionMetadata
+		if body.Leader != "" {
+			partition, err = a.Distributed.TransferResourcePartitionLeader(r.Context(), kind, parts[0], partitionID, body.Leader)
+		} else {
+			err = cluster.ErrPartitionTransferRequired
+		}
+		if err != nil {
+			a.writeControllerError(w, err)
+			return
+		}
+		writeBrokerJSON(w, partition)
+	default:
+		w.Header().Set("Allow", "GET, PUT, POST")
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (a AdminServer) writeControllerError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, cluster.ErrNotLeader), errors.Is(err, cluster.ErrLeaderLost):
+		var retry *RetryError
+		if errors.As(err, &retry) && retry.Class == RetryNotLeader {
+			// Preserve a resource-specific redirect. Replacing it with the
+			// controller leader can route partition operations to the wrong group.
+			break
+		}
+		if a.Distributed != nil {
+			err = NotLeaderError(a.Distributed.controllerLeaderClientAddress(), a.Distributed.raftTerm())
+		} else {
+			err = ErrNotLeader
+		}
+	case errors.Is(err, cluster.ErrQuorumLost), errors.Is(err, cluster.ErrQuorumNotMet), errors.Is(err, cluster.ErrPartitioned):
+		err = fmt.Errorf("%w: %v", ErrQuorumUnavailable, err)
+	case errors.Is(err, cluster.ErrNodeNotFound):
+		err = fmt.Errorf("%w: %v", ErrClusterNodeNotFound, err)
+	case errors.Is(err, cluster.ErrClosed):
+		err = fmt.Errorf("%w: %v", ErrBrokerUnavailable, err)
+	case errors.Is(err, cluster.ErrConfChangePending):
+		err = fmt.Errorf("%w: %v", ErrClusterChangePending, err)
+	case errors.Is(err, cluster.ErrStaleEpoch), errors.Is(err, cluster.ErrTermMismatch):
+		err = fmt.Errorf("%w: %v", ErrStaleEpoch, err)
+	case errors.Is(err, cluster.ErrUnknownReplica):
+		err = fmt.Errorf("%w: %v", ErrInvalidMessage, err)
+	case errors.Is(err, cluster.ErrPartitionNotFound):
+		err = fmt.Errorf("%w: %v", ErrPartitionNotFound, err)
+	case errors.Is(err, cluster.ErrSchemaNotFound):
+		err = fmt.Errorf("%w: %v", ErrSchemaNotFound, err)
+	case errors.Is(err, cluster.ErrInvalidSchema):
+		err = fmt.Errorf("%w: %v", ErrInvalidMessage, err)
+	case errors.Is(err, cluster.ErrACLPrincipalNotFound):
+		err = fmt.Errorf("%w: %v", ErrClusterACLPrincipalNotFound, err)
+	case errors.Is(err, cluster.ErrTransactionNotFound):
+		err = fmt.Errorf("%w: %v", ErrClusterTransactionNotFound, err)
+	case errors.Is(err, cluster.ErrInvalidTransaction):
+		err = fmt.Errorf("%w: %v", ErrInvalidMessage, err)
+	case errors.Is(err, cluster.ErrInvalidACLPrincipal):
+		err = fmt.Errorf("%w: %v", ErrInvalidMessage, err)
+	case errors.Is(err, cluster.ErrNodeInUse):
+		err = fmt.Errorf("%w: %v", ErrClusterNodeInUse, err)
+	case errors.Is(err, cluster.ErrNodeUnavailable):
+		err = fmt.Errorf("%w: %v", ErrClusterNodeUnavailable, err)
+	case errors.Is(err, cluster.ErrPartitionTransferRequired):
+		err = fmt.Errorf("%w: %v", ErrPartitionTransferRequired, err)
+	case errors.Is(err, cluster.ErrReplicaLagging):
+		err = fmt.Errorf("%w: %v", ErrClusterNodeUnavailable, err)
+	case errors.Is(err, cluster.ErrPartitionReassignmentRequired):
+		err = fmt.Errorf("%w: %v", ErrPartitionReassignmentRequired, err)
+	case errors.Is(err, cluster.ErrInvalidPartitionAssignment), errors.Is(err, cluster.ErrInvalidISR):
+		err = fmt.Errorf("%w: %v", ErrInvalidMessage, err)
+	case errors.Is(err, cluster.ErrInvalidNodeState):
+		err = fmt.Errorf("%w: %v", ErrInvalidMessage, err)
+	case errors.Is(err, cluster.ErrInvalidNodeClientAddress):
+		err = fmt.Errorf("%w: %v", ErrInvalidMessage, err)
+	case errors.Is(err, cluster.ErrInvalidNodeFailureDomain):
+		err = fmt.Errorf("%w: %v", ErrInvalidMessage, err)
+	case errors.Is(err, cluster.ErrInvalidNodeCapacityWeight):
+		err = fmt.Errorf("%w: %v", ErrInvalidMessage, err)
+	case errors.Is(err, cluster.ErrInvalidNodeBrokerVersion):
+		err = fmt.Errorf("%w: %v", ErrInvalidMessage, err)
+	case errors.Is(err, context.DeadlineExceeded):
+		err = fmt.Errorf("%w: %v", ErrRequestTimeout, err)
+	case errors.Is(err, context.Canceled):
+		err = fmt.Errorf("%w: %v", ErrCancelled, err)
+	}
+	WriteBrokerError(w, err)
+}
+
 func (a AdminServer) isAllowedOrigin(origin string) bool {
 	if len(a.AllowedOrigins) == 0 {
 		// Default: same-origin (no CORS header = browser default same-origin policy)
@@ -968,8 +1594,16 @@ func adminAction(r *http.Request) string {
 	path := r.URL.Path
 	method := r.Method
 	switch {
-	case path == "/healthz" || path == "/readyz" || path == "/stats":
+	case strings.HasPrefix(path, "/cluster/") && isMutation(method):
+		return PermissionClusterWrite
+	case strings.HasPrefix(path, "/cluster/"):
+		return PermissionClusterRead
+	case path == "/healthz" || path == "/readyz":
 		return PermissionBrokerRead
+	case path == "/stats":
+		return PermissionStatsRead
+	case path == "/metrics":
+		return PermissionMetricsRead
 	case path == "/publish" || path == "/publish/batch":
 		return PermissionPublish
 	case path == "/move":
@@ -1018,6 +1652,9 @@ func adminAction(r *http.Request) string {
 	case strings.HasPrefix(path, "/v1/publish"):
 		return PermissionPublish
 	case strings.HasPrefix(path, "/v1/streams/") || path == "/v1/streams":
+		if strings.HasSuffix(path, "/commit-and-append") {
+			return PermissionStreamCommit
+		}
 		if strings.HasSuffix(path, "/commit") {
 			return PermissionStreamCommit
 		}
@@ -1080,6 +1717,9 @@ func adminAction(r *http.Request) string {
 }
 
 func (a AdminServer) clusterStatus(w http.ResponseWriter, r *http.Request) {
+	if rejectScopedControlPlane(w, r, "cluster topology") {
+		return
+	}
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -1092,5 +1732,759 @@ func (a AdminServer) clusterStatus(w http.ResponseWriter, r *http.Request) {
 		resp["nodes"] = a.Broker.Cluster().Nodes()
 		resp["assignments"] = a.Broker.Cluster().Assignments()
 	}
+	if a.Distributed != nil && a.Distributed.raftCtrl != nil {
+		resp["raft"] = distributedRaftStatus(a.Distributed)
+		resp["raft_groups"] = distributedRaftGroupStatuses(a.Distributed)
+		resp["local_partition_progress"] = a.Distributed.LivePartitionProgress()
+	}
+	if a.Distributed != nil && a.Distributed.ControllerQuorum() != nil {
+		stats, err := a.Distributed.ControllerQuorum().StatsLinearizable(r.Context())
+		if err != nil {
+			resp["controller_metadata_read_error"] = err.Error()
+		} else {
+			resp["controller_metadata"] = stats
+		}
+	}
 	writeBrokerJSON(w, resp)
+}
+
+// clusterTransaction returns one quorum-confirmed coordinator record. It is
+// keyed by query parameter because transaction IDs may contain path separators.
+func (a AdminServer) clusterTransaction(w http.ResponseWriter, r *http.Request) {
+	if rejectScopedControlPlane(w, r, "cluster transactions") {
+		return
+	}
+	if r.URL.Path == "/cluster/transactions/prune" {
+		if r.Method != http.MethodPost {
+			w.Header().Set("Allow", http.MethodPost)
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if a.Distributed == nil || a.Distributed.ControllerQuorum() == nil {
+			WriteBrokerError(w, ErrUnsupportedMode)
+			return
+		}
+		var body struct {
+			Before time.Time `json:"before"`
+			Limit  int       `json:"limit,omitempty"`
+		}
+		decoder := json.NewDecoder(r.Body)
+		decoder.DisallowUnknownFields()
+		writeDecodeError := func(err error) {
+			var maxBytesErr *http.MaxBytesError
+			if errors.As(err, &maxBytesErr) {
+				WriteBrokerError(w, err)
+				return
+			}
+			WriteBrokerError(w, ErrInvalidMessage)
+		}
+		if err := decoder.Decode(&body); err != nil {
+			writeDecodeError(err)
+			return
+		}
+		if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+			writeDecodeError(err)
+			return
+		}
+		if body.Before.IsZero() || body.Limit < 0 {
+			WriteBrokerError(w, ErrInvalidMessage)
+			return
+		}
+		pruned, err := a.Distributed.ControllerQuorum().PruneResolvedTransactions(r.Context(), body.Before, body.Limit)
+		if err != nil {
+			a.writeControllerError(w, err)
+			return
+		}
+		writeBrokerJSON(w, map[string]any{"pruned": pruned})
+		return
+	}
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if a.Distributed == nil || a.Distributed.ControllerQuorum() == nil {
+		WriteBrokerError(w, ErrUnsupportedMode)
+		return
+	}
+	id := r.URL.Query().Get("id")
+	cq := a.Distributed.ControllerQuorum()
+	if id != "" {
+		if len(id) > cluster.MaxTransactionIDBytes || !utf8.ValidString(id) {
+			WriteBrokerError(w, ErrInvalidMessage)
+			return
+		}
+		transaction, err := cq.GetTransactionLinearizable(r.Context(), id)
+		if err != nil {
+			a.writeControllerError(w, err)
+			return
+		}
+		writeBrokerJSON(w, transaction)
+		return
+	}
+	limit := cluster.DefaultTransactionPageSize
+	if rawLimit := r.URL.Query().Get("limit"); rawLimit != "" {
+		parsed, err := strconv.Atoi(rawLimit)
+		if err != nil || parsed < 0 {
+			WriteBrokerError(w, ErrInvalidMessage)
+			return
+		}
+		limit = parsed
+	}
+	transactions, next, err := cq.ListTransactionsPageLinearizable(r.Context(), r.URL.Query().Get("after"), limit)
+	if err != nil {
+		if errors.Is(err, cluster.ErrInvalidTransaction) {
+			WriteBrokerError(w, ErrInvalidMessage)
+			return
+		}
+		a.writeControllerError(w, err)
+		return
+	}
+	writeBrokerJSON(w, map[string]any{"transactions": transactions, "next_cursor": next})
+}
+
+func (a AdminServer) clusterUpgradePlan(w http.ResponseWriter, r *http.Request) {
+	if rejectScopedControlPlane(w, r, "cluster upgrade planning") {
+		return
+	}
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if a.Distributed == nil {
+		WriteBrokerError(w, ErrUnsupportedMode)
+		return
+	}
+	plan, err := a.Distributed.PlanClusterUpgrade(r.Context(), r.URL.Query().Get("target_version"))
+	if err != nil {
+		a.writeControllerError(w, err)
+		return
+	}
+	writeBrokerJSON(w, plan)
+}
+
+// distributedRaftGroupStatuses exposes bounded local progress for application
+// groups beside the controller group's status. Group IDs are returned in
+// stable order so operators can diff snapshots without map-order noise.
+func distributedRaftGroupStatuses(db *DistributedBroker) []map[string]any {
+	groupIDs := db.RaftGroupIDs()
+	groups := make([]map[string]any, 0, len(groupIDs))
+	for _, groupID := range groupIDs {
+		controller, ok := db.RaftGroup(groupID)
+		if !ok {
+			continue
+		}
+		status := controller.Status()
+		commitIndex := status.HardState.GetCommit()
+		memberIDs := make(map[uint64]struct{})
+		voters := make(map[uint64]struct{})
+		for _, voterGroup := range status.Config.Voters {
+			for id := range voterGroup {
+				memberIDs[id] = struct{}{}
+				voters[id] = struct{}{}
+			}
+		}
+		for id := range status.Config.Learners {
+			memberIDs[id] = struct{}{}
+		}
+		for id := range status.Config.LearnersNext {
+			memberIDs[id] = struct{}{}
+		}
+		jointPending := status.Config.AutoLeave || (len(status.Config.Voters) > 1 && len(status.Config.Voters[1]) != 0)
+		ids := make([]uint64, 0, len(memberIDs))
+		for id := range memberIDs {
+			ids = append(ids, id)
+		}
+		sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+		members := make([]map[string]any, 0, len(ids))
+		for _, id := range ids {
+			address, _ := controller.PeerAddress(id)
+			member := map[string]any{"peer_id": id, "address": address}
+			_, member["voter"] = voters[id]
+			_, member["learner"] = status.Config.Learners[id]
+			_, member["learner_next"] = status.Config.LearnersNext[id]
+			if progress, ok := status.Progress[id]; ok {
+				lag := uint64(0)
+				if commitIndex > progress.Match {
+					lag = commitIndex - progress.Match
+				}
+				member["match_index"] = progress.Match
+				member["next_index"] = progress.Next
+				member["lag"] = lag
+			}
+			members = append(members, member)
+		}
+		groupInfo := map[string]any{
+			"group_id":      groupID,
+			"leader_id":     controller.LeaderID(),
+			"is_leader":     controller.IsLeader(),
+			"term":          status.HardState.GetTerm(),
+			"commit_index":  commitIndex,
+			"applied_index": status.Applied,
+			"joint_pending": jointPending,
+			"members":       members,
+		}
+		if strings.HasPrefix(groupID, "partition/") {
+			var partitionID cluster.PartitionGroupID
+			if err := partitionID.UnmarshalText([]byte(strings.TrimPrefix(groupID, "partition/"))); err == nil {
+				if partitionGroup, ok := db.PartitionGroup(partitionID); ok {
+					waits, failures, duration := partitionGroup.MinISRWaitStats()
+					groupInfo["replication_factor"] = partitionGroup.ReplicationFactor()
+					groupInfo["minimum_isr"] = partitionGroup.MinimumISR()
+					groupInfo["live_isr"] = partitionGroup.ISR()
+					groupInfo["min_isr_wait_metrics_scope"] = "this_node"
+					groupInfo["min_isr_wait_count"] = waits
+					groupInfo["min_isr_wait_failures"] = failures
+					groupInfo["min_isr_wait_duration_ms"] = float64(duration) / float64(time.Millisecond)
+				}
+			}
+		}
+		groups = append(groups, groupInfo)
+	}
+	return groups
+}
+
+func distributedRaftStatus(db *DistributedBroker) map[string]any {
+	status := db.raftCtrl.Status()
+	commitIndex := status.HardState.GetCommit()
+	term := status.HardState.GetTerm()
+
+	voterGroups := make([][]uint64, 0, len(status.Config.Voters))
+	voterIDs := make(map[uint64]struct{})
+	for _, group := range status.Config.Voters {
+		ids := make([]uint64, 0, len(group))
+		for id := range group {
+			ids = append(ids, id)
+			voterIDs[id] = struct{}{}
+		}
+		sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+		if len(ids) > 0 {
+			voterGroups = append(voterGroups, ids)
+		}
+	}
+	learnerIDs := sortedRaftIDs(status.Config.Learners)
+	learnerNextIDs := sortedRaftIDs(status.Config.LearnersNext)
+	memberIDs := make(map[uint64]struct{})
+	for id := range voterIDs {
+		memberIDs[id] = struct{}{}
+	}
+	for _, id := range learnerIDs {
+		memberIDs[id] = struct{}{}
+	}
+	for _, id := range learnerNextIDs {
+		memberIDs[id] = struct{}{}
+	}
+	ids := make([]uint64, 0, len(memberIDs))
+	for id := range memberIDs {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	learners := make(map[uint64]struct{}, len(learnerIDs))
+	for _, id := range learnerIDs {
+		learners[id] = struct{}{}
+	}
+	learnersNext := make(map[uint64]struct{}, len(learnerNextIDs))
+	for _, id := range learnerNextIDs {
+		learnersNext[id] = struct{}{}
+	}
+	members := make([]map[string]any, 0, len(ids))
+	for _, id := range ids {
+		address, _ := db.raftCtrl.PeerAddress(id)
+		member := map[string]any{"peer_id": id, "address": address}
+		_, member["voter"] = voterIDs[id]
+		_, member["learner"] = learners[id]
+		_, member["learner_next"] = learnersNext[id]
+		if progress, ok := status.Progress[id]; ok {
+			lag := uint64(0)
+			if commitIndex > progress.Match {
+				lag = commitIndex - progress.Match
+			}
+			member["match_index"] = progress.Match
+			member["next_index"] = progress.Next
+			member["lag"] = lag
+		}
+		members = append(members, member)
+	}
+	return map[string]any{
+		"state":         db.RaftState(),
+		"leader":        db.Leader(),
+		"leader_id":     db.raftCtrl.LeaderID(),
+		"is_leader":     db.IsLeader(),
+		"term":          term,
+		"commit_index":  commitIndex,
+		"applied_index": status.Applied,
+		"auto_leave":    status.Config.AutoLeave,
+		"voter_groups":  voterGroups,
+		"learners":      learnerIDs,
+		"learners_next": learnerNextIDs,
+		"members":       members,
+	}
+}
+
+func sortedRaftIDs(ids map[uint64]struct{}) []uint64 {
+	result := make([]uint64, 0, len(ids))
+	for id := range ids {
+		result = append(result, id)
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i] < result[j] })
+	return result
+}
+
+func (a AdminServer) clusterNodes(w http.ResponseWriter, r *http.Request) {
+	if rejectScopedControlPlane(w, r, "cluster membership") {
+		return
+	}
+	if a.Distributed == nil {
+		WriteBrokerError(w, ErrUnsupportedMode)
+		return
+	}
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var body struct {
+		Address string `json:"address"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		WriteBrokerError(w, err)
+		return
+	}
+	peerID, err := a.Distributed.AddRaftLearner(r.Context(), body.Address)
+	if err != nil {
+		a.writeControllerError(w, err)
+		return
+	}
+	role := a.Distributed.RaftPeerRole(peerID)
+	result := "learner_added"
+	if role != "learner" {
+		result = "already_member"
+	}
+	writeBrokerJSON(w, map[string]any{"status": result, "peer_id": peerID, "role": role})
+}
+
+// clusterMetadataNodes manages the replicated logical node registry. These
+// records are controller metadata and are distinct from Raft voter membership.
+func (a AdminServer) clusterMetadataNodes(w http.ResponseWriter, r *http.Request) {
+	if rejectScopedControlPlane(w, r, "cluster metadata nodes") {
+		return
+	}
+	if a.Distributed == nil || a.Distributed.ControllerQuorum() == nil {
+		WriteBrokerError(w, ErrUnsupportedMode)
+		return
+	}
+	cq := a.Distributed.ControllerQuorum()
+	switch r.Method {
+	case http.MethodGet:
+		nodes, err := cq.GetNodesLinearizable(r.Context())
+		if err != nil {
+			a.writeControllerError(w, err)
+			return
+		}
+		writeBrokerJSON(w, nodes)
+	case http.MethodPost:
+		var body struct {
+			ID            string            `json:"id"`
+			Address       string            `json:"address"`
+			ClientAddress string            `json:"client_address,omitempty"`
+			State         string            `json:"state,omitempty"`
+			Metadata      map[string]string `json:"metadata,omitempty"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			WriteBrokerError(w, err)
+			return
+		}
+		id, err := sanitizeIdentifier(body.ID)
+		if err != nil || strings.TrimSpace(body.Address) == "" || len(body.Address) > 1024 {
+			WriteBrokerError(w, ErrInvalidMessage)
+			return
+		}
+		node := &cluster.NodeInfo{
+			ID: id, Address: strings.TrimSpace(body.Address), ClientAddress: strings.TrimSpace(body.ClientAddress),
+			State: cluster.NodeState(strings.TrimSpace(body.State)), Metadata: body.Metadata,
+		}
+		if err := cq.RegisterNode(r.Context(), node); err != nil {
+			a.writeControllerError(w, err)
+			return
+		}
+		writeBrokerJSON(w, map[string]any{"status": "registered", "id": id})
+	default:
+		w.Header().Set("Allow", "GET, POST")
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (a AdminServer) clusterMetadataNode(w http.ResponseWriter, r *http.Request) {
+	if rejectScopedControlPlane(w, r, "cluster metadata nodes") {
+		return
+	}
+	if a.Distributed == nil || a.Distributed.ControllerQuorum() == nil {
+		WriteBrokerError(w, ErrUnsupportedMode)
+		return
+	}
+	if r.Method != http.MethodDelete {
+		w.Header().Set("Allow", http.MethodDelete)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	id, err := sanitizeIdentifier(strings.TrimPrefix(r.URL.Path, "/cluster/metadata/nodes/"))
+	if err != nil {
+		WriteBrokerError(w, ErrInvalidMessage)
+		return
+	}
+	cq := a.Distributed.ControllerQuorum()
+	if err := cq.DeregisterNode(r.Context(), id); err != nil {
+		a.writeControllerError(w, err)
+		return
+	}
+	writeBrokerJSON(w, map[string]any{"status": "deregistered", "id": id})
+}
+
+func (a AdminServer) clusterMetadataSchemas(w http.ResponseWriter, r *http.Request) {
+	if rejectScopedControlPlane(w, r, "cluster metadata schemas") {
+		return
+	}
+	if a.Distributed == nil || a.Distributed.ControllerQuorum() == nil {
+		WriteBrokerError(w, ErrUnsupportedMode)
+		return
+	}
+	cq := a.Distributed.ControllerQuorum()
+	switch r.Method {
+	case http.MethodGet:
+		name := r.URL.Query().Get("name")
+		if name != "" {
+			validated, err := sanitizeIdentifier(name)
+			if err != nil {
+				WriteBrokerError(w, ErrInvalidMessage)
+				return
+			}
+			name = validated
+		}
+		schemas, err := cq.ListSchemasLinearizable(r.Context(), name)
+		if err != nil {
+			a.writeControllerError(w, err)
+			return
+		}
+		writeBrokerJSON(w, schemas)
+	case http.MethodPost:
+		var definition SchemaDefinition
+		if err := json.NewDecoder(r.Body).Decode(&definition); err != nil {
+			WriteBrokerError(w, ErrInvalidMessage)
+			return
+		}
+		if err := cq.RegisterSchema(r.Context(), cluster.SchemaDefinition{
+			Name: definition.Name, Version: definition.Version, ContentType: definition.ContentType,
+			Required: definition.Required, AllowUnknown: definition.AllowUnknown,
+			CompatibleWith: definition.CompatibleWith, Deprecated: definition.Deprecated,
+			Description: definition.Description,
+		}); err != nil {
+			a.writeControllerError(w, err)
+			return
+		}
+		writeBrokerJSON(w, map[string]any{"status": "registered", "name": definition.Name, "version": firstNonEmpty(definition.Version, "v1")})
+	default:
+		w.Header().Set("Allow", "GET, POST")
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (a AdminServer) clusterMetadataSchema(w http.ResponseWriter, r *http.Request) {
+	if rejectScopedControlPlane(w, r, "cluster metadata schemas") {
+		return
+	}
+	if a.Distributed == nil || a.Distributed.ControllerQuorum() == nil {
+		WriteBrokerError(w, ErrUnsupportedMode)
+		return
+	}
+	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/cluster/metadata/schemas/"), "/")
+	if len(parts) < 2 || len(parts) > 3 {
+		WriteBrokerError(w, ErrInvalidMessage)
+		return
+	}
+	name, err := sanitizeIdentifier(parts[0])
+	if err != nil {
+		WriteBrokerError(w, ErrInvalidMessage)
+		return
+	}
+	version, err := sanitizeIdentifier(parts[1])
+	if err != nil {
+		WriteBrokerError(w, ErrInvalidMessage)
+		return
+	}
+	cq := a.Distributed.ControllerQuorum()
+	if len(parts) == 3 && parts[2] == "deprecate" && r.Method == http.MethodPost {
+		if err := cq.DeprecateSchema(r.Context(), name, version); err != nil {
+			a.writeControllerError(w, err)
+			return
+		}
+		writeBrokerJSON(w, map[string]any{"status": "deprecated", "name": name, "version": version})
+		return
+	}
+	if len(parts) != 2 || r.Method != http.MethodGet {
+		w.Header().Set("Allow", "GET, POST")
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	definition, err := cq.GetSchemaLinearizable(r.Context(), name, version)
+	if err != nil {
+		a.writeControllerError(w, err)
+		return
+	}
+	writeBrokerJSON(w, definition)
+}
+
+type clusterACLPrincipalView struct {
+	Name                  string    `json:"name"`
+	CertificateIdentities []string  `json:"certificate_identities,omitempty"`
+	Permissions           []string  `json:"permissions,omitempty"`
+	Tenants               []string  `json:"tenants,omitempty"`
+	RequestsPerSecond     int       `json:"requests_per_second,omitempty"`
+	Burst                 int       `json:"burst,omitempty"`
+	MaxConcurrent         int       `json:"max_concurrent,omitempty"`
+	ExpiresAt             time.Time `json:"expires_at,omitempty"`
+	Revoked               bool      `json:"revoked,omitempty"`
+	UpdatedAt             time.Time `json:"updated_at"`
+}
+
+func aclPrincipalView(principal cluster.ACLPrincipal) clusterACLPrincipalView {
+	return clusterACLPrincipalView{
+		Name: principal.Name, CertificateIdentities: principal.CertificateIdentities,
+		Permissions: principal.Permissions, Tenants: principal.Tenants,
+		RequestsPerSecond: principal.RequestsPerSecond, Burst: principal.Burst,
+		MaxConcurrent: principal.MaxConcurrent, ExpiresAt: principal.ExpiresAt,
+		Revoked: principal.Revoked, UpdatedAt: principal.UpdatedAt,
+	}
+}
+
+func (a AdminServer) clusterMetadataACLs(w http.ResponseWriter, r *http.Request) {
+	if rejectScopedControlPlane(w, r, "cluster metadata ACLs") {
+		return
+	}
+	if a.Distributed == nil || a.Distributed.ControllerQuorum() == nil {
+		WriteBrokerError(w, ErrUnsupportedMode)
+		return
+	}
+	cq := a.Distributed.ControllerQuorum()
+	switch r.Method {
+	case http.MethodGet:
+		principals, err := cq.ListACLPrincipalsLinearizable(r.Context())
+		if err != nil {
+			a.writeControllerError(w, err)
+			return
+		}
+		views := make([]clusterACLPrincipalView, 0, len(principals))
+		for _, principal := range principals {
+			views = append(views, aclPrincipalView(principal))
+		}
+		writeBrokerJSON(w, views)
+	case http.MethodPost:
+		var body struct {
+			Name                  string    `json:"name"`
+			Token                 string    `json:"token,omitempty"`
+			CertificateIdentities []string  `json:"certificate_identities,omitempty"`
+			Permissions           []string  `json:"permissions,omitempty"`
+			Tenants               []string  `json:"tenants,omitempty"`
+			RequestsPerSecond     int       `json:"requests_per_second,omitempty"`
+			Burst                 int       `json:"burst,omitempty"`
+			MaxConcurrent         int       `json:"max_concurrent,omitempty"`
+			ExpiresAt             time.Time `json:"expires_at,omitempty"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			WriteBrokerError(w, ErrInvalidMessage)
+			return
+		}
+		principal := cluster.ACLPrincipal{
+			Name: body.Name, CertificateIdentities: body.CertificateIdentities,
+			Permissions: body.Permissions, Tenants: body.Tenants,
+			RequestsPerSecond: body.RequestsPerSecond, Burst: body.Burst,
+			MaxConcurrent: body.MaxConcurrent, ExpiresAt: body.ExpiresAt,
+		}
+		if err := cq.PutACLPrincipal(r.Context(), principal, body.Token); err != nil {
+			a.writeControllerError(w, err)
+			return
+		}
+		writeBrokerJSON(w, map[string]any{"status": "stored", "name": body.Name})
+	default:
+		w.Header().Set("Allow", "GET, POST")
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (a AdminServer) clusterMetadataACL(w http.ResponseWriter, r *http.Request) {
+	if rejectScopedControlPlane(w, r, "cluster metadata ACLs") {
+		return
+	}
+	if a.Distributed == nil || a.Distributed.ControllerQuorum() == nil {
+		WriteBrokerError(w, ErrUnsupportedMode)
+		return
+	}
+	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/cluster/metadata/acls/"), "/")
+	if len(parts) == 0 || len(parts) > 2 {
+		WriteBrokerError(w, ErrInvalidMessage)
+		return
+	}
+	name, err := sanitizeIdentifier(parts[0])
+	if err != nil {
+		WriteBrokerError(w, ErrInvalidMessage)
+		return
+	}
+	cq := a.Distributed.ControllerQuorum()
+	if len(parts) == 2 && parts[1] == "revoke" && r.Method == http.MethodPost {
+		if err := cq.RevokeACLPrincipal(r.Context(), name); err != nil {
+			a.writeControllerError(w, err)
+			return
+		}
+		writeBrokerJSON(w, map[string]any{"status": "revoked", "name": name})
+		return
+	}
+	if len(parts) != 1 || r.Method != http.MethodGet {
+		w.Header().Set("Allow", "GET, POST")
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	principal, err := cq.GetACLPrincipalLinearizable(r.Context(), name)
+	if err != nil {
+		a.writeControllerError(w, err)
+		return
+	}
+	writeBrokerJSON(w, aclPrincipalView(principal))
+}
+
+func (a AdminServer) clusterNode(w http.ResponseWriter, r *http.Request) {
+	if rejectScopedControlPlane(w, r, "cluster membership") {
+		return
+	}
+	if a.Distributed == nil {
+		WriteBrokerError(w, ErrUnsupportedMode)
+		return
+	}
+	idPath := strings.TrimPrefix(r.URL.Path, "/cluster/nodes/")
+	parts := strings.Split(idPath, "/")
+	if len(parts) == 2 && parts[1] == "drain" {
+		if r.Method != http.MethodPost {
+			w.Header().Set("Allow", http.MethodPost)
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		peerID, err := strconv.ParseUint(parts[0], 10, 64)
+		if err != nil || peerID == 0 {
+			WriteBrokerError(w, ErrInvalidMessage)
+			return
+		}
+		node, err := a.Distributed.BeginRaftNodeDrain(r.Context(), peerID)
+		if err != nil {
+			a.writeControllerError(w, err)
+			return
+		}
+		writeBrokerJSON(w, map[string]any{"status": "draining", "node": node})
+		return
+	}
+	if len(parts) == 3 && parts[1] == "drain" && parts[2] == "complete" {
+		if r.Method != http.MethodPost {
+			w.Header().Set("Allow", http.MethodPost)
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		peerID, err := strconv.ParseUint(parts[0], 10, 64)
+		if err != nil || peerID == 0 {
+			WriteBrokerError(w, ErrInvalidMessage)
+			return
+		}
+		node, err := a.Distributed.CompleteRaftNodeDrain(r.Context(), peerID)
+		if err != nil {
+			a.writeControllerError(w, err)
+			return
+		}
+		writeBrokerJSON(w, map[string]any{"status": "left", "node": node})
+		return
+	}
+	if len(parts) == 2 && parts[1] == "removal-plan" {
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", http.MethodGet)
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		peerID, err := strconv.ParseUint(parts[0], 10, 64)
+		if err != nil || peerID == 0 {
+			WriteBrokerError(w, ErrInvalidMessage)
+			return
+		}
+		plan, err := a.Distributed.PlanRaftNodeRemoval(r.Context(), peerID)
+		if err != nil {
+			a.writeControllerError(w, err)
+			return
+		}
+		writeBrokerJSON(w, plan)
+		return
+	}
+	if len(parts) == 2 && parts[1] == "promote" {
+		if r.Method != http.MethodPost {
+			w.Header().Set("Allow", http.MethodPost)
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		peerID, err := strconv.ParseUint(parts[0], 10, 64)
+		if err != nil || peerID == 0 {
+			WriteBrokerError(w, ErrInvalidMessage)
+			return
+		}
+		if err := a.Distributed.PromoteRaftLearner(r.Context(), peerID); err != nil {
+			a.writeControllerError(w, err)
+			return
+		}
+		writeBrokerJSON(w, map[string]any{"status": "promoted", "peer_id": peerID, "role": "voter"})
+		return
+	}
+	if len(parts) != 1 {
+		WriteBrokerError(w, ErrInvalidMessage)
+		return
+	}
+	if r.Method != http.MethodDelete {
+		w.Header().Set("Allow", http.MethodDelete)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	idText := parts[0]
+	peerID, err := strconv.ParseUint(idText, 10, 64)
+	if err != nil || peerID == 0 {
+		WriteBrokerError(w, ErrInvalidMessage)
+		return
+	}
+	if err := a.Distributed.RemoveRaftNode(r.Context(), peerID); err != nil {
+		a.writeControllerError(w, err)
+		return
+	}
+	writeBrokerJSON(w, map[string]any{"status": "ok", "peer_id": peerID})
+}
+
+func (a AdminServer) clusterLeadership(w http.ResponseWriter, r *http.Request) {
+	if rejectScopedControlPlane(w, r, "cluster leadership") {
+		return
+	}
+	if a.Distributed == nil {
+		WriteBrokerError(w, ErrUnsupportedMode)
+		return
+	}
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var body struct {
+		PeerID uint64 `json:"peer_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		WriteBrokerError(w, err)
+		return
+	}
+	if body.PeerID == 0 {
+		WriteBrokerError(w, ErrInvalidMessage)
+		return
+	}
+	if err := a.Distributed.TransferRaftLeadership(r.Context(), body.PeerID); err != nil {
+		a.writeControllerError(w, err)
+		return
+	}
+	writeBrokerJSON(w, map[string]any{"status": "transferred", "leader_id": body.PeerID})
 }

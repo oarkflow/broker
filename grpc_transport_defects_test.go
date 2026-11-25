@@ -40,6 +40,7 @@ func startNativeServer(t *testing.T, b *Broker, cfg GRPCConfig) string {
 
 	cfg.ListenAddr = addr
 	cfg.BrokerToken = "secret"
+	cfg.AllowInsecure = true
 	srv := NewNativeRPCServer(b, cfg)
 	done := make(chan error, 1)
 	go func() { done <- srv.ListenAndServe() }()

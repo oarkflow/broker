@@ -388,6 +388,83 @@ func TestEtcdRaftQuorumLossLeaderChangeAndRecovery(t *testing.T) {
 	t.Fatalf("cluster did not converge after healing: counts=%d,%d,%d", states[0].Count(), states[1].Count(), states[2].Count())
 }
 
+func TestEtcdRaftScaleConfigurations(t *testing.T) {
+	for _, size := range []int{3, 5, 9, 25} {
+		t.Run(fmt.Sprintf("nodes_%d", size), func(t *testing.T) {
+			peers := make(map[uint64]string, size)
+			transports := make([]*MemoryTransport, size)
+			controllers := make([]*RaftController, size)
+			states := make([]*testStateMachine, size)
+			registry := make(map[string]*MemoryTransport, size)
+			for i := 0; i < size; i++ {
+				id := uint64(i + 1)
+				address := fmt.Sprintf("scale-%d-peer-%d", size, id)
+				peers[id] = address
+				transports[i] = NewMemoryTransport(address)
+				registry[address] = transports[i]
+			}
+			for _, transport := range transports {
+				transport.Register(registry)
+			}
+			for i := 0; i < size; i++ {
+				states[i] = &testStateMachine{}
+				controller, err := NewRaftController(RaftControllerConfig{
+					ID: uint64(i + 1), NodeID: peers[uint64(i+1)], Peers: peers,
+					ElectionTick: 2000, HeartbeatTick: 1, TickInterval: 5 * time.Millisecond,
+					Transport: transports[i], StateMachine: states[i], StorageDir: t.TempDir(),
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				controllers[i] = controller
+				if err := controller.RegisterTransportHandler(peers[uint64(i+1)]); err != nil {
+					t.Fatal(err)
+				}
+				if err := controller.Start(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			t.Cleanup(func() {
+				for i := len(controllers) - 1; i >= 0; i-- {
+					if controllers[i] != nil {
+						_ = controllers[i].Stop()
+					}
+				}
+			})
+			if err := controllers[0].Campaign(); err != nil {
+				t.Fatal(err)
+			}
+			leaderIndex := waitForLeaderIndex(controllers, nil, 8*time.Second)
+			if leaderIndex < 0 {
+				t.Fatal("no leader elected")
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			defer cancel()
+			if err := controllers[leaderIndex].Propose(ctx, []byte("scale-smoke")); err != nil {
+				t.Fatal(err)
+			}
+			deadline := time.Now().Add(20 * time.Second)
+			for time.Now().Before(deadline) {
+				applied := 0
+				for _, state := range states {
+					if state.Count() > 0 {
+						applied++
+					}
+				}
+				if applied == size {
+					return
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			counts := make([]int, size)
+			for i, state := range states {
+				counts[i] = state.Count()
+			}
+			t.Fatalf("committed entry failed to reach every peer: applied counts=%v", counts)
+		})
+	}
+}
+
 func waitForLeaderIndex(controllers []*RaftController, excluded map[int]bool, timeout time.Duration) int {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {

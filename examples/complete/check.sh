@@ -49,7 +49,12 @@ for expected in "consumer queue" "consumer topic" "consumer request" "consumer t
     grep -q "$expected" "$work/consumer.log" && break
     sleep .1
   done
-  grep -q "$expected" "$work/consumer.log"
+  if ! grep -q "$expected" "$work/consumer.log"; then
+    echo "consumer did not report expected event: $expected" >&2
+    cat "$work/consumer.log" >&2
+    tail -100 "$work/broker.log" >&2
+    exit 1
+  fi
 done
 echo "broker/consumer/publisher complete"
 

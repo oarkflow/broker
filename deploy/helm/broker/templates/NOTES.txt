@@ -7,17 +7,24 @@ Read deploy/README.md in the broker repository before relying on it.
 IMPORTANT CAVEATS
 ------------------
 1. Distributed/clustered mode in brokerd itself is EXPERIMENTAL and, per the
-   project's own Tasks.md, NOT PRODUCTION-SAFE. Running replicaCount > 1
-   gives you {{ .Values.replicaCount }} independent standalone brokers, each
-   with its own WAL volume and identity -- brokerd has no peer/Raft flags
-   wired up yet, so this is NOT a coordinated cluster today.
+   project's own Tasks.md, NOT PRODUCTION-SAFE.{{ if .Values.cluster.enabled }}
+   This release has clustered mode enabled for {{ .Values.replicaCount }} pods;
+   this is not a certified production cluster. Raft membership changes must
+   use the broker's membership workflow; do not scale this StatefulSet by
+   changing replicaCount alone.{{ else }}
+   With cluster.enabled=false, replicaCount {{ .Values.replicaCount }} runs
+   independent standalone brokers, each with its own WAL volume and identity.{{ end }}
 2. The native BST1 TCP stream (port 8091) is disabled by default
-   (broker.listeners.native.enabled=false) and MUST stay disabled in any
-   shared environment: it has no authentication and brokerd will not even
-   start that listener unless insecure-dev mode is on.
+   (broker.listeners.native.enabled=false). It supports token or mapped mTLS
+   authentication. Enabling it adds the port to both Services. When
+   `networkPolicy.enabled=true`, ingress remains denied until
+   `networkPolicy.nativeIngressFrom` lists authorized peers. Configure
+   production TLS/authentication and restrict external access if
+   `service.type` is NodePort or LoadBalancer.
 3. If you installed with default values and did not override `secrets.*` /
-   `tls.*`, the admin token and TLS certificate are PLACEHOLDERS and the
-   broker will not pass a real TLS handshake or be meaningfully secured.
+   `tls.*`, the admin token, AMQP credentials, and TLS certificate are
+   PLACEHOLDERS. Replace them before accepting real traffic; the default TLS
+   certificate will not pass a real TLS handshake.
 
 NEXT STEPS
 ----------
@@ -30,7 +37,9 @@ NEXT STEPS
        --set-file tls.key=/path/to/server.key
 
    or set `secrets.existingSecret` / `tls.existingSecret` to a Secret you
-   manage with sealed-secrets / external-secrets / SOPS.
+   manage with sealed-secrets / external-secrets / SOPS. Clustered mode
+   requires `tls.existingSecret` to contain `tls.crt`, `tls.key`, and `ca.crt`;
+   the certificate must cover every pod DNS name under the headless service.
 
 2. Check rollout status:
 

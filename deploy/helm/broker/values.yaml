@@ -1,16 +1,16 @@
 # Default values for the broker chart.
 # This chart is new/unvalidated tooling — read deploy/README.md before using
-# it anywhere that matters. In particular: distributed/clustered mode in the
-# underlying brokerd binary is experimental and not production-safe
-# (project Tasks.md), and replicaCount > 1 today just runs N independent
-# standalone brokers (no peer/Raft wiring exists in cmd/brokerd/main.go yet)
-# -- it does NOT give you a coordinated cluster.
+# it anywhere that matters. Distributed/clustered mode in the underlying
+# brokerd binary is experimental and not production-safe (project Tasks.md).
+# With cluster disabled, replicaCount > 1 runs independent standalone brokers.
+# Clustered wiring is opt-in; see deploy/README.md before enabling it.
 
 replicaCount: 3
 
 image:
   repository: ghcr.io/oarkflow/broker
   tag: "latest" # TODO: pin to a real, signed tag or digest before using this
+  digest: "" # Clustered mode requires sha256:<64 lowercase hex characters>.
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []
@@ -73,8 +73,10 @@ broker:
     amqp:
       enabled: true
       addr: ":5672"
-    # Native BST1 is unauthenticated and brokerd refuses to start it unless
-    # insecureDev is true. Do not enable in any shared/production chart use.
+    # Native BST1 supports token or mapped mTLS authentication. Production
+    # requires TLS plus an ACL credential. Enabling it adds the listener to
+    # both Services. With networkPolicy.enabled=true, ingress remains denied
+    # until networkPolicy.nativeIngressFrom explicitly allows client sources.
     native:
       enabled: false
       addr: ":8091"
@@ -84,6 +86,21 @@ broker:
   # - name: BROKER_OTLP_ENDPOINT
   #   value: "http://otel-collector.observability:4318"
   extraEnvFrom: []
+
+# -- optional etcd/raft cluster wiring. This bootstraps a fixed-size initial
+# cluster from the StatefulSet peer map; scaling requires the documented Raft
+# membership workflow and must not be done by changing replicaCount alone.
+cluster:
+  enabled: false
+  peerPort: 7946
+  clusterDomain: cluster.local
+  replicationFactor: 3
+  minISR: 0 # 0 selects the majority
+  maxReplicationLag: 1000
+  replicationTimeout: 5s
+  reconcileInterval: 5s
+  autoReassignInterval: 0s # set above zero to replace unavailable replicas and balance healthy replicas by count/workload/disk
+  readIndexTimeout: 5s
 
 # -- secrets --
 # By default the chart creates a placeholder Secret you MUST overwrite
@@ -99,8 +116,8 @@ secrets:
   publisherToken: ""
   frameSigningKey: ""
   frameEncryptionKey: ""
-  amqpUsername: ""
-  amqpPassword: ""
+  amqpUsername: "REPLACE_ME_AMQP_USERNAME"
+  amqpPassword: "REPLACE_ME_AMQP_PASSWORD"
 
 # -- TLS --
 # docs/OPERATIONS.md requires TLS or mTLS in any non-isolated-dev
@@ -137,6 +154,7 @@ service:
     grpc: 50051
     mqtt: 1883
     amqp: 5672
+    native: 8091
 
 terminationGracePeriodSeconds: 30
 
@@ -166,6 +184,9 @@ podDisruptionBudget:
 
 networkPolicy:
   enabled: true
+  # NetworkPolicyPeer entries allowed to connect to BST1 when its listener is
+  # enabled. Empty keeps port 8091 blocked by this policy.
+  nativeIngressFrom: []
 
 topologySpreadConstraints:
   enabled: true

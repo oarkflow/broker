@@ -262,6 +262,9 @@ func (s *EncryptedMessageStore) ConsumerOffsets(ctx context.Context, stream, ten
 func (s *EncryptedMessageStore) Stats(ctx context.Context) (broker.StoreStats, error) {
 	return s.mem.Stats(ctx)
 }
+func (s *EncryptedMessageStore) QueueReadyCount(ctx context.Context, queue string) (int, error) {
+	return s.mem.QueueReadyCount(ctx, queue)
+}
 func (s *EncryptedMessageStore) SweepLeases(ctx context.Context, now time.Time) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

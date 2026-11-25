@@ -3,10 +3,13 @@ package broker
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/oarkflow/broker/cluster"
 )
 
 // SchemaRegistry validates producer payloads before they enter the broker. It is
@@ -49,6 +52,80 @@ type MemorySchemaRegistry struct {
 	versions map[string][]SchemaDefinition // name -> ordered versions
 }
 
+// ControllerSchemaRegistry validates against schema records stored in the
+// distributed controller quorum. Reads are linearizable so every publisher
+// observes committed schema changes after its quorum read point.
+type ControllerSchemaRegistry struct {
+	Controller *cluster.ControllerQuorum
+}
+
+func (r *ControllerSchemaRegistry) Register(definition SchemaDefinition) error {
+	return r.RegisterContext(context.Background(), definition)
+}
+
+func (r *ControllerSchemaRegistry) RegisterContext(ctx context.Context, definition SchemaDefinition) error {
+	if r == nil || r.Controller == nil {
+		return fmt.Errorf("schema registry: controller quorum is unavailable")
+	}
+	if hasRestrictedTenantScope(ctx) {
+		return errf(ErrUnauthorized, "tenant-scoped credentials cannot alter shared schema configuration")
+	}
+	return r.Controller.RegisterSchema(ctx, cluster.SchemaDefinition{
+		Name: definition.Name, Version: definition.Version, ContentType: definition.ContentType,
+		Required: append([]string(nil), definition.Required...), AllowUnknown: definition.AllowUnknown,
+		CompatibleWith: definition.CompatibleWith, Deprecated: definition.Deprecated,
+		Description: definition.Description,
+	})
+}
+
+func (r *ControllerSchemaRegistry) Validate(ctx context.Context, msg Message) error {
+	if msg.Schema == "" {
+		return nil
+	}
+	if r == nil || r.Controller == nil {
+		return fmt.Errorf("schema registry: controller quorum is unavailable")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	version := msg.SchemaVersion
+	if version == "" {
+		version = "v1"
+	}
+	definition, err := r.Controller.GetSchemaLinearizable(ctx, msg.Schema, version)
+	if err != nil {
+		if errors.Is(err, cluster.ErrSchemaNotFound) {
+			return errf(ErrInvalidMessage, "schema %s/%s is not registered", msg.Schema, version)
+		}
+		return err
+	}
+	return validateSchemaPayload(msg, SchemaDefinition{
+		Name: definition.Name, Version: definition.Version, ContentType: definition.ContentType,
+		Required: definition.Required, AllowUnknown: definition.AllowUnknown,
+		CompatibleWith: definition.CompatibleWith, Deprecated: definition.Deprecated,
+		Description: definition.Description,
+	})
+}
+
+func validateSchemaPayload(msg Message, definition SchemaDefinition) error {
+	if definition.Deprecated {
+		return errf(ErrInvalidMessage, "schema %s/%s is deprecated", definition.Name, definition.Version)
+	}
+	if !strings.Contains(strings.ToLower(definition.ContentType), "json") {
+		return nil
+	}
+	var obj map[string]any
+	if err := json.Unmarshal(msg.Payload, &obj); err != nil {
+		return errf(ErrInvalidMessage, "schema %s/%s JSON validation failed: %v", definition.Name, definition.Version, err)
+	}
+	for _, required := range definition.Required {
+		if _, ok := obj[required]; !ok {
+			return errf(ErrInvalidMessage, "schema %s/%s missing required field %s", definition.Name, definition.Version, required)
+		}
+	}
+	return nil
+}
+
 func NewMemorySchemaRegistry(defs ...SchemaDefinition) *MemorySchemaRegistry {
 	r := &MemorySchemaRegistry{schemas: map[string]SchemaDefinition{}, versions: map[string][]SchemaDefinition{}}
 	for _, d := range defs {
@@ -79,16 +156,30 @@ func (r *MemorySchemaRegistry) RegisterContext(ctx context.Context, d SchemaDefi
 	if d.ContentType == "" {
 		d.ContentType = "application/json"
 	}
+	d = cloneSchemaDefinition(d)
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.schemas == nil {
+		r.schemas = make(map[string]SchemaDefinition)
+	}
+	if r.versions == nil {
+		r.versions = make(map[string][]SchemaDefinition)
+	}
 	key := schemaKey(d.Name, d.Version)
 	if existing, ok := r.schemas[key]; ok {
 		if existing.Deprecated {
 			return errf(ErrInvalidMessage, "cannot re-register deprecated schema %s/%s", d.Name, d.Version)
 		}
+		for i := range r.versions[d.Name] {
+			if r.versions[d.Name][i].Version == d.Version {
+				r.versions[d.Name][i] = d
+				break
+			}
+		}
+	} else {
+		r.versions[d.Name] = append(r.versions[d.Name], d)
 	}
 	r.schemas[key] = d
-	r.versions[d.Name] = append(r.versions[d.Name], d)
 	return nil
 }
 
@@ -106,21 +197,7 @@ func (r *MemorySchemaRegistry) Validate(ctx context.Context, msg Message) error 
 	if !ok {
 		return errf(ErrInvalidMessage, "schema %s/%s is not registered", msg.Schema, version)
 	}
-	if d.Deprecated {
-		return errf(ErrInvalidMessage, "schema %s/%s is deprecated", msg.Schema, version)
-	}
-	if strings.Contains(strings.ToLower(d.ContentType), "json") {
-		var obj map[string]any
-		if err := json.Unmarshal(msg.Payload, &obj); err != nil {
-			return errf(ErrInvalidMessage, "schema %s/%s JSON validation failed: %v", msg.Schema, version, err)
-		}
-		for _, k := range d.Required {
-			if _, ok := obj[k]; !ok {
-				return errf(ErrInvalidMessage, "schema %s/%s missing required field %s", msg.Schema, version, k)
-			}
-		}
-	}
-	return nil
+	return validateSchemaPayload(msg, d)
 }
 
 // GetSchema returns the schema definition for the given name and version.
@@ -128,14 +205,19 @@ func (r *MemorySchemaRegistry) GetSchema(name, version string) (SchemaDefinition
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	d, ok := r.schemas[schemaKey(name, version)]
-	return d, ok
+	return cloneSchemaDefinition(d), ok
 }
 
 // ListVersions returns all registered versions for a schema name.
 func (r *MemorySchemaRegistry) ListVersions(name string) []SchemaDefinition {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	return r.versions[name]
+	versions := r.versions[name]
+	result := make([]SchemaDefinition, len(versions))
+	for i := range versions {
+		result[i] = cloneSchemaDefinition(versions[i])
+	}
+	return result
 }
 
 // CheckCompatibility checks if a new schema version is compatible with an existing version.
@@ -192,7 +274,20 @@ func (r *MemorySchemaRegistry) DeprecateSchema(name, version string) error {
 	}
 	d.Deprecated = true
 	r.schemas[key] = d
+	for i := range r.versions[name] {
+		if r.versions[name][i].Version == version {
+			r.versions[name][i] = cloneSchemaDefinition(d)
+			break
+		}
+	}
 	return nil
 }
 
-func schemaKey(name, version string) string { return name + "/" + version }
+func cloneSchemaDefinition(d SchemaDefinition) SchemaDefinition {
+	d.Required = append([]string(nil), d.Required...)
+	return d
+}
+
+func schemaKey(name, version string) string {
+	return fmt.Sprintf("%d:%s%s", len(name), name, version)
+}

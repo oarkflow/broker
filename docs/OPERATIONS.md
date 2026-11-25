@@ -25,13 +25,24 @@ Keep the original immutable until the restored broker passes validation.
 
 ## Rolling upgrade
 
-1. Back up every node and verify the target version understands the current
+1. Run `brokerctl cluster upgrade-plan <tag>` (or request the authenticated
+   `GET /cluster/upgrade-plan?target_version=<tag>`) and resolve every reported
+   blocker. Follow its recommended peer order only after the manual
+   compatibility checks are complete; the plan never asserts that mixed
+   versions or storage formats are compatible.
+2. Query the authenticated `GET /cluster/nodes` endpoint and record each
+   node's `metadata.broker_version`. If a node is unreachable, run
+   `brokerd -version` inside its deployment to inspect the binary directly.
+   This is build inventory; it does not establish protocol or storage
+   compatibility.
+3. Back up every node and verify the target version understands the current
    storage format.
-2. Confirm quorum health and zero under-replicated partitions.
-3. Drain and upgrade one follower. Wait for it to rejoin and catch up.
-4. Repeat for remaining followers.
-5. Transfer leadership away from the final old-version leader, then upgrade it.
-6. Run publish, consume, lease-expiry, and failover probes before completion.
+4. Confirm quorum health and zero under-replicated partitions.
+5. Drain and upgrade one follower. Wait for it to rejoin and catch up.
+6. Repeat for remaining followers.
+7. Use `brokerctl cluster leadership-transfer <peer-id>` to move leadership
+   away from the final old-version leader, then upgrade it.
+8. Run publish, consume, lease-expiry, and failover probes before completion.
 
 Do not mix versions when a release changes Raft commands or storage encoding
 without an explicitly documented compatibility window.

@@ -13,14 +13,40 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/oarkflow/broker"
+	"github.com/oarkflow/broker/cluster"
 	fw "github.com/oarkflow/broker/pkg/pool"
 )
+
+const defaultMaxResponseBytes int64 = 64 << 20
+
+var ErrResponseTooLarge = errors.New("client: broker response exceeds configured size limit")
+
+func readBoundedResponse(body io.Reader, maxBytes int64) ([]byte, error) {
+	if maxBytes <= 0 {
+		maxBytes = defaultMaxResponseBytes
+	}
+	if maxBytes == int64(^uint64(0)>>1) {
+		return io.ReadAll(io.LimitReader(body, maxBytes))
+	}
+	data, err := io.ReadAll(io.LimitReader(body, maxBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("read broker response: %w", err)
+	}
+	if int64(len(data)) > maxBytes {
+		return nil, fmt.Errorf("%w: limit is %d bytes", ErrResponseTooLarge, maxBytes)
+	}
+	return data, nil
+}
 
 type Config struct {
 	BrokerURL, Token, ConsumerID, Group, Name, Version string
@@ -30,10 +56,13 @@ type Config struct {
 	DisableAutoExtendLeases                            bool
 	LeaseExtensionInterval                             time.Duration
 	MaxLeaseExtensions                                 int
-	HTTPClient                                         *http.Client
-	Pool                                               *fw.Pool
-	Hooks                                              Hooks
-	FrameCodec                                         broker.FrameCodec
+	// MaxResponseBytes bounds HTTP response body memory use for JSON and raw calls.
+	// A non-positive value uses the 64 MiB default.
+	MaxResponseBytes int64
+	HTTPClient       *http.Client
+	Pool             *fw.Pool
+	Hooks            Hooks
+	FrameCodec       broker.FrameCodec
 	// TLSCertFile is the path to the client TLS certificate for mTLS.
 	TLSCertFile string
 	// TLSKeyFile is the path to the client TLS private key for mTLS.
@@ -66,14 +95,18 @@ type NotificationEvent struct {
 	Time         time.Time
 }
 type Client struct {
-	cfg    Config
-	http   *http.Client
-	mu     sync.RWMutex
-	urls   []string
-	active int
+	cfg                   Config
+	http                  *http.Client
+	mu                    sync.RWMutex
+	urls                  []string
+	active                int
+	partitionPollSequence atomic.Uint64
 }
 
 func New(cfg Config) *Client {
+	if cfg.MaxResponseBytes <= 0 {
+		cfg.MaxResponseBytes = defaultMaxResponseBytes
+	}
 	if cfg.BrokerURL == "" && len(cfg.BrokerURLs) == 0 {
 		cfg.BrokerURL = "http://127.0.0.1:8090"
 	}
@@ -187,12 +220,54 @@ func remoteError(status int, body []byte) error {
 	return fmt.Errorf("broker %s: %s", http.StatusText(status), strings.TrimSpace(string(body)))
 }
 
-// isRetryableStatus reports whether a status is worth retrying against the next
-// broker URL. A typed envelope tells us authoritatively: a not-leader or
-// stale-epoch response should be retried elsewhere, whereas a genuine 5xx should
-// not be replayed against a different broker.
+// isRetryableStatus is the fallback for servers that return an untyped error
+// body. Typed broker envelopes use their Retryable field instead.
 func isRetryableStatus(status int) bool {
-	return status == http.StatusTooManyRequests || status == http.StatusServiceUnavailable
+	return status == http.StatusTooManyRequests || status >= http.StatusInternalServerError
+}
+
+func shouldFailover(method string, status int, body []byte) bool {
+	if remote := broker.ParseRemoteError(status, body); remote != nil {
+		// A not-leader response is emitted before this node accepts the
+		// operation, so replaying it on the named leader is safe. Other retryable
+		// errors can have an uncertain commit point and must be returned to the
+		// caller for an idempotency-aware decision.
+		return remote.Class == broker.RetryNotLeader || remote.Code == broker.ErrorCode(broker.ErrNotLeader)
+	}
+	readOnly := method == http.MethodGet || method == http.MethodHead || method == http.MethodOptions
+	return readOnly && isRetryableStatus(status)
+}
+
+// prioritizeLeaderURL moves an advertised leader ahead of remaining configured
+// brokers. It never follows an arbitrary address from the response: the leader
+// must match a URL the client already trusts.
+func prioritizeLeaderURL(urls []string, after int, err error) {
+	if after+1 >= len(urls) {
+		return
+	}
+	var remote *broker.RemoteError
+	if !errors.As(err, &remote) {
+		return
+	}
+	leader, _, _ := remote.RetryHint()
+	if leader == "" {
+		return
+	}
+	leaderHost := leader
+	if parsed, parseErr := url.Parse(leader); parseErr == nil && parsed.Host != "" {
+		leaderHost = parsed.Host
+	}
+	for i := after + 1; i < len(urls); i++ {
+		if strings.TrimRight(urls[i], "/") == strings.TrimRight(leader, "/") {
+			urls[after+1], urls[i] = urls[i], urls[after+1]
+			return
+		}
+		parsed, parseErr := url.Parse(urls[i])
+		if parseErr == nil && strings.EqualFold(parsed.Host, leaderHost) {
+			urls[after+1], urls[i] = urls[i], urls[after+1]
+			return
+		}
+	}
 }
 
 // defaultPollWait is how long the client asks the broker to hold a poll open.
@@ -263,9 +338,470 @@ func (c *Client) Poll(ctx context.Context, queue string, limit int) ([]broker.Me
 	err := c.doJSON(ctx, http.MethodPost, "/v1/poll", req, &out)
 	return out, err
 }
+
+// PollPartition leases work from one assigned queue partition through its
+// current leader. Messages carry partition metadata for subsequent Ack/Nack.
+func (c *Client) PollPartition(ctx context.Context, queue string, partition, limit int) ([]broker.Message, error) {
+	if queue == "" || strings.ContainsAny(queue, "/\\") || partition < 0 {
+		return nil, fmt.Errorf("%w: invalid queue partition", broker.ErrInvalidMessage)
+	}
+	if limit <= 0 {
+		limit = c.cfg.PollLimit
+	}
+	return c.pollPartition(ctx, queue, partition, limit, c.cfg.PollWait)
+}
+
+func (c *Client) pollPartition(ctx context.Context, queue string, partition, limit int, wait time.Duration) ([]broker.Message, error) {
+	base, err := c.PartitionResourceLeaderURL(ctx, "queue", queue, partition)
+	if err != nil {
+		return nil, err
+	}
+	req := broker.PollRequest{Queue: queue, Partition: partition, Partitioned: true, ConsumerID: c.cfg.ConsumerID, ConsumerGroup: c.cfg.Group, Limit: limit, WaitNS: wait.Nanoseconds(), VisibilityTimeoutNS: c.cfg.VisibilityTimeout.Nanoseconds()}
+	if c.cfg.Hooks.OnPollStart != nil {
+		c.cfg.Hooks.OnPollStart(Event{ConsumerID: c.cfg.ConsumerID, Group: c.cfg.Group, State: broker.ConsumerPolling, Time: time.Now()})
+	}
+	var out []broker.Message
+	err = c.doJSONAt(ctx, base, http.MethodPost, "/v1/poll", req, &out)
+	return out, err
+}
+
+// PollAssignedQueue polls assigned queue partitions with a bounded aggregate
+// lease count. If some partition requests fail, successful leases are returned
+// together with the joined errors so callers can still process those messages.
+func (c *Client) PollAssignedQueue(ctx context.Context, queue string, limit int) ([]broker.Message, error) {
+	if queue == "" || strings.ContainsAny(queue, "/\\") {
+		return nil, fmt.Errorf("%w: invalid queue", broker.ErrInvalidMessage)
+	}
+	if limit <= 0 {
+		limit = c.cfg.PollLimit
+	}
+	if limit > maxTopicPageSize {
+		limit = maxTopicPageSize
+	}
+	partitions, err := c.assignedResourcePartitions(ctx, "queue", queue)
+	if err != nil {
+		return nil, err
+	}
+	if len(partitions) == 0 {
+		return c.Poll(ctx, queue, limit)
+	}
+	start := int(c.partitionPollSequence.Add(1) % uint64(len(partitions)))
+	quotient, remainder := limit/len(partitions), limit%len(partitions)
+	type result struct {
+		partition int
+		messages  []broker.Message
+		err       error
+	}
+	semaphore := make(chan struct{}, 16)
+	var messages []broker.Message
+	var failures []error
+	pollRound := func(indexes []int, budgets []int, requestWait time.Duration) []result {
+		results := make([]result, len(indexes))
+		var wait sync.WaitGroup
+		for i, index := range indexes {
+			partition, budget := partitions[index], budgets[i]
+			results[i].partition = partition
+			wait.Add(1)
+			go func(resultIndex, partition, budget int) {
+				defer wait.Done()
+				select {
+				case semaphore <- struct{}{}:
+				case <-ctx.Done():
+					results[resultIndex].err = ctx.Err()
+					return
+				}
+				defer func() { <-semaphore }()
+				results[resultIndex].messages, results[resultIndex].err = c.pollPartition(ctx, queue, partition, budget, requestWait)
+			}(i, partition, budget)
+		}
+		wait.Wait()
+		return results
+	}
+	active := make([]int, 0, len(partitions))
+	quotas := make([]int, 0, len(partitions))
+	for i := range partitions {
+		budget := quotient
+		if (i-start+len(partitions))%len(partitions) < remainder {
+			budget++
+		}
+		if budget > 0 {
+			active = append(active, i)
+			quotas = append(quotas, budget)
+		}
+	}
+	results := pollRound(active, quotas, c.cfg.PollWait)
+	remaining := limit
+	for _, result := range results {
+		messages = append(messages, result.messages...)
+		remaining -= len(result.messages)
+		if result.err != nil {
+			failures = append(failures, fmt.Errorf("queue %s partition %d: %w", queue, result.partition, result.err))
+			continue
+		}
+	}
+	// Reassign unused lease capacity to partitions that filled their initial
+	// share. Retries are non-blocking so sparse partitions do not multiply the
+	// configured poll wait, and every round requests at most the remaining total.
+	activePartitions := make([]int, 0, len(active))
+	for i, result := range results {
+		if result.err == nil && len(result.messages) == quotas[i] && quotas[i] > 0 {
+			activePartitions = append(activePartitions, result.partition)
+		}
+	}
+	round := 0
+	for remaining > 0 && len(activePartitions) > 0 {
+		roundStart := (start + round) % len(activePartitions)
+		per, extra := remaining/len(activePartitions), remaining%len(activePartitions)
+		indexes := make([]int, 0, len(activePartitions))
+		budgets := make([]int, 0, len(activePartitions))
+		for i, partition := range activePartitions {
+			budget := per
+			if (i-roundStart+len(activePartitions))%len(activePartitions) < extra {
+				budget++
+			}
+			if budget > 0 {
+				indexes = append(indexes, sort.SearchInts(partitions, partition))
+				budgets = append(budgets, budget)
+			}
+		}
+		nextActive := make([]int, 0, len(activePartitions))
+		more := pollRound(indexes, budgets, 0)
+		for i, result := range more {
+			messages = append(messages, result.messages...)
+			remaining -= len(result.messages)
+			if result.err != nil {
+				failures = append(failures, fmt.Errorf("queue %s partition %d: %w", queue, result.partition, result.err))
+				continue
+			}
+			if len(result.messages) == budgets[i] && budgets[i] > 0 {
+				nextActive = append(nextActive, result.partition)
+			}
+		}
+		activePartitions = nextActive
+		round++
+	}
+	sort.SliceStable(messages, func(i, j int) bool {
+		if messages[i].CreatedAt.Equal(messages[j].CreatedAt) {
+			if messages[i].Partition == messages[j].Partition {
+				return messages[i].ID < messages[j].ID
+			}
+			return messages[i].Partition < messages[j].Partition
+		}
+		return messages[i].CreatedAt.Before(messages[j].CreatedAt)
+	})
+	return messages, errors.Join(failures...)
+}
+
+func (c *Client) assignedResourcePartitions(ctx context.Context, kind, name string) ([]int, error) {
+	var assignments []struct {
+		ID struct {
+			Topic     string `json:"topic"`
+			Partition int    `json:"partition"`
+			Kind      string `json:"kind"`
+		} `json:"id"`
+	}
+	if err := c.doJSON(ctx, http.MethodGet, "/cluster/partitions", nil, &assignments); err != nil {
+		return nil, err
+	}
+	partitionSet := make(map[int]struct{})
+	for _, assignment := range assignments {
+		if assignment.ID.Topic == name && assignment.ID.Kind == kind {
+			if assignment.ID.Partition < 0 {
+				return nil, fmt.Errorf("%w: invalid %s partition assignment for %q", broker.ErrInvalidMessage, kind, name)
+			}
+			partitionSet[assignment.ID.Partition] = struct{}{}
+		}
+	}
+	partitions := make([]int, 0, len(partitionSet))
+	for partition := range partitionSet {
+		partitions = append(partitions, partition)
+	}
+	sort.Ints(partitions)
+	if len(partitions) > maxTopicPagePartitions {
+		return nil, fmt.Errorf("%w: %s %q has %d partitions; client limit is %d", broker.ErrUnsupportedMode, kind, name, len(partitions), maxTopicPagePartitions)
+	}
+	return partitions, nil
+}
+
+// GetClusterTransaction returns one quorum-confirmed controller transaction
+// record by ID, including its participant votes, durable decision, and
+// resolution progress.
+func (c *Client) GetClusterTransaction(ctx context.Context, id string) (*cluster.CoordinatorTransaction, error) {
+	if id == "" || len(id) > cluster.MaxTransactionIDBytes {
+		return nil, fmt.Errorf("%w: invalid transaction ID", broker.ErrInvalidMessage)
+	}
+	var transaction cluster.CoordinatorTransaction
+	path := "/cluster/transactions?id=" + url.QueryEscape(id)
+	if err := c.doJSON(ctx, http.MethodGet, path, nil, &transaction); err != nil {
+		return nil, err
+	}
+	return &transaction, nil
+}
+
+// ListClusterTransactionsPage returns one stable, bounded controller
+// transaction page. Pass nextCursor as after to continue the scan.
+func (c *Client) ListClusterTransactionsPage(ctx context.Context, after string, limit int) ([]*cluster.CoordinatorTransaction, string, error) {
+	if len(after) > cluster.MaxTransactionIDBytes {
+		return nil, "", fmt.Errorf("%w: invalid transaction cursor", broker.ErrInvalidMessage)
+	}
+	if limit <= 0 {
+		limit = cluster.DefaultTransactionPageSize
+	}
+	if limit > cluster.MaxTransactionPageSize {
+		limit = cluster.MaxTransactionPageSize
+	}
+	query := url.Values{}
+	query.Set("after", after)
+	query.Set("limit", strconv.Itoa(limit))
+	var page struct {
+		Transactions []*cluster.CoordinatorTransaction `json:"transactions"`
+		NextCursor   string                            `json:"next_cursor"`
+	}
+	if err := c.doJSON(ctx, http.MethodGet, "/cluster/transactions?"+query.Encode(), nil, &page); err != nil {
+		return nil, "", err
+	}
+	return page.Transactions, page.NextCursor, nil
+}
+
+// PruneClusterTransactions removes a bounded number of fully resolved
+// coordinator records older than before. Unresolved transaction work is never
+// eligible for pruning.
+func (c *Client) PruneClusterTransactions(ctx context.Context, before time.Time, limit int) (int, error) {
+	if before.IsZero() {
+		return 0, fmt.Errorf("%w: transaction prune cutoff is required", broker.ErrInvalidMessage)
+	}
+	if limit <= 0 {
+		limit = 100
+	}
+	if limit > cluster.MaxTransactionPruneBatch {
+		limit = cluster.MaxTransactionPruneBatch
+	}
+	var result struct {
+		Pruned int `json:"pruned"`
+	}
+	if err := c.doJSON(ctx, http.MethodPost, "/cluster/transactions/prune", map[string]any{
+		"before": before.UTC(), "limit": limit,
+	}, &result); err != nil {
+		return 0, err
+	}
+	return result.Pruned, nil
+}
+
+func (c *Client) ListPartitionQueue(ctx context.Context, queue string, partition, limit int) ([]broker.Message, error) {
+	if queue == "" || strings.ContainsAny(queue, "/\\") || partition < 0 {
+		return nil, fmt.Errorf("%w: invalid queue partition", broker.ErrInvalidMessage)
+	}
+	base, err := c.PartitionResourceLeaderURL(ctx, "queue", queue, partition)
+	if err != nil {
+		return nil, err
+	}
+	path := fmt.Sprintf("/queues/%s/partitions/%d/messages", url.PathEscape(queue), partition)
+	if limit > 0 {
+		path += fmt.Sprintf("?limit=%d", limit)
+	}
+	var out []broker.Message
+	err = c.doJSONAt(ctx, base, http.MethodGet, path, nil, &out)
+	return out, err
+}
+
+// ListAssignedQueue returns a bounded merged view across assigned queue
+// partitions. Each partition receives a share of the limit; results are sorted
+// by creation time, but this is not a cursor-based global FIFO page. Successful
+// messages are returned alongside any per-partition error.
+func (c *Client) ListAssignedQueue(ctx context.Context, queue string, limit int) ([]broker.Message, error) {
+	report, err := c.ListAssignedQueueDetailed(ctx, queue, limit)
+	if report == nil {
+		return nil, err
+	}
+	return report.Messages, err
+}
+
+// ListAssignedQueueDetailed returns the bounded server-side queue sample with
+// the partitions queried, successes, and partial failures.
+func (c *Client) ListAssignedQueueDetailed(ctx context.Context, queue string, limit int) (*broker.AssignedQueueMessages, error) {
+	if queue == "" || strings.ContainsAny(queue, "/\\") {
+		return nil, fmt.Errorf("%w: invalid queue", broker.ErrInvalidMessage)
+	}
+	if limit <= 0 {
+		limit = 100
+	} else if limit > maxTopicPageSize {
+		limit = maxTopicPageSize
+	}
+	query := url.Values{}
+	query.Set("limit", strconv.Itoa(limit))
+	var report broker.AssignedQueueMessages
+	path := "/queues/" + url.PathEscape(queue) + "/assigned/messages?" + query.Encode()
+	if err := c.doJSON(ctx, http.MethodGet, path, nil, &report); err != nil {
+		return nil, err
+	}
+	if report.Queue != queue || len(report.Partitions) == 0 || len(report.Partitions) > maxTopicPagePartitions || len(report.Messages) > limit {
+		return nil, fmt.Errorf("%w: server returned an invalid assigned queue listing", broker.ErrInvalidMessage)
+	}
+	partitionSet := make(map[int]struct{}, len(report.Partitions))
+	lastPartition := -1
+	for _, partition := range report.Partitions {
+		if partition < 0 || partition <= lastPartition {
+			return nil, fmt.Errorf("%w: server returned invalid queue partition ordering", broker.ErrInvalidMessage)
+		}
+		partitionSet[partition] = struct{}{}
+		lastPartition = partition
+	}
+	completed := make(map[int]struct{}, len(report.Completed))
+	for _, partition := range report.Completed {
+		if _, ok := partitionSet[partition]; !ok {
+			return nil, fmt.Errorf("%w: server reported completion for an unassigned queue partition", broker.ErrInvalidMessage)
+		}
+		if _, duplicate := completed[partition]; duplicate {
+			return nil, fmt.Errorf("%w: server duplicated a completed queue partition", broker.ErrInvalidMessage)
+		}
+		completed[partition] = struct{}{}
+	}
+	var failures []error
+	for partition, reason := range report.Failures {
+		if _, ok := partitionSet[partition]; !ok || reason == "" {
+			return nil, fmt.Errorf("%w: server returned an invalid queue partition failure", broker.ErrInvalidMessage)
+		}
+		if _, ok := completed[partition]; ok {
+			return nil, fmt.Errorf("%w: server reported both success and failure for a queue partition", broker.ErrInvalidMessage)
+		}
+		failures = append(failures, fmt.Errorf("queue %s partition %d: %s", queue, partition, reason))
+	}
+	seenMessages := make(map[string]struct{}, len(report.Messages))
+	for _, message := range report.Messages {
+		if message.Queue != queue {
+			return nil, fmt.Errorf("%w: server returned a message from another queue", broker.ErrInvalidMessage)
+		}
+		if _, ok := completed[message.Partition]; !ok {
+			return nil, fmt.Errorf("%w: server returned a message from an unsuccessful queue partition", broker.ErrInvalidMessage)
+		}
+		if _, duplicate := seenMessages[message.ID]; duplicate {
+			return nil, fmt.Errorf("%w: server returned a duplicate queue message", broker.ErrInvalidMessage)
+		}
+		seenMessages[message.ID] = struct{}{}
+	}
+	return &report, errors.Join(failures...)
+}
+
+func (c *Client) PausePartitionQueue(ctx context.Context, queue string, partition int) error {
+	return c.partitionQueueControl(ctx, queue, partition, "pause", nil)
+}
+
+func (c *Client) ResumePartitionQueue(ctx context.Context, queue string, partition int) error {
+	return c.partitionQueueControl(ctx, queue, partition, "resume", nil)
+}
+
+func (c *Client) PurgePartitionQueue(ctx context.Context, queue string, partition int) (int, error) {
+	var out struct {
+		Purged int `json:"purged"`
+	}
+	err := c.partitionQueueControl(ctx, queue, partition, "purge", &out)
+	return out.Purged, err
+}
+
+func (c *Client) partitionQueueControl(ctx context.Context, queue string, partition int, action string, out any) error {
+	if queue == "" || strings.ContainsAny(queue, "/\\") || partition < 0 {
+		return fmt.Errorf("%w: invalid queue partition", broker.ErrInvalidMessage)
+	}
+	base, err := c.PartitionResourceLeaderURL(ctx, "queue", queue, partition)
+	if err != nil {
+		return err
+	}
+	path := fmt.Sprintf("/queues/%s/partitions/%d/%s", url.PathEscape(queue), partition, action)
+	return c.doJSONAt(ctx, base, http.MethodPost, path, nil, out)
+}
+
+// QueuePartitionOperationResult identifies which assigned partitions accepted
+// a best-effort whole-queue control operation. Failures can coexist with
+// successes because queue partitions commit independently.
+type QueuePartitionOperationResult = broker.QueuePartitionOperationResult
+
+func (c *Client) PauseAssignedQueue(ctx context.Context, queue string) (*QueuePartitionOperationResult, error) {
+	return c.applyAssignedQueueControl(ctx, queue, "pause")
+}
+
+func (c *Client) ResumeAssignedQueue(ctx context.Context, queue string) (*QueuePartitionOperationResult, error) {
+	return c.applyAssignedQueueControl(ctx, queue, "resume")
+}
+
+func (c *Client) PurgeAssignedQueue(ctx context.Context, queue string) (*QueuePartitionOperationResult, error) {
+	return c.applyAssignedQueueControl(ctx, queue, "purge")
+}
+
+func (c *Client) applyAssignedQueueControl(ctx context.Context, queue, action string) (*QueuePartitionOperationResult, error) {
+	if queue == "" || strings.ContainsAny(queue, "/\\") {
+		return nil, fmt.Errorf("%w: invalid queue", broker.ErrInvalidMessage)
+	}
+	if action != "pause" && action != "resume" && action != "purge" {
+		return nil, fmt.Errorf("%w: invalid queue control action", broker.ErrInvalidMessage)
+	}
+	var result QueuePartitionOperationResult
+	path := "/queues/" + url.PathEscape(queue) + "/assigned/" + action
+	if err := c.doJSON(ctx, http.MethodPost, path, nil, &result); err != nil {
+		return nil, err
+	}
+	if len(result.Partitions) == 0 || len(result.Partitions) > maxTopicPagePartitions {
+		return nil, fmt.Errorf("%w: server returned an invalid queue operation report", broker.ErrInvalidMessage)
+	}
+	partitions := make(map[int]struct{}, len(result.Partitions))
+	lastPartition := -1
+	for _, partition := range result.Partitions {
+		if partition < 0 || partition <= lastPartition {
+			return nil, fmt.Errorf("%w: server returned invalid queue partition ordering", broker.ErrInvalidMessage)
+		}
+		partitions[partition] = struct{}{}
+		lastPartition = partition
+	}
+	completed := make(map[int]struct{}, len(result.Completed))
+	for _, partition := range result.Completed {
+		if _, ok := partitions[partition]; !ok {
+			return nil, fmt.Errorf("%w: server reported completion for an unassigned queue partition", broker.ErrInvalidMessage)
+		}
+		if _, duplicate := completed[partition]; duplicate {
+			return nil, fmt.Errorf("%w: server duplicated a completed queue partition", broker.ErrInvalidMessage)
+		}
+		completed[partition] = struct{}{}
+	}
+	var failures []error
+	for partition, reason := range result.Failures {
+		if _, ok := partitions[partition]; !ok || reason == "" {
+			return nil, fmt.Errorf("%w: server returned an invalid queue partition failure", broker.ErrInvalidMessage)
+		}
+		if _, ok := completed[partition]; ok {
+			return nil, fmt.Errorf("%w: server reported both success and failure for a queue partition", broker.ErrInvalidMessage)
+		}
+		failures = append(failures, fmt.Errorf("queue %s partition %d: %s", queue, partition, reason))
+	}
+	if len(completed)+len(result.Failures) != len(partitions) {
+		return nil, fmt.Errorf("%w: server omitted a queue partition operation result", broker.ErrInvalidMessage)
+	}
+	if action == "purge" {
+		if len(result.Purged) != len(completed) {
+			return nil, fmt.Errorf("%w: server returned an incomplete purge count map", broker.ErrInvalidMessage)
+		}
+		for partition := range result.Purged {
+			if _, ok := completed[partition]; !ok {
+				return nil, fmt.Errorf("%w: server returned a purge count for an unsuccessful partition", broker.ErrInvalidMessage)
+			}
+		}
+	} else if len(result.Purged) != 0 {
+		return nil, fmt.Errorf("%w: server returned purge counts for a non-purge operation", broker.ErrInvalidMessage)
+	}
+	return &result, errors.Join(failures...)
+}
+
 func (c *Client) Ack(ctx context.Context, m broker.Message) error {
-	body := broker.AckRequest{MessageID: m.ID, Queue: m.Queue, LeaseToken: m.LeaseToken, ConsumerID: c.cfg.ConsumerID}
-	err := c.doJSON(ctx, http.MethodPost, "/v1/messages/"+m.ID+"/ack", body, nil)
+	body := broker.AckRequest{MessageID: m.ID, Queue: m.Queue, Partition: m.Partition, Partitioned: m.Partitioned, LeaseToken: m.LeaseToken, ConsumerID: c.cfg.ConsumerID}
+	path := "/v1/messages/" + url.PathEscape(m.ID) + "/ack"
+	var err error
+	if m.Partitioned {
+		var base string
+		base, err = c.PartitionResourceLeaderURL(ctx, "queue", m.Queue, m.Partition)
+		if err == nil {
+			err = c.doJSONAt(ctx, base, http.MethodPost, path, body, nil)
+		}
+	} else {
+		err = c.doJSON(ctx, http.MethodPost, path, body, nil)
+	}
 	if err == nil && c.cfg.Hooks.OnAck != nil {
 		c.cfg.Hooks.OnAck(MessageEvent{Message: m, Queue: m.Queue, Time: time.Now()})
 	}
@@ -278,24 +814,54 @@ func (c *Client) Nack(ctx context.Context, m broker.Message, opts ...NackOption)
 			fn(&o)
 		}
 	}
-	body := broker.NackRequest{MessageID: m.ID, Queue: m.Queue, LeaseToken: m.LeaseToken, ConsumerID: c.cfg.ConsumerID, Action: o.Action, Reason: o.Reason, Error: o.Error, Delay: o.Delay, DLQ: o.DLQ}
-	err := c.doJSON(ctx, http.MethodPost, "/v1/messages/"+m.ID+"/nack", body, nil)
+	body := broker.NackRequest{MessageID: m.ID, Queue: m.Queue, Partition: m.Partition, Partitioned: m.Partitioned, LeaseToken: m.LeaseToken, ConsumerID: c.cfg.ConsumerID, Action: o.Action, Reason: o.Reason, Error: o.Error, Delay: o.Delay, DLQ: o.DLQ}
+	path := "/v1/messages/" + url.PathEscape(m.ID) + "/nack"
+	var err error
+	if m.Partitioned {
+		var base string
+		base, err = c.PartitionResourceLeaderURL(ctx, "queue", m.Queue, m.Partition)
+		if err == nil {
+			err = c.doJSONAt(ctx, base, http.MethodPost, path, body, nil)
+		}
+	} else {
+		err = c.doJSON(ctx, http.MethodPost, path, body, nil)
+	}
 	if err == nil && c.cfg.Hooks.OnNack != nil {
 		c.cfg.Hooks.OnNack(MessageEvent{Message: m, Queue: m.Queue, Error: errors.New(o.Error), Time: time.Now()})
 	}
 	return err
 }
 func (c *Client) Reject(ctx context.Context, m broker.Message, reason string) error {
-	body := broker.NackRequest{MessageID: m.ID, Queue: m.Queue, LeaseToken: m.LeaseToken, ConsumerID: c.cfg.ConsumerID, Action: broker.NackReject, Reason: reason, Error: reason}
-	err := c.doJSON(ctx, http.MethodPost, "/v1/messages/"+m.ID+"/reject", body, nil)
+	body := broker.NackRequest{MessageID: m.ID, Queue: m.Queue, Partition: m.Partition, Partitioned: m.Partitioned, LeaseToken: m.LeaseToken, ConsumerID: c.cfg.ConsumerID, Action: broker.NackReject, Reason: reason, Error: reason}
+	path := "/v1/messages/" + url.PathEscape(m.ID) + "/reject"
+	var err error
+	if m.Partitioned {
+		var base string
+		base, err = c.PartitionResourceLeaderURL(ctx, "queue", m.Queue, m.Partition)
+		if err == nil {
+			err = c.doJSONAt(ctx, base, http.MethodPost, path, body, nil)
+		}
+	} else {
+		err = c.doJSON(ctx, http.MethodPost, path, body, nil)
+	}
 	if err == nil && c.cfg.Hooks.OnReject != nil {
 		c.cfg.Hooks.OnReject(MessageEvent{Message: m, Queue: m.Queue, Error: errors.New(reason), Time: time.Now()})
 	}
 	return err
 }
 func (c *Client) Extend(ctx context.Context, m broker.Message, d time.Duration) error {
-	body := broker.LeaseRequest{MessageID: m.ID, Queue: m.Queue, LeaseToken: m.LeaseToken, ConsumerID: c.cfg.ConsumerID, VisibilityTimeout: d}
-	err := c.doJSON(ctx, http.MethodPost, "/v1/messages/"+m.ID+"/extend", body, nil)
+	body := broker.LeaseRequest{MessageID: m.ID, Queue: m.Queue, Partition: m.Partition, Partitioned: m.Partitioned, LeaseToken: m.LeaseToken, ConsumerID: c.cfg.ConsumerID, VisibilityTimeout: d}
+	path := "/v1/messages/" + url.PathEscape(m.ID) + "/extend"
+	var err error
+	if m.Partitioned {
+		var base string
+		base, err = c.PartitionResourceLeaderURL(ctx, "queue", m.Queue, m.Partition)
+		if err == nil {
+			err = c.doJSONAt(ctx, base, http.MethodPost, path, body, nil)
+		}
+	} else {
+		err = c.doJSON(ctx, http.MethodPost, path, body, nil)
+	}
 	if err == nil && c.cfg.Hooks.OnLeaseExtended != nil {
 		c.cfg.Hooks.OnLeaseExtended(MessageEvent{Message: m, Queue: m.Queue, Time: time.Now()})
 	}
@@ -430,6 +996,7 @@ func (o PublishOptions) applyTo(req *broker.PublishHTTPPayload) {
 	req.Key = o.Key
 	req.RoutingKey = o.RoutingKey
 	req.Priority = o.Priority
+	req.Partition = o.Partition
 	req.TenantID = o.TenantID
 	req.CorrelationID = o.CorrelationID
 	req.CausationID = o.CausationID
@@ -616,6 +1183,61 @@ func (c *Client) CommitStreamOffset(ctx context.Context, stream, group string, o
 	return c.doJSON(ctx, http.MethodPost, "/v1/streams/"+stream+"/commit", broker.OffsetCommit{Stream: stream, ConsumerGroup: group, Offset: offset}, nil)
 }
 
+// CommitPartitionStreamOffset commits a consumer checkpoint within one
+// assigned stream partition. Offsets are local to each partition.
+func (c *Client) CommitPartitionStreamOffset(ctx context.Context, stream, group string, partition int, offset uint64) error {
+	if stream == "" || partition < 0 {
+		return fmt.Errorf("%w: invalid stream partition", broker.ErrInvalidMessage)
+	}
+	base, err := c.PartitionResourceLeaderURL(ctx, "stream", stream, partition)
+	if err != nil {
+		return err
+	}
+	path := fmt.Sprintf("/v1/streams/%s/partitions/%d/commit", url.PathEscape(stream), partition)
+	return c.doJSONAt(ctx, base, http.MethodPost, path, broker.OffsetCommit{Stream: stream, ConsumerGroup: group, Offset: offset, Partition: partition, Partitioned: true}, nil)
+}
+
+// CommitPartitionStreamOffsetAndAppend atomically commits a partition-local
+// consumer checkpoint and appends outputs confined to that same stream
+// partition. Set transactionID to make retries idempotent.
+func (c *Client) CommitPartitionStreamOffsetAndAppend(ctx context.Context, stream, group string, partition int, offset uint64, transactionID string, entries []broker.AppendEntry) ([]broker.Message, error) {
+	if stream == "" || strings.ContainsAny(stream, "/\\") || partition < 0 {
+		return nil, fmt.Errorf("%w: invalid stream partition", broker.ErrInvalidMessage)
+	}
+	base, err := c.PartitionResourceLeaderURL(ctx, "stream", stream, partition)
+	if err != nil {
+		return nil, err
+	}
+	path := fmt.Sprintf("/v1/streams/%s/partitions/%d/commit-and-append", url.PathEscape(stream), partition)
+	body := struct {
+		ConsumerGroup string               `json:"consumer_group"`
+		Offset        uint64               `json:"offset"`
+		TransactionID string               `json:"transaction_id,omitempty"`
+		Entries       []broker.AppendEntry `json:"entries"`
+	}{ConsumerGroup: group, Offset: offset, TransactionID: transactionID, Entries: entries}
+	var messages []broker.Message
+	err = c.doJSONAt(ctx, base, http.MethodPost, path, body, &messages)
+	return messages, err
+}
+
+// PartitionStreamOffset reads a consumer checkpoint from one assigned stream
+// partition.
+func (c *Client) PartitionStreamOffset(ctx context.Context, stream, group string, partition int) (uint64, error) {
+	if stream == "" || partition < 0 {
+		return 0, fmt.Errorf("%w: invalid stream partition", broker.ErrInvalidMessage)
+	}
+	base, err := c.PartitionResourceLeaderURL(ctx, "stream", stream, partition)
+	if err != nil {
+		return 0, err
+	}
+	path := fmt.Sprintf("/v1/streams/%s/partitions/%d/offset?consumer_group=%s", url.PathEscape(stream), partition, url.QueryEscape(group))
+	var out struct {
+		Offset uint64 `json:"offset"`
+	}
+	err = c.doJSONAt(ctx, base, http.MethodGet, path, nil, &out)
+	return out.Offset, err
+}
+
 func (c *Client) StreamOffset(ctx context.Context, stream, group string) (uint64, error) {
 	var out struct {
 		Offset uint64 `json:"offset"`
@@ -628,6 +1250,823 @@ func (c *Client) Consumers(ctx context.Context) ([]broker.ConsumerInfo, error) {
 	err := c.doJSON(ctx, http.MethodGet, "/v1/consumers", nil, &out)
 	return out, err
 }
+
+// PartitionRoute retrieves the quorum-confirmed leader assignment for one
+// partition and any local Raft observation returned by the broker.
+func (c *Client) PartitionRoute(ctx context.Context, topic string, partition int) (*broker.PartitionRoute, error) {
+	return c.PartitionResourceRoute(ctx, "topic", topic, partition)
+}
+
+// PartitionResourceRoute retrieves the route for a topic or stream partition.
+func (c *Client) PartitionResourceRoute(ctx context.Context, kind, name string, partition int) (*broker.PartitionRoute, error) {
+	if name == "" || strings.ContainsAny(name, "/\\") || partition < 0 || (kind != "topic" && kind != "stream" && kind != "queue") {
+		return nil, fmt.Errorf("%w: invalid partition resource or index", broker.ErrInvalidMessage)
+	}
+	path := fmt.Sprintf("/cluster/partitions/%s/%d/route", url.PathEscape(name), partition)
+	if kind != "topic" {
+		path += "?resource_kind=" + url.QueryEscape(kind)
+	}
+	var route broker.PartitionRoute
+	if err := c.doJSON(ctx, http.MethodGet, path, nil, &route); err != nil {
+		return nil, err
+	}
+	return &route, nil
+}
+
+func (c *Client) PlanPartitionReassignment(ctx context.Context, kind, name string, partition int, replicas []string, leader string) (*broker.PartitionReassignmentPlan, error) {
+	if name == "" || strings.ContainsAny(name, "/\\") || partition < 0 || (kind != "topic" && kind != "stream" && kind != "queue") {
+		return nil, fmt.Errorf("%w: invalid partition resource or index", broker.ErrInvalidMessage)
+	}
+	query := url.Values{}
+	query.Set("resource_kind", kind)
+	query.Set("replicas", strings.Join(replicas, ","))
+	if leader != "" {
+		query.Set("leader", leader)
+	}
+	path := fmt.Sprintf("/cluster/partitions/%s/%d/reassignment-plan?%s", url.PathEscape(name), partition, query.Encode())
+	base, err := c.PartitionResourceLeaderURL(ctx, kind, name, partition)
+	if err != nil {
+		return nil, err
+	}
+	var plan broker.PartitionReassignmentPlan
+	err = c.doJSONAt(ctx, base, http.MethodGet, path, nil, &plan)
+	return &plan, err
+}
+
+// ReassignPartition advances one safe reassignment phase. Repeat the call with
+// the same replica set and leader while Complete is false; WaitingFor reports
+// replicas that are still catching up or membership steps awaiting retry.
+func (c *Client) ReassignPartition(ctx context.Context, kind, name string, partition int, replicas []string, leader string) (*broker.PartitionReassignmentProgress, error) {
+	if name == "" || strings.ContainsAny(name, "/\\") || partition < 0 || (kind != "topic" && kind != "stream" && kind != "queue") {
+		return nil, fmt.Errorf("%w: invalid partition resource or index", broker.ErrInvalidMessage)
+	}
+	path := fmt.Sprintf("/cluster/partitions/%s/%d/reassign?resource_kind=%s", url.PathEscape(name), partition, url.QueryEscape(kind))
+	base, err := c.PartitionResourceLeaderURL(ctx, kind, name, partition)
+	if err != nil {
+		return nil, err
+	}
+	request := struct {
+		Replicas []string `json:"replicas"`
+		Leader   string   `json:"leader,omitempty"`
+	}{Replicas: append([]string(nil), replicas...), Leader: leader}
+	var progress broker.PartitionReassignmentProgress
+	if err := c.doJSONAt(ctx, base, http.MethodPost, path, request, &progress); err != nil {
+		return nil, err
+	}
+	return &progress, nil
+}
+
+// CancelPartitionReassignment stops a not-yet-committed reassignment and
+// removes its target-only Raft members. Repeat while Complete is false.
+func (c *Client) CancelPartitionReassignment(ctx context.Context, kind, name string, partition int) (*broker.PartitionReassignmentProgress, error) {
+	if name == "" || strings.ContainsAny(name, "/\\") || partition < 0 || (kind != "topic" && kind != "stream" && kind != "queue") {
+		return nil, fmt.Errorf("%w: invalid partition resource or index", broker.ErrInvalidMessage)
+	}
+	path := fmt.Sprintf("/cluster/partitions/%s/%d/cancel-reassignment?resource_kind=%s", url.PathEscape(name), partition, url.QueryEscape(kind))
+	base, err := c.PartitionResourceLeaderURL(ctx, kind, name, partition)
+	if err != nil {
+		return nil, err
+	}
+	var progress broker.PartitionReassignmentProgress
+	if err := c.doJSONAt(ctx, base, http.MethodPost, path, nil, &progress); err != nil {
+		return nil, err
+	}
+	return &progress, nil
+}
+
+// PlanRaftNodeRemoval lists partition assignments that must be moved before a
+// controller Raft peer can be removed.
+func (c *Client) PlanRaftNodeRemoval(ctx context.Context, peerID uint64) (*broker.RaftNodeRemovalPlan, error) {
+	if peerID == 0 {
+		return nil, fmt.Errorf("%w: Raft peer ID must be positive", broker.ErrInvalidMessage)
+	}
+	var plan broker.RaftNodeRemovalPlan
+	path := fmt.Sprintf("/cluster/nodes/%d/removal-plan", peerID)
+	if err := c.doJSON(ctx, http.MethodGet, path, nil, &plan); err != nil {
+		return nil, err
+	}
+	return &plan, nil
+}
+
+// PlanClusterUpgrade returns a read-only version inventory and conservative
+// controller-peer upgrade order. It does not verify storage or protocol
+// compatibility; inspect plan.ManualChecks before using the order.
+func (c *Client) PlanClusterUpgrade(ctx context.Context, targetVersion string) (*broker.ClusterUpgradePlan, error) {
+	if strings.TrimSpace(targetVersion) == "" {
+		return nil, fmt.Errorf("%w: target broker version is required", broker.ErrInvalidMessage)
+	}
+	var plan broker.ClusterUpgradePlan
+	path := "/cluster/upgrade-plan?target_version=" + url.QueryEscape(targetVersion)
+	if err := c.doJSON(ctx, http.MethodGet, path, nil, &plan); err != nil {
+		return nil, err
+	}
+	if plan.TargetVersion != targetVersion || plan.CompatibilityVerified {
+		return nil, fmt.Errorf("%w: server returned an invalid cluster upgrade plan", broker.ErrInvalidMessage)
+	}
+	return &plan, nil
+}
+
+// BeginRaftNodeDrain prevents new partition assignments from adding a
+// controller peer's logical node while existing assignments are moved.
+func (c *Client) BeginRaftNodeDrain(ctx context.Context, peerID uint64) (*cluster.NodeInfo, error) {
+	if peerID == 0 {
+		return nil, fmt.Errorf("%w: Raft peer ID must be positive", broker.ErrInvalidMessage)
+	}
+	var response struct {
+		Node *cluster.NodeInfo `json:"node"`
+	}
+	path := fmt.Sprintf("/cluster/nodes/%d/drain", peerID)
+	if err := c.doJSON(ctx, http.MethodPost, path, struct{}{}, &response); err != nil {
+		return nil, err
+	}
+	if response.Node == nil || response.Node.State != cluster.NodeDraining {
+		return nil, fmt.Errorf("%w: drain response does not confirm the draining state", broker.ErrInvalidMessage)
+	}
+	return response.Node, nil
+}
+
+// CompleteRaftNodeDrain marks a drained node left after its partition
+// assignments are gone.
+func (c *Client) CompleteRaftNodeDrain(ctx context.Context, peerID uint64) (*cluster.NodeInfo, error) {
+	if peerID == 0 {
+		return nil, fmt.Errorf("%w: Raft peer ID must be positive", broker.ErrInvalidMessage)
+	}
+	var response struct {
+		Node *cluster.NodeInfo `json:"node"`
+	}
+	path := fmt.Sprintf("/cluster/nodes/%d/drain/complete", peerID)
+	if err := c.doJSON(ctx, http.MethodPost, path, struct{}{}, &response); err != nil {
+		return nil, err
+	}
+	if response.Node == nil || response.Node.State != cluster.NodeLeft {
+		return nil, fmt.Errorf("%w: drain completion response does not confirm the left state", broker.ErrInvalidMessage)
+	}
+	return response.Node, nil
+}
+
+// RaftMembershipResult describes the result of a controller membership action.
+type RaftMembershipResult struct {
+	Status   string `json:"status,omitempty"`
+	PeerID   uint64 `json:"peer_id,omitempty"`
+	Role     string `json:"role,omitempty"`
+	LeaderID uint64 `json:"leader_id,omitempty"`
+}
+
+// AddRaftLearner adds a non-voting controller peer and returns its assigned
+// Raft ID. The peer must catch up before it can be promoted.
+func (c *Client) AddRaftLearner(ctx context.Context, address string) (*RaftMembershipResult, error) {
+	if strings.TrimSpace(address) == "" {
+		return nil, fmt.Errorf("%w: peer address is required", broker.ErrInvalidMessage)
+	}
+	var result RaftMembershipResult
+	address = strings.TrimSpace(address)
+	if err := c.doJSON(ctx, http.MethodPost, "/cluster/nodes", map[string]string{"address": address}, &result); err != nil {
+		return nil, err
+	}
+	if result.PeerID == 0 || (result.Role != "learner" && result.Role != "voter") {
+		return nil, fmt.Errorf("%w: learner response contains invalid membership data", broker.ErrInvalidMessage)
+	}
+	return &result, nil
+}
+
+// PromoteRaftLearner promotes a caught-up learner to a controller voter.
+func (c *Client) PromoteRaftLearner(ctx context.Context, peerID uint64) (*RaftMembershipResult, error) {
+	if peerID == 0 {
+		return nil, fmt.Errorf("%w: Raft peer ID must be positive", broker.ErrInvalidMessage)
+	}
+	var result RaftMembershipResult
+	path := fmt.Sprintf("/cluster/nodes/%d/promote", peerID)
+	if err := c.doJSON(ctx, http.MethodPost, path, struct{}{}, &result); err != nil {
+		return nil, err
+	}
+	if result.PeerID != peerID || result.Role != "voter" {
+		return nil, fmt.Errorf("%w: promotion response does not confirm voter membership", broker.ErrInvalidMessage)
+	}
+	return &result, nil
+}
+
+// TransferControllerLeadership moves controller leadership to a caught-up
+// voter and waits for the target to become leader.
+func (c *Client) TransferControllerLeadership(ctx context.Context, peerID uint64) (*RaftMembershipResult, error) {
+	if peerID == 0 {
+		return nil, fmt.Errorf("%w: Raft peer ID must be positive", broker.ErrInvalidMessage)
+	}
+	var result RaftMembershipResult
+	if err := c.doJSON(ctx, http.MethodPost, "/cluster/leadership", map[string]uint64{"peer_id": peerID}, &result); err != nil {
+		return nil, err
+	}
+	if result.LeaderID != peerID {
+		return nil, fmt.Errorf("%w: leadership response does not confirm the requested leader", broker.ErrInvalidMessage)
+	}
+	return &result, nil
+}
+
+// RemoveRaftNode removes a voter or learner after the server's drain and
+// leadership preconditions pass.
+func (c *Client) RemoveRaftNode(ctx context.Context, peerID uint64) (*RaftMembershipResult, error) {
+	if peerID == 0 {
+		return nil, fmt.Errorf("%w: Raft peer ID must be positive", broker.ErrInvalidMessage)
+	}
+	var result RaftMembershipResult
+	path := fmt.Sprintf("/cluster/nodes/%d", peerID)
+	if err := c.doJSON(ctx, http.MethodDelete, path, nil, &result); err != nil {
+		return nil, err
+	}
+	if result.PeerID != peerID {
+		return nil, fmt.Errorf("%w: removal response does not confirm the requested peer", broker.ErrInvalidMessage)
+	}
+	return &result, nil
+}
+
+// PlanPartitionPlacement previews deterministic load-aware initial placement.
+func (c *Client) PlanPartitionPlacement(ctx context.Context, kind, name string, partition int) (*broker.PartitionPlacementPlan, error) {
+	if name == "" || strings.ContainsAny(name, "/\\") || partition < 0 || (kind != "topic" && kind != "stream" && kind != "queue") {
+		return nil, fmt.Errorf("%w: invalid partition resource or index", broker.ErrInvalidMessage)
+	}
+	query := url.Values{}
+	query.Set("resource_kind", kind)
+	path := fmt.Sprintf("/cluster/partitions/%s/%d/placement-plan?%s", url.PathEscape(name), partition, query.Encode())
+	var plan broker.PartitionPlacementPlan
+	if err := c.doJSON(ctx, http.MethodGet, path, nil, &plan); err != nil {
+		return nil, err
+	}
+	return &plan, nil
+}
+
+// AssignPartitionBalanced asks the controller to select active replicas using
+// the current replica and leader counts. The assignment is idempotent.
+func (c *Client) AssignPartitionBalanced(ctx context.Context, kind, name string, partition int) (*cluster.PartitionMetadata, error) {
+	if name == "" || strings.ContainsAny(name, "/\\") || partition < 0 || (kind != "topic" && kind != "stream" && kind != "queue") {
+		return nil, fmt.Errorf("%w: invalid partition resource or index", broker.ErrInvalidMessage)
+	}
+	request := struct {
+		Name         string `json:"name"`
+		ResourceKind string `json:"resource_kind"`
+		Partition    int    `json:"partition"`
+		AutoAssign   bool   `json:"auto_assign"`
+	}{Name: name, ResourceKind: kind, Partition: partition, AutoAssign: true}
+	var assignment cluster.PartitionMetadata
+	if err := c.doJSON(ctx, http.MethodPost, "/cluster/partitions", request, &assignment); err != nil {
+		return nil, err
+	}
+	return &assignment, nil
+}
+
+// PartitionLeaderURL returns the broker's advertised client URL for a
+// partition leader. Raft peer addresses are not valid client endpoints and are
+// deliberately not used as a fallback.
+func (c *Client) PartitionLeaderURL(ctx context.Context, topic string, partition int) (string, error) {
+	return c.PartitionResourceLeaderURL(ctx, "topic", topic, partition)
+}
+
+func (c *Client) PartitionResourceLeaderURL(ctx context.Context, kind, name string, partition int) (string, error) {
+	route, err := c.PartitionResourceRoute(ctx, kind, name, partition)
+	if err != nil {
+		return "", err
+	}
+	if route.LeaderClientAddress == "" {
+		return "", fmt.Errorf("partition %s/%d leader has no advertised client address", name, partition)
+	}
+	parsed, err := url.ParseRequestURI(route.LeaderClientAddress)
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return "", fmt.Errorf("partition %s/%d has an invalid advertised client address", name, partition)
+	}
+	allowed := false
+	for _, configured := range c.orderedURLs() {
+		base, parseErr := url.Parse(configured)
+		if parseErr == nil && strings.EqualFold(base.Scheme, parsed.Scheme) && strings.EqualFold(base.Host, parsed.Host) {
+			allowed = true
+			break
+		}
+	}
+	if !allowed {
+		return "", fmt.Errorf("partition %s/%d leader client address is outside the configured broker origins", name, partition)
+	}
+	return strings.TrimRight(parsed.String(), "/"), nil
+}
+
+// ReadPartitionStream reads one stream partition from its assigned client
+// endpoint. Offsets are local to that partition.
+func (c *Client) ReadPartitionStream(ctx context.Context, stream string, partition int, afterOffset uint64, limit int) ([]broker.Message, error) {
+	if stream == "" || strings.ContainsAny(stream, "/\\") || partition < 0 {
+		return nil, fmt.Errorf("%w: invalid stream partition", broker.ErrInvalidMessage)
+	}
+	base, err := c.PartitionResourceLeaderURL(ctx, "stream", stream, partition)
+	if err != nil {
+		return nil, err
+	}
+	path := fmt.Sprintf("/v1/streams/%s/partitions/%d/messages", url.PathEscape(stream), partition)
+	query := url.Values{}
+	if afterOffset > 0 {
+		query.Set("after_offset", strconv.FormatUint(afterOffset, 10))
+	}
+	if limit > 0 {
+		query.Set("limit", strconv.Itoa(limit))
+	}
+	if encoded := query.Encode(); encoded != "" {
+		path += "?" + encoded
+	}
+	var messages []broker.Message
+	if err := c.doJSONAt(ctx, base, http.MethodGet, path, nil, &messages); err != nil {
+		return nil, err
+	}
+	return messages, nil
+}
+
+// ReadPartitionTopic reads one topic partition from its assigned client
+// endpoint. The advertised endpoint must share an origin with a configured
+// BrokerURL so the client's bearer token is never sent to an unconfigured host.
+func (c *Client) ReadPartitionTopic(ctx context.Context, topic string, partition int, afterID string, limit int) ([]broker.Message, error) {
+	if topic == "" || strings.ContainsAny(topic, "/\\") || partition < 0 {
+		return nil, fmt.Errorf("%w: invalid topic partition", broker.ErrInvalidMessage)
+	}
+	base, err := c.PartitionLeaderURL(ctx, topic, partition)
+	if err != nil {
+		return nil, err
+	}
+	path := fmt.Sprintf("/v1/topics/%s/partitions/%d/messages", url.PathEscape(topic), partition)
+	query := url.Values{}
+	if afterID != "" {
+		query.Set("after", afterID)
+	}
+	if limit > 0 {
+		query.Set("limit", strconv.Itoa(limit))
+	}
+	if encoded := query.Encode(); encoded != "" {
+		path += "?" + encoded
+	}
+	var messages []broker.Message
+	if err := c.doJSONAt(ctx, base, http.MethodGet, path, nil, &messages); err != nil {
+		return nil, err
+	}
+	return messages, nil
+}
+
+// TopicPage contains one merged page and an opaque cursor for the next page.
+type TopicPage struct {
+	Messages   []broker.Message `json:"messages"`
+	NextCursor string           `json:"next_cursor,omitempty"`
+}
+
+// StreamPage contains one merged stream page and an opaque per-partition
+// offset cursor. Stream offsets are local to each assigned partition.
+type StreamPage struct {
+	Messages   []broker.Message `json:"messages"`
+	NextCursor string           `json:"next_cursor,omitempty"`
+}
+
+type AssignedStreamLag = broker.AssignedStreamLag
+
+func (c *Client) StreamPartitionLag(ctx context.Context, stream string, partition int, consumerGroup string) (broker.PartitionStreamLag, error) {
+	if stream == "" || strings.ContainsAny(stream, "/\\") || partition < 0 {
+		return broker.PartitionStreamLag{}, fmt.Errorf("%w: invalid stream partition", broker.ErrInvalidMessage)
+	}
+	base, err := c.PartitionResourceLeaderURL(ctx, "stream", stream, partition)
+	if err != nil {
+		return broker.PartitionStreamLag{}, err
+	}
+	path := fmt.Sprintf("/v1/streams/%s/partitions/%d/lag", url.PathEscape(stream), partition)
+	query := url.Values{}
+	if consumerGroup != "" {
+		query.Set("consumer_group", consumerGroup)
+	}
+	if encoded := query.Encode(); encoded != "" {
+		path += "?" + encoded
+	}
+	var report broker.PartitionStreamLag
+	err = c.doJSONAt(ctx, base, http.MethodGet, path, nil, &report)
+	return report, err
+}
+
+// StreamLagAssigned requests a server-side aggregate. The result retains each
+// partition's local head and committed offset because offsets are not
+// comparable across partitions.
+func (c *Client) StreamLagAssigned(ctx context.Context, stream, consumerGroup string) (*AssignedStreamLag, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if stream == "" || strings.ContainsAny(stream, "/\\") {
+		return nil, fmt.Errorf("%w: invalid stream", broker.ErrInvalidMessage)
+	}
+	query := url.Values{}
+	if consumerGroup != "" {
+		query.Set("consumer_group", consumerGroup)
+	}
+	path := "/v1/streams/" + url.PathEscape(stream) + "/lag"
+	if encoded := query.Encode(); encoded != "" {
+		path += "?" + encoded
+	}
+	var report AssignedStreamLag
+	if err := c.doJSON(ctx, http.MethodGet, path, nil, &report); err != nil {
+		return nil, err
+	}
+	resultCount := len(report.Partitions) + len(report.Failures)
+	if report.Stream != stream || report.ConsumerGroup != consumerGroup || resultCount == 0 || resultCount > maxTopicPagePartitions {
+		return nil, fmt.Errorf("%w: server returned an invalid assigned stream lag report", broker.ErrUnsupportedMode)
+	}
+	var total uint64
+	lastPartition := -1
+	seenPartitions := make(map[int]struct{}, resultCount)
+	overflow := false
+	for _, partition := range report.Partitions {
+		if partition.Stream != stream || partition.ConsumerGroup != consumerGroup || partition.Partition < 0 || partition.Partition <= lastPartition {
+			return nil, fmt.Errorf("%w: server returned inconsistent assigned stream lag data", broker.ErrInvalidMessage)
+		}
+		lastPartition = partition.Partition
+		seenPartitions[partition.Partition] = struct{}{}
+		if partition.Lag > ^uint64(0)-total {
+			overflow = true
+			total = ^uint64(0)
+		} else if !overflow {
+			total += partition.Lag
+		}
+	}
+	var failures []error
+	for partition, reason := range report.Failures {
+		if partition < 0 || reason == "" {
+			return nil, fmt.Errorf("%w: server returned an invalid stream lag failure", broker.ErrInvalidMessage)
+		}
+		if _, duplicate := seenPartitions[partition]; duplicate {
+			return nil, fmt.Errorf("%w: server reported both success and failure for a stream partition", broker.ErrInvalidMessage)
+		}
+		seenPartitions[partition] = struct{}{}
+		failures = append(failures, fmt.Errorf("stream %s partition %d: %s", stream, partition, reason))
+	}
+	if report.Error != "" && report.Error != "aggregate lag overflows uint64" {
+		return nil, fmt.Errorf("%w: server returned an unknown aggregate lag error", broker.ErrInvalidMessage)
+	}
+	if total != report.TotalLag || (overflow && report.Error == "") || (!overflow && report.Error != "") {
+		return nil, fmt.Errorf("%w: server returned an inconsistent aggregate lag", broker.ErrInvalidMessage)
+	}
+	if report.Error != "" {
+		failures = append(failures, fmt.Errorf("stream %s: %s", stream, report.Error))
+	}
+	return &report, errors.Join(failures...)
+}
+
+type topicPageCursor struct {
+	Version       int            `json:"version"`
+	Topic         string         `json:"topic"`
+	Partitions    []int          `json:"partitions"`
+	Positions     map[int]string `json:"positions"`
+	NextPartition int            `json:"next_partition,omitempty"`
+}
+
+type topicPageMessage struct {
+	partition int
+	position  int
+	message   broker.Message
+}
+
+const maxTopicPageSize = 10000
+const maxTopicCursorEncodedSize = 4 << 20
+const maxTopicPagePartitions = 10000
+
+func perPartitionPageLimit(pageLimit, partitionCount int) int {
+	if partitionCount <= 0 {
+		return 1
+	}
+	readLimit := (pageLimit + partitionCount - 1) / partitionCount
+	maxPerPartition := maxTopicPageSize / partitionCount
+	if maxPerPartition < 1 {
+		maxPerPartition = 1
+	}
+	if readLimit > maxPerPartition {
+		readLimit = maxPerPartition
+	}
+	if readLimit < 1 {
+		return 1
+	}
+	return readLimit
+}
+
+type streamPageCursor struct {
+	Version       int            `json:"version"`
+	Stream        string         `json:"stream"`
+	Partitions    []int          `json:"partitions"`
+	Positions     map[int]uint64 `json:"positions"`
+	NextPartition int            `json:"next_partition,omitempty"`
+}
+
+type streamPageMessage struct {
+	partition int
+	position  int
+	message   broker.Message
+}
+
+// ReadStreamPage merges every assigned stream partition and advances a local
+// offset per partition, so equal offsets in different partitions cannot cause
+// messages to be skipped between pages.
+func (c *Client) ReadStreamPage(ctx context.Context, stream, cursor string, limit int) (*StreamPage, error) {
+	if stream == "" || strings.ContainsAny(stream, "/\\") {
+		return nil, fmt.Errorf("%w: invalid stream", broker.ErrInvalidMessage)
+	}
+	if len(cursor) > maxTopicCursorEncodedSize {
+		return nil, fmt.Errorf("%w: stream cursor exceeds %d bytes", broker.ErrInvalidMessage, maxTopicCursorEncodedSize)
+	}
+	if limit <= 0 {
+		limit = 100
+	} else if limit > maxTopicPageSize {
+		limit = maxTopicPageSize
+	}
+	var assignments []struct {
+		ID struct {
+			Topic     string `json:"topic"`
+			Partition int    `json:"partition"`
+			Kind      string `json:"kind"`
+		} `json:"id"`
+	}
+	if err := c.doJSON(ctx, http.MethodGet, "/cluster/partitions", nil, &assignments); err != nil {
+		return nil, err
+	}
+	partitionSet := make(map[int]struct{})
+	for _, assignment := range assignments {
+		if assignment.ID.Topic == stream && assignment.ID.Kind == "stream" {
+			if assignment.ID.Partition < 0 {
+				return nil, fmt.Errorf("%w: invalid stream partition assignment for %q", broker.ErrInvalidMessage, stream)
+			}
+			partitionSet[assignment.ID.Partition] = struct{}{}
+		}
+	}
+	partitions := make([]int, 0, len(partitionSet))
+	for partition := range partitionSet {
+		partitions = append(partitions, partition)
+	}
+	sort.Ints(partitions)
+	if len(partitions) > maxTopicPagePartitions {
+		return nil, fmt.Errorf("%w: stream %q has %d partitions; client page limit is %d", broker.ErrUnsupportedMode, stream, len(partitions), maxTopicPagePartitions)
+	}
+	if len(partitions) == 0 {
+		return &StreamPage{Messages: []broker.Message{}}, nil
+	}
+	partitionReadLimit := perPartitionPageLimit(limit, len(partitions))
+	positions := make(map[int]uint64, len(partitions))
+	nextPartition := partitions[0]
+	if cursor != "" {
+		data, err := base64.RawURLEncoding.DecodeString(cursor)
+		if err != nil {
+			return nil, fmt.Errorf("%w: invalid stream cursor", broker.ErrInvalidMessage)
+		}
+		var state streamPageCursor
+		if err := json.Unmarshal(data, &state); err != nil || state.Version != 1 || state.Stream != stream || !samePartitionIndexes(state.Partitions, partitions) {
+			return nil, fmt.Errorf("%w: stream cursor does not match current stream assignment", broker.ErrInvalidMessage)
+		}
+		if _, assigned := partitionSet[state.NextPartition]; !assigned || len(state.Positions) > len(partitions) {
+			return nil, fmt.Errorf("%w: stream cursor has invalid partition positions", broker.ErrInvalidMessage)
+		}
+		nextPartition = state.NextPartition
+		for partition, offset := range state.Positions {
+			if _, assigned := partitionSet[partition]; !assigned {
+				return nil, fmt.Errorf("%w: invalid stream cursor partition %d", broker.ErrInvalidMessage, partition)
+			}
+			positions[partition] = offset
+		}
+	}
+	type partitionResult struct {
+		messages []broker.Message
+		err      error
+	}
+	results := make([]partitionResult, len(partitions))
+	semaphore := make(chan struct{}, 16)
+	var wait sync.WaitGroup
+	for i, partition := range partitions {
+		wait.Add(1)
+		go func(index, partition int) {
+			defer wait.Done()
+			select {
+			case semaphore <- struct{}{}:
+			case <-ctx.Done():
+				results[index].err = ctx.Err()
+				return
+			}
+			defer func() { <-semaphore }()
+			results[index].messages, results[index].err = c.ReadPartitionStream(ctx, stream, partition, positions[partition], partitionReadLimit)
+		}(i, partition)
+	}
+	wait.Wait()
+	merged := make([]streamPageMessage, 0)
+	for i, result := range results {
+		if result.err != nil {
+			return nil, result.err
+		}
+		for position, message := range result.messages {
+			merged = append(merged, streamPageMessage{partition: partitions[i], position: position, message: message})
+		}
+	}
+	startIndex := sort.SearchInts(partitions, nextPartition)
+	if startIndex == len(partitions) {
+		startIndex = 0
+	}
+	partitionRank := func(partition int) int {
+		index := sort.SearchInts(partitions, partition)
+		return (index - startIndex + len(partitions)) % len(partitions)
+	}
+	sort.SliceStable(merged, func(i, j int) bool {
+		if merged[i].position == merged[j].position {
+			return partitionRank(merged[i].partition) < partitionRank(merged[j].partition)
+		}
+		return merged[i].position < merged[j].position
+	})
+	if len(merged) > limit {
+		merged = merged[:limit]
+	}
+	messages := make([]broker.Message, len(merged))
+	for i, entry := range merged {
+		messages[i] = entry.message
+		positions[entry.partition] = entry.message.Offset
+	}
+	page := &StreamPage{Messages: messages}
+	if len(messages) > 0 {
+		lastPartition := merged[len(merged)-1].partition
+		lastIndex := sort.SearchInts(partitions, lastPartition)
+		state := streamPageCursor{
+			Version: 1, Stream: stream, Partitions: partitions, Positions: positions,
+			NextPartition: partitions[(lastIndex+1)%len(partitions)],
+		}
+		data, err := json.Marshal(state)
+		if err != nil {
+			return nil, err
+		}
+		nextCursor := base64.RawURLEncoding.EncodeToString(data)
+		if len(nextCursor) > maxTopicCursorEncodedSize {
+			return nil, fmt.Errorf("%w: stream assignment produces a cursor larger than %d bytes", broker.ErrInvalidMessage, maxTopicCursorEncodedSize)
+		}
+		page.NextCursor = nextCursor
+	}
+	return page, nil
+}
+
+// ReadTopicPage reads one merged page across every controller-assigned
+// partition. Cursor positions advance only for returned messages, so messages
+// fetched from a partition but sorted onto the next page are read again instead
+// of being skipped. Pages use a deterministic round-robin merge by each
+// partition's local position, preserving every partition's order.
+func (c *Client) ReadTopicPage(ctx context.Context, topic, cursor string, limit int) (*TopicPage, error) {
+	if topic == "" || strings.ContainsAny(topic, "/\\") {
+		return nil, fmt.Errorf("%w: invalid topic", broker.ErrInvalidMessage)
+	}
+	if len(cursor) > maxTopicCursorEncodedSize {
+		return nil, fmt.Errorf("%w: topic cursor exceeds %d bytes", broker.ErrInvalidMessage, maxTopicCursorEncodedSize)
+	}
+	if limit <= 0 {
+		limit = 100
+	} else if limit > maxTopicPageSize {
+		limit = maxTopicPageSize
+	}
+	var assignments []struct {
+		ID struct {
+			Topic     string `json:"topic"`
+			Partition int    `json:"partition"`
+			Kind      string `json:"kind"`
+		} `json:"id"`
+	}
+	if err := c.doJSON(ctx, http.MethodGet, "/cluster/partitions", nil, &assignments); err != nil {
+		return nil, err
+	}
+	partitionSet := make(map[int]struct{})
+	for _, assignment := range assignments {
+		if assignment.ID.Topic == topic && (assignment.ID.Kind == "" || assignment.ID.Kind == "topic") {
+			if assignment.ID.Partition < 0 {
+				return nil, fmt.Errorf("%w: invalid partition assignment for topic %q", broker.ErrInvalidMessage, topic)
+			}
+			partitionSet[assignment.ID.Partition] = struct{}{}
+		}
+	}
+	partitions := make([]int, 0, len(partitionSet))
+	for partition := range partitionSet {
+		partitions = append(partitions, partition)
+	}
+	sort.Ints(partitions)
+	if len(partitions) > maxTopicPagePartitions {
+		return nil, fmt.Errorf("%w: topic %q has %d partitions; client page limit is %d", broker.ErrUnsupportedMode, topic, len(partitions), maxTopicPagePartitions)
+	}
+	if len(partitions) == 0 {
+		return &TopicPage{Messages: []broker.Message{}}, nil
+	}
+	partitionReadLimit := perPartitionPageLimit(limit, len(partitions))
+	positions := make(map[int]string, len(partitions))
+	nextPartition := partitions[0]
+	if cursor != "" {
+		data, decodeErr := base64.RawURLEncoding.DecodeString(cursor)
+		if decodeErr != nil {
+			return nil, fmt.Errorf("%w: invalid topic cursor", broker.ErrInvalidMessage)
+		}
+		var state topicPageCursor
+		if err := json.Unmarshal(data, &state); err != nil || state.Version != 1 || state.Topic != topic || !samePartitionIndexes(state.Partitions, partitions) {
+			return nil, fmt.Errorf("%w: topic cursor does not match current topic assignment", broker.ErrInvalidMessage)
+		}
+		if _, assigned := partitionSet[state.NextPartition]; !assigned {
+			return nil, fmt.Errorf("%w: topic cursor has an invalid round-robin position", broker.ErrInvalidMessage)
+		}
+		if len(state.Positions) > len(partitions) {
+			return nil, fmt.Errorf("%w: topic cursor has too many partition positions", broker.ErrInvalidMessage)
+		}
+		nextPartition = state.NextPartition
+		for partition, messageID := range state.Positions {
+			if _, assigned := partitionSet[partition]; !assigned || messageID == "" {
+				return nil, fmt.Errorf("%w: invalid topic cursor position", broker.ErrInvalidMessage)
+			}
+			positions[partition] = messageID
+		}
+	}
+	type partitionResult struct {
+		messages []broker.Message
+		err      error
+	}
+	results := make([]partitionResult, len(partitions))
+	semaphore := make(chan struct{}, 16)
+	var wait sync.WaitGroup
+	for i, partition := range partitions {
+		wait.Add(1)
+		go func(index, partition int) {
+			defer wait.Done()
+			select {
+			case semaphore <- struct{}{}:
+			case <-ctx.Done():
+				results[index].err = ctx.Err()
+				return
+			}
+			defer func() { <-semaphore }()
+			results[index].messages, results[index].err = c.ReadPartitionTopic(ctx, topic, partition, positions[partition], partitionReadLimit)
+		}(i, partition)
+	}
+	wait.Wait()
+	merged := make([]topicPageMessage, 0)
+	for i, result := range results {
+		if result.err != nil {
+			return nil, result.err
+		}
+		for position, message := range result.messages {
+			merged = append(merged, topicPageMessage{partition: partitions[i], position: position, message: message})
+		}
+	}
+	startIndex := sort.SearchInts(partitions, nextPartition)
+	if startIndex == len(partitions) {
+		startIndex = 0
+	}
+	partitionRank := func(partition int) int {
+		index := sort.SearchInts(partitions, partition)
+		return (index - startIndex + len(partitions)) % len(partitions)
+	}
+	sort.SliceStable(merged, func(i, j int) bool {
+		a, b := merged[i], merged[j]
+		if a.position == b.position {
+			return partitionRank(a.partition) < partitionRank(b.partition)
+		}
+		return a.position < b.position
+	})
+	if len(merged) > limit {
+		merged = merged[:limit]
+	}
+	messages := make([]broker.Message, len(merged))
+	for i, entry := range merged {
+		messages[i] = entry.message
+		positions[entry.partition] = entry.message.ID
+	}
+	page := &TopicPage{Messages: messages}
+	if len(messages) > 0 {
+		lastPartition := merged[len(merged)-1].partition
+		lastIndex := sort.SearchInts(partitions, lastPartition)
+		state := topicPageCursor{
+			Version: 1, Topic: topic, Partitions: partitions, Positions: positions,
+			NextPartition: partitions[(lastIndex+1)%len(partitions)],
+		}
+		data, err := json.Marshal(state)
+		if err != nil {
+			return nil, err
+		}
+		nextCursor := base64.RawURLEncoding.EncodeToString(data)
+		if len(nextCursor) > maxTopicCursorEncodedSize {
+			return nil, fmt.Errorf("%w: topic assignment produces a cursor larger than %d bytes", broker.ErrInvalidMessage, maxTopicCursorEncodedSize)
+		}
+		page.NextCursor = nextCursor
+	}
+	return page, nil
+}
+
+// ListTopic returns the first bounded round-robin page of all
+// controller-assigned topic partitions. Use ReadTopicPage when the caller
+// needs a continuation cursor.
+func (c *Client) ListTopic(ctx context.Context, topic string, limit int) ([]broker.Message, error) {
+	page, err := c.ReadTopicPage(ctx, topic, "", limit)
+	if err != nil {
+		return nil, err
+	}
+	return page.Messages, nil
+}
+
+func samePartitionIndexes(a, b []int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
 func (c *Client) Events(ctx context.Context, after string, wait time.Duration) ([]broker.Notification, error) {
 	path := "/v1/consumers/" + c.cfg.ConsumerID + "/events"
 	qs := []string{}
@@ -689,16 +2128,25 @@ func (c *Client) doRawStatus(ctx context.Context, method, path, contentType stri
 			}
 			continue
 		}
-		data, _ := io.ReadAll(resp.Body)
+		if resp.ContentLength > c.cfg.MaxResponseBytes {
+			_ = resp.Body.Close()
+			return nil, 0, fmt.Errorf("%w: limit is %d bytes", ErrResponseTooLarge, c.cfg.MaxResponseBytes)
+		}
+		data, readErr := readBoundedResponse(resp.Body, c.cfg.MaxResponseBytes)
 		_ = resp.Body.Close()
-		if resp.StatusCode >= 500 && len(urls) > 1 && !isRetryableStatus(resp.StatusCode) {
+		if readErr != nil {
+			return nil, 0, readErr
+		}
+		if resp.StatusCode >= 300 {
 			last = remoteError(resp.StatusCode, data)
-			continue
+			if len(urls) > 1 && shouldFailover(method, resp.StatusCode, data) {
+				prioritizeLeaderURL(urls, i, last)
+				continue
+			}
+			c.markActive(base)
+			return nil, resp.StatusCode, last
 		}
 		c.markActive(base)
-		if resp.StatusCode >= 300 {
-			return nil, resp.StatusCode, remoteError(resp.StatusCode, data)
-		}
 		return data, resp.StatusCode, nil
 	}
 	if last == nil {
@@ -707,6 +2155,43 @@ func (c *Client) doRawStatus(ctx context.Context, method, path, contentType stri
 	return nil, 0, last
 }
 func (c *Client) doJSON(ctx context.Context, method, path string, in, out any) error {
+	return c.doJSONBases(ctx, c.orderedURLs(), method, path, in, out)
+}
+
+func (c *Client) doJSONAt(ctx context.Context, base, method, path string, in, out any) error {
+	base = strings.TrimRight(base, "/")
+	err := c.doJSONBases(ctx, []string{base}, method, path, in, out)
+	var remote *broker.RemoteError
+	if !errors.As(err, &remote) || (remote.Class != broker.RetryNotLeader && remote.Code != broker.ErrorCode(broker.ErrNotLeader)) {
+		return err
+	}
+	leader, _, _ := remote.RetryHint()
+	trustedBase := c.trustedLeaderBase(leader)
+	if trustedBase == "" || trustedBase == base {
+		return err
+	}
+	return c.doJSONBases(ctx, []string{trustedBase}, method, path, in, out)
+}
+
+// trustedLeaderBase accepts a redirect only when its origin matches a broker
+// URL explicitly configured by the caller. It returns that configured base,
+// rather than retaining any path or other URL components from the response.
+func (c *Client) trustedLeaderBase(leader string) string {
+	parsedLeader, err := url.ParseRequestURI(leader)
+	if err != nil || (parsedLeader.Scheme != "http" && parsedLeader.Scheme != "https") || parsedLeader.Host == "" ||
+		parsedLeader.User != nil || parsedLeader.RawQuery != "" || parsedLeader.Fragment != "" {
+		return ""
+	}
+	for _, configured := range c.orderedURLs() {
+		parsedConfigured, err := url.Parse(configured)
+		if err == nil && strings.EqualFold(parsedConfigured.Scheme, parsedLeader.Scheme) && strings.EqualFold(parsedConfigured.Host, parsedLeader.Host) {
+			return strings.TrimRight(configured, "/")
+		}
+	}
+	return ""
+}
+
+func (c *Client) doJSONBases(ctx context.Context, urls []string, method, path string, in, out any) error {
 	var bodyBytes []byte
 	var err error
 	if in != nil {
@@ -715,7 +2200,6 @@ func (c *Client) doJSON(ctx context.Context, method, path string, in, out any) e
 			return err
 		}
 	}
-	urls := c.orderedURLs()
 	var last error
 	for i, base := range urls {
 		var body io.Reader
@@ -741,16 +2225,25 @@ func (c *Client) doJSON(ctx context.Context, method, path string, in, out any) e
 			}
 			continue
 		}
-		data, _ := io.ReadAll(resp.Body)
+		if resp.ContentLength > c.cfg.MaxResponseBytes {
+			_ = resp.Body.Close()
+			return fmt.Errorf("%w: limit is %d bytes", ErrResponseTooLarge, c.cfg.MaxResponseBytes)
+		}
+		data, readErr := readBoundedResponse(resp.Body, c.cfg.MaxResponseBytes)
 		_ = resp.Body.Close()
-		if resp.StatusCode >= 500 && len(urls) > 1 && !isRetryableStatus(resp.StatusCode) {
+		if readErr != nil {
+			return readErr
+		}
+		if resp.StatusCode >= 300 {
 			last = remoteError(resp.StatusCode, data)
-			continue
+			if len(urls) > 1 && shouldFailover(method, resp.StatusCode, data) {
+				prioritizeLeaderURL(urls, i, last)
+				continue
+			}
+			c.markActive(base)
+			return last
 		}
 		c.markActive(base)
-		if resp.StatusCode >= 300 {
-			return remoteError(resp.StatusCode, data)
-		}
 		if out != nil && len(data) > 0 {
 			return json.Unmarshal(data, out)
 		}
@@ -822,7 +2315,7 @@ func hostnameID() string {
 type PublishOptions struct {
 	Queue, Stream, Type, Key, RoutingKey, TenantID, IdempotencyKey string
 	Headers, Metadata                                              map[string]string
-	Priority                                                       int
+	Priority, Partition                                            int
 
 	ContentType         string
 	Schema              string
@@ -872,6 +2365,7 @@ func WithStrategy(v broker.StrategyType) PublishOption {
 }
 func WithKey(v string) PublishOption      { return func(o *PublishOptions) { o.Key = v } }
 func WithPriority(v int) PublishOption    { return func(o *PublishOptions) { o.Priority = v } }
+func WithPartition(v int) PublishOption   { return func(o *PublishOptions) { o.Partition = v } }
 func WithTenantID(v string) PublishOption { return func(o *PublishOptions) { o.TenantID = v } }
 func WithIdempotencyKey(v string) PublishOption {
 	return func(o *PublishOptions) { o.IdempotencyKey = v }

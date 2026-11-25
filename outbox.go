@@ -388,7 +388,7 @@ func (o *DurableOutbox) flushClaimed(ctx context.Context, store OutboxClaimStore
 	if err != nil {
 		return fmt.Errorf("durable outbox: claim entries: %w", err)
 	}
-	for _, claimed := range entries {
+	for i, claimed := range entries {
 		entry := cloneOutboxEntry(claimed)
 		o.mu.Lock()
 		cached := cloneOutboxEntry(entry)
@@ -396,13 +396,16 @@ func (o *DurableOutbox) flushClaimed(ctx context.Context, store OutboxClaimStore
 		o.mu.Unlock()
 
 		if err := ctx.Err(); err != nil {
-			return err // the claim expires and another worker can recover it
+			return errors.Join(err, o.releaseUnprocessedClaims(ctx, store, token, entries[i:]))
 		}
 		save := func(ctx context.Context, entry DurableOutboxEntry) error {
 			return store.UpdateClaimedOutboxEntry(ctx, token, entry)
 		}
 		if err := o.dispatchEntry(ctx, &entry, save); err != nil {
-			return fmt.Errorf("durable outbox: dispatch %q: %w", entry.ID, err)
+			return errors.Join(
+				fmt.Errorf("durable outbox: dispatch %q: %w", entry.ID, err),
+				o.releaseUnprocessedClaims(ctx, store, token, entries[i+1:]),
+			)
 		}
 		o.mu.Lock()
 		cached = cloneOutboxEntry(entry)
@@ -410,6 +413,44 @@ func (o *DurableOutbox) flushClaimed(ctx context.Context, store OutboxClaimStore
 		o.mu.Unlock()
 	}
 	return nil
+}
+
+// releaseUnprocessedClaims returns claimed entries that this batch has not
+// attempted yet. The current entry stays leased after a dispatch error because
+// the append may have succeeded even if persisting its outcome failed.
+func (o *DurableOutbox) releaseUnprocessedClaims(ctx context.Context, store OutboxClaimStore, token string, entries []DurableOutboxEntry) error {
+	if len(entries) == 0 {
+		return nil
+	}
+	releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), o.timeout)
+	defer cancel()
+	now := time.Now()
+	var releaseErrors []error
+	for _, claimed := range entries {
+		entry := cloneOutboxEntry(claimed)
+		if entry.NextAttemptAt.After(now) {
+			entry.Status = OutboxFailed
+		} else {
+			entry.Status = OutboxPending
+		}
+		entry.ClaimToken = ""
+		entry.ClaimUntil = time.Time{}
+		entry.UpdatedAt = now
+		if err := store.UpdateClaimedOutboxEntry(releaseCtx, token, entry); err != nil {
+			releaseErrors = append(releaseErrors, fmt.Errorf("durable outbox: release unprocessed claim %q: %w", entry.ID, err))
+			continue
+		}
+		o.mu.Lock()
+		if current := o.entries[entry.ID]; current == nil {
+			copy := cloneOutboxEntry(entry)
+			o.entries[entry.ID] = &copy
+		} else if current.ClaimToken == token {
+			updated := cloneOutboxEntry(entry)
+			*current = updated
+		}
+		o.mu.Unlock()
+	}
+	return errors.Join(releaseErrors...)
 }
 
 func (o *DurableOutbox) dispatchEntry(ctx context.Context, entry *DurableOutboxEntry, save func(context.Context, DurableOutboxEntry) error) error {

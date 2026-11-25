@@ -1,3 +1,58 @@
+{{- if .Values.cluster.enabled -}}
+{{- if not .Values.persistence.enabled -}}
+{{- fail "cluster.enabled requires persistence.enabled=true for broker, Raft, and partition WAL data" -}}
+{{- end -}}
+{{- if not .Values.podDisruptionBudget.enabled -}}
+{{- fail "cluster.enabled requires podDisruptionBudget.enabled=true to protect Raft quorum during voluntary disruptions" -}}
+{{- end -}}
+{{- if not (regexMatch "^[0-9]+$" (toString .Values.podDisruptionBudget.maxUnavailable)) -}}
+{{- fail "cluster.enabled requires podDisruptionBudget.maxUnavailable to be a non-negative integer" -}}
+{{- end -}}
+{{- if gt (int .Values.podDisruptionBudget.maxUnavailable) (div (int .Values.replicaCount) 2) -}}
+{{- fail "podDisruptionBudget.maxUnavailable cannot exceed floor(replicaCount/2) in clustered mode" -}}
+{{- end -}}
+{{- if not .Values.topologySpreadConstraints.enabled -}}
+{{- fail "cluster.enabled requires topologySpreadConstraints.enabled=true to separate Raft replicas" -}}
+{{- end -}}
+{{- if not (regexMatch "^sha256:[a-f0-9]{64}$" (toString .Values.image.digest)) -}}
+{{- fail "cluster.enabled requires image.digest to pin every Raft peer to the same sha256 image" -}}
+{{- end -}}
+{{- if lt (int .Values.replicaCount) 3 -}}
+{{- fail "cluster.enabled requires replicaCount of at least 3" -}}
+{{- end -}}
+{{- if eq (mod (int .Values.replicaCount) 2) 0 -}}
+{{- fail "cluster.enabled requires an odd replicaCount for the initial Raft quorum" -}}
+{{- end -}}
+{{- if gt (int .Values.cluster.replicationFactor) (int .Values.replicaCount) -}}
+{{- fail "cluster.replicationFactor cannot exceed replicaCount" -}}
+{{- end -}}
+{{- if lt (int .Values.cluster.replicationFactor) 1 -}}
+{{- fail "cluster.replicationFactor must be positive" -}}
+{{- end -}}
+{{- if or (lt (int .Values.cluster.minISR) 0) (gt (int .Values.cluster.minISR) (int .Values.cluster.replicationFactor)) -}}
+{{- fail "cluster.minISR must be zero (majority default) or between 1 and cluster.replicationFactor" -}}
+{{- end -}}
+{{- if or (lt (int .Values.cluster.peerPort) 1) (gt (int .Values.cluster.peerPort) 65535) -}}
+{{- fail "cluster.peerPort must be between 1 and 65535" -}}
+{{- end -}}
+{{- if lt (int .Values.cluster.maxReplicationLag) 0 -}}
+{{- fail "cluster.maxReplicationLag must be non-negative" -}}
+{{- end -}}
+{{- if not (has .Values.broker.store.kind (list "wal" "filewal" "file-wal" "wal2" "segmented" "segmented-wal")) -}}
+{{- fail "cluster.enabled requires broker.store.kind to be a durable WAL store" -}}
+{{- end -}}
+{{- if or (not .Values.tls.enabled) (not .Values.tls.requireClientCert) (not .Values.tls.existingSecret) -}}
+{{- fail "cluster.enabled requires TLS, tls.requireClientCert=true, and tls.existingSecret with tls.crt, tls.key, and ca.crt" -}}
+{{- end -}}
+{{- end -}}
+{{- if .Values.broker.listeners.native.enabled -}}
+{{- if or (lt (int .Values.service.ports.native) 1) (gt (int .Values.service.ports.native) 65535) -}}
+{{- fail "service.ports.native must be between 1 and 65535 when the native listener is enabled" -}}
+{{- end -}}
+{{- if ne .Values.broker.listeners.native.addr (printf ":%v" (int .Values.service.ports.native)) -}}
+{{- fail "broker.listeners.native.addr must match service.ports.native (for example, :8091)" -}}
+{{- end -}}
+{{- end -}}
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -35,7 +90,7 @@ spec:
       topologySpreadConstraints:
         - maxSkew: {{ .Values.topologySpreadConstraints.maxSkew }}
           topologyKey: {{ .Values.topologySpreadConstraints.topologyKey }}
-          whenUnsatisfiable: ScheduleAnyway
+          whenUnsatisfiable: {{ if .Values.cluster.enabled }}DoNotSchedule{{ else }}ScheduleAnyway{{ end }}
           labelSelector:
             matchLabels:
               {{- include "broker.selectorLabels" . | nindent 14 }}
@@ -58,7 +113,7 @@ spec:
       {{- end }}
       containers:
         - name: brokerd
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          image: "{{ .Values.image.repository }}{{ if .Values.image.digest }}@{{ .Values.image.digest }}{{ else }}:{{ .Values.image.tag }}{{ end }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           command: ["/brokerd"]
           args:
@@ -69,6 +124,19 @@ spec:
             {{- if .Values.tls.requireClientCert }}
             - -client-ca=/etc/broker/tls/ca.crt
             - -require-client-cert
+            {{- end }}
+            {{- if .Values.cluster.enabled }}
+            - -cluster
+            - -cluster-listen=:{{ .Values.cluster.peerPort }}
+            - -cluster-wal=/data/raft
+            - -cluster-partition-wal=/data/partitions
+            - -cluster-replication-factor={{ .Values.cluster.replicationFactor }}
+            - -cluster-min-isr={{ .Values.cluster.minISR }}
+            - -cluster-max-replication-lag={{ .Values.cluster.maxReplicationLag }}
+            - -cluster-replication-timeout={{ .Values.cluster.replicationTimeout }}
+            - -cluster-reconcile-interval={{ .Values.cluster.reconcileInterval }}
+            - -cluster-auto-reassign-interval={{ .Values.cluster.autoReassignInterval }}
+            - -cluster-read-index-timeout={{ .Values.cluster.readIndexTimeout }}
             {{- end }}
           ports:
             - name: http-admin
@@ -85,9 +153,14 @@ spec:
             - name: amqp
               containerPort: 5672
             {{- end }}
+            {{- if .Values.cluster.enabled }}
+            - name: raft-peer
+              containerPort: {{ .Values.cluster.peerPort }}
+              protocol: TCP
+            {{- end }}
             {{- if .Values.broker.listeners.native.enabled }}
             - name: native-bst1
-              containerPort: 8091
+              containerPort: {{ .Values.service.ports.native }}
             {{- end }}
           envFrom:
             - configMapRef:
@@ -102,6 +175,12 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
+            {{- if .Values.cluster.enabled }}
+            - name: BROKER_CLUSTER_NODE_ID
+              value: "0"
+            - name: BROKER_CLUSTER_PEERS
+              value: {{ include "broker.clusterPeers" . | quote }}
+            {{- end }}
             {{- with .Values.broker.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

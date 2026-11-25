@@ -543,7 +543,9 @@ func (b *Broker) RegisterTask(ctx context.Context, name string, handler TaskHand
 			return err
 		}
 		if res != nil {
-			_ = d.Respond(runCtx, res)
+			if err := d.Respond(runCtx, res); err != nil {
+				return fmt.Errorf("encode task %s result: %w", tid, err)
+			}
 		}
 		return nil
 	})

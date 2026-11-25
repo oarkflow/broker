@@ -19,6 +19,8 @@ type PublishOptions struct {
 	DeduplicationID     string
 	DeduplicationWindow time.Duration
 	Priority            int
+	Partition           int
+	PartitionSet        bool
 	Delay               time.Duration
 	RunAt               time.Time
 	TTL                 time.Duration
@@ -51,9 +53,12 @@ const (
 	ConfirmProcessed  ConfirmLevel = "processed"
 )
 
-func WithMessageID(v string) PublishOption   { return func(o *PublishOptions) { o.MessageID = v } }
-func WithKey(v string) PublishOption         { return func(o *PublishOptions) { o.Key = v } }
-func WithRoutingKey(v string) PublishOption  { return func(o *PublishOptions) { o.RoutingKey = v } }
+func WithMessageID(v string) PublishOption  { return func(o *PublishOptions) { o.MessageID = v } }
+func WithKey(v string) PublishOption        { return func(o *PublishOptions) { o.Key = v } }
+func WithRoutingKey(v string) PublishOption { return func(o *PublishOptions) { o.RoutingKey = v } }
+func WithPartition(v int) PublishOption {
+	return func(o *PublishOptions) { o.Partition = v; o.PartitionSet = true }
+}
 func WithType(v string) PublishOption        { return func(o *PublishOptions) { o.Type = v } }
 func WithContentType(v string) PublishOption { return func(o *PublishOptions) { o.ContentType = v } }
 func WithSchema(name, version string) PublishOption {

@@ -33,6 +33,45 @@ Do not label a build production-ready solely because the automated test, race,
 and vet gates pass. Record the commit, environment, commands, logs, benchmark
 hardware, and reviewer for every manual gate.
 
+## Verify tagged release assets
+
+Download every asset from the tagged GitHub release into one directory,
+including `checksums.txt` and `cosign.bundle`. Verify the checksum manifest
+against the exact GitHub Actions release workflow identity, then verify every
+listed archive and CycloneDX SBOM:
+
+```bash
+cosign verify-blob checksums.txt \
+  --bundle cosign.bundle \
+  --certificate-identity-regexp '^https://github\.com/oarkflow/broker/\.github/workflows/release\.yml@refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$' \
+  --certificate-oidc-issuer 'https://token.actions.githubusercontent.com'
+sha256sum -c checksums.txt
+```
+
+The checksum manifest covers the downloadable release archives and per-binary
+SBOMs, the digest-pinned container image reference, and the per-platform
+container SBOMs. The Cosign bundle is the signature evidence for the manifest
+and is not listed inside that manifest. Do not use `--ignore-missing`: all
+listed files must be present for the check to pass.
+
+The release workflow also publishes `linux/amd64` and `linux/arm64` broker
+images to GHCR, signs the manifest-list digest, attaches a CycloneDX
+attestation for each platform, and verifies the signature and attestation
+identity before publishing the GitHub release. After verifying the release
+checksums, verify the image signature and its CycloneDX attestation using the
+digest reference in `container-image.txt`:
+
+```bash
+IMAGE_REF="$(cat container-image.txt)"
+cosign verify "$IMAGE_REF" \
+  --certificate-identity-regexp '^https://github\.com/oarkflow/broker/\.github/workflows/release\.yml@refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$' \
+  --certificate-oidc-issuer 'https://token.actions.githubusercontent.com'
+cosign verify-attestation "$IMAGE_REF" \
+  --type cyclonedx \
+  --certificate-identity-regexp '^https://github\.com/oarkflow/broker/\.github/workflows/release\.yml@refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$' \
+  --certificate-oidc-issuer 'https://token.actions.githubusercontent.com'
+```
+
 ## Release sign-off
 
 A stable release requires all rows above to be complete, no unresolved critical

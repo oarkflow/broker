@@ -11,6 +11,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"time"
 )
@@ -35,9 +36,15 @@ type GRPCConfig struct {
 	ClientCAFile string
 	// RequireClientCert requires client certificate verification (mTLS).
 	RequireClientCert bool
+	// AllowInsecure permits plaintext or unauthenticated development listeners.
+	// Production listeners require TLS and a token or verified client certificate.
+	AllowInsecure bool
 	// BrokerToken is the bearer token for authentication.
-	// If set, every request must include this token.
+	// If set without ACL, it becomes an admin:* compatibility credential.
 	BrokerToken string
+	// ACL maps bearer tokens and verified client certificates to scoped
+	// principals. When configured, every request is authorized against it.
+	ACL *ACL
 }
 
 // GRPCServer provides the legacy native JSON/TCP transport.
@@ -55,9 +62,12 @@ type GRPCServer struct {
 }
 
 type grpcConn struct {
-	id     string
-	conn   net.Conn
-	closed chan struct{}
+	id            string
+	conn          net.Conn
+	closed        chan struct{}
+	principal     AdminPrincipal
+	authenticated bool
+	release       func()
 	// closeOnce guards closed, which more than one shutdown path can reach.
 	closeOnce sync.Once
 }
@@ -114,6 +124,9 @@ func NewGRPCServer(b *Broker, cfg GRPCConfig) *GRPCServer {
 	if cfg.KeepAlive <= 0 {
 		cfg.KeepAlive = 60 * time.Second
 	}
+	if cfg.ACL == nil && cfg.BrokerToken != "" {
+		cfg.ACL = NewACL(AdminToken{Name: "native-rpc", Token: cfg.BrokerToken, Permissions: []string{PermissionAdminAll}})
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	return &GRPCServer{
 		broker: b,
@@ -136,6 +149,18 @@ func NewNativeRPCServer(b *Broker, cfg NativeRPCConfig) *NativeRPCServer {
 
 // ListenAndServe starts the legacy native JSON/TCP server.
 func (gs *GRPCServer) ListenAndServe() error {
+	if (gs.cfg.TLSCertFile == "") != (gs.cfg.TLSKeyFile == "") {
+		return errors.New("native rpc: TLS certificate and key must be configured together")
+	}
+	hasTLS := gs.cfg.TLSCertFile != "" && gs.cfg.TLSKeyFile != ""
+	if gs.cfg.RequireClientCert && gs.cfg.ClientCAFile == "" {
+		return errors.New("native rpc: client CA is required when client certificates are mandatory")
+	}
+	certificateAuth := hasTLS && gs.cfg.RequireClientCert && gs.cfg.ClientCAFile != ""
+	hasAuthentication := gs.cfg.ACL.hasUsableCredential(certificateAuth)
+	if err := validateListenerSecurity("native rpc", gs.cfg.AllowInsecure, hasTLS, hasAuthentication, ""); err != nil {
+		return err
+	}
 	var err error
 	// Set up TLS if configured
 	if gs.cfg.TLSCertFile != "" && gs.cfg.TLSKeyFile != "" {
@@ -222,6 +247,9 @@ func (gs *GRPCServer) handleConn(conn net.Conn) {
 	gs.conns[id] = gc
 	gs.mu.Unlock()
 	defer func() {
+		if gc.release != nil {
+			gc.release()
+		}
 		gs.mu.Lock()
 		delete(gs.conns, id)
 		gs.mu.Unlock()
@@ -250,7 +278,7 @@ func (gs *GRPCServer) handleConn(conn net.Conn) {
 			}
 			return
 		}
-		resp := gs.handleMethod(req)
+		resp := gs.handleMethod(gc, req)
 		conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 		if err := encoder.Encode(resp); err != nil {
 			return
@@ -258,27 +286,47 @@ func (gs *GRPCServer) handleConn(conn net.Conn) {
 	}
 }
 
-func (gs *GRPCServer) handleMethod(req grpcRequest) grpcResponse {
-	// Check authentication if token is configured
-	if gs.cfg.BrokerToken != "" {
-		if req.Headers == nil {
-			return grpcResponse{ID: req.ID, Error: "unauthorized: missing auth token", Status: 401}
+func (gs *GRPCServer) handleMethod(gc *grpcConn, req grpcRequest) grpcResponse {
+	principal := AdminPrincipal{Name: "insecure-dev", Permissions: []string{PermissionAdminAll}}
+	if !gs.cfg.AllowInsecure || gs.cfg.BrokerToken != "" {
+		var cert *x509.Certificate
+		if tc, ok := gc.conn.(*tls.Conn); ok {
+			state := tc.ConnectionState()
+			if len(state.VerifiedChains) > 0 && len(state.VerifiedChains[0]) > 0 {
+				cert = state.VerifiedChains[0][0]
+			}
 		}
-		token := req.Headers["Authorization"]
-		if token == "" {
-			token = req.Headers["authorization"]
+		token := nativeRPCBearerToken(req.Headers)
+		var authenticated bool
+		principal, authenticated = authenticateAdminCredential(gs.cfg.ACL, token, cert)
+		if !authenticated {
+			return grpcResponse{ID: req.ID, Error: "unauthorized: missing or invalid credential", Status: 401}
 		}
-		if len(token) > 7 && token[:7] == "Bearer " {
-			token = token[7:]
+		if !gs.cfg.ACL.Authorize(principal, nativeRPCMethodPermission(req.Method)) {
+			return grpcResponse{ID: req.ID, Error: "forbidden: credential lacks required permission", Status: 403}
 		}
-		if token != gs.cfg.BrokerToken {
-			return grpcResponse{ID: req.ID, Error: "unauthorized: invalid token", Status: 401}
+		if gc.authenticated {
+			if !sameAdminPrincipal(gc.principal, principal) {
+				return grpcResponse{ID: req.ID, Error: "unauthorized: credential changed on connection", Status: 401}
+			}
+		} else {
+			release, err := gs.cfg.ACL.AdmitConnection(principal)
+			if err != nil {
+				return grpcResponse{ID: req.ID, Error: err.Error(), Status: 429}
+			}
+			gc.principal = principal
+			gc.authenticated = true
+			gc.release = release
 		}
+		release, err := gs.cfg.ACL.Admit(principal)
+		if err != nil {
+			return grpcResponse{ID: req.ID, Error: err.Error(), Status: 429}
+		}
+		defer release()
 	}
-	// A background context ignored broker shutdown and client disconnect
-	// entirely, so an in-flight request could not be cancelled. It also meant the
-	// tenant resolved for the request never reached the store.
-	ctx := gs.requestContext(req)
+	ctx, cancel := gs.requestContext(req)
+	defer cancel()
+	ctx = WithAdminPrincipal(ctx, principal)
 	switch req.Method {
 	case GRPCMethodPublish:
 		return gs.handlePublish(ctx, req)
@@ -316,6 +364,57 @@ func (gs *GRPCServer) handleMethod(req grpcRequest) grpcResponse {
 		return gs.handlePurgeQueue(ctx, req)
 	default:
 		return grpcResponse{ID: req.ID, Error: "unknown method: " + req.Method, Status: 404}
+	}
+}
+
+func nativeRPCBearerToken(headers map[string]string) string {
+	for key, value := range headers {
+		if !strings.EqualFold(key, "authorization") {
+			continue
+		}
+		token := strings.TrimSpace(value)
+		if len(token) >= 7 && strings.EqualFold(token[:7], "Bearer ") {
+			token = strings.TrimSpace(token[7:])
+		}
+		return token
+	}
+	return ""
+}
+
+func nativeRPCMethodPermission(method string) string {
+	switch method {
+	case GRPCMethodPublish, GRPCMethodRequest:
+		return PermissionPublish
+	case GRPCMethodAck:
+		return PermissionMessageAck
+	case GRPCMethodNack:
+		return PermissionMessageNack
+	case GRPCMethodPoll:
+		return PermissionConsumerPoll
+	case GRPCMethodSubscribe:
+		return PermissionConsumerRegister
+	case GRPCMethodStats:
+		return PermissionStatsRead
+	case GRPCMethodHealth:
+		return PermissionBrokerRead
+	case GRPCMethodDeclareQueue:
+		return PermissionQueueWrite
+	case GRPCMethodDeclareTopic:
+		return PermissionTopicWrite
+	case GRPCMethodDeclareStream:
+		return PermissionStreamWrite
+	case GRPCMethodReadStream:
+		return PermissionStreamRead
+	case GRPCMethodCommitOffset:
+		return PermissionStreamCommit
+	case GRPCMethodMove:
+		return PermissionMessageMove
+	case GRPCMethodPauseQueue, GRPCMethodResumeQueue:
+		return PermissionQueueControl
+	case GRPCMethodPurgeQueue:
+		return PermissionQueuePurge
+	default:
+		return PermissionBrokerRead
 	}
 }
 
@@ -648,23 +747,17 @@ func (r *maxBytesReader) Read(p []byte) (int, error) {
 // the server context so shutdown and keep-alive deadlines cancel in-flight work,
 // and it carries the request deadline when the client sent one.
 //
-// This transport authenticates with a single static bearer token and has no ACL,
-// so there is no per-request principal to attach. Tenant scoping therefore has
-// to come from the request body, which the handlers now pass through. Adding a
-// real per-principal identity here would need an ACL on GRPCConfig.
-func (gs *GRPCServer) requestContext(req grpcRequest) context.Context {
+// Authenticated requests use ACL principals for operation permissions and tenant
+// scoping. An explicit insecure development listener receives an admin context.
+func (gs *GRPCServer) requestContext(req grpcRequest) (context.Context, context.CancelFunc) {
 	ctx := gs.ctx
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	if req.Context != 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithDeadline(ctx, time.Unix(0, req.Context))
-		// The handler runs synchronously and returns before the response is
-		// written, so releasing here bounds the cancel to the request.
-		defer cancel()
+		return context.WithDeadline(ctx, time.Unix(0, req.Context))
 	}
-	return ctx
+	return context.WithCancel(ctx)
 }
 
 // decodeNativePayload resolves a publish payload, honouring an explicit

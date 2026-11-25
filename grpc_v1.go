@@ -3,6 +3,7 @@ package broker
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"net"
 	"strings"
@@ -44,11 +45,9 @@ func NewGRPCV1Server(b *Broker, cfg GRPCV1Config) (*GRPCV1Server, error) {
 	if cfg.MaxMessageSize <= 0 {
 		cfg.MaxMessageSize = 4 << 20
 	}
-	if !cfg.InsecureDev && cfg.TLSConfig == nil {
-		return nil, errf(ErrUnauthorized, "gRPC production listener requires TLS")
-	}
-	if !cfg.InsecureDev && cfg.ACL == nil {
-		return nil, errf(ErrUnauthorized, "gRPC production listener requires an ACL")
+	certificateAuth := tlsConfigVerifiesClientCertificates(cfg.TLSConfig)
+	if err := validateListenerSecurity("gRPC", cfg.InsecureDev, cfg.TLSConfig != nil, cfg.ACL.hasUsableCredential(certificateAuth), "ACL authentication"); err != nil {
+		return nil, errf(ErrUnauthorized, "%s", err)
 	}
 	s := &GRPCV1Server{broker: b, cfg: cfg}
 	options := []grpc.ServerOption{
@@ -97,10 +96,10 @@ func (s *GRPCV1Server) Stop(ctx context.Context) error {
 func (s *GRPCV1Server) authorizeUnary(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
 	principal := AdminPrincipal{Name: "development", Permissions: []string{PermissionAdminAll}}
 	if !s.cfg.InsecureDev {
-		var ok bool
+		var cert *x509.Certificate
 		if remote, exists := peer.FromContext(ctx); exists {
 			if tlsInfo, isTLS := remote.AuthInfo.(credentials.TLSInfo); isTLS && len(tlsInfo.State.VerifiedChains) > 0 && len(tlsInfo.State.VerifiedChains[0]) > 0 {
-				principal, ok = s.cfg.ACL.AuthenticateCertificate(tlsInfo.State.VerifiedChains[0][0])
+				cert = tlsInfo.State.VerifiedChains[0][0]
 			}
 		}
 		values := metadata.ValueFromIncomingContext(ctx, "authorization")
@@ -111,9 +110,8 @@ func (s *GRPCV1Server) authorizeUnary(ctx context.Context, req any, info *grpc.U
 				raw = strings.TrimSpace(raw[7:])
 			}
 		}
-		if !ok {
-			principal, ok = s.cfg.ACL.Authenticate(raw)
-		}
+		var ok bool
+		principal, ok = authenticateAdminCredential(s.cfg.ACL, raw, cert)
 		if !ok {
 			return nil, status.Error(codes.Unauthenticated, "invalid credential")
 		}
@@ -134,10 +132,10 @@ func (s *GRPCV1Server) authorizeStream(srv any, ss grpc.ServerStream, info *grpc
 	ctx := ss.Context()
 	principal := AdminPrincipal{Name: "development", Permissions: []string{PermissionAdminAll}}
 	if !s.cfg.InsecureDev {
-		var ok bool
+		var cert *x509.Certificate
 		if remote, exists := peer.FromContext(ctx); exists {
 			if tlsInfo, isTLS := remote.AuthInfo.(credentials.TLSInfo); isTLS && len(tlsInfo.State.VerifiedChains) > 0 && len(tlsInfo.State.VerifiedChains[0]) > 0 {
-				principal, ok = s.cfg.ACL.AuthenticateCertificate(tlsInfo.State.VerifiedChains[0][0])
+				cert = tlsInfo.State.VerifiedChains[0][0]
 			}
 		}
 		values := metadata.ValueFromIncomingContext(ctx, "authorization")
@@ -148,9 +146,8 @@ func (s *GRPCV1Server) authorizeStream(srv any, ss grpc.ServerStream, info *grpc
 				raw = strings.TrimSpace(raw[7:])
 			}
 		}
-		if !ok {
-			principal, ok = s.cfg.ACL.Authenticate(raw)
-		}
+		var ok bool
+		principal, ok = authenticateAdminCredential(s.cfg.ACL, raw, cert)
 		if !ok {
 			return status.Error(codes.Unauthenticated, "invalid credential")
 		}
@@ -180,8 +177,10 @@ func (w *wrappedStream) Context() context.Context {
 }
 
 func (w *wrappedStream) RecvMsg(message any) error {
-	if err := w.acl.AdmitRate(w.principal); err != nil {
-		return status.Error(codes.ResourceExhausted, err.Error())
+	if w.acl != nil {
+		if err := w.acl.AdmitRate(w.principal); err != nil {
+			return status.Error(codes.ResourceExhausted, err.Error())
+		}
 	}
 	return w.ServerStream.RecvMsg(message)
 }

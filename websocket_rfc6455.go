@@ -2,6 +2,7 @@ package broker
 
 import (
 	"context"
+	"crypto/x509"
 	"encoding/json"
 	"net/http"
 	"sync"
@@ -69,23 +70,30 @@ func (s *RFC6455Server) Handler() http.Handler {
 			http.NotFound(w, r)
 			return
 		}
+		if !s.cfg.InsecureDev && s.cfg.ACL == nil {
+			http.Error(w, "authentication is not configured", http.StatusServiceUnavailable)
+			return
+		}
 		principal, ok := AdminPrincipal{Name: "development", Permissions: []string{PermissionAdminAll}}, s.cfg.InsecureDev
 		if !ok {
+			var cert *x509.Certificate
 			if r.TLS != nil && len(r.TLS.VerifiedChains) > 0 && len(r.TLS.VerifiedChains[0]) > 0 {
-				principal, ok = s.cfg.ACL.AuthenticateCertificate(r.TLS.VerifiedChains[0][0])
+				cert = r.TLS.VerifiedChains[0][0]
 			}
-			if !ok {
-				principal, ok = s.cfg.ACL.Authenticate(bearerToken(r))
-			}
+			principal, ok = authenticateAdminCredential(s.cfg.ACL, bearerToken(r), cert)
 		}
 		if !ok {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
-		release, err := s.cfg.ACL.AdmitConnection(principal)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusTooManyRequests)
-			return
+		release := func() {}
+		if s.cfg.ACL != nil {
+			var err error
+			release, err = s.cfg.ACL.AdmitConnection(principal)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusTooManyRequests)
+				return
+			}
 		}
 		defer release()
 		s.mu.Lock()
@@ -133,11 +141,13 @@ func (s *RFC6455Server) serve(parent context.Context, conn *websocket.Conn, prin
 			s.write(conn, webSocketResponse{OK: false, Error: "invalid JSON request"})
 			continue
 		}
-		if err := s.cfg.ACL.AdmitRate(principal); err != nil {
-			if s.write(conn, webSocketResponse{ID: req.ID, OK: false, Error: err.Error()}) != nil {
-				return
+		if s.cfg.ACL != nil {
+			if err := s.cfg.ACL.AdmitRate(principal); err != nil {
+				if s.write(conn, webSocketResponse{ID: req.ID, OK: false, Error: err.Error()}) != nil {
+					return
+				}
+				continue
 			}
-			continue
 		}
 		ctx := context.WithValue(parent, adminPrincipalKey{}, principal)
 		resp := s.dispatch(ctx, principal, req)

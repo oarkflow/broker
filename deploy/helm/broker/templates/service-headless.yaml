@@ -11,6 +11,11 @@ spec:
   selector:
     {{- include "broker.selectorLabels" . | nindent 4 }}
   ports:
+    {{- if .Values.cluster.enabled }}
+    - name: raft-peer
+      port: {{ .Values.cluster.peerPort }}
+      targetPort: raft-peer
+    {{- end }}
     - name: http-admin
       port: {{ .Values.service.ports.httpAdmin }}
       targetPort: http-admin
@@ -28,4 +33,9 @@ spec:
     - name: amqp
       port: {{ .Values.service.ports.amqp }}
       targetPort: amqp
+    {{- end }}
+    {{- if .Values.broker.listeners.native.enabled }}
+    - name: native-bst1
+      port: {{ .Values.service.ports.native }}
+      targetPort: native-bst1
     {{- end }}

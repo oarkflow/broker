@@ -17,6 +17,7 @@ var (
 	ErrTopicNotFound    = errors.New("broker: topic not found")
 	ErrStreamNotFound   = errors.New("broker: stream not found")
 	ErrMessageNotFound  = errors.New("broker: message not found")
+	ErrCursorExpired    = errors.New("broker: topic cursor expired")
 	ErrInvalidMessage   = errors.New("broker: invalid message")
 	ErrMessageTooLarge  = errors.New("broker: message too large")
 	ErrNoDestination    = errors.New("broker: no route destination")
@@ -31,25 +32,35 @@ var (
 	// ErrUnauthorized which is an authenticated principal lacking permission.
 	// The two need separating so a client can tell "authenticate again" from
 	// "you are not allowed", which is also how the HTTP status differs.
-	ErrUnauthenticated     = errors.New("broker: unauthenticated")
-	ErrLeaseLost           = errors.New("broker: lease lost")
-	ErrOutboxClaimLost     = errors.New("broker: outbox claim lost")
-	ErrPermanent           = errors.New("broker: permanent error")
-	ErrTransactionClosed   = errors.New("broker: transaction closed")
-	ErrTransactionConflict = errors.New("broker: transaction id reused with different input")
-	ErrUnsupportedMode     = errors.New("broker: unsupported mode")
-	ErrBrokerUnavailable   = errors.New("broker: unavailable")
-	ErrCallbackFailed      = errors.New("broker: callback failed")
-	ErrCancelled           = errors.New("broker: cancelled")
-	ErrConsumerBanned      = errors.New("broker: consumer banned")
-	ErrTaskAlreadyExists   = errors.New("broker: task already exists")
-	ErrRateLimited         = errors.New("broker: rate limited")
-	ErrNotLeader           = errors.New("broker: not leader")
-	ErrStaleEpoch          = errors.New("broker: stale leader epoch")
-	ErrQuorumUnavailable   = errors.New("broker: quorum unavailable")
-	ErrThrottled           = errors.New("broker: throttled")
-	ErrTransactionAborted  = errors.New("broker: transaction aborted")
-	ErrStorageUnavailable  = errors.New("broker: storage unavailable")
+	ErrUnauthenticated               = errors.New("broker: unauthenticated")
+	ErrLeaseLost                     = errors.New("broker: lease lost")
+	ErrOutboxClaimLost               = errors.New("broker: outbox claim lost")
+	ErrPermanent                     = errors.New("broker: permanent error")
+	ErrTransactionClosed             = errors.New("broker: transaction closed")
+	ErrTransactionConflict           = errors.New("broker: transaction id reused with different input")
+	ErrUnsupportedMode               = errors.New("broker: unsupported mode")
+	ErrBrokerUnavailable             = errors.New("broker: unavailable")
+	ErrCallbackFailed                = errors.New("broker: callback failed")
+	ErrCancelled                     = errors.New("broker: cancelled")
+	ErrConsumerBanned                = errors.New("broker: consumer banned")
+	ErrTaskAlreadyExists             = errors.New("broker: task already exists")
+	ErrRateLimited                   = errors.New("broker: rate limited")
+	ErrNotLeader                     = errors.New("broker: not leader")
+	ErrStaleEpoch                    = errors.New("broker: stale leader epoch")
+	ErrQuorumUnavailable             = errors.New("broker: quorum unavailable")
+	ErrPartitionNotFound             = errors.New("broker: partition metadata not found")
+	ErrSchemaNotFound                = errors.New("broker: schema metadata not found")
+	ErrClusterNodeNotFound           = errors.New("broker: cluster node not found")
+	ErrClusterACLPrincipalNotFound   = errors.New("broker: cluster ACL principal not found")
+	ErrClusterTransactionNotFound    = errors.New("broker: cluster transaction not found")
+	ErrClusterNodeInUse              = errors.New("broker: cluster node is still assigned")
+	ErrClusterNodeUnavailable        = errors.New("broker: cluster node is unavailable for placement")
+	ErrClusterChangePending          = errors.New("broker: cluster membership change is pending")
+	ErrPartitionReassignmentRequired = errors.New("broker: partition reassignment requires the safe reassignment protocol")
+	ErrPartitionTransferRequired     = errors.New("broker: partition leader changes require a Raft leadership transfer")
+	ErrThrottled                     = errors.New("broker: throttled")
+	ErrTransactionAborted            = errors.New("broker: transaction aborted")
+	ErrStorageUnavailable            = errors.New("broker: storage unavailable")
 )
 
 type RetryClassification string
@@ -156,40 +167,51 @@ func errf(base error, format string, args ...any) error {
 // indistinguishable text. A client could not recover ErrNotLeader or reach
 // ClassifyRetry at all.
 var errorCodes = map[error]string{
-	ErrClosed:             "closed",
-	ErrStopped:            "stopped",
-	ErrPaused:             "paused",
-	ErrQueueNotFound:      "queue_not_found",
-	ErrTopicNotFound:      "topic_not_found",
-	ErrStreamNotFound:     "stream_not_found",
-	ErrMessageNotFound:    "message_not_found",
-	ErrInvalidMessage:     "invalid_message",
-	ErrMessageTooLarge:    "message_too_large",
-	ErrNoDestination:      "no_destination",
-	ErrNoSubscribers:      "no_subscribers",
-	ErrDuplicateMessage:   "duplicate_message",
-	ErrBackpressure:       "backpressure",
-	ErrPublishTimeout:     "publish_timeout",
-	ErrRequestTimeout:     "request_timeout",
-	ErrNoHandler:          "no_handler",
-	ErrUnauthorized:       "unauthorized",
-	ErrUnauthenticated:    "unauthenticated",
-	ErrLeaseLost:          "lease_lost",
-	ErrPermanent:          "permanent",
-	ErrTransactionClosed:  "transaction_closed",
-	ErrTaskAlreadyExists:  "task_already_exists",
-	ErrUnsupportedMode:    "unsupported_mode",
-	ErrBrokerUnavailable:  "broker_unavailable",
-	ErrCallbackFailed:     "callback_failed",
-	ErrCancelled:          "cancelled",
-	ErrConsumerBanned:     "consumer_banned",
-	ErrRateLimited:        "rate_limited",
-	ErrNotLeader:          "not_leader",
-	ErrStaleEpoch:         "stale_epoch",
-	ErrQuorumUnavailable:  "quorum_unavailable",
-	ErrThrottled:          "throttled",
-	ErrTransactionAborted: "transaction_aborted",
-	ErrStorageUnavailable: "storage_unavailable",
+	ErrClosed:                        "closed",
+	ErrStopped:                       "stopped",
+	ErrPaused:                        "paused",
+	ErrQueueNotFound:                 "queue_not_found",
+	ErrTopicNotFound:                 "topic_not_found",
+	ErrStreamNotFound:                "stream_not_found",
+	ErrMessageNotFound:               "message_not_found",
+	ErrCursorExpired:                 "cursor_expired",
+	ErrInvalidMessage:                "invalid_message",
+	ErrMessageTooLarge:               "message_too_large",
+	ErrNoDestination:                 "no_destination",
+	ErrNoSubscribers:                 "no_subscribers",
+	ErrDuplicateMessage:              "duplicate_message",
+	ErrBackpressure:                  "backpressure",
+	ErrPublishTimeout:                "publish_timeout",
+	ErrRequestTimeout:                "request_timeout",
+	ErrNoHandler:                     "no_handler",
+	ErrUnauthorized:                  "unauthorized",
+	ErrUnauthenticated:               "unauthenticated",
+	ErrLeaseLost:                     "lease_lost",
+	ErrPermanent:                     "permanent",
+	ErrTransactionClosed:             "transaction_closed",
+	ErrTaskAlreadyExists:             "task_already_exists",
+	ErrUnsupportedMode:               "unsupported_mode",
+	ErrBrokerUnavailable:             "broker_unavailable",
+	ErrCallbackFailed:                "callback_failed",
+	ErrCancelled:                     "cancelled",
+	ErrConsumerBanned:                "consumer_banned",
+	ErrRateLimited:                   "rate_limited",
+	ErrNotLeader:                     "not_leader",
+	ErrStaleEpoch:                    "stale_epoch",
+	ErrQuorumUnavailable:             "quorum_unavailable",
+	ErrPartitionNotFound:             "partition_not_found",
+	ErrSchemaNotFound:                "schema_not_found",
+	ErrClusterNodeNotFound:           "cluster_node_not_found",
+	ErrClusterACLPrincipalNotFound:   "cluster_acl_principal_not_found",
+	ErrClusterTransactionNotFound:    "cluster_transaction_not_found",
+	ErrClusterNodeInUse:              "cluster_node_in_use",
+	ErrClusterNodeUnavailable:        "cluster_node_unavailable",
+	ErrClusterChangePending:          "cluster_change_pending",
+	ErrPartitionReassignmentRequired: "partition_reassignment_required",
+	ErrPartitionTransferRequired:     "partition_transfer_required",
+	ErrThrottled:                     "throttled",
+	ErrTransactionAborted:            "transaction_aborted",
+	ErrStorageUnavailable:            "storage_unavailable",
 }
 
 // errorSentinels is the reverse mapping, used by clients to recover a comparable
@@ -207,6 +229,10 @@ var errorSentinels = func() map[string]error {
 func ErrorCode(err error) string {
 	if err == nil {
 		return ""
+	}
+	var maxBytesErr *http.MaxBytesError
+	if errors.As(err, &maxBytesErr) {
+		return errorCodes[ErrMessageTooLarge]
 	}
 	var be BrokerError
 	if errors.As(err, &be) && be.Code != "" {
@@ -234,6 +260,10 @@ func HTTPStatusForError(err error) int {
 	if err == nil {
 		return http.StatusOK
 	}
+	var maxBytesErr *http.MaxBytesError
+	if errors.As(err, &maxBytesErr) {
+		return http.StatusRequestEntityTooLarge
+	}
 	if IsPermanent(err) {
 		return http.StatusBadRequest
 	}
@@ -248,11 +278,19 @@ func HTTPStatusForError(err error) int {
 		return http.StatusBadRequest
 	case errors.Is(err, ErrMessageTooLarge):
 		return http.StatusRequestEntityTooLarge
+	case errors.Is(err, ErrCursorExpired):
+		return http.StatusGone
 	case errors.Is(err, ErrQueueNotFound), errors.Is(err, ErrTopicNotFound),
-		errors.Is(err, ErrStreamNotFound), errors.Is(err, ErrMessageNotFound):
+		errors.Is(err, ErrStreamNotFound), errors.Is(err, ErrMessageNotFound),
+		errors.Is(err, ErrPartitionNotFound), errors.Is(err, ErrSchemaNotFound), errors.Is(err, ErrClusterNodeNotFound), errors.Is(err, ErrClusterACLPrincipalNotFound), errors.Is(err, ErrClusterTransactionNotFound):
 		return http.StatusNotFound
-	case errors.Is(err, ErrDuplicateMessage), errors.Is(err, ErrTaskAlreadyExists):
+	case errors.Is(err, ErrDuplicateMessage), errors.Is(err, ErrTaskAlreadyExists),
+		errors.Is(err, ErrClusterNodeInUse), errors.Is(err, ErrClusterNodeUnavailable),
+		errors.Is(err, ErrClusterChangePending), errors.Is(err, ErrPartitionReassignmentRequired),
+		errors.Is(err, ErrPartitionTransferRequired):
 		return http.StatusConflict
+	case errors.Is(err, ErrCancelled):
+		return http.StatusRequestTimeout
 	case errors.Is(err, ErrBackpressure), errors.Is(err, ErrRateLimited), errors.Is(err, ErrThrottled):
 		return http.StatusTooManyRequests
 	case errors.Is(err, ErrPublishTimeout), errors.Is(err, ErrRequestTimeout):

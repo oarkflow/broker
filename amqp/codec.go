@@ -225,6 +225,8 @@ func EncodeMethodArgs(args ...any) []byte {
 // table is a map[string]any for AMQP field tables.
 type table = map[string]any
 
+const maxAMQPFieldTableDepth = 32
+
 // encodeTable encodes an AMQP field table.
 func encodeTable(buf *bytes.Buffer, t table) {
 	// Reserve space for length
@@ -287,17 +289,27 @@ func encodeFieldValue(buf *bytes.Buffer, v any) {
 
 // DecodeTable decodes an AMQP field table from bytes.
 func DecodeTable(data []byte) (table, error) {
-	t := make(table)
 	if len(data) < 4 {
-		return t, nil
+		return nil, io.ErrUnexpectedEOF
 	}
 
 	length := binary.BigEndian.Uint32(data[0:4])
-	if length == 0 {
-		return t, nil
+	available := uint64(len(data) - 4)
+	if uint64(length) > available {
+		return nil, io.ErrUnexpectedEOF
 	}
+	if uint64(length) < available {
+		return nil, errors.New("AMQP field table has trailing bytes")
+	}
+	return decodeTableEntries(data[4:], 0)
+}
 
-	r := bytes.NewReader(data[4 : 4+length])
+func decodeTableEntries(data []byte, depth int) (table, error) {
+	if depth > maxAMQPFieldTableDepth {
+		return nil, errors.New("AMQP field table nesting exceeds limit")
+	}
+	t := make(table)
+	r := bytes.NewReader(data)
 	for r.Len() > 0 {
 		// Read key length
 		var keyLen uint8
@@ -312,7 +324,7 @@ func DecodeTable(data []byte) (table, error) {
 		}
 
 		// Read value
-		value, err := decodeFieldValue(r)
+		value, err := decodeFieldValue(r, depth)
 		if err != nil {
 			return nil, err
 		}
@@ -324,20 +336,22 @@ func DecodeTable(data []byte) (table, error) {
 }
 
 // decodeFieldValue reads a single field value from the reader.
-func decodeFieldValue(r io.Reader) (any, error) {
+func decodeFieldValue(r *bytes.Reader, depth int) (any, error) {
 	var valueType byte
 	if err := binary.Read(r, binary.BigEndian, &valueType); err != nil {
 		return nil, err
 	}
 
 	switch valueType {
+	case 'V':
+		return nil, nil
 	case 'S':
 		var length uint32
 		if err := binary.Read(r, binary.BigEndian, &length); err != nil {
 			return nil, err
 		}
-		buf := make([]byte, length)
-		if _, err := io.ReadFull(r, buf); err != nil {
+		buf, err := readFieldValueBytes(r, length)
+		if err != nil {
 			return nil, err
 		}
 		return string(buf), nil
@@ -382,8 +396,8 @@ func decodeFieldValue(r io.Reader) (any, error) {
 		if err := binary.Read(r, binary.BigEndian, &length); err != nil {
 			return nil, err
 		}
-		buf := make([]byte, length)
-		if _, err := io.ReadFull(r, buf); err != nil {
+		buf, err := readFieldValueBytes(r, length)
+		if err != nil {
 			return nil, err
 		}
 		return buf, nil
@@ -393,12 +407,23 @@ func decodeFieldValue(r io.Reader) (any, error) {
 		if err := binary.Read(r, binary.BigEndian, &length); err != nil {
 			return nil, err
 		}
-		buf := make([]byte, length)
-		if _, err := io.ReadFull(r, buf); err != nil {
+		buf, err := readFieldValueBytes(r, length)
+		if err != nil {
 			return nil, err
 		}
-		return DecodeTable(buf)
+		return decodeTableEntries(buf, depth+1)
 	}
 
 	return nil, fmt.Errorf("unknown field type: %c", valueType)
+}
+
+func readFieldValueBytes(r *bytes.Reader, length uint32) ([]byte, error) {
+	if uint64(length) > uint64(r.Len()) {
+		return nil, io.ErrUnexpectedEOF
+	}
+	buf := make([]byte, int(length))
+	if _, err := io.ReadFull(r, buf); err != nil {
+		return nil, err
+	}
+	return buf, nil
 }

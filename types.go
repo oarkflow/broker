@@ -124,11 +124,14 @@ const (
 type DestinationKind string
 
 const (
-	DestinationTopic   DestinationKind = "topic"
-	DestinationQueue   DestinationKind = "queue"
-	DestinationStream  DestinationKind = "stream"
-	DestinationDLQ     DestinationKind = "dlq"
-	DestinationArchive DestinationKind = "archive"
+	DestinationTopic DestinationKind = "topic"
+	// DestinationExchange forwards a matched message through another named
+	// exchange. Router.Route resolves these destinations recursively.
+	DestinationExchange DestinationKind = "exchange"
+	DestinationQueue    DestinationKind = "queue"
+	DestinationStream   DestinationKind = "stream"
+	DestinationDLQ      DestinationKind = "dlq"
+	DestinationArchive  DestinationKind = "archive"
 )
 
 type Destination struct {
@@ -143,6 +146,7 @@ type Message struct {
 	Queue            string            `json:"queue,omitempty"`
 	Stream           string            `json:"stream,omitempty"`
 	Partition        int               `json:"partition,omitempty"`
+	Partitioned      bool              `json:"partitioned,omitempty"`
 	Offset           uint64            `json:"offset,omitempty"`
 	Key              string            `json:"key,omitempty"`
 	RoutingKey       string            `json:"routing_key,omitempty"`
@@ -244,6 +248,7 @@ func DefaultRetryPolicy() RetryPolicy {
 
 type QueueConfig struct {
 	Name              string             `json:"name"`
+	Durable           bool               `json:"durable,omitempty"` // Retain queue metadata across store recovery.
 	Workers           int                `json:"workers"`
 	MaxInFlight       int                `json:"max_inflight"`
 	MaxDepth          int                `json:"max_depth"`

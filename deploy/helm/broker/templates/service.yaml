@@ -28,3 +28,8 @@ spec:
       port: {{ .Values.service.ports.amqp }}
       targetPort: amqp
     {{- end }}
+    {{- if .Values.broker.listeners.native.enabled }}
+    - name: native-bst1
+      port: {{ .Values.service.ports.native }}
+      targetPort: native-bst1
+    {{- end }}

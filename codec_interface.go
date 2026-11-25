@@ -19,6 +19,17 @@ const (
 	CodecFWB2 CodecType = "fwb2" // Compact format with numeric tags
 )
 
+func cloneByteSlices(values [][]byte) [][]byte {
+	if values == nil {
+		return nil
+	}
+	cloned := make([][]byte, len(values))
+	for i, value := range values {
+		cloned[i] = append([]byte(nil), value...)
+	}
+	return cloned
+}
+
 // FrameCodecConfig holds configuration for creating a FrameCodec.
 type FrameCodecConfig struct {
 	Type              CodecType
@@ -26,6 +37,7 @@ type FrameCodecConfig struct {
 	MaxFrameSize      int
 	SigningKey        []byte
 	EncryptionKey     []byte
+	WALDecryptionKeys [][]byte
 }
 
 // NewFrameCodec creates a FrameCodec based on the config.
@@ -37,6 +49,7 @@ func NewFrameCodec(cfg FrameCodecConfig) FrameCodec {
 			WithCompactMaxFrameSize(cfg.MaxFrameSize),
 			WithCompactSigningKey(cfg.SigningKey),
 			WithCompactEncryptionKey(cfg.EncryptionKey),
+			WithCompactWALDecryptionKeys(cfg.WALDecryptionKeys),
 		)
 	default: // CodecFWB1 or empty
 		return NewBinaryMessageCodec(
@@ -44,6 +57,7 @@ func NewFrameCodec(cfg FrameCodecConfig) FrameCodec {
 			WithFrameMaxSize(cfg.MaxFrameSize),
 			WithFrameSigningKey(cfg.SigningKey),
 			WithFrameEncryptionKey(cfg.EncryptionKey),
+			WithFrameWALDecryptionKeys(cfg.WALDecryptionKeys),
 		)
 	}
 }
@@ -58,6 +72,7 @@ func (c *BinaryMessageCodec) WALCodecConfig() WALCodecConfig {
 		CompressThreshold: c.CompressThreshold,
 		MaxRecordSize:     c.MaxFrameSize,
 		EncryptionKey:     append([]byte(nil), c.EncryptionKey...),
+		DecryptionKeys:    cloneByteSlices(c.WALDecryptionKeys),
 		SigningKey:        append([]byte(nil), c.SigningKey...),
 	}
 }
@@ -72,6 +87,7 @@ func (c *CompactMessageCodec) WALCodecConfig() WALCodecConfig {
 		CompressThreshold: c.CompressThreshold,
 		MaxRecordSize:     c.MaxFrameSize,
 		EncryptionKey:     append([]byte(nil), c.EncryptionKey...),
+		DecryptionKeys:    cloneByteSlices(c.WALDecryptionKeys),
 		SigningKey:        append([]byte(nil), c.SigningKey...),
 	}
 }

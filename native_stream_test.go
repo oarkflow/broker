@@ -28,7 +28,7 @@ func netListenLocal(s *NativeStreamServer) (string, error) {
 
 func TestNativeStreamRestartAndOffsets(t *testing.T) {
 	dir := t.TempDir()
-	s, err := NewNativeStreamServer(NativeStreamConfig{Dir: dir, Partitions: 2, SegmentBytes: 128, GroupCommitDelay: 50 * time.Microsecond, Sync: true})
+	s, err := NewNativeStreamServer(NativeStreamConfig{Dir: dir, Partitions: 2, SegmentBytes: 128, GroupCommitDelay: 50 * time.Microsecond, Sync: true, InsecureDev: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -56,7 +56,7 @@ func TestNativeStreamRestartAndOffsets(t *testing.T) {
 	}
 	_ = c.Close()
 	_ = s.Close()
-	s2, err := NewNativeStreamServer(NativeStreamConfig{Dir: dir, Partitions: 2, SegmentBytes: 128, Sync: true})
+	s2, err := NewNativeStreamServer(NativeStreamConfig{Dir: dir, Partitions: 2, SegmentBytes: 128, Sync: true, InsecureDev: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -87,7 +87,7 @@ func TestNativeStreamRestartAndOffsets(t *testing.T) {
 
 func TestNativeStreamFetchRaw(t *testing.T) {
 	dir := t.TempDir()
-	s, err := NewNativeStreamServer(NativeStreamConfig{Dir: dir, Partitions: 2, Sync: true})
+	s, err := NewNativeStreamServer(NativeStreamConfig{Dir: dir, Partitions: 2, Sync: true, InsecureDev: true})
 	if err != nil {
 		t.Fatal(err)
 	}

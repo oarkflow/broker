@@ -132,6 +132,12 @@ func TestRemoteClientFailoverBrokerURLs(t *testing.T) {
 	bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { http.Error(w, "bad", http.StatusBadGateway) }))
 	defer bad.Close()
 	c := bclient.New(bclient.Config{BrokerURLs: []string{bad.URL, ts.URL}, PollWait: 20 * time.Millisecond})
+	// Read requests are safe to retry across brokers. Publishing is not retried
+	// after an ambiguous gateway failure because the first broker may have
+	// accepted the message before the response was lost.
+	if _, err := c.Consumers(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := c.Publish(context.Background(), "failover.event", map[string]any{"ok": true}, bclient.WithQueue("failover.q")); err != nil {
 		t.Fatal(err)
 	}

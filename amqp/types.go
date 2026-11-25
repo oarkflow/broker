@@ -55,7 +55,10 @@ const (
 	PropUserID          = 0x0010
 	PropAppID           = 0x0008
 	PropReserved        = 0x0004
-	PropClusterID       = 0x0001
+	// PropClusterID is retained for API compatibility. In AMQP 0-9-1 this
+	// value occupies the legacy reserved Basic-property slot.
+	PropClusterID    = PropReserved
+	PropContinuation = 0x0001
 )
 
 // AMQP method class IDs.
@@ -173,6 +176,7 @@ const (
 	ReplyUnexpectedFrame    = 505
 	ReplySyntaxError        = 502
 	ReplyCommandInvalid     = 503
+	ReplyNotImplemented     = 540
 	ReplyInternalError      = 541
 )
 
@@ -226,18 +230,26 @@ type Delivery struct {
 
 // Properties holds AMQP message properties.
 type Properties struct {
-	ContentType     string
-	ContentEncoding string
-	Headers         map[string]any
-	DeliveryMode    uint8
-	Priority        uint8
-	CorrelationID   string
-	ReplyTo         string
-	Expiration      string
-	MessageID       string
-	Timestamp       uint64
-	Type            string
-	UserID          string
-	AppID           string
-	ClusterID       string
+	ContentType        string
+	ContentEncoding    string
+	HasContentEncoding bool
+	Headers            map[string]any
+	HasHeaders         bool
+	DeliveryMode       uint8
+	HasDeliveryMode    bool
+	Priority           uint8
+	CorrelationID      string
+	ReplyTo            string
+	Expiration         string
+	HasExpiration      bool
+	MessageID          string
+	Timestamp          uint64
+	HasTimestamp       bool
+	Type               string
+	UserID             string
+	HasUserID          bool
+	AppID              string
+	HasAppID           bool
+	ClusterID          string
+	HasClusterID       bool
 }

@@ -8,7 +8,7 @@
 | MQTT 3.1.1 | Connect, publish/subscribe and persistent-session subset | Subset only; MQTT 5 is not supported |
 | WebSocket | Broker data-plane framing over RFC 6455 | Pre-v1 extension, not an industry broker protocol |
 | Native JSON/TCP | Bounded request/response transport | Pre-v1, no compatibility promise |
-| BST1 stream | Append/fetch/commit stream operations | Development-only until authenticated version negotiation ships |
+| BST1 stream | Append/fetch/commit with token or mapped mTLS authentication; BST2 handshake negotiates the supported frame version | Pre-v1; production requires TLS and ACL; only frame version 1 is implemented and compatibility certification remains open |
 
 “Implemented” does not mean complete protocol conformance. A release record must
 name the third-party client libraries and versions exercised against the exact

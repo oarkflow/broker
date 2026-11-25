@@ -41,6 +41,10 @@ const (
 	binaryWALKnownFlags = binaryWALFlagCompressed | binaryWALFlagEncrypted | binaryWALFlagSigned
 )
 
+const checkpointCipherMagic = "BWL2CHK1"
+
+const MaxWALDecryptionKeys = 16
+
 const (
 	walOpDeclareQueue byte = iota + 1
 	walOpDeclareTopic
@@ -76,6 +80,7 @@ type WALCodecConfig struct {
 	CompressThreshold int
 	MaxRecordSize     int
 	EncryptionKey     []byte
+	DecryptionKeys    [][]byte
 	SigningKey        []byte
 }
 
@@ -92,7 +97,55 @@ type WALRecordCodec struct {
 	compressThreshold int
 	maxRecordSize     int
 	aead              cipher.AEAD
+	decryptionAEADs   []cipher.AEAD
 	signingKey        []byte
+}
+
+func (c *WALRecordCodec) encryptionEnabled() bool {
+	return c != nil && c.aead != nil
+}
+
+func (c *WALRecordCodec) encryptCheckpoint(plain []byte) ([]byte, error) {
+	if !c.encryptionEnabled() {
+		return append([]byte(nil), plain...), nil
+	}
+	nonce := make([]byte, c.aead.NonceSize())
+	if _, err := rand.Read(nonce); err != nil {
+		return nil, fmt.Errorf("generate checkpoint nonce: %w", err)
+	}
+	sealed := c.aead.Seal(nil, nonce, plain, []byte(checkpointCipherMagic))
+	out := make([]byte, 0, len(checkpointCipherMagic)+1+len(nonce)+len(sealed))
+	out = append(out, checkpointCipherMagic...)
+	out = append(out, byte(len(nonce)))
+	out = append(out, nonce...)
+	out = append(out, sealed...)
+	return out, nil
+}
+
+func (c *WALRecordCodec) decryptCheckpoint(data []byte) ([]byte, bool, error) {
+	if !bytes.HasPrefix(data, []byte(checkpointCipherMagic)) {
+		return data, false, nil // legacy plaintext checkpoint
+	}
+	if !c.encryptionEnabled() {
+		return nil, true, fmt.Errorf("checkpoint is encrypted but no encryption key is configured")
+	}
+	headerLen := len(checkpointCipherMagic) + 1
+	if len(data) < headerLen {
+		return nil, true, fmt.Errorf("truncated encrypted checkpoint header")
+	}
+	nonceLen := int(data[len(checkpointCipherMagic)])
+	if nonceLen != c.aead.NonceSize() || len(data) < headerLen+nonceLen+c.aead.Overhead() {
+		return nil, true, fmt.Errorf("invalid encrypted checkpoint length")
+	}
+	nonce := data[headerLen : headerLen+nonceLen]
+	sealed := data[headerLen+nonceLen:]
+	for _, aead := range c.decryptionAEADs {
+		plain, err := aead.Open(nil, nonce, sealed, []byte(checkpointCipherMagic))
+		if err == nil {
+			return plain, true, nil
+		}
+	}
+	return nil, true, fmt.Errorf("decrypt checkpoint: none of the configured keys authenticated it")
 }
 
 func NewWALRecordCodec(cfg WALCodecConfig) (*WALRecordCodec, error) {
@@ -105,18 +158,52 @@ func NewWALRecordCodec(cfg WALCodecConfig) (*WALRecordCodec, error) {
 		maxRecordSize:     max,
 		signingKey:        append([]byte(nil), cfg.SigningKey...),
 	}
+	if len(cfg.DecryptionKeys) > MaxWALDecryptionKeys {
+		return nil, fmt.Errorf("wal codec: at most %d decryption keys may be configured", MaxWALDecryptionKeys)
+	}
 	if len(cfg.EncryptionKey) > 0 {
-		block, err := newWALAESBlock(cfg.EncryptionKey)
+		aead, err := newWALAESGCM(cfg.EncryptionKey)
 		if err != nil {
 			return nil, err
 		}
-		aead, err := cipher.NewGCM(block)
-		if err != nil {
-			return nil, fmt.Errorf("wal codec: initialize AES-GCM: %w", err)
-		}
 		c.aead = aead
+		c.decryptionAEADs = append(c.decryptionAEADs, aead)
+	}
+	if len(cfg.DecryptionKeys) > 0 && c.aead == nil {
+		return nil, fmt.Errorf("wal codec: a primary encryption key is required when decryption keys are configured")
+	}
+	seenKeys := make(map[string]struct{}, len(cfg.DecryptionKeys)+1)
+	if len(cfg.EncryptionKey) > 0 {
+		seenKeys[string(normalizeAESKey(cfg.EncryptionKey))] = struct{}{}
+	}
+	for i, key := range cfg.DecryptionKeys {
+		if len(key) == 0 {
+			return nil, fmt.Errorf("wal codec: decryption key %d is empty", i)
+		}
+		normalized := normalizeAESKey(key)
+		if _, duplicate := seenKeys[string(normalized)]; duplicate {
+			continue
+		}
+		aead, err := newWALAESGCM(normalized)
+		if err != nil {
+			return nil, err
+		}
+		c.decryptionAEADs = append(c.decryptionAEADs, aead)
+		seenKeys[string(normalized)] = struct{}{}
 	}
 	return c, nil
+}
+
+func newWALAESGCM(key []byte) (cipher.AEAD, error) {
+	block, err := newWALAESBlock(key)
+	if err != nil {
+		return nil, err
+	}
+	aead, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, fmt.Errorf("wal codec: initialize AES-GCM: %w", err)
+	}
+	return aead, nil
 }
 
 func newWALRecordCodecFromFrameCodec(codec FrameCodec) (*WALRecordCodec, error) {
@@ -356,15 +443,22 @@ func (c *WALRecordCodec) decode(frame []byte, record *walRecord) error {
 
 	payload := frame[idx:payloadEnd]
 	if flags&binaryWALFlagEncrypted != 0 {
-		if c.aead == nil {
+		if len(c.decryptionAEADs) == 0 {
 			return errf(ErrInvalidMessage, "BWL record is encrypted but no encryption key is configured")
 		}
-		if len(nonce) != c.aead.NonceSize() {
+		if len(nonce) != c.decryptionAEADs[0].NonceSize() {
 			return errf(ErrInvalidMessage, "invalid BWL nonce size")
 		}
-		opened, err := c.aead.Open(nil, nonce, payload, frame[:binaryWALFixedHeader])
-		if err != nil {
-			return errf(ErrInvalidMessage, "BWL decrypt failed: %v", err)
+		var opened []byte
+		var openErr error
+		for _, aead := range c.decryptionAEADs {
+			opened, openErr = aead.Open(nil, nonce, payload, frame[:binaryWALFixedHeader])
+			if openErr == nil {
+				break
+			}
+		}
+		if openErr != nil {
+			return errf(ErrInvalidMessage, "BWL decrypt failed: none of the configured keys authenticated the record")
 		}
 		payload = opened
 	} else if nonceLen != 0 {

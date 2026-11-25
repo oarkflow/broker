@@ -44,15 +44,41 @@ type Cluster struct {
 
 // NodeInfo contains information about a cluster node.
 type NodeInfo struct {
-	ID        string            `json:"id"`
-	Address   string            `json:"address"`
-	State     NodeState         `json:"state"`
-	Metadata  map[string]string `json:"metadata,omitempty"`
-	JoinedAt  time.Time         `json:"joined_at"`
-	UpdatedAt time.Time         `json:"updated_at"`
-	LastSeen  time.Time         `json:"last_seen"`
-	IsLeader  bool              `json:"is_leader"`
+	ID            string            `json:"id"`
+	Address       string            `json:"address"`
+	ClientAddress string            `json:"client_address,omitempty"`
+	State         NodeState         `json:"state"`
+	Metadata      map[string]string `json:"metadata,omitempty"`
+	JoinedAt      time.Time         `json:"joined_at"`
+	UpdatedAt     time.Time         `json:"updated_at"`
+	LastSeen      time.Time         `json:"last_seen"`
+	IsLeader      bool              `json:"is_leader"`
 }
+
+// NodeMetadataFailureDomain is the NodeInfo.Metadata key used by initial
+// partition placement to spread replicas across failure domains.
+const NodeMetadataFailureDomain = "failure_domain"
+
+// NodeMetadataBrokerVersion records the brokerd build reported by that node.
+// It is inventory data only and does not imply cross-version compatibility.
+const NodeMetadataBrokerVersion = "broker_version"
+
+// MaxNodeBrokerVersionBytes bounds the replicated broker version label.
+const MaxNodeBrokerVersionBytes = 128
+
+// MaxNodeFailureDomainBytes bounds the replicated label used for placement.
+const MaxNodeFailureDomainBytes = 256
+
+// NodeMetadataCapacityWeight is an optional relative capacity used by initial
+// partition placement. Higher values allow a node to receive proportionally
+// more partitions; omitted values default to one.
+const NodeMetadataCapacityWeight = "capacity_weight"
+
+// MaxNodeCapacityWeight bounds replicated placement metadata and score math.
+const MaxNodeCapacityWeight = 1000
+
+// DefaultNodeCapacityWeight is used when a node does not declare a weight.
+const DefaultNodeCapacityWeight = 1
 
 // ClusterConfig holds configuration for the cluster.
 type ClusterConfig struct {

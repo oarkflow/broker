@@ -524,8 +524,8 @@ func TestClientTaskLifecycle(t *testing.T) {
 		t.Fatalf("task id mismatch: %s vs %s", got.ID, info.ID)
 	}
 
-	if err := c.RetryTask(ctx, info.ID); err != nil {
-		t.Fatal(err)
+	if err := c.RetryTask(ctx, info.ID); !errors.Is(err, broker.ErrInvalidMessage) {
+		t.Fatalf("retrying a queued task should be rejected, got %v", err)
 	}
 	if err := c.CancelTask(ctx, info.ID, "no longer needed"); err != nil {
 		t.Fatal(err)
@@ -617,20 +617,23 @@ func TestClientFailoverAcrossBrokerURLs(t *testing.T) {
 		atomic.AddInt32(&reconnects, 1)
 	}}})
 
-	info, err := c.Register(context.Background(), broker.ConsumerRegistration{})
+	err := c.doJSON(context.Background(), http.MethodGet, "/healthz", nil, nil)
 	if err != nil {
 		t.Fatalf("expected failover to the healthy broker to succeed: %v", err)
 	}
-	if info.ConsumerID == "" {
-		t.Fatalf("unexpected empty consumer id in response: %+v", info)
+	if c.Config().BrokerURL != goodURL {
+		t.Fatalf("expected healthy broker to become active, got %q", c.Config().BrokerURL)
 	}
 	if atomic.LoadInt32(&hits) == 0 {
 		t.Fatal("expected the unhealthy broker to be tried first")
 	}
 
 	// Subsequent calls should stick to the now-known-good broker.
-	if _, err := c.Heartbeat(context.Background()); err != nil {
+	if err := c.doJSON(context.Background(), http.MethodGet, "/healthz", nil, nil); err != nil {
 		t.Fatal(err)
+	}
+	if atomic.LoadInt32(&hits) != 1 {
+		t.Fatalf("expected subsequent calls to stay on the healthy broker; unhealthy broker hits=%d", hits)
 	}
 }
 

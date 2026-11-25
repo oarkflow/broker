@@ -147,8 +147,9 @@ func TestDistributedAtomicPublishAndLeaseExpiry(t *testing.T) {
 	if err != nil || len(leased) != 1 {
 		t.Fatalf("lease: messages=%+v err=%v", leased, err)
 	}
-	time.Sleep(2 * time.Millisecond)
-	n, err := db.Store().SweepLeases(ctx, time.Now())
+	// Use a comfortably expired timestamp rather than a tiny wall-clock delay;
+	// scheduling jitter can otherwise make this test miss the lease deadline.
+	n, err := db.Store().SweepLeases(ctx, time.Now().Add(time.Second))
 	if err != nil || n != 1 {
 		t.Fatalf("sweep: count=%d err=%v", n, err)
 	}

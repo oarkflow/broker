@@ -69,6 +69,8 @@ type DurabilityScope string
 const (
 	DurabilityMemory      DurabilityScope = "memory"
 	DurabilityLocalFsync  DurabilityScope = "local_fsync"
+	// DurabilityQuorumFsync means a consensus quorum synced the committed log
+	// entry before the write returned successfully.
 	DurabilityQuorumFsync DurabilityScope = "quorum_fsync"
 )
 

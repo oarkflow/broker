@@ -154,6 +154,13 @@ func (s *MessageStore) DeclareQueue(ctx context.Context, cfg broker.QueueConfig)
 	}
 	return s.persistLocked(ctx)
 }
+
+func (s *MessageStore) LookupQueueConfig(ctx context.Context, name string) (broker.QueueConfig, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.mem.LookupQueueConfig(ctx, name)
+}
+
 func (s *MessageStore) DeclareTopic(ctx context.Context, cfg broker.TopicConfig) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -345,6 +352,11 @@ func (s *MessageStore) Stats(ctx context.Context) (broker.StoreStats, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.mem.Stats(ctx)
+}
+func (s *MessageStore) QueueReadyCount(ctx context.Context, queue string) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.mem.QueueReadyCount(ctx, queue)
 }
 func (s *MessageStore) SweepLeases(ctx context.Context, now time.Time) (int, error) {
 	s.mu.Lock()

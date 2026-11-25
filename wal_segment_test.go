@@ -5,11 +5,32 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 )
+
+type memorySegmentArchiver struct {
+	segments map[string][]byte
+	fail     bool
+}
+
+func (a *memorySegmentArchiver) ArchiveSegment(_ context.Context, segment SegmentMeta, reader io.Reader) error {
+	if a.fail {
+		return errors.New("injected archive failure")
+	}
+	data, err := io.ReadAll(reader)
+	if err != nil {
+		return err
+	}
+	if a.segments == nil {
+		a.segments = make(map[string][]byte)
+	}
+	a.segments[segment.Filename] = data
+	return nil
+}
 
 func TestSegmentedWALBasicAndRotation(t *testing.T) {
 	ctx := context.Background()
@@ -65,6 +86,144 @@ func TestSegmentedWALBasicAndRotation(t *testing.T) {
 	}
 	if report.TotalRecords < 50 {
 		t.Fatalf("expected at least 50 records verified, got %d", report.TotalRecords)
+	}
+}
+
+func TestSegmentedWALKeyRotationPreservesRecoverableState(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	oldKey := []byte("old-bwl2-test-key-material-0000001")
+	newKey := []byte("new-bwl2-test-key-material-0000002")
+	oldCodec, err := NewWALRecordCodec(WALCodecConfig{EncryptionKey: oldKey})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := NewSegmentedWALStore(SegmentedWALConfig{Dir: dir, MaxSegmentSize: 512, DisableCompactor: true, WALCodec: oldCodec})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DeclareQueue(ctx, QueueConfig{Name: "key-rotation-q"}); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 8; i++ {
+		id := fmt.Sprintf("key-rotation-%d", i)
+		if _, err := store.Append(ctx, Message{ID: id, Payload: []byte(id)}, []Destination{{Kind: DestinationQueue, Name: "key-rotation-q"}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	rotatingCodec, err := NewWALRecordCodec(WALCodecConfig{EncryptionKey: newKey, DecryptionKeys: [][]byte{oldKey}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rotating, err := NewSegmentedWALStore(SegmentedWALConfig{Dir: dir, MaxSegmentSize: 512, DisableCompactor: true, WALCodec: rotatingCodec})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rotating.RotateEncryptionKey(); err != nil {
+		t.Fatal(err)
+	}
+	if err := rotating.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	newCodec, err := NewWALRecordCodec(WALCodecConfig{EncryptionKey: newKey})
+	if err != nil {
+		t.Fatal(err)
+	}
+	verify, err := VerifySegmentedWAL(dir, newCodec, nil)
+	if err != nil || !verify.Valid() {
+		t.Fatalf("verify rotated BWL2 WAL: report=%+v err=%v", verify, err)
+	}
+	recovered, err := NewSegmentedWALStore(SegmentedWALConfig{Dir: dir, DisableCompactor: true, WALCodec: newCodec})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer recovered.Close()
+	for i := 0; i < 8; i++ {
+		id := fmt.Sprintf("key-rotation-%d", i)
+		message, ok, err := recovered.Get(ctx, id)
+		if err != nil || !ok || string(message.Payload) != id {
+			t.Fatalf("recovered %q: message=%+v found=%t err=%v", id, message, ok, err)
+		}
+	}
+}
+
+func TestSegmentedWALArchivesPrunedSegmentsBeforeRemoval(t *testing.T) {
+	ctx := context.Background()
+	archiver := &memorySegmentArchiver{}
+	store, err := NewSegmentedWALStore(SegmentedWALConfig{
+		Dir: t.TempDir(), MaxSegmentSize: 512, MaxSegments: 2,
+		DisableCompactor: true, SegmentArchiver: archiver,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DeclareQueue(ctx, QueueConfig{Name: "archive-q"}); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 20; i++ {
+		id := fmt.Sprintf("archive-%d", i)
+		if _, err := store.Append(ctx, Message{ID: id, Payload: []byte(id)}, []Destination{{Kind: DestinationQueue, Name: "archive-q"}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(store.manifest.Segments) <= 2 {
+		t.Fatalf("segments before compaction = %d, want more than 2", len(store.manifest.Segments))
+	}
+	if err := newSegmentCompactor(store).Compact(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(archiver.segments) == 0 {
+		t.Fatal("compaction pruned segments without archiving them")
+	}
+	if len(store.manifest.Segments) > 2 {
+		t.Fatalf("segments after compaction = %d, want at most 2", len(store.manifest.Segments))
+	}
+	for filename, data := range archiver.segments {
+		if len(data) == 0 {
+			t.Errorf("archived segment %q is empty", filename)
+		}
+		if _, err := os.Stat(filepath.Join(store.dir, filename)); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("archived local segment %q remains after pruning: %v", filename, err)
+		}
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	failing := &memorySegmentArchiver{fail: true}
+	failedStore, err := NewSegmentedWALStore(SegmentedWALConfig{
+		Dir: t.TempDir(), MaxSegmentSize: 512, MaxSegments: 2,
+		DisableCompactor: true, SegmentArchiver: failing,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer failedStore.Close()
+	if err := failedStore.DeclareQueue(ctx, QueueConfig{Name: "archive-fail-q"}); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 20; i++ {
+		id := fmt.Sprintf("archive-fail-%d", i)
+		if _, err := failedStore.Append(ctx, Message{ID: id, Payload: []byte(id)}, []Destination{{Kind: DestinationQueue, Name: "archive-fail-q"}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	before := append([]SegmentMeta(nil), failedStore.manifest.Segments...)
+	if err := newSegmentCompactor(failedStore).Compact(ctx); err == nil {
+		t.Fatal("compaction succeeded despite archive failure")
+	}
+	if len(failedStore.manifest.Segments) != len(before) {
+		t.Fatalf("manifest segment count after archive failure = %d, want %d", len(failedStore.manifest.Segments), len(before))
+	}
+	for _, segment := range before {
+		if _, err := os.Stat(filepath.Join(failedStore.dir, segment.Filename)); err != nil {
+			t.Errorf("segment %q was removed despite archive failure: %v", segment.Filename, err)
+		}
 	}
 }
 

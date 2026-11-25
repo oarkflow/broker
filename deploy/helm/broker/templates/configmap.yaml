@@ -24,8 +24,8 @@ data:
   BROKER_GRPC_ADDR: {{ .Values.broker.listeners.grpc.addr | quote }}
   {{- end }}
   {{- if .Values.broker.listeners.native.enabled }}
-  # WARNING: native BST1 is unauthenticated. This only takes effect if
-  # BROKER_INSECURE_DEV is also true; brokerd otherwise refuses to start.
+  # Production BST1 requires TLS and token or mapped mTLS authentication.
+  # NetworkPolicy ingress is separate and denied unless explicitly allowed.
   BROKER_NATIVE_ADDR: {{ .Values.broker.listeners.native.addr | quote }}
   {{- end }}
   BROKER_DEFAULT_QUEUE: {{ .Values.broker.defaultQueue | quote }}

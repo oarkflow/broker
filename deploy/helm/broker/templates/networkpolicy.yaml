@@ -30,6 +30,13 @@ spec:
         - protocol: TCP
           port: {{ .Values.service.ports.amqp }}
         {{- end }}
+    {{- if and .Values.broker.listeners.native.enabled .Values.networkPolicy.nativeIngressFrom }}
+    - from:
+        {{- toYaml .Values.networkPolicy.nativeIngressFrom | nindent 8 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.service.ports.native }}
+    {{- end }}
     - from:
         - podSelector:
             matchLabels:

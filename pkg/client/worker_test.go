@@ -128,10 +128,29 @@ func TestWorkerHandleRegistrationAndSnapshots(t *testing.T) {
 	}
 
 	pollQueues := w.snapshotPollQueues()
-	for _, q := range []string{"orders", "sub.w1.events.created", "sub.w1.events.star", "tasks.resize", "tasks.custom", "request.lookup", "request.custom", "command.do-thing", "command.custom"} {
+	for _, q := range []string{"orders", "tasks.resize", "tasks.custom", "request.lookup", "request.custom", "command.do-thing", "command.custom"} {
 		if _, ok := pollQueues[q]; !ok {
 			t.Errorf("expected poll queue %q to be registered, have %v", q, pollQueues)
 		}
+	}
+	for _, q := range []string{"sub.w1.events.created", "sub.w1.events.star"} {
+		if _, ok := pollQueues[q]; ok {
+			t.Errorf("subscription queue %q must come from the broker response, have %v", q, pollQueues)
+		}
+	}
+}
+
+func TestWorkerPollsBrokerAssignedSubscriptionQueue(t *testing.T) {
+	w := newTestWorker(t)
+	requested := broker.RemoteSubscription{Type: "topic", Name: "events.created"}
+	assigned := "sub.w1.4cb2d6b4c5017694f67b"
+	if err := w.addSubscriptionPollQueue(broker.ConsumerInfo{
+		Subscriptions: []broker.RemoteSubscription{{Type: "topic", Name: "events.created", Queue: assigned}},
+	}, requested); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := w.snapshotPollQueues()[assigned]; !ok {
+		t.Fatalf("broker-assigned subscription queue %q was not registered for polling", assigned)
 	}
 }
 
