@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sync"
 	"time"
 
 	"github.com/oarkflow/broker/cluster"
@@ -551,16 +552,28 @@ func readFrameBatch(reader io.Reader, codec FrameCodec, maxMessages int, sizeHin
 }
 
 func EncodeMessageFrameBatch(dst []byte, codec FrameCodec, messages []Message) ([]byte, error) {
+	// Frames are length-prefixed, so each is encoded into a scratch buffer
+	// first. FrameCodec implementations append to dst, which lets one scratch
+	// buffer serve the whole batch instead of allocating per message.
+	scratch := frameScratchPool.Get().(*[]byte)
+	defer func() {
+		if cap(*scratch) <= 1<<20 {
+			frameScratchPool.Put(scratch)
+		}
+	}()
 	for i := range messages {
-		frame, err := codec.EncodeMessage(nil, messages[i])
+		frame, err := codec.EncodeMessage((*scratch)[:0], messages[i])
 		if err != nil {
 			return nil, err
 		}
+		*scratch = frame[:0]
 		dst = binary.AppendUvarint(dst, uint64(len(frame)))
 		dst = append(dst, frame...)
 	}
 	return dst, nil
 }
+
+var frameScratchPool = sync.Pool{New: func() any { b := make([]byte, 0, 1024); return &b }}
 
 func DecodeMessageFrameBatch(data []byte, codec FrameCodec, maxMessages int) ([]Message, error) {
 	return readFrameBatch(bytes.NewReader(data), codec, maxMessages, int64(len(data)))

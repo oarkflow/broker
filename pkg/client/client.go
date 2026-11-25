@@ -1,7 +1,6 @@
 package client
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"crypto/tls"
@@ -31,23 +30,6 @@ import (
 const defaultMaxResponseBytes int64 = 64 << 20
 
 var ErrResponseTooLarge = errors.New("client: broker response exceeds configured size limit")
-
-func readBoundedResponse(body io.Reader, maxBytes int64) ([]byte, error) {
-	if maxBytes <= 0 {
-		maxBytes = defaultMaxResponseBytes
-	}
-	if maxBytes == int64(^uint64(0)>>1) {
-		return io.ReadAll(io.LimitReader(body, maxBytes))
-	}
-	data, err := io.ReadAll(io.LimitReader(body, maxBytes+1))
-	if err != nil {
-		return nil, fmt.Errorf("read broker response: %w", err)
-	}
-	if int64(len(data)) > maxBytes {
-		return nil, fmt.Errorf("%w: limit is %d bytes", ErrResponseTooLarge, maxBytes)
-	}
-	return data, nil
-}
 
 type Config struct {
 	BrokerURL, Token, ConsumerID, Group, Name, Version string
@@ -103,6 +85,7 @@ type NotificationEvent struct {
 type Client struct {
 	cfg                   Config
 	http                  *fh.Client
+	headers               *headerSets
 	mu                    sync.RWMutex
 	urls                  []string
 	active                int
@@ -208,7 +191,7 @@ func New(cfg Config) *Client {
 		})
 	}
 	c := cfg.HTTPClient
-	return &Client{cfg: cfg, http: c, urls: urls}
+	return &Client{cfg: cfg, http: c, urls: urls, headers: &headerSets{token: cfg.Token}}
 }
 
 // remoteError turns a data-plane error response into an error that behaves like
@@ -943,27 +926,34 @@ func mustMarshal(v any) []byte {
 	return b
 }
 
+// decodeFrameBatch decodes a length-prefixed frame batch. data is a buffer
+// the caller owns for the life of the returned messages, so frames are decoded
+// in place rather than copied out first.
 func decodeFrameBatch(data []byte, codec broker.FrameCodec) ([]broker.Message, error) {
-	r := bufio.NewReader(bytes.NewReader(data))
 	var out []broker.Message
-	for {
-		l, err := binary.ReadUvarint(r)
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				return out, nil
-			}
-			return nil, err
+	for len(data) > 0 {
+		l, n := binary.Uvarint(data)
+		if n <= 0 {
+			return nil, fmt.Errorf("%w: malformed frame length", broker.ErrInvalidMessage)
 		}
-		buf := make([]byte, int(l))
-		if _, err := io.ReadFull(r, buf); err != nil {
-			return nil, err
+		data = data[n:]
+		if l > uint64(len(data)) {
+			return nil, io.ErrUnexpectedEOF
+		}
+		frame := data[:l:l]
+		data = data[l:]
+		if out == nil {
+			// Size the result from the first frame (its prefix included):
+			// batches are homogeneous enough that this avoids regrowth.
+			out = make([]broker.Message, 0, (len(data)+len(frame)+n)/(len(frame)+n))
 		}
 		var msg broker.Message
-		if err := codec.DecodeMessage(buf, &msg); err != nil {
+		if err := codec.DecodeMessage(frame, &msg); err != nil {
 			return nil, err
 		}
 		out = append(out, msg)
 	}
+	return out, nil
 }
 
 // encodePayload prepares a publish payload for the JSON wire format.
@@ -2122,14 +2112,7 @@ func (c *Client) doRawStatus(ctx context.Context, method, path, contentType stri
 	urls := c.orderedURLs()
 	var last error
 	for i, base := range urls {
-		headers := c.requestHeaders(contentType)
-		if prefer != "" {
-			headers["Prefer"] = prefer
-		}
-		if bodyBytes == nil {
-			bodyBytes = []byte{}
-		}
-		resp, err := broker.SendHTTP(ctx, c.http, method, strings.TrimRight(base, "/")+path, bodyBytes, headers)
+		resp, err := c.send(ctx, method, base+path, bodyBytes, c.headers.get(contentType, prefer))
 		if err != nil {
 			last = err
 			if i == 0 && c.cfg.Hooks.OnReconnect != nil && len(urls) > 1 {
@@ -2141,7 +2124,7 @@ func (c *Client) doRawStatus(ctx context.Context, method, path, contentType stri
 			_ = resp.Close()
 			return nil, 0, fmt.Errorf("%w: limit is %d bytes", ErrResponseTooLarge, c.cfg.MaxResponseBytes)
 		}
-		data, readErr := readBoundedResponse(resp.Reader(), c.cfg.MaxResponseBytes)
+		data, readErr := readBoundedResponseHint(resp.Reader(), c.cfg.MaxResponseBytes, resp.Raw.ContentLength)
 		_ = resp.Close()
 		if readErr != nil {
 			return nil, 0, readErr
@@ -2202,20 +2185,23 @@ func (c *Client) trustedLeaderBase(leader string) string {
 
 func (c *Client) doJSONBases(ctx context.Context, urls []string, method, path string, in, out any) error {
 	var bodyBytes []byte
-	var err error
+	contentType := ""
 	if in != nil {
-		bodyBytes, err = json.Marshal(in)
+		reqBuf, err := encodeJSONBody(in)
 		if err != nil {
 			return err
 		}
+		// The body is only read while the request is in flight; every attempt
+		// below completes before this function returns.
+		defer putRequestBuffer(reqBuf)
+		bodyBytes, contentType = reqBuf.Bytes(), "application/json"
 	}
+	headers := c.headers.get(contentType, "")
+	respBuf := getRequestBuffer()
+	defer putRequestBuffer(respBuf)
 	var last error
 	for i, base := range urls {
-		contentType := ""
-		if in != nil {
-			contentType = "application/json"
-		}
-		resp, err := broker.SendHTTP(ctx, c.http, method, strings.TrimRight(base, "/")+path, bodyBytes, c.requestHeaders(contentType))
+		resp, err := c.send(ctx, method, base+path, bodyBytes, headers)
 		if err != nil {
 			last = err
 			if i == 0 && c.cfg.Hooks.OnReconnect != nil && len(urls) > 1 {
@@ -2227,14 +2213,18 @@ func (c *Client) doJSONBases(ctx context.Context, urls []string, method, path st
 			_ = resp.Close()
 			return fmt.Errorf("%w: limit is %d bytes", ErrResponseTooLarge, c.cfg.MaxResponseBytes)
 		}
-		data, readErr := readBoundedResponse(resp.Reader(), c.cfg.MaxResponseBytes)
+		respBuf.Reset()
+		readErr := readBoundedInto(respBuf, resp.Reader(), c.cfg.MaxResponseBytes, resp.Raw.ContentLength)
+		status := resp.StatusCode()
 		_ = resp.Close()
 		if readErr != nil {
 			return readErr
 		}
-		if resp.StatusCode() >= 300 {
-			last = remoteError(resp.StatusCode(), data)
-			if len(urls) > 1 && shouldFailover(method, resp.StatusCode(), data) {
+		data := respBuf.Bytes()
+		if status >= 300 {
+			// remoteError keeps text from the body, so give it its own copy.
+			last = remoteError(status, bytes.Clone(data))
+			if len(urls) > 1 && shouldFailover(method, status, data) {
 				prioritizeLeaderURL(urls, i, last)
 				continue
 			}
@@ -2243,12 +2233,14 @@ func (c *Client) doJSONBases(ctx context.Context, urls []string, method, path st
 		}
 		c.markActive(base)
 		if out != nil && len(data) > 0 {
+			// json.Unmarshal copies everything it keeps, so the pooled buffer
+			// can be reused afterwards.
 			return json.Unmarshal(data, out)
 		}
 		return nil
 	}
 	if last == nil {
-		last = errors.New("broker unavailable")
+		last = errBrokerUnavailable
 	}
 	return last
 }
@@ -2256,6 +2248,11 @@ func (c *Client) doJSONBases(ctx context.Context, urls []string, method, path st
 func (c *Client) orderedURLs() []string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
+	if len(c.urls) == 1 {
+		// Callers only reorder the slice when it has more than one entry
+		// (prioritizeLeaderURL), so the single-broker slice can be shared.
+		return c.urls
+	}
 	if len(c.urls) == 0 {
 		return []string{strings.TrimRight(c.cfg.BrokerURL, "/")}
 	}
@@ -2395,15 +2392,3 @@ func NackDLQ(v string) NackOption {
 }
 func NackReason(v string) NackOption { return func(o *NackOptions) { o.Reason = v } }
 func NackError(v string) NackOption  { return func(o *NackOptions) { o.Error = v } }
-
-// requestHeaders returns the per-request headers for a broker call.
-func (c *Client) requestHeaders(contentType string) map[string]string {
-	headers := make(map[string]string, 3)
-	if contentType != "" {
-		headers["Content-Type"] = contentType
-	}
-	if c.cfg.Token != "" {
-		headers["Authorization"] = "Bearer " + c.cfg.Token
-	}
-	return headers
-}

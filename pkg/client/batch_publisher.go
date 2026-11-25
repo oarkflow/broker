@@ -74,10 +74,11 @@ func (p *BatchPublisher) Publish(ctx context.Context, msg broker.Message) error 
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	item := &batchItem{msg: msg, done: make(chan error, 1)}
+	item := getBatchItem(msg)
 	p.mu.RLock()
 	if p.closed {
 		p.mu.RUnlock()
+		putBatchItem(item)
 		return ErrBatchPublisherClosed
 	}
 	select {
@@ -89,8 +90,12 @@ func (p *BatchPublisher) Publish(ctx context.Context, msg broker.Message) error 
 	}
 	select {
 	case err := <-item.done:
+		// The sender has delivered its only result, so nothing else holds the
+		// item and it can be reused.
+		putBatchItem(item)
 		return err
 	case <-ctx.Done():
+		// The sender will still write to item.done; leave the item to the GC.
 		return ctx.Err()
 	}
 }
@@ -109,6 +114,9 @@ func (p *BatchPublisher) Close() {
 func (p *BatchPublisher) run() {
 	defer p.wg.Done()
 	batch := make([]*batchItem, 0, p.cfg.MaxBatch)
+	// Each sender owns its message slice and frame buffer and reuses them for
+	// every batch: send is synchronous, so both are free once it returns.
+	enc := &batchEncoder{msgs: make([]broker.Message, 0, p.cfg.MaxBatch)}
 	for first := range p.in {
 		batch = append(batch[:0], first)
 	drain:
@@ -123,16 +131,21 @@ func (p *BatchPublisher) run() {
 				break drain
 			}
 		}
-		p.send(batch)
+		p.send(batch, enc)
 	}
 }
 
-func (p *BatchPublisher) send(batch []*batchItem) {
-	msgs := make([]broker.Message, len(batch))
-	for i, it := range batch {
-		msgs[i] = it.msg
+func (p *BatchPublisher) send(batch []*batchItem, enc *batchEncoder) {
+	enc.msgs = enc.msgs[:0]
+	for _, it := range batch {
+		enc.msgs = append(enc.msgs, it.msg)
 	}
-	body, err := broker.EncodeMessageFrameBatch(nil, p.c.cfg.FrameCodec, msgs)
+	body, err := broker.EncodeMessageFrameBatch(enc.frame[:0], p.c.cfg.FrameCodec, enc.msgs)
+	if cap(body) <= maxPooledBuffer {
+		enc.frame = body
+	}
+	// Drop message references so payloads are not kept alive between batches.
+	clear(enc.msgs)
 	if err != nil {
 		for _, it := range batch {
 			it.done <- err
@@ -172,6 +185,25 @@ func (p *BatchPublisher) send(batch []*batchItem) {
 			it.done <- nil
 		}
 	}
+}
+
+// batchEncoder holds one sender's reusable encoding state.
+type batchEncoder struct {
+	msgs  []broker.Message
+	frame []byte
+}
+
+var batchItemPool = sync.Pool{New: func() any { return &batchItem{done: make(chan error, 1)} }}
+
+func getBatchItem(msg broker.Message) *batchItem {
+	it := batchItemPool.Get().(*batchItem)
+	it.msg = msg
+	return it
+}
+
+func putBatchItem(it *batchItem) {
+	it.msg = broker.Message{}
+	batchItemPool.Put(it)
 }
 
 // doFrameBatch posts a frame batch with minimal responses and returns the body
