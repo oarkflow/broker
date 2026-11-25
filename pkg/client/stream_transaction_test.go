@@ -5,7 +5,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
-	"net/http/httptest"
 	"testing"
 
 	"github.com/oarkflow/broker"
@@ -21,7 +20,7 @@ func TestClientStreamTransactionBinaryPayloadAndConflict(t *testing.T) {
 	if _, err := b.Publisher().Publish(ctx, "events", "input", broker.WithStream("input")); err != nil {
 		t.Fatal(err)
 	}
-	server := httptest.NewServer((broker.AdminServer{Broker: b, Token: "secret"}).Handler())
+	server := newTestServer(t, (broker.AdminServer{Broker: b, Token: "secret"}).App())
 	defer server.Close()
 	c := New(Config{BrokerURL: server.URL, Token: "secret"})
 	data := []byte{0, 255, 1, 254}

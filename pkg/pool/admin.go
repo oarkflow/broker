@@ -2,10 +2,12 @@ package pool
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
-	"net/http"
-	"strings"
+	"log"
 	"time"
+
+	"github.com/oarkflow/fh"
 )
 
 type AdminServer struct {
@@ -13,130 +15,118 @@ type AdminServer struct {
 	Token string
 }
 
-func (a AdminServer) Handler() http.Handler {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", a.wrap(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ok\n"))
-	}))
-	mux.HandleFunc("/readyz", a.wrap(a.ready))
-	mux.HandleFunc("/stats", a.wrap(a.stats))
-	mux.HandleFunc("/metrics", a.wrap(a.prometheus))
-	mux.HandleFunc("/pause", a.wrap(a.pause))
-	mux.HandleFunc("/resume", a.wrap(a.resume))
-	mux.HandleFunc("/terminate", a.wrap(a.terminate))
-	mux.HandleFunc("/jobs", a.wrap(a.jobs))
-	mux.HandleFunc("/jobs/", a.wrap(a.job))
-	mux.HandleFunc("/dlq", a.wrap(a.dlq))
-	mux.HandleFunc("/dlq/replay", a.wrap(a.replayDLQ))
-	mux.HandleFunc("/dlq/purge", a.wrap(a.purgeDLQ))
-	return mux
+// App builds the pool admin application.
+func (a AdminServer) App() *fh.App {
+	app := fh.New(
+		fh.WithStartupBannerDisabled(true),
+		fh.WithReadHeaderTimeout(5*time.Second),
+		fh.WithNotFoundHandler(func(c fh.Ctx) error { return httpError(c, "404 page not found", fh.StatusNotFound) }),
+		fh.WithMethodNotAllowedHandler(func(c fh.Ctx, _ []string) error { return method(c) }),
+	)
+	app.Use(a.auth)
+	app.Get("/healthz", func(c fh.Ctx) error { return c.SendString("ok\n") })
+	app.Get("/readyz", a.ready)
+	app.Get("/stats", a.stats)
+	app.Get("/metrics", a.prometheus)
+	app.Post("/pause", a.pause)
+	app.Post("/resume", a.resume)
+	app.Post("/terminate", a.terminate)
+	app.Get("/jobs", a.jobs)
+	app.Get("/jobs/:id", a.job)
+	app.Post("/jobs/:id/cancel", a.cancelJob)
+	app.Get("/dlq", a.dlq)
+	app.Post("/dlq/replay", a.replayDLQ)
+	app.Post("/dlq/purge", a.purgeDLQ)
+	return app
 }
 
-func (a AdminServer) ListenAndServe(addr string) *http.Server {
-	srv := &http.Server{Addr: addr, Handler: a.Handler(), ReadHeaderTimeout: 5 * time.Second}
-	go func() { _ = srv.ListenAndServe() }()
-	return srv
-}
-
-func (a AdminServer) wrap(next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if a.Token != "" && r.Header.Get("Authorization") != "Bearer "+a.Token {
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
-			return
+// ListenAndServe serves the admin application on addr in the background.
+func (a AdminServer) ListenAndServe(addr string) *fh.App {
+	app := a.App()
+	go func() {
+		if err := app.Listen(addr); err != nil {
+			log.Printf("[pool] admin server stopped: %v", err)
 		}
-		next(w, r)
-	}
+	}()
+	return app
 }
 
-func (a AdminServer) ready(w http.ResponseWriter, r *http.Request) {
+func (a AdminServer) Shutdown(ctx context.Context, app *fh.App) error {
+	return app.ShutdownWithContext(ctx)
+}
+
+func (a AdminServer) auth(c fh.Ctx) error {
+	if a.Token != "" && subtle.ConstantTimeCompare([]byte(c.Get("Authorization")), []byte("Bearer "+a.Token)) != 1 {
+		return httpError(c, "unauthorized", fh.StatusUnauthorized)
+	}
+	return c.Next()
+}
+
+func (a AdminServer) ready(c fh.Ctx) error {
 	if a.Pool == nil || !(a.Pool.IsRunning() || a.Pool.IsPaused()) {
-		http.Error(w, "not ready", http.StatusServiceUnavailable)
-		return
+		return httpError(c, "not ready", fh.StatusServiceUnavailable)
 	}
-	_, _ = w.Write([]byte("ready\n"))
+	return c.SendString("ready\n")
 }
-func (a AdminServer) stats(w http.ResponseWriter, r *http.Request) { writeJSON(w, a.Pool.Stats()) }
-func (a AdminServer) prometheus(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
-	_, _ = w.Write([]byte(a.Pool.Prometheus()))
+
+func (a AdminServer) stats(c fh.Ctx) error { return writeJSON(c, a.Pool.Stats()) }
+
+func (a AdminServer) prometheus(c fh.Ctx) error {
+	c.Set("Content-Type", "text/plain; version=0.0.4")
+	return c.SendString(a.Pool.Prometheus())
 }
-func (a AdminServer) pause(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		method(w)
-		return
-	}
-	writeErr(w, a.Pool.Pause())
-}
-func (a AdminServer) resume(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		method(w)
-		return
-	}
-	writeErr(w, a.Pool.Resume())
-}
-func (a AdminServer) terminate(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		method(w)
-		return
-	}
-	writeErr(w, a.Pool.Terminate())
-}
-func (a AdminServer) jobs(w http.ResponseWriter, r *http.Request) { writeJSON(w, a.Pool.ActiveJobs()) }
-func (a AdminServer) job(w http.ResponseWriter, r *http.Request) {
-	id := strings.TrimPrefix(r.URL.Path, "/jobs/")
-	if id == "" {
-		http.NotFound(w, r)
-		return
-	}
-	if strings.HasSuffix(id, "/cancel") {
-		if r.Method != http.MethodPost {
-			method(w)
-			return
-		}
-		id = strings.TrimSuffix(id, "/cancel")
-		writeJSON(w, map[string]any{"cancelled": a.Pool.CancelJob(id)})
-		return
-	}
-	info, ok := a.Pool.InspectJob(id)
+
+func (a AdminServer) pause(c fh.Ctx) error     { return writeErr(c, a.Pool.Pause()) }
+func (a AdminServer) resume(c fh.Ctx) error    { return writeErr(c, a.Pool.Resume()) }
+func (a AdminServer) terminate(c fh.Ctx) error { return writeErr(c, a.Pool.Terminate()) }
+func (a AdminServer) jobs(c fh.Ctx) error      { return writeJSON(c, a.Pool.ActiveJobs()) }
+
+func (a AdminServer) job(c fh.Ctx) error {
+	info, ok := a.Pool.InspectJob(c.Params("id"))
 	if !ok {
-		http.NotFound(w, r)
-		return
+		return httpError(c, "404 page not found", fh.StatusNotFound)
 	}
-	writeJSON(w, info)
+	return writeJSON(c, info)
 }
-func (a AdminServer) dlq(w http.ResponseWriter, r *http.Request) { writeJSON(w, a.Pool.DeadLetters()) }
-func (a AdminServer) replayDLQ(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		method(w)
-		return
-	}
+
+func (a AdminServer) cancelJob(c fh.Ctx) error {
+	return writeJSON(c, map[string]any{"cancelled": a.Pool.CancelJob(c.Params("id"))})
+}
+
+func (a AdminServer) dlq(c fh.Ctx) error { return writeJSON(c, a.Pool.DeadLetters()) }
+
+func (a AdminServer) replayDLQ(c fh.Ctx) error {
 	n, err := a.Pool.ReplayDeadLetters()
 	if err != nil {
-		writeJSON(w, map[string]any{"replayed": n, "error": err.Error()})
-		return
+		return writeJSON(c, map[string]any{"replayed": n, "error": err.Error()})
 	}
-	writeJSON(w, map[string]any{"replayed": n})
-}
-func (a AdminServer) purgeDLQ(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		method(w)
-		return
-	}
-	writeJSON(w, map[string]any{"purged": a.Pool.PurgeDeadLetters()})
+	return writeJSON(c, map[string]any{"replayed": n})
 }
 
-func writeJSON(w http.ResponseWriter, v any) {
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(v)
+func (a AdminServer) purgeDLQ(c fh.Ctx) error {
+	return writeJSON(c, map[string]any{"purged": a.Pool.PurgeDeadLetters()})
 }
-func writeErr(w http.ResponseWriter, err error) {
+
+func writeJSON(c fh.Ctx, v any) error {
+	b, err := json.Marshal(v)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusConflict)
-		return
+		return httpError(c, err.Error(), fh.StatusInternalServerError)
 	}
-	writeJSON(w, map[string]bool{"ok": true})
+	c.Set("Content-Type", "application/json")
+	return c.Send(append(b, '\n'))
 }
-func method(w http.ResponseWriter) { http.Error(w, "method not allowed", http.StatusMethodNotAllowed) }
 
-func (a AdminServer) Shutdown(ctx context.Context, srv *http.Server) error { return srv.Shutdown(ctx) }
+func writeErr(c fh.Ctx, err error) error {
+	if err != nil {
+		return httpError(c, err.Error(), fh.StatusConflict)
+	}
+	return writeJSON(c, map[string]bool{"ok": true})
+}
+
+func method(c fh.Ctx) error { return httpError(c, "method not allowed", fh.StatusMethodNotAllowed) }
+
+func httpError(c fh.Ctx, msg string, status int) error {
+	c.Set("Content-Type", "text/plain; charset=utf-8")
+	c.Set("X-Content-Type-Options", "nosniff")
+	return c.Status(status).SendString(msg + "\n")
+}

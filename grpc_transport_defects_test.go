@@ -7,10 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"net/http"
-	"net/http/httptest"
 	"testing"
 	"time"
+
+	"github.com/oarkflow/fh"
 )
 
 // The native JSON/TCP transport had several defects that failed silently: a nack
@@ -522,9 +522,10 @@ func TestNativeNotLeaderIsStructured(t *testing.T) {
 // The HTTP envelope and the native envelope must agree, so one client-side
 // handler works over either transport.
 func TestNotLeaderErrorIsStructuredForHTTP(t *testing.T) {
-	rec := httptest.NewRecorder()
-	WriteBrokerError(rec, NotLeaderError("node-3", 7))
-	if rec.Code != http.StatusServiceUnavailable {
+	app := fh.New(fh.WithStartupBannerDisabled(true))
+	app.Get("/", func(c fh.Ctx) error { return WriteBrokerError(c, NotLeaderError("node-3", 7)) })
+	rec := serveTest(t, app, newTestRequest(fh.MethodGET, "/", nil))
+	if rec.Code != fh.StatusServiceUnavailable {
 		t.Errorf("status = %d, want 503", rec.Code)
 	}
 	remote := ParseRemoteError(rec.Code, rec.Body.Bytes())

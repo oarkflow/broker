@@ -3,10 +3,10 @@ package main
 import (
 	"context"
 	"log"
-	"net/http"
 	"time"
 
 	"github.com/oarkflow/broker"
+	"github.com/oarkflow/fh"
 )
 
 // Stage 2: Metrics and Tracing
@@ -55,8 +55,7 @@ func main() {
 	// Start metrics HTTP server
 	log.Println("[server] metrics available at http://localhost:9090/metrics")
 	log.Println("[server] health available at http://localhost:9090/healthz")
-	http.Handle("/healthz", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("ok"))
-	}))
-	log.Fatal(http.ListenAndServe(":9090", nil))
+	app := fh.New(fh.WithStartupBannerDisabled(true))
+	app.Get("/healthz", func(c fh.Ctx) error { return c.SendString("ok") })
+	log.Fatal(app.Listen(":9090"))
 }

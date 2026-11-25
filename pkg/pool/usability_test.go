@@ -2,12 +2,13 @@ package pool
 
 import (
 	"context"
-	"net/http"
-	"net/http/httptest"
+	"net"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/oarkflow/fh"
 )
 
 func TestQueuePolicyBuilderAndProgress(t *testing.T) {
@@ -59,19 +60,30 @@ func TestPauseResumeNamedQueue(t *testing.T) {
 	}
 }
 
-func TestHTTPMiddlewareAcceptsAndProcesses(t *testing.T) {
+func TestHTTPHandlerAcceptsAndProcesses(t *testing.T) {
 	p := MustNewPool(WithWorkers(1), WithQueueSize(16), WithJobTracking(true))
 	if err := p.Start(); err != nil {
 		t.Fatal(err)
 	}
 	defer p.Terminate()
 	done := make(chan struct{})
-	h := HTTPMiddleware(p, HTTPOptions{Queue: "api", RespondJobID: true, Handler: func(ctx context.Context, r HTTPRequest) error { close(done); return nil }})
-	rr := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/work", strings.NewReader(`{"ok":true}`))
-	h.ServeHTTP(rr, req)
-	if rr.Code != http.StatusAccepted {
-		t.Fatalf("code=%d body=%s", rr.Code, rr.Body.String())
+	app := fh.New(fh.WithStartupBannerDisabled(true))
+	app.Post("/work", HTTPHandler(p, HTTPOptions{Queue: "api", RespondJobID: true, Handler: func(ctx context.Context, r HTTPRequest) error { close(done); return nil }}))
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() { _ = app.Serve(ln) }()
+	defer app.ShutdownWithTimeout(time.Second)
+	client := fh.NewClient(fh.ClientConfig{Timeout: 5 * time.Second, Retry: fh.NoRetry(), Logger: fh.NewNoopLogger()})
+	resp, err := client.R().Bytes([]byte(`{"ok":true}`), "application/json").Post(context.Background(), "http://"+ln.Addr().String()+"/work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Close()
+	body, _ := resp.Bytes()
+	if resp.StatusCode() != fh.StatusAccepted || !strings.Contains(string(body), `"job_id":"job-`) {
+		t.Fatalf("code=%d body=%s", resp.StatusCode(), body)
 	}
 	select {
 	case <-done:

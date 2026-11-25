@@ -4,10 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"net/http"
-	"net/http/httptest"
 	"testing"
 	"time"
+
+	"github.com/oarkflow/fh"
 )
 
 func TestTenantEnforcementStatsAndAudit(t *testing.T) {
@@ -45,7 +45,7 @@ func TestTenantEnforcementStatsAndAudit(t *testing.T) {
 		Broker: b,
 		ACL:    acl,
 	}
-	handler := admin.Handler()
+	handler := admin.App()
 
 	// Declare queues for different tenants
 	ctx := context.Background()
@@ -58,11 +58,10 @@ func TestTenantEnforcementStatsAndAudit(t *testing.T) {
 
 	// 1. Stats endpoint check
 	// A) Superadmin sees both queues
-	reqSuper := httptest.NewRequest(http.MethodGet, "/stats", nil)
+	reqSuper := newTestRequest(fh.MethodGET, "/stats", nil)
 	reqSuper.Header.Set("Authorization", "Bearer super-token")
-	recSuper := httptest.NewRecorder()
-	handler.ServeHTTP(recSuper, reqSuper)
-	if recSuper.Code != http.StatusOK {
+	recSuper := serveTest(t, handler, reqSuper)
+	if recSuper.Code != fh.StatusOK {
 		t.Fatalf("expected 200 from /stats for superadmin, got %d: %s", recSuper.Code, recSuper.Body.String())
 	}
 	var superStats struct {
@@ -79,11 +78,10 @@ func TestTenantEnforcementStatsAndAudit(t *testing.T) {
 	}
 
 	// B) User A sees ONLY tenant-a queues
-	reqA := httptest.NewRequest(http.MethodGet, "/stats", nil)
+	reqA := newTestRequest(fh.MethodGET, "/stats", nil)
 	reqA.Header.Set("Authorization", "Bearer token-a")
-	recA := httptest.NewRecorder()
-	handler.ServeHTTP(recA, reqA)
-	if recA.Code != http.StatusOK {
+	recA := serveTest(t, handler, reqA)
+	if recA.Code != fh.StatusOK {
 		t.Fatalf("expected 200 from /stats for user-a, got %d", recA.Code)
 	}
 	var aStats struct {
@@ -107,11 +105,10 @@ func TestTenantEnforcementStatsAndAudit(t *testing.T) {
 	}
 
 	// Superadmin sees both
-	reqAuditSuper := httptest.NewRequest(http.MethodGet, "/audit", nil)
+	reqAuditSuper := newTestRequest(fh.MethodGET, "/audit", nil)
 	reqAuditSuper.Header.Set("Authorization", "Bearer super-token")
-	recAuditSuper := httptest.NewRecorder()
-	handler.ServeHTTP(recAuditSuper, reqAuditSuper)
-	if recAuditSuper.Code != http.StatusOK {
+	recAuditSuper := serveTest(t, handler, reqAuditSuper)
+	if recAuditSuper.Code != fh.StatusOK {
 		t.Fatalf("audit superadmin code: %d", recAuditSuper.Code)
 	}
 	var superAudit []AuditEvent
@@ -130,11 +127,10 @@ func TestTenantEnforcementStatsAndAudit(t *testing.T) {
 	}
 
 	// User A sees only tenant-a events
-	reqAuditA := httptest.NewRequest(http.MethodGet, "/audit", nil)
+	reqAuditA := newTestRequest(fh.MethodGET, "/audit", nil)
 	reqAuditA.Header.Set("Authorization", "Bearer token-a")
-	recAuditA := httptest.NewRecorder()
-	handler.ServeHTTP(recAuditA, reqAuditA)
-	if recAuditA.Code != http.StatusOK {
+	recAuditA := serveTest(t, handler, reqAuditA)
+	if recAuditA.Code != fh.StatusOK {
 		t.Fatalf("audit user-a code: %d", recAuditA.Code)
 	}
 	var aAudit []AuditEvent
@@ -175,7 +171,7 @@ func TestTenantEnforcementConsumersAndTasks(t *testing.T) {
 		Broker: b,
 		ACL:    acl,
 	}
-	handler := admin.Handler()
+	handler := admin.App()
 
 	// 1. Consumer registration with mismatched tenant should fail with 403 Forbidden
 	mismatchedReg := ConsumerRegistration{
@@ -184,11 +180,10 @@ func TestTenantEnforcementConsumersAndTasks(t *testing.T) {
 		TenantID:   "tenant-b", // trying to register for tenant-b with token-a
 	}
 	body, _ := json.Marshal(mismatchedReg)
-	req := httptest.NewRequest(http.MethodPost, "/v1/consumers/register", bytes.NewReader(body))
+	req := newTestRequest(fh.MethodPOST, "/v1/consumers/register", bytes.NewReader(body))
 	req.Header.Set("Authorization", "Bearer token-a")
-	rec := httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusForbidden {
+	rec := serveTest(t, handler, req)
+	if rec.Code != fh.StatusForbidden {
 		t.Fatalf("expected 403 Forbidden when registering mismatched tenant consumer, got %d: %s", rec.Code, rec.Body.String())
 	}
 
@@ -199,11 +194,10 @@ func TestTenantEnforcementConsumersAndTasks(t *testing.T) {
 		TenantID:   "tenant-a",
 	}
 	body, _ = json.Marshal(validReg)
-	req = httptest.NewRequest(http.MethodPost, "/v1/consumers/register", bytes.NewReader(body))
+	req = newTestRequest(fh.MethodPOST, "/v1/consumers/register", bytes.NewReader(body))
 	req.Header.Set("Authorization", "Bearer token-a")
-	rec = httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
+	rec = serveTest(t, handler, req)
+	if rec.Code != fh.StatusOK {
 		t.Fatalf("expected 200 OK registering valid consumer, got %d: %s", rec.Code, rec.Body.String())
 	}
 
@@ -214,20 +208,18 @@ func TestTenantEnforcementConsumersAndTasks(t *testing.T) {
 		TenantID:   "tenant-b",
 	}
 	body, _ = json.Marshal(regB)
-	req = httptest.NewRequest(http.MethodPost, "/v1/consumers/register", bytes.NewReader(body))
+	req = newTestRequest(fh.MethodPOST, "/v1/consumers/register", bytes.NewReader(body))
 	req.Header.Set("Authorization", "Bearer token-b")
-	rec = httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
+	rec = serveTest(t, handler, req)
+	if rec.Code != fh.StatusOK {
 		t.Fatalf("expected 200 OK registering tenant-b consumer, got %d", rec.Code)
 	}
 
 	// 3. List consumers: user-a should only see c-good-a
-	req = httptest.NewRequest(http.MethodGet, "/v1/consumers", nil)
+	req = newTestRequest(fh.MethodGET, "/v1/consumers", nil)
 	req.Header.Set("Authorization", "Bearer token-a")
-	rec = httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
+	rec = serveTest(t, handler, req)
+	if rec.Code != fh.StatusOK {
 		t.Fatalf("expected 200 listing consumers, got %d", rec.Code)
 	}
 	var consumersA []ConsumerInfo
@@ -237,11 +229,10 @@ func TestTenantEnforcementConsumersAndTasks(t *testing.T) {
 	}
 
 	// 4. Heartbeat: user-a cannot heartbeat tenant-b consumer
-	req = httptest.NewRequest(http.MethodPost, "/v1/consumers/c-good-b/heartbeat", nil)
+	req = newTestRequest(fh.MethodPOST, "/v1/consumers/c-good-b/heartbeat", nil)
 	req.Header.Set("Authorization", "Bearer token-a")
-	rec = httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusUnauthorized && rec.Code != http.StatusForbidden && rec.Code != http.StatusNotFound {
+	rec = serveTest(t, handler, req)
+	if rec.Code != fh.StatusUnauthorized && rec.Code != fh.StatusForbidden && rec.Code != fh.StatusNotFound {
 		t.Fatalf("expected 401/403/404 when user-a heartbeats user-b consumer, got %d", rec.Code)
 	}
 
@@ -252,11 +243,10 @@ func TestTenantEnforcementConsumersAndTasks(t *testing.T) {
 		"tenant_id": "tenant-b",
 	}
 	body, _ = json.Marshal(taskMismatched)
-	req = httptest.NewRequest(http.MethodPost, "/v1/tasks/submit", bytes.NewReader(body))
+	req = newTestRequest(fh.MethodPOST, "/v1/tasks/submit", bytes.NewReader(body))
 	req.Header.Set("Authorization", "Bearer token-a")
-	rec = httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusForbidden {
+	rec = serveTest(t, handler, req)
+	if rec.Code != fh.StatusForbidden {
 		t.Fatalf("expected 403 when submitting task with mismatched tenant, got %d", rec.Code)
 	}
 
@@ -267,11 +257,10 @@ func TestTenantEnforcementConsumersAndTasks(t *testing.T) {
 		"tenant_id": "tenant-a",
 	}
 	body, _ = json.Marshal(taskA)
-	req = httptest.NewRequest(http.MethodPost, "/v1/tasks/submit", bytes.NewReader(body))
+	req = newTestRequest(fh.MethodPOST, "/v1/tasks/submit", bytes.NewReader(body))
 	req.Header.Set("Authorization", "Bearer token-a")
-	rec = httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
+	rec = serveTest(t, handler, req)
+	if rec.Code != fh.StatusOK {
 		t.Fatalf("expected 200 submitting task-a, got %d: %s", rec.Code, rec.Body.String())
 	}
 	var taskResp struct {
@@ -283,29 +272,26 @@ func TestTenantEnforcementConsumersAndTasks(t *testing.T) {
 	}
 
 	// User-b attempting to fetch user-a's task returns 404 (isolation)
-	req = httptest.NewRequest(http.MethodGet, "/v1/tasks/"+taskResp.ID, nil)
+	req = newTestRequest(fh.MethodGET, "/v1/tasks/"+taskResp.ID, nil)
 	req.Header.Set("Authorization", "Bearer token-b")
-	rec = httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusNotFound {
+	rec = serveTest(t, handler, req)
+	if rec.Code != fh.StatusNotFound {
 		t.Fatalf("expected 404 accessing other tenant's task, got %d: %s", rec.Code, rec.Body.String())
 	}
 
 	// User-a can fetch its own task
-	req = httptest.NewRequest(http.MethodGet, "/v1/tasks/"+taskResp.ID, nil)
+	req = newTestRequest(fh.MethodGET, "/v1/tasks/"+taskResp.ID, nil)
 	req.Header.Set("Authorization", "Bearer token-a")
-	rec = httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
+	rec = serveTest(t, handler, req)
+	if rec.Code != fh.StatusOK {
 		t.Fatalf("expected 200 accessing own task, got %d", rec.Code)
 	}
 
 	// List tasks: user-b sees 0 tasks, user-a sees 1 task
-	req = httptest.NewRequest(http.MethodGet, "/v1/tasks", nil)
+	req = newTestRequest(fh.MethodGET, "/v1/tasks", nil)
 	req.Header.Set("Authorization", "Bearer token-b")
-	rec = httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
+	rec = serveTest(t, handler, req)
+	if rec.Code != fh.StatusOK {
 		t.Fatalf("list tasks user-b code: %d", rec.Code)
 	}
 	var tasksB []any
@@ -314,11 +300,10 @@ func TestTenantEnforcementConsumersAndTasks(t *testing.T) {
 		t.Fatalf("expected 0 tasks for user-b, got %d", len(tasksB))
 	}
 
-	req = httptest.NewRequest(http.MethodGet, "/v1/tasks", nil)
+	req = newTestRequest(fh.MethodGET, "/v1/tasks", nil)
 	req.Header.Set("Authorization", "Bearer token-a")
-	rec = httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
+	rec = serveTest(t, handler, req)
+	if rec.Code != fh.StatusOK {
 		t.Fatalf("list tasks user-a code: %d", rec.Code)
 	}
 	var tasksA []any

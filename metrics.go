@@ -3,12 +3,13 @@ package broker
 import (
 	"context"
 	"fmt"
-	"net/http"
 	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/oarkflow/fh"
 )
 
 // PrometheusMetrics holds all broker metrics in Prometheus exposition format.
@@ -314,14 +315,14 @@ func (m *PrometheusMetrics) UpdateGauges() {
 	m.memoryAllocBytes.Store(int64(rtm.Alloc))
 }
 
-// PromHandler returns an HTTP handler that serves Prometheus exposition format.
-func (m *PrometheusMetrics) PromHandler() http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+// PromHandler returns an fh handler that serves Prometheus exposition format.
+func (m *PrometheusMetrics) PromHandler() fh.HandlerFunc {
+	return func(c fh.Ctx) error {
 		m.UpdateGauges()
-		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
-		w.Header().Set("Cache-Control", "no-store")
-		fmt.Fprint(w, m.exposition())
-	})
+		c.Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+		c.Set("Cache-Control", "no-store")
+		return c.SendString(m.exposition())
+	}
 }
 
 // exposition returns Prometheus text exposition format.
@@ -565,26 +566,12 @@ func estimateSum(buckets []atomic.Uint64) float64 {
 	return sum
 }
 
-// Middleware returns an HTTP middleware that records request metrics.
-func (m *PrometheusMetrics) Middleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		start := time.Now()
-		rr := &promResponseWriter{ResponseWriter: w, status: 200}
-		next.ServeHTTP(rr, r)
-		latency := time.Since(start)
-		m.recordLatency(&m.publishLatencyBuckets, latency)
-		_ = rr.status
-	})
-}
-
-type promResponseWriter struct {
-	http.ResponseWriter
-	status int
-}
-
-func (rw *promResponseWriter) WriteHeader(code int) {
-	rw.status = code
-	rw.ResponseWriter.WriteHeader(code)
+// Middleware is fh middleware that records request latency.
+func (m *PrometheusMetrics) Middleware(c fh.Ctx) error {
+	start := time.Now()
+	err := c.Next()
+	m.recordLatency(&m.publishLatencyBuckets, time.Since(start))
+	return err
 }
 
 // HookMetrics creates a Hooks struct that records metrics for all broker operations.

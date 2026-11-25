@@ -1,6 +1,6 @@
 module github.com/oarkflow/broker/examples/pipeline_consumer
 
-go 1.26.5
+go 1.27.4
 
 require (
 	github.com/oarkflow/broker v0.0.0

@@ -4,11 +4,11 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
-	"net/http"
-	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/oarkflow/fh"
 )
 
 func TestDLQDashboardEndpoints(t *testing.T) {
@@ -83,15 +83,14 @@ func TestDLQDashboardEndpoints(t *testing.T) {
 	}
 
 	admin := AdminServer{Broker: b, InsecureDev: true}
-	handler := admin.Handler()
+	handler := admin.App()
 
 	// 1. Test GET /dlq/dashboard
 	t.Run("GET /dlq/dashboard", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodGet, "/dlq/dashboard", nil)
-		rec := httptest.NewRecorder()
-		handler.ServeHTTP(rec, req)
+		req := newTestRequest(fh.MethodGET, "/dlq/dashboard", nil)
+		rec := serveTest(t, handler, req)
 
-		if rec.Code != http.StatusOK {
+		if rec.Code != fh.StatusOK {
 			t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
 		}
 
@@ -129,11 +128,10 @@ func TestDLQDashboardEndpoints(t *testing.T) {
 
 	// 2. Test GET /dlq/:queue/errors
 	t.Run("GET /dlq/:queue/errors", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodGet, "/dlq/orders.dlq/errors?limit=2&page=1", nil)
-		rec := httptest.NewRecorder()
-		handler.ServeHTTP(rec, req)
+		req := newTestRequest(fh.MethodGET, "/dlq/orders.dlq/errors?limit=2&page=1", nil)
+		rec := serveTest(t, handler, req)
 
-		if rec.Code != http.StatusOK {
+		if rec.Code != fh.StatusOK {
 			t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
 		}
 
@@ -158,11 +156,10 @@ func TestDLQDashboardEndpoints(t *testing.T) {
 
 	// 3. Test GET /dlq/:queue/export (NDJSON streaming)
 	t.Run("GET /dlq/:queue/export", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodGet, "/dlq/orders.dlq/export?limit=10", nil)
-		rec := httptest.NewRecorder()
-		handler.ServeHTTP(rec, req)
+		req := newTestRequest(fh.MethodGET, "/dlq/orders.dlq/export?limit=10", nil)
+		rec := serveTest(t, handler, req)
 
-		if rec.Code != http.StatusOK {
+		if rec.Code != fh.StatusOK {
 			t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
 		}
 		if rec.Header().Get("Content-Type") != "application/x-ndjson" {
@@ -190,11 +187,10 @@ func TestDLQDashboardEndpoints(t *testing.T) {
 	// 4. Test POST /dlq/:queue/archive (dry run and actual)
 	t.Run("POST /dlq/:queue/archive", func(t *testing.T) {
 		// Dry run first
-		dryReq := httptest.NewRequest(http.MethodPost, "/dlq/orders.dlq/archive?limit=2&dry_run=true", nil)
-		dryRec := httptest.NewRecorder()
-		handler.ServeHTTP(dryRec, dryReq)
+		dryReq := newTestRequest(fh.MethodPOST, "/dlq/orders.dlq/archive?limit=2&dry_run=true", nil)
+		dryRec := serveTest(t, handler, dryReq)
 
-		if dryRec.Code != http.StatusOK {
+		if dryRec.Code != fh.StatusOK {
 			t.Fatalf("dry run failed: %d: %s", dryRec.Code, dryRec.Body.String())
 		}
 		var dryResp DLQArchiveResponse
@@ -204,11 +200,10 @@ func TestDLQDashboardEndpoints(t *testing.T) {
 		}
 
 		// Now actual archive of 1 message
-		actReq := httptest.NewRequest(http.MethodPost, "/dlq/orders.dlq/archive?limit=1&dest=orders.archive", nil)
-		actRec := httptest.NewRecorder()
-		handler.ServeHTTP(actRec, actReq)
+		actReq := newTestRequest(fh.MethodPOST, "/dlq/orders.dlq/archive?limit=1&dest=orders.archive", nil)
+		actRec := serveTest(t, handler, actReq)
 
-		if actRec.Code != http.StatusOK {
+		if actRec.Code != fh.StatusOK {
 			t.Fatalf("actual archive failed: %d: %s", actRec.Code, actRec.Body.String())
 		}
 		var actResp DLQArchiveResponse
@@ -233,11 +228,10 @@ func TestDLQDashboardEndpoints(t *testing.T) {
 	// 5. Test POST /dlq/:queue/replay-all
 	t.Run("POST /dlq/:queue/replay-all", func(t *testing.T) {
 		// Replay remaining 4 messages in batches of 2
-		replayReq := httptest.NewRequest(http.MethodPost, "/dlq/orders.dlq/replay-all?batch_size=2&dest=orders", nil)
-		replayRec := httptest.NewRecorder()
-		handler.ServeHTTP(replayRec, replayReq)
+		replayReq := newTestRequest(fh.MethodPOST, "/dlq/orders.dlq/replay-all?batch_size=2&dest=orders", nil)
+		replayRec := serveTest(t, handler, replayReq)
 
-		if replayRec.Code != http.StatusOK {
+		if replayRec.Code != fh.StatusOK {
 			t.Fatalf("replay-all failed: %d: %s", replayRec.Code, replayRec.Body.String())
 		}
 
@@ -295,32 +289,29 @@ func TestDLQDashboardACLPermissions(t *testing.T) {
 	}, []Destination{{Kind: DestinationQueue, Name: "tasks.dlq"}})
 
 	admin := AdminServer{Broker: b, ACL: acl}
-	handler := admin.Handler()
+	handler := admin.App()
 
 	// 1. Viewer can read dashboard
-	req := httptest.NewRequest(http.MethodGet, "/dlq/dashboard", nil)
+	req := newTestRequest(fh.MethodGET, "/dlq/dashboard", nil)
 	req.Header.Set("Authorization", "Bearer view-token")
-	rec := httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
+	rec := serveTest(t, handler, req)
+	if rec.Code != fh.StatusOK {
 		t.Fatalf("expected 200 for viewer, got %d", rec.Code)
 	}
 
 	// 2. Viewer cannot replay-all (forbidden 403)
-	req = httptest.NewRequest(http.MethodPost, "/dlq/tasks.dlq/replay-all", nil)
+	req = newTestRequest(fh.MethodPOST, "/dlq/tasks.dlq/replay-all", nil)
 	req.Header.Set("Authorization", "Bearer view-token")
-	rec = httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusForbidden {
+	rec = serveTest(t, handler, req)
+	if rec.Code != fh.StatusForbidden {
 		t.Fatalf("expected 403 for viewer replay-all, got %d", rec.Code)
 	}
 
 	// 3. Operator CAN replay-all (200 OK)
-	req = httptest.NewRequest(http.MethodPost, "/dlq/tasks.dlq/replay-all", nil)
+	req = newTestRequest(fh.MethodPOST, "/dlq/tasks.dlq/replay-all", nil)
 	req.Header.Set("Authorization", "Bearer op-token")
-	rec = httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
+	rec = serveTest(t, handler, req)
+	if rec.Code != fh.StatusOK {
 		t.Fatalf("expected 200 for operator replay-all, got %d: %s", rec.Code, rec.Body.String())
 	}
 }

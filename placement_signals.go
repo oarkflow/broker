@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"net/http"
 	"reflect"
 	"slices"
 	"sort"
@@ -14,6 +13,7 @@ import (
 	"time"
 
 	"github.com/oarkflow/broker/cluster"
+	"github.com/oarkflow/fh"
 )
 
 const internalPlacementSignalsPath = "/cluster/internal/placement-signals"
@@ -259,25 +259,18 @@ func (db *DistributedBroker) localPartitionStorageUsage(ctx context.Context, gro
 	return total, true
 }
 
-func (a AdminServer) internalPlacementSignals(w http.ResponseWriter, r *http.Request) {
-	if rejectScopedControlPlane(w, r, "internal placement signals") {
-		return
-	}
-	if r.Method != http.MethodGet {
-		w.Header().Set("Allow", http.MethodGet)
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
+func (a AdminServer) internalPlacementSignals(c fh.Ctx) error {
+	if rejectScopedControlPlane(c, "internal placement signals") {
+		return nil
 	}
 	if a.Distributed == nil {
-		WriteBrokerError(w, ErrUnsupportedMode)
-		return
+		return WriteBrokerError(c, ErrUnsupportedMode)
 	}
-	report, err := a.Distributed.localPlacementSignals(r.Context())
+	report, err := a.Distributed.localPlacementSignals(c.Context())
 	if err != nil {
-		WriteBrokerError(w, err)
-		return
+		return WriteBrokerError(c, err)
 	}
-	writeBrokerJSON(w, report)
+	return writeBrokerJSON(c, report)
 }
 
 // gatherPlacementSignals uses the broker-to-broker mTLS client to collect a
@@ -556,21 +549,17 @@ func placementSignalFresh(observedAt, now time.Time) bool {
 }
 
 func (db *DistributedBroker) requestPlacementSignals(ctx context.Context, node *cluster.NodeInfo) (PlacementNodeSignals, error) {
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(node.ClientAddress, "/")+internalPlacementSignalsPath, nil)
+	response, err := SendHTTP(ctx, db.partitionForwardClient, fh.MethodGET, strings.TrimRight(node.ClientAddress, "/")+internalPlacementSignalsPath, nil, nil)
 	if err != nil {
 		return PlacementNodeSignals{}, err
 	}
-	response, err := db.partitionForwardClient.Do(request)
-	if err != nil {
-		return PlacementNodeSignals{}, err
-	}
-	defer response.Body.Close()
-	if response.StatusCode != http.StatusOK {
-		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 4096))
-		return PlacementNodeSignals{}, fmt.Errorf("placement signal endpoint returned %s", response.Status)
+	defer response.Close()
+	if response.StatusCode() != fh.StatusOK {
+		_, _ = io.Copy(io.Discard, io.LimitReader(response.Reader(), 4096))
+		return PlacementNodeSignals{}, fmt.Errorf("placement signal endpoint returned %s", response.Raw.Status)
 	}
 	var report PlacementNodeSignals
-	decoder := json.NewDecoder(io.LimitReader(response.Body, 64<<20))
+	decoder := json.NewDecoder(io.LimitReader(response.Reader(), 64<<20))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&report); err != nil {
 		return PlacementNodeSignals{}, err

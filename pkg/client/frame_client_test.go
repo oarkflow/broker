@@ -2,7 +2,6 @@ package client
 
 import (
 	"context"
-	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -19,7 +18,7 @@ func TestRemoteFramePublishAndPoll(t *testing.T) {
 		t.Fatal(err)
 	}
 	admin := broker.AdminServer{Broker: b, InsecureDev: true}
-	srv := httptest.NewServer(admin.Handler())
+	srv := newTestServer(t, admin.App())
 	defer srv.Close()
 	c := New(Config{BrokerURL: srv.URL, ConsumerID: "c", Group: "g", FrameCodec: b.FrameCodec(), PollWait: 10 * time.Millisecond})
 	_, err := c.PublishFrame(context.Background(), broker.Message{ID: "frame-msg", Topic: "", Queue: "q", Type: "raw", Payload: []byte("payload"), CreatedAt: time.Now(), Status: broker.MessageQueued})

@@ -4,13 +4,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"net/http"
-	"net/http/httptest"
 	"regexp"
 	"strings"
 	"testing"
 
 	"github.com/oarkflow/broker/console"
+	"github.com/oarkflow/fh"
 )
 
 // The console must be reachable, must not be a way around auth, and must not be
@@ -26,15 +25,15 @@ func TestConsoleIsServedFromEmbeddedAssets(t *testing.T) {
 	defer b.Stop(t.Context())
 
 	admin := AdminServer{Broker: b, InsecureDev: true}
-	srv := httptest.NewServer(admin.Handler())
+	srv := newTestServer(t, admin.App())
 	defer srv.Close()
 
-	resp, err := http.Get(srv.URL + "/console/")
+	resp, err := testHTTP.Get(srv.URL + "/console/")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode != fh.StatusOK {
 		t.Fatalf("console: got %d", resp.StatusCode)
 	}
 	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "text/html") {
@@ -50,11 +49,11 @@ func TestConsoleIsServedFromEmbeddedAssets(t *testing.T) {
 	}
 
 	for _, asset := range []string{"/console/app.css", "/console/app.js"} {
-		r, err := http.Get(srv.URL + asset)
+		r, err := testHTTP.Get(srv.URL + asset)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if r.StatusCode != http.StatusOK {
+		if r.StatusCode != fh.StatusOK {
 			t.Fatalf("%s: got %d", asset, r.StatusCode)
 		}
 		if r.ContentLength == 0 {
@@ -72,11 +71,11 @@ func TestConsoleSetsStrictCSP(t *testing.T) {
 	defer b.Stop(t.Context())
 
 	admin := AdminServer{Broker: b, InsecureDev: true}
-	srv := httptest.NewServer(admin.Handler())
+	srv := newTestServer(t, admin.App())
 	defer srv.Close()
 
 	for _, path := range []string{"/console/", "/console/app.js"} {
-		resp, err := http.Get(srv.URL + path)
+		resp, err := testHTTP.Get(srv.URL + path)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -111,26 +110,26 @@ func TestConsoleRequiresAdminAuth(t *testing.T) {
 	defer b.Stop(t.Context())
 
 	admin := AdminServer{Broker: b, ACL: acl}
-	srv := httptest.NewServer(admin.Handler())
+	srv := newTestServer(t, admin.App())
 	defer srv.Close()
 
-	resp, err := http.Get(srv.URL + "/console/")
+	resp, err := testHTTP.Get(srv.URL + "/console/")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode == http.StatusOK {
+	if resp.StatusCode == fh.StatusOK {
 		t.Fatal("console served without a token; it must sit behind admin auth")
 	}
 
-	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/console/", nil)
+	req, _ := newHTTPRequest(fh.MethodGET, srv.URL+"/console/", nil)
 	req.Header.Set("Authorization", "Bearer secret-token")
-	ok, err := http.DefaultClient.Do(req)
+	ok, err := testHTTP.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer ok.Body.Close()
-	if ok.StatusCode != http.StatusOK {
+	if ok.StatusCode != fh.StatusOK {
 		t.Fatalf("console with valid token: got %d", ok.StatusCode)
 	}
 }
@@ -142,15 +141,15 @@ func TestConsoleServesShellForUnknownSubpath(t *testing.T) {
 	defer b.Stop(t.Context())
 
 	admin := AdminServer{Broker: b, InsecureDev: true}
-	srv := httptest.NewServer(admin.Handler())
+	srv := newTestServer(t, admin.App())
 	defer srv.Close()
 
-	resp, err := http.Get(srv.URL + "/console/consumers/deep/link")
+	resp, err := testHTTP.Get(srv.URL + "/console/consumers/deep/link")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode != fh.StatusOK {
 		t.Fatalf("deep link: got %d", resp.StatusCode)
 	}
 }
@@ -163,15 +162,15 @@ func TestConsoleMissingAssetIs404(t *testing.T) {
 	defer b.Stop(t.Context())
 
 	admin := AdminServer{Broker: b, InsecureDev: true}
-	srv := httptest.NewServer(admin.Handler())
+	srv := newTestServer(t, admin.App())
 	defer srv.Close()
 
-	resp, err := http.Get(srv.URL + "/console/does-not-exist.js")
+	resp, err := testHTTP.Get(srv.URL + "/console/does-not-exist.js")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusNotFound {
+	if resp.StatusCode != fh.StatusNotFound {
 		t.Fatalf("missing asset: got %d, want 404", resp.StatusCode)
 	}
 }
@@ -201,7 +200,7 @@ func TestConsoleEveryEndpointItCallsResolves(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	srv := httptest.NewServer(AdminServer{Broker: b, InsecureDev: true}.Handler())
+	srv := newTestServer(t, AdminServer{Broker: b, InsecureDev: true}.App())
 	defer srv.Close()
 
 	for _, p := range []string{
@@ -211,17 +210,17 @@ func TestConsoleEveryEndpointItCallsResolves(t *testing.T) {
 		"/streams", "/cluster/status", "/v1/consumers",
 		"/v1/tasks?limit=50", "/dlq", "/console/",
 	} {
-		resp, err := http.Get(srv.URL + p)
+		resp, err := testHTTP.Get(srv.URL + p)
 		if err != nil {
 			t.Fatalf("%s: %v", p, err)
 		}
 		resp.Body.Close()
-		if resp.StatusCode != http.StatusOK {
+		if resp.StatusCode != fh.StatusOK {
 			t.Errorf("%s -> %d, console view would break", p, resp.StatusCode)
 		}
 	}
 
-	resp, err := http.Get(srv.URL + "/v1/tasks?limit=50")
+	resp, err := testHTTP.Get(srv.URL + "/v1/tasks?limit=50")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -253,7 +252,7 @@ func TestConsoleDeclaredEndpointsExist(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	srv := httptest.NewServer(AdminServer{Broker: b, InsecureDev: true}.Handler())
+	srv := newTestServer(t, AdminServer{Broker: b, InsecureDev: true}.App())
 	defer srv.Close()
 
 	seen := map[string]bool{}
@@ -286,7 +285,7 @@ func TestConsoleDeclaredEndpointsExist(t *testing.T) {
 		if path == "" || needsParam[path] {
 			continue
 		}
-		resp, err := http.Get(srv.URL + path)
+		resp, err := testHTTP.Get(srv.URL + path)
 		if err != nil {
 			bad = append(bad, path+": "+err.Error())
 			continue
@@ -297,7 +296,7 @@ func TestConsoleDeclaredEndpointsExist(t *testing.T) {
 		// matched and wanted a parameter. Both still prove the route exists, which
 		// is the property under test. Only 404 (no route) and 5xx are failures.
 		switch code {
-		case http.StatusOK, http.StatusBadRequest, http.StatusMethodNotAllowed:
+		case fh.StatusOK, fh.StatusBadRequest, fh.StatusMethodNotAllowed:
 		default:
 			bad = append(bad, fmt.Sprintf("%s -> %d", path, code))
 		}
@@ -339,12 +338,12 @@ func TestConsoleResponseShapes(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	srv := httptest.NewServer(AdminServer{Broker: b, InsecureDev: true}.Handler())
+	srv := newTestServer(t, AdminServer{Broker: b, InsecureDev: true}.App())
 	defer srv.Close()
 
 	get := func(path string) map[string]any {
 		t.Helper()
-		resp, err := http.Get(srv.URL + path)
+		resp, err := testHTTP.Get(srv.URL + path)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -380,7 +379,7 @@ func TestConsoleResponseShapes(t *testing.T) {
 	}
 
 	// Consumers: consumer_id, and no queue field.
-	resp, err := http.Get(srv.URL + "/v1/consumers")
+	resp, err := testHTTP.Get(srv.URL + "/v1/consumers")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -405,7 +404,7 @@ func TestConsoleResponseShapes(t *testing.T) {
 
 	// Tasks and topics: id-keyed rows.
 	var tasks []map[string]any
-	resp2, err := http.Get(srv.URL + "/v1/tasks?limit=10")
+	resp2, err := testHTTP.Get(srv.URL + "/v1/tasks?limit=10")
 	if err != nil {
 		t.Fatal(err)
 	}

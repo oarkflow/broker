@@ -3,10 +3,10 @@ package broker
 import (
 	"context"
 	"errors"
-	"net/http"
-	"net/http/httptest"
 	"testing"
 	"time"
+
+	"github.com/oarkflow/fh"
 )
 
 type invoice struct {
@@ -194,10 +194,9 @@ func TestStoreHealthFencingDegradedMode(t *testing.T) {
 
 	// Check /readyz via AdminServer returns 503
 	admin := AdminServer{Broker: b, InsecureDev: true}
-	req := httptest.NewRequest("GET", "/readyz", nil)
-	rec := httptest.NewRecorder()
-	admin.Handler().ServeHTTP(rec, req)
-	if rec.Code != http.StatusServiceUnavailable {
+	req := newTestRequest("GET", "/readyz", nil)
+	rec := serveTest(t, admin.App(), req)
+	if rec.Code != fh.StatusServiceUnavailable {
 		t.Fatalf("expected 503 Service Unavailable from /readyz when fenced, got %d", rec.Code)
 	}
 }

@@ -4,7 +4,6 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"net/http"
 	"os"
 	"os/signal"
 	"strings"
@@ -121,12 +120,12 @@ func main() {
 		MaxBodyBytes: exconfig.ParseBytes(bc.String("max_body", "1MB"), 1<<20),
 	}
 	addr := bc.String("addr", ":8090")
-	srv := admin.HTTPServer(addr)
+	srv := admin.App()
 	serverErr := make(chan error, 1)
-	go func() { serverErr <- srv.ListenAndServe() }()
+	go func() { serverErr <- broker.ListenHTTPApp(srv, addr, nil) }()
 	select {
 	case err := <-serverErr:
-		if err != nil && err != http.ErrServerClosed {
+		if err != nil {
 			logger.Log.Fatal("listen", zlog.String("addr", addr), zlog.Err(err))
 		}
 	case <-time.After(200 * time.Millisecond):
@@ -140,7 +139,7 @@ func main() {
 	<-sig
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	_ = srv.Shutdown(ctx)
+	_ = broker.ShutdownHTTPApp(ctx, srv)
 	_ = b.Stop(ctx)
 }
 

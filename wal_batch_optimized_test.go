@@ -5,14 +5,14 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"net/http"
-	"net/http/httptest"
 	"net/url"
 	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/oarkflow/fh"
 )
 
 func makeQueueEntries(queue string, count int, key string) []AppendEntry {
@@ -166,7 +166,7 @@ func TestNativeFrameBatchPublishPollAndAck(t *testing.T) {
 	if err := b.DeclareQueue(ctx, QueueConfig{Name: "q"}); err != nil {
 		t.Fatal(err)
 	}
-	server := httptest.NewServer(AdminServer{Broker: b, InsecureDev: true, MaxBodyBytes: 8 << 20}.Handler())
+	server := newTestServer(t, AdminServer{Broker: b, InsecureDev: true, MaxBodyBytes: 8 << 20}.App())
 	defer server.Close()
 
 	messages := make([]Message, 64)
@@ -177,26 +177,26 @@ func TestNativeFrameBatchPublishPollAndAck(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	req, _ := http.NewRequest(http.MethodPost, server.URL+"/v1/publish/frame/batch", bytes.NewReader(body))
+	req, _ := newHTTPRequest(fh.MethodPOST, server.URL+"/v1/publish/frame/batch", bytes.NewReader(body))
 	req.Header.Set("Prefer", "return=minimal")
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := testHTTP.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
 	io.Copy(io.Discard, resp.Body)
 	resp.Body.Close()
-	if resp.StatusCode != http.StatusNoContent {
+	if resp.StatusCode != fh.StatusNoContent {
 		t.Fatalf("publish status %d", resp.StatusCode)
 	}
 
 	query := url.Values{"queue": {"q"}, "consumer_id": {"c"}, "consumer_group": {"g"}, "limit": {"64"}}
-	resp, err = http.Get(server.URL + "/v1/poll/frame?" + query.Encode())
+	resp, err = testHTTP.Get(server.URL + "/v1/poll/frame?" + query.Encode())
 	if err != nil {
 		t.Fatal(err)
 	}
 	frameBody, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode != fh.StatusOK {
 		t.Fatalf("poll status %d", resp.StatusCode)
 	}
 	leased, err := DecodeMessageFrameBatch(frameBody, b.FrameCodec(), 64)
@@ -210,15 +210,15 @@ func TestNativeFrameBatchPublishPollAndAck(t *testing.T) {
 	for i := range leased {
 		acks[i] = AckRequest{MessageID: leased[i].ID, Queue: "q", LeaseToken: leased[i].LeaseToken, ConsumerID: "c"}
 	}
-	ackReq, _ := http.NewRequest(http.MethodPost, server.URL+"/v1/ack/frame", bytes.NewReader(EncodeAckFrameBatch(nil, acks)))
+	ackReq, _ := newHTTPRequest(fh.MethodPOST, server.URL+"/v1/ack/frame", bytes.NewReader(EncodeAckFrameBatch(nil, acks)))
 	ackReq.Header.Set("Prefer", "return=minimal")
-	ackResp, err := http.DefaultClient.Do(ackReq)
+	ackResp, err := testHTTP.Do(ackReq)
 	if err != nil {
 		t.Fatal(err)
 	}
 	io.Copy(io.Discard, ackResp.Body)
 	ackResp.Body.Close()
-	if ackResp.StatusCode != http.StatusNoContent {
+	if ackResp.StatusCode != fh.StatusNoContent {
 		t.Fatalf("ack status %d", ackResp.StatusCode)
 	}
 	stats, err := store.Stats(ctx)

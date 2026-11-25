@@ -3,10 +3,10 @@ package broker
 import (
 	"context"
 	"errors"
-	"net/http"
-	"net/http/httptest"
 	"os"
 	"testing"
+
+	"github.com/oarkflow/fh"
 )
 
 func TestGroupCommitFencesAfterStorageFailure(t *testing.T) {
@@ -47,10 +47,9 @@ func TestReadinessFailsAfterWALIsFenced(t *testing.T) {
 	if _, err := store.Append(context.Background(), Message{ID: "fault"}, []Destination{{Kind: DestinationQueue, Name: "jobs"}}); !errors.Is(err, ErrStorageUnavailable) {
 		t.Fatalf("append error=%v", err)
 	}
-	recorder := httptest.NewRecorder()
-	request := httptest.NewRequest(http.MethodGet, "/readyz", nil)
-	AdminServer{Broker: broker}.Handler().ServeHTTP(recorder, request)
-	if recorder.Code != http.StatusServiceUnavailable {
+	request := newTestRequest(fh.MethodGET, "/readyz", nil)
+	recorder := serveTest(t, AdminServer{Broker: broker}.App(), request)
+	if recorder.Code != fh.StatusServiceUnavailable {
 		t.Fatalf("readiness status=%d body=%q", recorder.Code, recorder.Body.String())
 	}
 }

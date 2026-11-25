@@ -4,10 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"net/http"
-	"net/http/httptest"
 	"testing"
 	"time"
+
+	"github.com/oarkflow/fh"
 )
 
 func remainingTimeoutCtx(t *testing.T, d time.Duration) context.Context {
@@ -106,13 +106,13 @@ func TestAdminPullAckStreamAndSSEEndpoints(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer b.Stop(context.Background())
-	srv := httptest.NewServer(AdminServer{Broker: b, InsecureDev: true}.Handler())
+	srv := newTestServer(t, AdminServer{Broker: b, InsecureDev: true}.App())
 	defer srv.Close()
 	if _, err := b.Publisher().Publish(ctx, "jobs", []byte(`{"x":1}`), WithQueue("adminq")); err != nil {
 		t.Fatal(err)
 	}
 	pullBody := bytes.NewBufferString(`{"consumer_id":"admin-test","consumer_group":"admin-test","limit":1}`)
-	resp, err := http.Post(srv.URL+"/queues/adminq/pull", "application/json", pullBody)
+	resp, err := testHTTP.Post(srv.URL+"/queues/adminq/pull", "application/json", pullBody)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -128,7 +128,7 @@ func TestAdminPullAckStreamAndSSEEndpoints(t *testing.T) {
 		t.Fatalf("bad pull: %+v", pulled)
 	}
 	ackBody, _ := json.Marshal(AckRequest{Queue: "adminq", LeaseToken: pulled[0].LeaseToken, ConsumerID: "admin-test"})
-	resp2, err := http.Post(srv.URL+"/messages/"+pulled[0].ID+"/ack", "application/json", bytes.NewReader(ackBody))
+	resp2, err := testHTTP.Post(srv.URL+"/messages/"+pulled[0].ID+"/ack", "application/json", bytes.NewReader(ackBody))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -139,7 +139,7 @@ func TestAdminPullAckStreamAndSSEEndpoints(t *testing.T) {
 	if _, err := b.Publisher().Publish(ctx, "events", []byte(`{"e":1}`), WithStream("admins")); err != nil {
 		t.Fatal(err)
 	}
-	resp3, err := http.Get(srv.URL + "/streams/admins/messages?limit=10")
+	resp3, err := testHTTP.Get(srv.URL + "/streams/admins/messages?limit=10")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -158,14 +158,13 @@ func TestAdminPullAckStreamAndSSEEndpoints(t *testing.T) {
 
 func TestWebhookCallbackRetriesAndFailsOnNon2xx(t *testing.T) {
 	var calls int
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := newCatchAllServer(t, func(c fh.Ctx) error {
 		calls++
 		if calls < 2 {
-			http.Error(w, "try again", http.StatusBadGateway)
-			return
+			return c.Status(fh.StatusBadGateway).SendString("try again")
 		}
-		w.WriteHeader(http.StatusNoContent)
-	}))
+		return c.SendStatus(fh.StatusNoContent)
+	})
 	defer srv.Close()
 	cb := WebhookCallback{URL: srv.URL, MaxAttempts: 3, RetryDelay: time.Millisecond, Timeout: time.Second}
 	if err := cb.HandleNotification(context.Background(), Notification{Type: "test", Source: "test"}); err != nil {

@@ -4,14 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"io"
-	"net/http"
-	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/oarkflow/fh"
 )
 
-func managementServer(t *testing.T) (*Broker, *httptest.Server) {
+func managementServer(t *testing.T) (*Broker, *testServer) {
 	t.Helper()
 	b, err := New(Config{})
 	if err != nil {
@@ -22,7 +22,7 @@ func managementServer(t *testing.T) (*Broker, *httptest.Server) {
 		t.Fatal(err)
 	}
 	admin := AdminServer{Broker: b, InsecureDev: true}
-	srv := httptest.NewServer(admin.Handler())
+	srv := newTestServer(t, admin.App())
 	t.Cleanup(func() {
 		srv.Close()
 		_ = b.Stop(ctx)
@@ -30,9 +30,9 @@ func managementServer(t *testing.T) (*Broker, *httptest.Server) {
 	return b, srv
 }
 
-func mgmtPost(t *testing.T, srv *httptest.Server, path, body string) (int, string) {
+func mgmtPost(t *testing.T, srv *testServer, path, body string) (int, string) {
 	t.Helper()
-	resp, err := http.Post(srv.URL+path, "application/json", strings.NewReader(body))
+	resp, err := testHTTP.Post(srv.URL+path, "application/json", strings.NewReader(body))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -41,9 +41,9 @@ func mgmtPost(t *testing.T, srv *httptest.Server, path, body string) (int, strin
 	return resp.StatusCode, string(raw)
 }
 
-func mgmtGet(t *testing.T, srv *httptest.Server, path string) (int, string) {
+func mgmtGet(t *testing.T, srv *testServer, path string) (int, string) {
 	t.Helper()
-	resp, err := http.Get(srv.URL + path)
+	resp, err := testHTTP.Get(srv.URL + path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -58,7 +58,7 @@ func TestManagementBrokerPauseResumeOverHTTP(t *testing.T) {
 	_, srv := managementServer(t)
 
 	code, body := mgmtGet(t, srv, "/v1/broker")
-	if code != http.StatusOK {
+	if code != fh.StatusOK {
 		t.Fatalf("get broker state: %d %s", code, body)
 	}
 	var got map[string]any
@@ -70,7 +70,7 @@ func TestManagementBrokerPauseResumeOverHTTP(t *testing.T) {
 	}
 
 	code, body = mgmtPost(t, srv, "/v1/broker", `{"action":"pause","reason":"maintenance"}`)
-	if code != http.StatusOK {
+	if code != fh.StatusOK {
 		t.Fatalf("pause: %d %s", code, body)
 	}
 	if err := json.Unmarshal([]byte(body), &got); err != nil {
@@ -81,7 +81,7 @@ func TestManagementBrokerPauseResumeOverHTTP(t *testing.T) {
 	}
 
 	code, body = mgmtGet(t, srv, "/v1/broker")
-	if code != http.StatusOK {
+	if code != fh.StatusOK {
 		t.Fatalf("get paused state: %d %s", code, body)
 	}
 	_ = json.Unmarshal([]byte(body), &got)
@@ -90,7 +90,7 @@ func TestManagementBrokerPauseResumeOverHTTP(t *testing.T) {
 	}
 
 	code, body = mgmtPost(t, srv, "/v1/broker", `{"action":"resume"}`)
-	if code != http.StatusOK {
+	if code != fh.StatusOK {
 		t.Fatalf("resume: %d %s", code, body)
 	}
 	_ = json.Unmarshal([]byte(body), &got)
@@ -110,7 +110,7 @@ func TestManagementBrokerLifecycleRejectsUnknownAction(t *testing.T) {
 	}
 	// A rejected request must not have changed broker state.
 	code, body = mgmtGet(t, srv, "/v1/broker")
-	if code != http.StatusOK || !strings.Contains(body, "running") {
+	if code != fh.StatusOK || !strings.Contains(body, "running") {
 		t.Fatalf("broker state changed after bad action: %d %s", code, body)
 	}
 }
@@ -126,7 +126,7 @@ func TestManagementTopicReadOverHTTP(t *testing.T) {
 		}
 	}
 	code, body := mgmtGet(t, srv, "/v1/topics/orders")
-	if code != http.StatusOK {
+	if code != fh.StatusOK {
 		t.Fatalf("read topic: %d %s", code, body)
 	}
 	var msgs []Message
@@ -154,7 +154,7 @@ func TestManagementTopicReadCursorPaging(t *testing.T) {
 		}
 	}
 	code, body := mgmtGet(t, srv, "/v1/topics/t?limit=2")
-	if code != http.StatusOK {
+	if code != fh.StatusOK {
 		t.Fatalf("page 1: %d %s", code, body)
 	}
 	var page1 []Message
@@ -167,7 +167,7 @@ func TestManagementTopicReadCursorPaging(t *testing.T) {
 	last := page1[1].ID
 
 	code, body = mgmtGet(t, srv, "/v1/topics/t?after="+last+"&limit=2")
-	if code != http.StatusOK {
+	if code != fh.StatusOK {
 		t.Fatalf("page 2: %d %s", code, body)
 	}
 	var page2 []Message

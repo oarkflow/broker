@@ -7,11 +7,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net/http"
 	"strings"
 	"time"
 
 	"github.com/oarkflow/broker/cluster"
+	"github.com/oarkflow/fh"
 )
 
 const internalPartitionProposalPath = "/cluster/internal/partition-propose"
@@ -91,25 +91,20 @@ func (db *DistributedBroker) forwardPartitionPurgeResultLookup(ctx context.Conte
 	if requestCtx == nil {
 		requestCtx = context.Background()
 	}
-	request, err := http.NewRequestWithContext(requestCtx, http.MethodPost, strings.TrimRight(address, "/")+internalPartitionPurgeResultPath, bytes.NewReader(body))
-	if err != nil {
-		return 0, false, err
-	}
-	request.Header.Set("Content-Type", "application/json")
-	response, err := db.partitionForwardClient.Do(request)
+	response, err := SendHTTP(requestCtx, db.partitionForwardClient, fh.MethodPOST, strings.TrimRight(address, "/")+internalPartitionPurgeResultPath, body, jsonRequestHeaders)
 	if err != nil {
 		return 0, false, fmt.Errorf("lookup committed partition purge result: %w", err)
 	}
-	defer response.Body.Close()
-	if response.StatusCode != http.StatusOK {
-		data, readErr := io.ReadAll(io.LimitReader(response.Body, 4096))
+	defer response.Close()
+	if response.StatusCode() != fh.StatusOK {
+		data, readErr := io.ReadAll(io.LimitReader(response.Reader(), 4096))
 		if readErr != nil {
-			return 0, false, fmt.Errorf("partition leader returned %s (read error: %v)", response.Status, readErr)
+			return 0, false, fmt.Errorf("partition leader returned %s (read error: %v)", response.Raw.Status, readErr)
 		}
-		return 0, false, fmt.Errorf("partition leader returned %s: %s", response.Status, strings.TrimSpace(string(data)))
+		return 0, false, fmt.Errorf("partition leader returned %s: %s", response.Raw.Status, strings.TrimSpace(string(data)))
 	}
 	var result partitionPurgeResultResponse
-	if err := json.NewDecoder(io.LimitReader(response.Body, 4096)).Decode(&result); err != nil {
+	if err := json.NewDecoder(io.LimitReader(response.Reader(), 4096)).Decode(&result); err != nil {
 		return 0, false, fmt.Errorf("decode committed partition purge result: %w", err)
 	}
 	return result.Purged, result.Found, nil
@@ -127,25 +122,20 @@ func (db *DistributedBroker) forwardPartitionStagedLookup(ctx context.Context, i
 	if requestCtx == nil {
 		requestCtx = context.Background()
 	}
-	request, err := http.NewRequestWithContext(requestCtx, http.MethodPost, strings.TrimRight(address, "/")+internalPartitionStagedPath, bytes.NewReader(body))
-	if err != nil {
-		return stagedBrokerTransaction{}, false, err
-	}
-	request.Header.Set("Content-Type", "application/json")
-	response, err := db.partitionForwardClient.Do(request)
+	response, err := SendHTTP(requestCtx, db.partitionForwardClient, fh.MethodPOST, strings.TrimRight(address, "/")+internalPartitionStagedPath, body, jsonRequestHeaders)
 	if err != nil {
 		return stagedBrokerTransaction{}, false, fmt.Errorf("lookup staged partition transaction: %w", err)
 	}
-	defer response.Body.Close()
-	if response.StatusCode != http.StatusOK {
-		data, readErr := io.ReadAll(io.LimitReader(response.Body, 4096))
+	defer response.Close()
+	if response.StatusCode() != fh.StatusOK {
+		data, readErr := io.ReadAll(io.LimitReader(response.Reader(), 4096))
 		if readErr != nil {
-			return stagedBrokerTransaction{}, false, fmt.Errorf("partition leader returned %s (read error: %v)", response.Status, readErr)
+			return stagedBrokerTransaction{}, false, fmt.Errorf("partition leader returned %s (read error: %v)", response.Raw.Status, readErr)
 		}
-		return stagedBrokerTransaction{}, false, fmt.Errorf("partition leader returned %s: %s", response.Status, strings.TrimSpace(string(data)))
+		return stagedBrokerTransaction{}, false, fmt.Errorf("partition leader returned %s: %s", response.Raw.Status, strings.TrimSpace(string(data)))
 	}
 	var result partitionStagedResponse
-	if err := json.NewDecoder(io.LimitReader(response.Body, 64<<20)).Decode(&result); err != nil {
+	if err := json.NewDecoder(io.LimitReader(response.Reader(), 64<<20)).Decode(&result); err != nil {
 		return stagedBrokerTransaction{}, false, fmt.Errorf("decode staged partition transaction: %w", err)
 	}
 	return result.Staged, result.Found, nil
@@ -163,25 +153,20 @@ func (db *DistributedBroker) forwardPartitionResultLookup(ctx context.Context, i
 	if requestCtx == nil {
 		requestCtx = context.Background()
 	}
-	request, err := http.NewRequestWithContext(requestCtx, http.MethodPost, strings.TrimRight(address, "/")+internalPartitionResultPath, bytes.NewReader(body))
-	if err != nil {
-		return nil, false, err
-	}
-	request.Header.Set("Content-Type", "application/json")
-	response, err := db.partitionForwardClient.Do(request)
+	response, err := SendHTTP(requestCtx, db.partitionForwardClient, fh.MethodPOST, strings.TrimRight(address, "/")+internalPartitionResultPath, body, jsonRequestHeaders)
 	if err != nil {
 		return nil, false, fmt.Errorf("lookup committed partition transaction result: %w", err)
 	}
-	defer response.Body.Close()
-	if response.StatusCode != http.StatusOK {
-		data, readErr := io.ReadAll(io.LimitReader(response.Body, 4096))
+	defer response.Close()
+	if response.StatusCode() != fh.StatusOK {
+		data, readErr := io.ReadAll(io.LimitReader(response.Reader(), 4096))
 		if readErr != nil {
-			return nil, false, fmt.Errorf("partition leader returned %s (read error: %v)", response.Status, readErr)
+			return nil, false, fmt.Errorf("partition leader returned %s (read error: %v)", response.Raw.Status, readErr)
 		}
-		return nil, false, fmt.Errorf("partition leader returned %s: %s", response.Status, strings.TrimSpace(string(data)))
+		return nil, false, fmt.Errorf("partition leader returned %s: %s", response.Raw.Status, strings.TrimSpace(string(data)))
 	}
 	var result partitionResultResponse
-	if err := json.NewDecoder(io.LimitReader(response.Body, 64<<20)).Decode(&result); err != nil {
+	if err := json.NewDecoder(io.LimitReader(response.Reader(), 64<<20)).Decode(&result); err != nil {
 		return nil, false, fmt.Errorf("decode committed partition transaction result: %w", err)
 	}
 	return result.Messages, result.Found, nil
@@ -205,22 +190,17 @@ func (db *DistributedBroker) forwardPartitionProposal(ctx context.Context, addre
 	if requestCtx == nil {
 		requestCtx = context.Background()
 	}
-	request, err := http.NewRequestWithContext(requestCtx, http.MethodPost, strings.TrimRight(address, "/")+internalPartitionProposalPath, bytes.NewReader(encoded))
-	if err != nil {
-		return err
-	}
-	request.Header.Set("Content-Type", "application/json")
-	response, err := db.partitionForwardClient.Do(request)
+	response, err := SendHTTP(requestCtx, db.partitionForwardClient, fh.MethodPOST, strings.TrimRight(address, "/")+internalPartitionProposalPath, encoded, jsonRequestHeaders)
 	if err != nil {
 		return fmt.Errorf("forward partition proposal to leader: %w", err)
 	}
-	defer response.Body.Close()
-	if response.StatusCode != http.StatusNoContent {
-		body, readErr := io.ReadAll(io.LimitReader(response.Body, 4096))
+	defer response.Close()
+	if response.StatusCode() != fh.StatusNoContent {
+		body, readErr := io.ReadAll(io.LimitReader(response.Reader(), 4096))
 		if readErr != nil {
-			return fmt.Errorf("partition leader returned %s (read error: %v)", response.Status, readErr)
+			return fmt.Errorf("partition leader returned %s (read error: %v)", response.Raw.Status, readErr)
 		}
-		return fmt.Errorf("partition leader returned %s: %s", response.Status, strings.TrimSpace(string(body)))
+		return fmt.Errorf("partition leader returned %s: %s", response.Raw.Status, strings.TrimSpace(string(body)))
 	}
 	return nil
 }
@@ -268,25 +248,20 @@ func (db *DistributedBroker) forwardPartitionTransactionPrepare(ctx context.Cont
 	if requestCtx == nil {
 		requestCtx = context.Background()
 	}
-	request, err := http.NewRequestWithContext(requestCtx, http.MethodPost, strings.TrimRight(route.LeaderClientAddress, "/")+internalPartitionPreparePath, bytes.NewReader(encoded))
-	if err != nil {
-		return nil, err
-	}
-	request.Header.Set("Content-Type", "application/json")
-	response, err := db.partitionForwardClient.Do(request)
+	response, err := SendHTTP(requestCtx, db.partitionForwardClient, fh.MethodPOST, strings.TrimRight(route.LeaderClientAddress, "/")+internalPartitionPreparePath, encoded, jsonRequestHeaders)
 	if err != nil {
 		return nil, fmt.Errorf("forward partition transaction prepare to leader: %w", err)
 	}
-	defer response.Body.Close()
-	if response.StatusCode != http.StatusOK {
-		body, readErr := io.ReadAll(io.LimitReader(response.Body, 4096))
+	defer response.Close()
+	if response.StatusCode() != fh.StatusOK {
+		body, readErr := io.ReadAll(io.LimitReader(response.Reader(), 4096))
 		if readErr != nil {
-			return nil, fmt.Errorf("partition leader returned %s (read error: %v)", response.Status, readErr)
+			return nil, fmt.Errorf("partition leader returned %s (read error: %v)", response.Raw.Status, readErr)
 		}
-		return nil, fmt.Errorf("partition leader returned %s: %s", response.Status, strings.TrimSpace(string(body)))
+		return nil, fmt.Errorf("partition leader returned %s: %s", response.Raw.Status, strings.TrimSpace(string(body)))
 	}
 	var result partitionTransactionPrepareResponse
-	if err := json.NewDecoder(io.LimitReader(response.Body, 64<<20)).Decode(&result); err != nil {
+	if err := json.NewDecoder(io.LimitReader(response.Reader(), 64<<20)).Decode(&result); err != nil {
 		return nil, fmt.Errorf("decode partition transaction prepare result: %w", err)
 	}
 	return result.Messages, nil
@@ -325,53 +300,40 @@ func (db *DistributedBroker) lookupPartitionOffsetAppendOutcome(ctx context.Cont
 	if requestCtx == nil {
 		requestCtx = context.Background()
 	}
-	request, err := http.NewRequestWithContext(requestCtx, http.MethodPost, strings.TrimRight(route.LeaderClientAddress, "/")+internalPartitionOutcomePath, bytes.NewReader(encoded))
-	if err != nil {
-		return OffsetAppendTransaction{}, false, err
-	}
-	request.Header.Set("Content-Type", "application/json")
-	response, err := db.partitionForwardClient.Do(request)
+	response, err := SendHTTP(requestCtx, db.partitionForwardClient, fh.MethodPOST, strings.TrimRight(route.LeaderClientAddress, "/")+internalPartitionOutcomePath, encoded, jsonRequestHeaders)
 	if err != nil {
 		return OffsetAppendTransaction{}, false, fmt.Errorf("lookup partition transaction outcome: %w", err)
 	}
-	defer response.Body.Close()
-	if response.StatusCode != http.StatusOK {
-		body, readErr := io.ReadAll(io.LimitReader(response.Body, 4096))
+	defer response.Close()
+	if response.StatusCode() != fh.StatusOK {
+		body, readErr := io.ReadAll(io.LimitReader(response.Reader(), 4096))
 		if readErr != nil {
-			return OffsetAppendTransaction{}, false, fmt.Errorf("partition leader returned %s (read error: %v)", response.Status, readErr)
+			return OffsetAppendTransaction{}, false, fmt.Errorf("partition leader returned %s (read error: %v)", response.Raw.Status, readErr)
 		}
-		return OffsetAppendTransaction{}, false, fmt.Errorf("partition leader returned %s: %s", response.Status, strings.TrimSpace(string(body)))
+		return OffsetAppendTransaction{}, false, fmt.Errorf("partition leader returned %s: %s", response.Raw.Status, strings.TrimSpace(string(body)))
 	}
 	var result partitionTransactionOutcomeResponse
-	if err := json.NewDecoder(io.LimitReader(response.Body, 64<<20)).Decode(&result); err != nil {
+	if err := json.NewDecoder(io.LimitReader(response.Reader(), 64<<20)).Decode(&result); err != nil {
 		return OffsetAppendTransaction{}, false, fmt.Errorf("decode partition transaction outcome: %w", err)
 	}
 	return result.Transaction, result.Found, nil
 }
 
-func (a AdminServer) internalPartitionPropose(w http.ResponseWriter, r *http.Request) {
-	if rejectScopedControlPlane(w, r, "internal partition proposal") {
-		return
+func (a AdminServer) internalPartitionPropose(c fh.Ctx) error {
+	if rejectScopedControlPlane(c, "internal partition proposal") {
+		return nil
 	}
 	if a.Distributed == nil {
-		WriteBrokerError(w, ErrUnsupportedMode)
-		return
-	}
-	if r.Method != http.MethodPost {
-		w.Header().Set("Allow", http.MethodPost)
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
+		return WriteBrokerError(c, ErrUnsupportedMode)
 	}
 	var request partitionProposalRequest
-	decoder := json.NewDecoder(r.Body)
+	decoder := json.NewDecoder(bytes.NewReader(c.Body()))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&request); err != nil {
-		WriteBrokerError(w, err)
-		return
+		return WriteBrokerError(c, err)
 	}
 	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-		WriteBrokerError(w, ErrInvalidMessage)
-		return
+		return WriteBrokerError(c, ErrInvalidMessage)
 	}
 	kind := request.Kind
 	if kind == "" {
@@ -379,39 +341,30 @@ func (a AdminServer) internalPartitionPropose(w http.ResponseWriter, r *http.Req
 	}
 	if (kind != cluster.PartitionResourceTopic && kind != cluster.PartitionResourceStream && kind != cluster.PartitionResourceQueue) ||
 		request.Name == "" || request.Partition < 0 || request.Epoch == 0 || len(request.Data) == 0 || len(request.Data) > 64<<20 {
-		WriteBrokerError(w, ErrInvalidMessage)
-		return
+		return WriteBrokerError(c, ErrInvalidMessage)
 	}
-	if err := a.Distributed.proposeResourcePartitionFromPeer(r.Context(), kind, request.Name, request.Partition, request.Epoch, request.Data); err != nil {
-		a.writeControllerError(w, err)
-		return
+	if err := a.Distributed.proposeResourcePartitionFromPeer(c.Context(), kind, request.Name, request.Partition, request.Epoch, request.Data); err != nil {
+		return a.writeControllerError(c, err)
 	}
-	w.WriteHeader(http.StatusNoContent)
+	c.Status(fh.StatusNoContent)
+	return nil
 }
 
-func (a AdminServer) internalPartitionPrepare(w http.ResponseWriter, r *http.Request) {
-	if rejectScopedControlPlane(w, r, "internal partition transaction prepare") {
-		return
+func (a AdminServer) internalPartitionPrepare(c fh.Ctx) error {
+	if rejectScopedControlPlane(c, "internal partition transaction prepare") {
+		return nil
 	}
 	if a.Distributed == nil {
-		WriteBrokerError(w, ErrUnsupportedMode)
-		return
-	}
-	if r.Method != http.MethodPost {
-		w.Header().Set("Allow", http.MethodPost)
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
+		return WriteBrokerError(c, ErrUnsupportedMode)
 	}
 	var request partitionTransactionPrepareRequest
-	decoder := json.NewDecoder(r.Body)
+	decoder := json.NewDecoder(bytes.NewReader(c.Body()))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&request); err != nil {
-		WriteBrokerError(w, err)
-		return
+		return WriteBrokerError(c, err)
 	}
 	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-		WriteBrokerError(w, ErrInvalidMessage)
-		return
+		return WriteBrokerError(c, ErrInvalidMessage)
 	}
 	request.ID = request.ID.Canonical()
 	participantID := PartitionTransactionParticipantID(request.ID)
@@ -421,266 +374,193 @@ func (a AdminServer) internalPartitionPrepare(w http.ResponseWriter, r *http.Req
 	if !validBrokerTransactionIdentity(request.TransactionID, participantID) ||
 		request.ID.Topic == "" || request.ID.Partition < 0 || request.Deadline.IsZero() || !json.Valid(request.Payload) || len(request.Payload) > 64<<20 ||
 		request.RequestFingerprint != transactionPayloadFingerprint(request.Payload) {
-		WriteBrokerError(w, cluster.ErrInvalidTransaction)
-		return
+		return WriteBrokerError(c, cluster.ErrInvalidTransaction)
 	}
-	messages, err := a.Distributed.preparePartitionTransactionFromPeer(r.Context(), request.ID, request.TransactionID, request.Deadline, request.Operation, request.Payload, request.RequestFingerprint)
+	messages, err := a.Distributed.preparePartitionTransactionFromPeer(c.Context(), request.ID, request.TransactionID, request.Deadline, request.Operation, request.Payload, request.RequestFingerprint)
 	if err != nil {
-		a.writeControllerError(w, err)
-		return
+		return a.writeControllerError(c, err)
 	}
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	_ = json.NewEncoder(w).Encode(partitionTransactionPrepareResponse{Messages: messages})
+	return writeBrokerJSON(c, partitionTransactionPrepareResponse{Messages: messages})
 }
 
-func (a AdminServer) internalPartitionOutcome(w http.ResponseWriter, r *http.Request) {
-	if rejectScopedControlPlane(w, r, "internal partition transaction outcome") {
-		return
+func (a AdminServer) internalPartitionOutcome(c fh.Ctx) error {
+	if rejectScopedControlPlane(c, "internal partition transaction outcome") {
+		return nil
 	}
 	if a.Distributed == nil {
-		WriteBrokerError(w, ErrUnsupportedMode)
-		return
-	}
-	if r.Method != http.MethodPost {
-		w.Header().Set("Allow", http.MethodPost)
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
+		return WriteBrokerError(c, ErrUnsupportedMode)
 	}
 	var request partitionTransactionOutcomeRequest
-	decoder := json.NewDecoder(r.Body)
+	decoder := json.NewDecoder(bytes.NewReader(c.Body()))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&request); err != nil {
-		WriteBrokerError(w, err)
-		return
+		return WriteBrokerError(c, err)
 	}
 	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-		WriteBrokerError(w, ErrInvalidMessage)
-		return
+		return WriteBrokerError(c, ErrInvalidMessage)
 	}
 	if !request.Commit.Partitioned || request.Commit.Partition < 0 || request.Commit.Stream == "" ||
 		request.Commit.TransactionID == "" || !validTransactionPayloadFingerprint(request.Fingerprint) {
-		WriteBrokerError(w, cluster.ErrInvalidTransaction)
-		return
+		return WriteBrokerError(c, cluster.ErrInvalidTransaction)
 	}
 	id := cluster.PartitionGroupID{Kind: cluster.PartitionResourceStream, Topic: request.Commit.Stream, Partition: request.Commit.Partition}
-	route, err := a.Distributed.PartitionResourceRoute(r.Context(), id.Kind, id.Topic, id.Partition)
+	route, err := a.Distributed.PartitionResourceRoute(c.Context(), id.Kind, id.Topic, id.Partition)
 	if err != nil {
-		a.writeControllerError(w, err)
-		return
+		return a.writeControllerError(c, err)
 	}
 	if !route.LocalLeader {
-		a.writeControllerError(w, NotLeaderError(route.LeaderClientAddress, route.RaftTerm))
-		return
+		return a.writeControllerError(c, NotLeaderError(route.LeaderClientAddress, route.RaftTerm))
 	}
-	store, _, routed, err := a.Distributed.partitionStoreForResourceWrite(r.Context(), id.Kind, id.Topic, id.Partition)
+	store, _, routed, err := a.Distributed.partitionStoreForResourceWrite(c.Context(), id.Kind, id.Topic, id.Partition)
 	if err != nil {
-		a.writeControllerError(w, err)
-		return
+		return a.writeControllerError(c, err)
 	}
 	if !routed || store == nil {
-		WriteBrokerError(w, ErrBrokerUnavailable)
-		return
+		return WriteBrokerError(c, ErrBrokerUnavailable)
 	}
 	lookup, ok := store.(interface {
 		lookupOffsetAppendTransaction(OffsetCommit, string) (OffsetAppendTransaction, bool, error)
 	})
 	if !ok {
-		WriteBrokerError(w, fmt.Errorf("%w: partition store cannot query offset-append outcomes", ErrUnsupportedMode))
-		return
+		return WriteBrokerError(c, fmt.Errorf("%w: partition store cannot query offset-append outcomes", ErrUnsupportedMode))
 	}
 	transaction, found, err := lookup.lookupOffsetAppendTransaction(request.Commit, request.Fingerprint)
 	if err != nil {
-		WriteBrokerError(w, err)
-		return
+		return WriteBrokerError(c, err)
 	}
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	_ = json.NewEncoder(w).Encode(partitionTransactionOutcomeResponse{Found: found, Transaction: transaction})
+	return writeBrokerJSON(c, partitionTransactionOutcomeResponse{Found: found, Transaction: transaction})
 }
 
-func (a AdminServer) internalPartitionStaged(w http.ResponseWriter, r *http.Request) {
-	if rejectScopedControlPlane(w, r, "internal partition transaction lookup") {
-		return
+func (a AdminServer) internalPartitionStaged(c fh.Ctx) error {
+	if rejectScopedControlPlane(c, "internal partition transaction lookup") {
+		return nil
 	}
 	if a.Distributed == nil {
-		WriteBrokerError(w, ErrUnsupportedMode)
-		return
-	}
-	if r.Method != http.MethodPost {
-		w.Header().Set("Allow", http.MethodPost)
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
+		return WriteBrokerError(c, ErrUnsupportedMode)
 	}
 	var request partitionStagedRequest
-	decoder := json.NewDecoder(r.Body)
+	decoder := json.NewDecoder(bytes.NewReader(c.Body()))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&request); err != nil {
-		WriteBrokerError(w, err)
-		return
+		return WriteBrokerError(c, err)
 	}
 	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-		WriteBrokerError(w, ErrInvalidMessage)
-		return
+		return WriteBrokerError(c, ErrInvalidMessage)
 	}
 	id := request.ID.Canonical()
 	participantID, err := decodePartitionTransactionParticipantID(request.ParticipantID)
 	if err != nil || participantID != id || !validBrokerTransactionIdentity(request.TransactionID, request.ParticipantID) {
-		WriteBrokerError(w, cluster.ErrInvalidTransaction)
-		return
+		return WriteBrokerError(c, cluster.ErrInvalidTransaction)
 	}
-	route, err := a.Distributed.PartitionResourceRoute(r.Context(), id.Kind, id.Topic, id.Partition)
+	route, err := a.Distributed.PartitionResourceRoute(c.Context(), id.Kind, id.Topic, id.Partition)
 	if err != nil {
-		a.writeControllerError(w, err)
-		return
+		return a.writeControllerError(c, err)
 	}
 	if !route.LocalLeader {
-		a.writeControllerError(w, NotLeaderError(route.LeaderClientAddress, route.RaftTerm))
-		return
+		return a.writeControllerError(c, NotLeaderError(route.LeaderClientAddress, route.RaftTerm))
 	}
-	staged, found, err := a.Distributed.lookupLocalPartitionStagedTransaction(r.Context(), id, request.TransactionID, request.ParticipantID)
+	staged, found, err := a.Distributed.lookupLocalPartitionStagedTransaction(c.Context(), id, request.TransactionID, request.ParticipantID)
 	if err != nil {
-		a.writeControllerError(w, err)
-		return
+		return a.writeControllerError(c, err)
 	}
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	_ = json.NewEncoder(w).Encode(partitionStagedResponse{Found: found, Staged: staged})
+	return writeBrokerJSON(c, partitionStagedResponse{Found: found, Staged: staged})
 }
 
-func (a AdminServer) internalPartitionResult(w http.ResponseWriter, r *http.Request) {
-	if rejectScopedControlPlane(w, r, "internal partition transaction result") {
-		return
+func (a AdminServer) internalPartitionResult(c fh.Ctx) error {
+	if rejectScopedControlPlane(c, "internal partition transaction result") {
+		return nil
 	}
 	if a.Distributed == nil {
-		WriteBrokerError(w, ErrUnsupportedMode)
-		return
-	}
-	if r.Method != http.MethodPost {
-		w.Header().Set("Allow", http.MethodPost)
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
+		return WriteBrokerError(c, ErrUnsupportedMode)
 	}
 	var request partitionResultRequest
-	decoder := json.NewDecoder(r.Body)
+	decoder := json.NewDecoder(bytes.NewReader(c.Body()))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&request); err != nil {
-		WriteBrokerError(w, err)
-		return
+		return WriteBrokerError(c, err)
 	}
 	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-		WriteBrokerError(w, ErrInvalidMessage)
-		return
+		return WriteBrokerError(c, ErrInvalidMessage)
 	}
 	id := request.ID.Canonical()
 	participantID, err := decodePartitionTransactionParticipantID(request.ParticipantID)
 	if err != nil || participantID != id || id.Kind != cluster.PartitionResourceStream ||
 		request.ParticipantID != PartitionTransactionParticipantID(id) || !validBrokerTransactionIdentity(request.TransactionID, request.ParticipantID) {
-		WriteBrokerError(w, cluster.ErrInvalidTransaction)
-		return
+		return WriteBrokerError(c, cluster.ErrInvalidTransaction)
 	}
-	route, err := a.Distributed.PartitionResourceRoute(r.Context(), id.Kind, id.Topic, id.Partition)
+	route, err := a.Distributed.PartitionResourceRoute(c.Context(), id.Kind, id.Topic, id.Partition)
 	if err != nil {
-		a.writeControllerError(w, err)
-		return
+		return a.writeControllerError(c, err)
 	}
 	if !route.LocalLeader {
-		a.writeControllerError(w, NotLeaderError(route.LeaderClientAddress, route.RaftTerm))
-		return
+		return a.writeControllerError(c, NotLeaderError(route.LeaderClientAddress, route.RaftTerm))
 	}
-	messages, found, err := a.Distributed.lookupLocalPartitionTransactionResult(r.Context(), id, request.TransactionID, request.ParticipantID)
+	messages, found, err := a.Distributed.lookupLocalPartitionTransactionResult(c.Context(), id, request.TransactionID, request.ParticipantID)
 	if err != nil {
-		a.writeControllerError(w, err)
-		return
+		return a.writeControllerError(c, err)
 	}
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	_ = json.NewEncoder(w).Encode(partitionResultResponse{Found: found, Messages: messages})
+	return writeBrokerJSON(c, partitionResultResponse{Found: found, Messages: messages})
 }
 
-func (a AdminServer) internalPartitionPurgeResult(w http.ResponseWriter, r *http.Request) {
-	if rejectScopedControlPlane(w, r, "internal partition purge result") {
-		return
+func (a AdminServer) internalPartitionPurgeResult(c fh.Ctx) error {
+	if rejectScopedControlPlane(c, "internal partition purge result") {
+		return nil
 	}
 	if a.Distributed == nil {
-		WriteBrokerError(w, ErrUnsupportedMode)
-		return
-	}
-	if r.Method != http.MethodPost {
-		w.Header().Set("Allow", http.MethodPost)
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
+		return WriteBrokerError(c, ErrUnsupportedMode)
 	}
 	var request partitionStagedRequest
-	decoder := json.NewDecoder(r.Body)
+	decoder := json.NewDecoder(bytes.NewReader(c.Body()))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&request); err != nil {
-		WriteBrokerError(w, err)
-		return
+		return WriteBrokerError(c, err)
 	}
 	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-		WriteBrokerError(w, ErrInvalidMessage)
-		return
+		return WriteBrokerError(c, ErrInvalidMessage)
 	}
 	id := request.ID.Canonical()
 	decodedID, err := decodePartitionTransactionParticipantID(request.ParticipantID)
 	if err != nil || decodedID != id || id.Kind != cluster.PartitionResourceQueue ||
 		request.ParticipantID != PartitionTransactionParticipantID(id) || !validBrokerTransactionIdentity(request.TransactionID, request.ParticipantID) {
-		WriteBrokerError(w, cluster.ErrInvalidTransaction)
-		return
+		return WriteBrokerError(c, cluster.ErrInvalidTransaction)
 	}
-	route, err := a.Distributed.PartitionResourceRoute(r.Context(), id.Kind, id.Topic, id.Partition)
+	route, err := a.Distributed.PartitionResourceRoute(c.Context(), id.Kind, id.Topic, id.Partition)
 	if err != nil {
-		a.writeControllerError(w, err)
-		return
+		return a.writeControllerError(c, err)
 	}
 	if !route.LocalLeader {
-		a.writeControllerError(w, NotLeaderError(route.LeaderClientAddress, route.RaftTerm))
-		return
+		return a.writeControllerError(c, NotLeaderError(route.LeaderClientAddress, route.RaftTerm))
 	}
-	count, found, err := a.Distributed.lookupLocalPartitionTransactionPurgeResult(r.Context(), id, request.TransactionID, request.ParticipantID)
+	count, found, err := a.Distributed.lookupLocalPartitionTransactionPurgeResult(c.Context(), id, request.TransactionID, request.ParticipantID)
 	if err != nil {
-		WriteBrokerError(w, err)
-		return
+		return WriteBrokerError(c, err)
 	}
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	_ = json.NewEncoder(w).Encode(partitionPurgeResultResponse{Found: found, Purged: count})
+	return writeBrokerJSON(c, partitionPurgeResultResponse{Found: found, Purged: count})
 }
 
-func (a AdminServer) internalPartitionLag(w http.ResponseWriter, r *http.Request) {
-	if rejectScopedControlPlane(w, r, "internal partition stream lag") {
-		return
+func (a AdminServer) internalPartitionLag(c fh.Ctx) error {
+	if rejectScopedControlPlane(c, "internal partition stream lag") {
+		return nil
 	}
 	if a.Distributed == nil {
-		WriteBrokerError(w, ErrUnsupportedMode)
-		return
-	}
-	if r.Method != http.MethodPost {
-		w.Header().Set("Allow", http.MethodPost)
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
+		return WriteBrokerError(c, ErrUnsupportedMode)
 	}
 	var request partitionLagRequest
-	decoder := json.NewDecoder(r.Body)
+	decoder := json.NewDecoder(bytes.NewReader(c.Body()))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&request); err != nil {
-		WriteBrokerError(w, err)
-		return
+		return WriteBrokerError(c, err)
 	}
 	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-		WriteBrokerError(w, ErrInvalidMessage)
-		return
+		return WriteBrokerError(c, ErrInvalidMessage)
 	}
 	stream, validationErr := sanitizeIdentifier(request.Stream)
 	if validationErr != nil || stream != request.Stream || request.Partition < 0 {
-		WriteBrokerError(w, ErrInvalidMessage)
-		return
+		return WriteBrokerError(c, ErrInvalidMessage)
 	}
-	report, err := a.Distributed.PartitionStreamLag(r.Context(), request.Stream, request.Partition, request.ConsumerGroup)
+	report, err := a.Distributed.PartitionStreamLag(c.Context(), request.Stream, request.Partition, request.ConsumerGroup)
 	if err != nil {
-		a.writeControllerError(w, err)
-		return
+		return a.writeControllerError(c, err)
 	}
-	writeBrokerJSON(w, report)
+	return writeBrokerJSON(c, report)
 }

@@ -5,13 +5,12 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
-	"net/http"
-	"net/http/httptest"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/oarkflow/broker"
+	"github.com/oarkflow/fh"
 )
 
 // ---------------------------------------------------------------------
@@ -237,7 +236,7 @@ func TestDecodeFrameBatchTruncated(t *testing.T) {
 
 // ---------------------------------------------------------------------
 // Integration-style tests against a real in-process broker exposed over
-// httptest, following the pattern established in frame_client_test.go.
+// an fh test server, following the pattern established in frame_client_test.go.
 // ---------------------------------------------------------------------
 
 func TestClientRegisterHeartbeatSubscribe(t *testing.T) {
@@ -603,11 +602,10 @@ func TestClientErrorStatusPropagation(t *testing.T) {
 func TestClientFailoverAcrossBrokerURLs(t *testing.T) {
 	// First URL points at a server that always 500s; second is a real broker.
 	var hits int32
-	bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	bad := newCatchAllServer(t, func(c fh.Ctx) error {
 		atomic.AddInt32(&hits, 1)
-		w.WriteHeader(http.StatusInternalServerError)
-		_, _ = w.Write([]byte("down"))
-	}))
+		return c.Status(fh.StatusInternalServerError).SendString("down")
+	})
 	defer bad.Close()
 	_, goodURL := newTestBrokerServer(t)
 
@@ -617,7 +615,7 @@ func TestClientFailoverAcrossBrokerURLs(t *testing.T) {
 		atomic.AddInt32(&reconnects, 1)
 	}}})
 
-	err := c.doJSON(context.Background(), http.MethodGet, "/healthz", nil, nil)
+	err := c.doJSON(context.Background(), fh.MethodGET, "/healthz", nil, nil)
 	if err != nil {
 		t.Fatalf("expected failover to the healthy broker to succeed: %v", err)
 	}
@@ -629,7 +627,7 @@ func TestClientFailoverAcrossBrokerURLs(t *testing.T) {
 	}
 
 	// Subsequent calls should stick to the now-known-good broker.
-	if err := c.doJSON(context.Background(), http.MethodGet, "/healthz", nil, nil); err != nil {
+	if err := c.doJSON(context.Background(), fh.MethodGET, "/healthz", nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	if atomic.LoadInt32(&hits) != 1 {
@@ -638,8 +636,7 @@ func TestClientFailoverAcrossBrokerURLs(t *testing.T) {
 }
 
 func TestClientUnreachableReturnsError(t *testing.T) {
-	c := New(Config{BrokerURL: "http://127.0.0.1:1"})
-	c.http.Timeout = 200 * time.Millisecond
+	c := New(Config{BrokerURL: "http://127.0.0.1:1", HTTPClient: broker.NewHTTPClient(broker.HTTPClientConfig{Timeout: 200 * time.Millisecond})})
 	_, err := c.Register(context.Background(), broker.ConsumerRegistration{})
 	if err == nil {
 		t.Fatal("expected an error when the broker is unreachable")
@@ -671,10 +668,7 @@ func TestPublishBinaryPayloadRoundTrips(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	admin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		admin := broker.AdminServer{Broker: b, Token: "secret", InsecureDev: false}
-		admin.Handler().ServeHTTP(w, r)
-	}))
+	admin := newTestServer(t, broker.AdminServer{Broker: b, Token: "secret", InsecureDev: false}.App())
 	t.Cleanup(admin.Close)
 
 	c := New(Config{BrokerURLs: []string{admin.URL}, Token: "secret"})
@@ -703,10 +697,7 @@ func TestPublishJSONPayloadUnchanged(t *testing.T) {
 	if err := b.DeclareQueue(ctx, broker.QueueConfig{Name: "json"}); err != nil {
 		t.Fatal(err)
 	}
-	admin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		a := broker.AdminServer{Broker: b, Token: "secret"}
-		a.Handler().ServeHTTP(w, r)
-	}))
+	admin := newTestServer(t, broker.AdminServer{Broker: b, Token: "secret"}.App())
 	t.Cleanup(admin.Close)
 	c := New(Config{BrokerURLs: []string{admin.URL}, Token: "secret"})
 
@@ -734,10 +725,7 @@ func TestPublishOptionsReachTheBroker(t *testing.T) {
 	if err := b.DeclareQueue(ctx, broker.QueueConfig{Name: "opts"}); err != nil {
 		t.Fatal(err)
 	}
-	admin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		a := broker.AdminServer{Broker: b, Token: "secret"}
-		a.Handler().ServeHTTP(w, r)
-	}))
+	admin := newTestServer(t, broker.AdminServer{Broker: b, Token: "secret"}.App())
 	t.Cleanup(admin.Close)
 	c := New(Config{BrokerURLs: []string{admin.URL}, Token: "secret"})
 
@@ -790,42 +778,45 @@ func TestPublishOptionsReachTheBroker(t *testing.T) {
 // a handler per attempt.
 func TestClientTimeoutExceedsPollWait(t *testing.T) {
 	t.Run("default", func(t *testing.T) {
-		c := New(Config{BrokerURL: "http://127.0.0.1:1"})
-		cfg := c.Config()
-		if cfg.HTTPClient.Timeout <= cfg.PollWait {
-			t.Fatalf("client timeout %s must exceed PollWait %s", cfg.HTTPClient.Timeout, cfg.PollWait)
+		cfg := New(Config{BrokerURL: "http://127.0.0.1:1"}).Config()
+		if cfg.HTTPTimeout <= cfg.PollWait {
+			t.Fatalf("client timeout %s must exceed PollWait %s", cfg.HTTPTimeout, cfg.PollWait)
 		}
 	})
 
 	t.Run("larger poll wait", func(t *testing.T) {
-		c := New(Config{BrokerURL: "http://127.0.0.1:1", PollWait: 2 * time.Minute})
-		cfg := c.Config()
-		if cfg.HTTPClient.Timeout <= cfg.PollWait {
-			t.Fatalf("client timeout %s must exceed PollWait %s", cfg.HTTPClient.Timeout, cfg.PollWait)
+		cfg := New(Config{BrokerURL: "http://127.0.0.1:1", PollWait: 2 * time.Minute}).Config()
+		if cfg.HTTPTimeout <= cfg.PollWait {
+			t.Fatalf("client timeout %s must exceed PollWait %s", cfg.HTTPTimeout, cfg.PollWait)
 		}
 	})
 
-	t.Run("raised when a supplied client is too short", func(t *testing.T) {
-		c := New(Config{
-			BrokerURL:  "http://127.0.0.1:1",
-			PollWait:   45 * time.Second,
-			HTTPClient: &http.Client{Timeout: 20 * time.Second},
-		})
-		cfg := c.Config()
-		if cfg.HTTPClient.Timeout <= cfg.PollWait {
-			t.Fatalf("a supplied 20s timeout against a 45s PollWait was left in place (%s)", cfg.HTTPClient.Timeout)
+	t.Run("raised when the configured timeout is too short", func(t *testing.T) {
+		cfg := New(Config{BrokerURL: "http://127.0.0.1:1", PollWait: 45 * time.Second, HTTPTimeout: 20 * time.Second}).Config()
+		if cfg.HTTPTimeout <= cfg.PollWait {
+			t.Fatalf("a 20s timeout against a 45s PollWait was left in place (%s)", cfg.HTTPTimeout)
 		}
 	})
 
-	t.Run("respects a generous supplied timeout", func(t *testing.T) {
-		c := New(Config{
-			BrokerURL:  "http://127.0.0.1:1",
-			PollWait:   5 * time.Second,
-			HTTPClient: &http.Client{Timeout: 10 * time.Minute},
-		})
-		cfg := c.Config()
-		if cfg.HTTPClient.Timeout != 10*time.Minute {
-			t.Fatalf("a generous supplied timeout was rewritten to %s", cfg.HTTPClient.Timeout)
+	t.Run("respects a generous configured timeout", func(t *testing.T) {
+		cfg := New(Config{BrokerURL: "http://127.0.0.1:1", PollWait: 5 * time.Second, HTTPTimeout: 10 * time.Minute}).Config()
+		if cfg.HTTPTimeout != 10*time.Minute {
+			t.Fatalf("a generous timeout was rewritten to %s", cfg.HTTPTimeout)
+		}
+	})
+
+	t.Run("long poll outlives fh's default response-header wait", func(t *testing.T) {
+		// fh's client waits only 15s for response headers by default; a 20s
+		// long poll must not be cut off by it.
+		_, base := newTestBrokerServer(t, "lp20")
+		c := New(Config{BrokerURL: base, PollWait: 20 * time.Second})
+		if testing.Short() {
+			t.Skip("waits 20s")
+		}
+		start := time.Now()
+		msgs, err := c.Poll(context.Background(), "lp20", 1)
+		if err != nil || len(msgs) != 0 || time.Since(start) < 15*time.Second {
+			t.Fatalf("empty long poll after %s: msgs=%d err=%v", time.Since(start), len(msgs), err)
 		}
 	})
 }
@@ -838,10 +829,7 @@ func TestLongPollReturnsPromptlyOnMessage(t *testing.T) {
 	if err := b.DeclareQueue(ctx, broker.QueueConfig{Name: "lp"}); err != nil {
 		t.Fatal(err)
 	}
-	admin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		a := broker.AdminServer{Broker: b, Token: "secret"}
-		a.Handler().ServeHTTP(w, r)
-	}))
+	admin := newTestServer(t, broker.AdminServer{Broker: b, Token: "secret"}.App())
 	defer admin.Close()
 
 	c := New(Config{BrokerURLs: []string{admin.URL}, Token: "secret", PollWait: 20 * time.Second})
@@ -866,7 +854,7 @@ func TestLongPollReturnsPromptlyOnMessage(t *testing.T) {
 }
 
 // Errors from the data plane must behave like the in-process equivalents. The
-// server used to answer every failure with http.Error(w, err.Error(), 409), so a
+// server used to answer every failure with a plain-text 409, so a
 // remote caller received an opaque string: errors.Is against a broker sentinel
 // was always false and broker.ClassifyRetry never matched.
 func TestRemoteErrorsAreTyped(t *testing.T) {
@@ -876,10 +864,7 @@ func TestRemoteErrorsAreTyped(t *testing.T) {
 	if err := b.DeclareQueue(ctx, broker.QueueConfig{Name: "q"}); err != nil {
 		t.Fatal(err)
 	}
-	admin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		a := broker.AdminServer{Broker: b, Token: "secret"}
-		a.Handler().ServeHTTP(w, r)
-	}))
+	admin := newTestServer(t, broker.AdminServer{Broker: b, Token: "secret"}.App())
 	defer admin.Close()
 	c := New(Config{BrokerURLs: []string{admin.URL}, Token: "secret"})
 
@@ -898,7 +883,7 @@ func TestRemoteErrorsAreTyped(t *testing.T) {
 		if remote.Code != "queue_not_found" {
 			t.Errorf("code = %q", remote.Code)
 		}
-		if remote.Status != http.StatusNotFound {
+		if remote.Status != fh.StatusNotFound {
 			t.Errorf("status = %d, want 404; the data plane flattened everything to 409", remote.Status)
 		}
 	})
@@ -947,7 +932,7 @@ func TestRemoteErrorsAreTyped(t *testing.T) {
 // A typed retryable error must be classifiable, which is what a follower-aware
 // client needs to redirect.
 func TestRemoteRetryClassification(t *testing.T) {
-	err := broker.ParseRemoteError(http.StatusServiceUnavailable,
+	err := broker.ParseRemoteError(fh.StatusServiceUnavailable,
 		[]byte(`{"error":{"code":"not_leader","message":"broker: not leader; leader is node 3","retryable":true,"class":"not_leader","details":{"leader":"node-3","leader_epoch":"7"}}}`))
 	if err == nil {
 		t.Fatal("expected a parsed error")
@@ -971,11 +956,11 @@ func TestRemoteRetryClassification(t *testing.T) {
 // A server that answers with plain text must still produce a usable error rather
 // than a confusing zero value.
 func TestRemoteErrorFallsBackToPlainText(t *testing.T) {
-	err := broker.ParseRemoteError(http.StatusConflict, []byte("broker: something broke"))
+	err := broker.ParseRemoteError(fh.StatusConflict, []byte("broker: something broke"))
 	if err != nil {
 		t.Fatalf("plain text should not parse as an envelope, got %+v", err)
 	}
-	got := remoteError(http.StatusConflict, []byte("broker: something broke"))
+	got := remoteError(fh.StatusConflict, []byte("broker: something broke"))
 	if got == nil || got.Error() == "" {
 		t.Fatal("expected a non-empty fallback error")
 	}

@@ -9,7 +9,6 @@ import (
 	"flag"
 	"fmt"
 	"net"
-	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -25,6 +24,7 @@ import (
 	"github.com/oarkflow/broker/cluster"
 	"github.com/oarkflow/broker/contrib/sqlitestore"
 	"github.com/oarkflow/broker/pkg/logger"
+	"github.com/oarkflow/fh"
 	"github.com/oarkflow/zlog"
 )
 
@@ -453,22 +453,25 @@ func main() {
 		}()
 	}
 	admin := broker.AdminServer{Broker: b, Distributed: distributed, ACL: acl, InsecureDev: *insecureDev, MaxBodyBytes: *maxBody, TLSCertFile: *tlsCert, TLSKeyFile: *tlsKey, ClientCAFile: *clientCA, RequireClientCert: *requireClientCert}
-	srv := admin.HTTPServer(*addr)
+	srv := admin.App()
+	var adminTLS *tls.Config
+	if *tlsCert != "" || *tlsKey != "" {
+		var tlsErr error
+		if adminTLS, tlsErr = admin.TLSConfig(); tlsErr != nil {
+			logger.Log.Fatal("configure admin TLS", zlog.Err(tlsErr))
+		}
+	}
 	type listenerFailure struct {
 		name string
 		err  error
 	}
 	serverErr := make(chan listenerFailure, 8)
 	go func() {
-		if *tlsCert != "" || *tlsKey != "" {
-			serverErr <- listenerFailure{"http", srv.ListenAndServeTLS(*tlsCert, *tlsKey)}
-			return
-		}
-		serverErr <- listenerFailure{"http", srv.ListenAndServe()}
+		serverErr <- listenerFailure{"http", broker.ListenHTTPApp(srv, *addr, adminTLS)}
 	}()
 	select {
 	case failure := <-serverErr:
-		if failure.err != nil && failure.err != http.ErrServerClosed {
+		if failure.err != nil {
 			logger.Log.Fatal("broker listen failed", zlog.String("listener", failure.name), zlog.Err(failure.err))
 		}
 	case <-time.After(200 * time.Millisecond):
@@ -533,7 +536,7 @@ func main() {
 		go func() { serverErr <- listenerFailure{"amqp", amqpServer.Serve()} }()
 	}
 	var sse *broker.SSEServer
-	var sseHTTP *http.Server
+	var sseHTTP *fh.App
 	if *sseAddr != "" {
 		sse = broker.NewSSEServer(b, broker.SSEConfig{Path: *ssePath, ACL: admin.ACL, InsecureDev: *insecureDev})
 		sse.SetToken(*token)
@@ -541,30 +544,20 @@ func main() {
 		if tlsErr != nil {
 			logger.Log.Fatal("configure SSE TLS", zlog.Err(tlsErr))
 		}
-		sseHTTP = &http.Server{Addr: *sseAddr, Handler: sse.Handler(), ReadHeaderTimeout: 5 * time.Second, TLSConfig: sseTLS}
-		go func() {
-			if *tlsCert != "" {
-				serverErr <- listenerFailure{"sse", sseHTTP.ListenAndServeTLS(*tlsCert, *tlsKey)}
-				return
-			}
-			serverErr <- listenerFailure{"sse", sseHTTP.ListenAndServe()}
-		}()
+		sseHTTP = sse.App()
+		go func() { serverErr <- listenerFailure{"sse", broker.ListenHTTPApp(sseHTTP, *sseAddr, sseTLS)} }()
 	}
 	var webSocket *broker.RFC6455Server
-	var webSocketHTTP *http.Server
+	var webSocketHTTP *fh.App
 	if *webSocketAddr != "" {
 		webSocket = broker.NewRFC6455Server(b, broker.RFC6455Config{Path: *webSocketPath, ACL: admin.ACL, InsecureDev: *insecureDev, MaxMessageSize: *maxBody})
 		webSocketTLS, tlsErr := listenerTLSConfig(*tlsCert, *tlsKey, *clientCA, *requireClientCert)
 		if tlsErr != nil {
 			logger.Log.Fatal("configure WebSocket TLS", zlog.Err(tlsErr))
 		}
-		webSocketHTTP = &http.Server{Addr: *webSocketAddr, Handler: webSocket.Handler(), ReadHeaderTimeout: 5 * time.Second, TLSConfig: webSocketTLS}
+		webSocketHTTP = webSocket.App()
 		go func() {
-			if *tlsCert != "" {
-				serverErr <- listenerFailure{"websocket", webSocketHTTP.ListenAndServeTLS(*tlsCert, *tlsKey)}
-				return
-			}
-			serverErr <- listenerFailure{"websocket", webSocketHTTP.ListenAndServe()}
+			serverErr <- listenerFailure{"websocket", broker.ListenHTTPApp(webSocketHTTP, *webSocketAddr, webSocketTLS)}
 		}()
 	}
 	fmt.Printf("fastworker broker listening on %s\n", *addr)
@@ -613,7 +606,7 @@ func main() {
 	select {
 	case <-sig:
 	case failure := <-serverErr:
-		if failure.err != nil && failure.err != http.ErrServerClosed {
+		if failure.err != nil {
 			logger.Log.Error("listener stopped", zlog.String("listener", failure.name), zlog.Err(failure.err))
 		}
 	}
@@ -626,7 +619,7 @@ func main() {
 	}
 	stopPartitionReconcile()
 	partitionReconcileWG.Wait()
-	_ = srv.Shutdown(ctx)
+	_ = broker.ShutdownHTTPApp(ctx, srv)
 	if native != nil {
 		_ = native.Close()
 	}
@@ -643,11 +636,11 @@ func main() {
 		_ = amqpServer.Stop(ctx)
 	}
 	if sseHTTP != nil {
-		_ = sseHTTP.Shutdown(ctx)
+		_ = broker.ShutdownHTTPApp(ctx, sseHTTP)
 		sse.Stop()
 	}
 	if webSocketHTTP != nil {
-		_ = webSocketHTTP.Shutdown(ctx)
+		_ = broker.ShutdownHTTPApp(ctx, webSocketHTTP)
 		webSocket.Stop()
 	}
 	if distributed != nil {
@@ -655,12 +648,9 @@ func main() {
 	} else {
 		_ = b.Stop(ctx)
 	}
-	if srvErr := srv.Close(); srvErr != nil && srvErr != http.ErrServerClosed {
-		logger.Log.Warn("server close", zlog.Err(srvErr))
-	}
 	select {
 	case failure := <-serverErr:
-		if failure.err != nil && failure.err != http.ErrServerClosed {
+		if failure.err != nil {
 			logger.Log.Warn("server error", zlog.String("listener", failure.name), zlog.Err(failure.err))
 		}
 	default:

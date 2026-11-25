@@ -1,15 +1,14 @@
 package broker
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
-	"io"
-	"net/http"
 	"reflect"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/oarkflow/fh"
 )
 
 type Severity string
@@ -222,7 +221,7 @@ func (b *NotificationBus) Close() {
 type WebhookCallback struct {
 	URL         string
 	Token       string
-	Client      *http.Client
+	Client      *fh.Client
 	Timeout     time.Duration
 	MaxAttempts int
 	RetryDelay  time.Duration
@@ -241,17 +240,13 @@ func (w WebhookCallback) HandleNotification(ctx context.Context, n Notification)
 		ctx, cancel = context.WithTimeout(ctx, w.Timeout)
 		defer cancel()
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, w.URL, bytes.NewReader(body))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json")
+	headers := map[string]string{"Content-Type": "application/json"}
 	if w.Token != "" {
-		req.Header.Set("Authorization", "Bearer "+w.Token)
+		headers["Authorization"] = "Bearer " + w.Token
 	}
 	c := w.Client
 	if c == nil {
-		c = http.DefaultClient
+		c = defaultWebhookClient()
 	}
 	attempts := w.MaxAttempts
 	if attempts <= 0 {
@@ -272,18 +267,28 @@ func (w WebhookCallback) HandleNotification(ctx context.Context, n Notification)
 				return ctx.Err()
 			}
 		}
-		req2 := req.Clone(ctx)
-		req2.Body = io.NopCloser(bytes.NewReader(body))
-		resp, err := c.Do(req2)
+		resp, err := SendHTTP(ctx, c, fh.MethodPOST, w.URL, body, headers)
 		if err != nil {
 			last = err
 			continue
 		}
-		_ = resp.Body.Close()
-		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		_ = resp.Close()
+		if resp.IsSuccess() {
 			return nil
 		}
-		last = errf(ErrCallbackFailed, "webhook returned status %d", resp.StatusCode)
+		last = errf(ErrCallbackFailed, "webhook returned status %d", resp.StatusCode())
 	}
 	return last
+}
+
+var (
+	webhookClientOnce sync.Once
+	webhookClient     *fh.Client
+)
+
+// defaultWebhookClient is the shared client for webhooks without their own.
+// Requests are bounded by the caller's context (WebhookCallback.Timeout).
+func defaultWebhookClient() *fh.Client {
+	webhookClientOnce.Do(func() { webhookClient = NewHTTPClient(HTTPClientConfig{Timeout: -1}) })
+	return webhookClient
 }

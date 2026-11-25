@@ -9,7 +9,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net"
-	"net/http"
 	"slices"
 	"strconv"
 	"strings"
@@ -799,14 +798,6 @@ func constantTimeEqual(a, b string) bool {
 		return false
 	}
 	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
-}
-
-func bearerToken(r *http.Request) string {
-	auth := r.Header.Get("Authorization")
-	if len(auth) < len("Bearer ") || !strings.EqualFold(auth[:len("Bearer ")], "Bearer ") {
-		return ""
-	}
-	return strings.TrimSpace(auth[len("Bearer "):])
 }
 
 type AdminAuditEvent struct {

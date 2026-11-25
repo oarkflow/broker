@@ -6,13 +6,12 @@
 package main
 
 import (
-	"bytes"
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"math/rand"
-	"net/http"
 	"net/url"
 	"os"
 	"slices"
@@ -23,6 +22,7 @@ import (
 	"time"
 
 	"github.com/oarkflow/broker"
+	"github.com/oarkflow/fh"
 )
 
 type result struct {
@@ -57,8 +57,7 @@ func main() {
 		*consumerID = host
 	}
 
-	client := &http.Client{Timeout: 10 * time.Second}
-	client.Transport = &http.Transport{MaxIdleConnsPerHost: 256}
+	client := broker.NewHTTPClient(broker.HTTPClientConfig{Timeout: 10 * time.Second, MaxIdleConnsPerHost: 256, MaxConnsPerHost: 1 << 16})
 	payload := randPayload(*payloadSize)
 	frameCodec := broker.NewFrameCodec(broker.FrameCodecConfig{Type: broker.CodecFWB1, MaxFrameSize: 128 << 20})
 	*protocol = strings.ToLower(strings.TrimSpace(*protocol))
@@ -145,14 +144,14 @@ func main() {
 	report(results, total, errs, totalMsgs, totalPublished, totalConsumed, elapsed)
 }
 
-func waitForReady(client *http.Client, addr string, timeout time.Duration) {
+func waitForReady(client *fh.Client, addr string, timeout time.Duration) {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		resp, err := client.Get(addr + "/readyz")
+		resp, err := broker.SendHTTP(context.Background(), client, fh.MethodGET, addr+"/readyz", nil, nil)
 		if err == nil {
-			io.Copy(io.Discard, resp.Body)
-			resp.Body.Close()
-			if resp.StatusCode == 200 {
+			io.Copy(io.Discard, resp.Reader())
+			resp.Close()
+			if resp.StatusCode() == 200 {
 				return
 			}
 		}
@@ -161,54 +160,47 @@ func waitForReady(client *http.Client, addr string, timeout time.Duration) {
 	fmt.Fprintln(os.Stderr, "warning: broker did not report ready within timeout, proceeding anyway")
 }
 
-func declareQueue(client *http.Client, addr, token, queue string) {
+func declareQueue(client *fh.Client, addr, token, queue string) {
 	body, _ := json.Marshal(map[string]any{"name": queue})
-	req, _ := http.NewRequest(http.MethodPost, addr+"/queues", bytes.NewReader(body))
-	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := client.Do(req)
+	resp, err := broker.SendHTTP(context.Background(), client, fh.MethodPOST, addr+"/queues", body, map[string]string{"Authorization": "Bearer " + token, "Content-Type": "application/json"})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "declare queue:", err)
 		return
 	}
-	io.Copy(io.Discard, resp.Body)
-	resp.Body.Close()
+	io.Copy(io.Discard, resp.Reader())
+	resp.Close()
 }
 
 // doPublish sends either a single message via /publish or, when batch > 1, a
 // slice of messages via /publish/batch — one HTTP round trip either way.
-func doPublish(client *http.Client, codec broker.FrameCodec, protocol, addr, token, queue string, payload []byte, batch int) (time.Duration, int, bool, int) {
+func doPublish(client *fh.Client, codec broker.FrameCodec, protocol, addr, token, queue string, payload []byte, batch int) (time.Duration, int, bool, int) {
 	if protocol == "frame" {
 		return doPublishFrame(client, codec, addr, token, queue, payload, batch)
 	}
 	return doPublishJSON(client, addr, token, queue, payload, batch)
 }
 
-func doPublishJSON(client *http.Client, addr, token, queue string, payload []byte, batch int) (time.Duration, int, bool, int) {
+func doPublishJSON(client *fh.Client, addr, token, queue string, payload []byte, batch int) (time.Duration, int, bool, int) {
 	if batch <= 1 {
 		body, _ := json.Marshal(map[string]any{
 			"topic":   "bench",
 			"queue":   queue,
 			"payload": json.RawMessage(payload),
 		})
-		req, _ := http.NewRequest(http.MethodPost, addr+"/publish", bytes.NewReader(body))
-		req.Header.Set("Authorization", "Bearer "+token)
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Prefer", "return=minimal")
 		start := time.Now()
-		resp, err := client.Do(req)
+		resp, err := broker.SendHTTP(context.Background(), client, fh.MethodPOST, addr+"/publish", body, map[string]string{"Authorization": "Bearer " + token, "Content-Type": "application/json", "Prefer": "return=minimal"})
 		dur := time.Since(start)
 		if err != nil {
 			return dur, 0, false, 0
 		}
-		io.Copy(io.Discard, resp.Body)
-		resp.Body.Close()
-		ok := resp.StatusCode >= 200 && resp.StatusCode < 300
+		io.Copy(io.Discard, resp.Reader())
+		resp.Close()
+		ok := resp.StatusCode() >= 200 && resp.StatusCode() < 300
 		msgs := 0
 		if ok {
 			msgs = 1
 		}
-		return dur, resp.StatusCode, ok, msgs
+		return dur, resp.StatusCode(), ok, msgs
 	}
 
 	items := make([]map[string]any, batch)
@@ -220,23 +212,19 @@ func doPublishJSON(client *http.Client, addr, token, queue string, payload []byt
 		}
 	}
 	body, _ := json.Marshal(items)
-	req, _ := http.NewRequest(http.MethodPost, addr+"/publish/batch", bytes.NewReader(body))
-	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Prefer", "return=minimal")
 	start := time.Now()
-	resp, err := client.Do(req)
+	resp, err := broker.SendHTTP(context.Background(), client, fh.MethodPOST, addr+"/publish/batch", body, map[string]string{"Authorization": "Bearer " + token, "Content-Type": "application/json", "Prefer": "return=minimal"})
 	dur := time.Since(start)
 	if err != nil {
 		return dur, 0, false, 0
 	}
-	data, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return dur, resp.StatusCode, false, 0
+	data, _ := io.ReadAll(resp.Reader())
+	resp.Close()
+	if resp.StatusCode() < 200 || resp.StatusCode() >= 300 {
+		return dur, resp.StatusCode(), false, 0
 	}
-	if resp.StatusCode == http.StatusNoContent {
-		return dur, resp.StatusCode, true, batch
+	if resp.StatusCode() == fh.StatusNoContent {
+		return dur, resp.StatusCode(), true, batch
 	}
 	var out struct {
 		Results []json.RawMessage `json:"results"`
@@ -250,45 +238,42 @@ func doPublishJSON(client *http.Client, addr, token, queue string, payload []byt
 			}
 		}
 	}
-	return dur, resp.StatusCode, msgs > 0, msgs
+	return dur, resp.StatusCode(), msgs > 0, msgs
 }
 
 // doPull leases up to limit messages in one HTTP call, then acks all of them
 // in a single /ack/batch call. Ack failures are counted against msgs so a
 // worker that leases but can't durably complete messages shows up as errors
 // rather than silently inflating throughput.
-func doPull(client *http.Client, codec broker.FrameCodec, protocol, addr, token, queue string, limit int, consumerID, group string) (time.Duration, int, bool, int) {
+func doPull(client *fh.Client, codec broker.FrameCodec, protocol, addr, token, queue string, limit int, consumerID, group string) (time.Duration, int, bool, int) {
 	if protocol == "frame" {
 		return doPullFrame(client, codec, addr, token, queue, limit, consumerID, group)
 	}
 	return doPullJSON(client, addr, token, queue, limit, consumerID, group)
 }
 
-func doPullJSON(client *http.Client, addr, token, queue string, limit int, consumerID, group string) (time.Duration, int, bool, int) {
+func doPullJSON(client *fh.Client, addr, token, queue string, limit int, consumerID, group string) (time.Duration, int, bool, int) {
 	body, _ := json.Marshal(map[string]any{
 		"consumer_id":    consumerID,
 		"consumer_group": group,
 		"limit":          limit,
 	})
-	req, _ := http.NewRequest(http.MethodPost, addr+"/queues/"+queue+"/pull", bytes.NewReader(body))
-	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("Content-Type", "application/json")
 	start := time.Now()
-	resp, err := client.Do(req)
+	resp, err := broker.SendHTTP(context.Background(), client, fh.MethodPOST, addr+"/queues/"+queue+"/pull", body, map[string]string{"Authorization": "Bearer " + token, "Content-Type": "application/json"})
 	if err != nil {
 		return time.Since(start), 0, false, 0
 	}
-	data, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return time.Since(start), resp.StatusCode, false, 0
+	data, _ := io.ReadAll(resp.Reader())
+	resp.Close()
+	if resp.StatusCode() < 200 || resp.StatusCode() >= 300 {
+		return time.Since(start), resp.StatusCode(), false, 0
 	}
 	var msgs []struct {
 		ID         string `json:"id"`
 		LeaseToken string `json:"lease_token"`
 	}
 	if err := json.Unmarshal(data, &msgs); err != nil || len(msgs) == 0 {
-		return time.Since(start), resp.StatusCode, true, 0 // empty queue is not an error
+		return time.Since(start), resp.StatusCode(), true, 0 // empty queue is not an error
 	}
 
 	acks := make([]map[string]any, len(msgs))
@@ -301,28 +286,24 @@ func doPullJSON(client *http.Client, addr, token, queue string, limit int, consu
 		}
 	}
 	ackBody, _ := json.Marshal(acks)
-	ackReq, _ := http.NewRequest(http.MethodPost, addr+"/ack/batch", bytes.NewReader(ackBody))
-	ackReq.Header.Set("Authorization", "Bearer "+token)
-	ackReq.Header.Set("Content-Type", "application/json")
-	ackReq.Header.Set("Prefer", "return=minimal")
-	ackResp, err := client.Do(ackReq)
+	ackResp, err := broker.SendHTTP(context.Background(), client, fh.MethodPOST, addr+"/ack/batch", ackBody, map[string]string{"Authorization": "Bearer " + token, "Content-Type": "application/json", "Prefer": "return=minimal"})
 	dur := time.Since(start)
 	if err != nil {
-		return dur, resp.StatusCode, false, 0
+		return dur, resp.StatusCode(), false, 0
 	}
-	ackData, _ := io.ReadAll(ackResp.Body)
-	ackResp.Body.Close()
-	if ackResp.StatusCode == http.StatusNoContent {
-		return dur, ackResp.StatusCode, true, len(msgs)
+	ackData, _ := io.ReadAll(ackResp.Reader())
+	ackResp.Close()
+	if ackResp.StatusCode() == fh.StatusNoContent {
+		return dur, ackResp.StatusCode(), true, len(msgs)
 	}
 	var ackOut struct {
 		Acked int `json:"acked"`
 	}
 	_ = json.Unmarshal(ackData, &ackOut)
-	return dur, ackResp.StatusCode, ackOut.Acked == len(msgs), ackOut.Acked
+	return dur, ackResp.StatusCode(), ackOut.Acked == len(msgs), ackOut.Acked
 }
 
-func doPublishFrame(client *http.Client, codec broker.FrameCodec, addr, token, queue string, payload []byte, batch int) (time.Duration, int, bool, int) {
+func doPublishFrame(client *fh.Client, codec broker.FrameCodec, addr, token, queue string, payload []byte, batch int) (time.Duration, int, bool, int) {
 	if batch <= 0 {
 		batch = 1
 	}
@@ -334,71 +315,61 @@ func doPublishFrame(client *http.Client, codec broker.FrameCodec, addr, token, q
 	if err != nil {
 		return 0, 0, false, 0
 	}
-	req, _ := http.NewRequest(http.MethodPost, addr+"/v1/publish/frame/batch", bytes.NewReader(body))
-	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("Content-Type", "application/vnd.pool.broker.frames")
-	req.Header.Set("Prefer", "return=minimal")
 	start := time.Now()
-	resp, err := client.Do(req)
+	resp, err := broker.SendHTTP(context.Background(), client, fh.MethodPOST, addr+"/v1/publish/frame/batch", body, map[string]string{"Authorization": "Bearer " + token, "Content-Type": "application/vnd.pool.broker.frames", "Prefer": "return=minimal"})
 	dur := time.Since(start)
 	if err != nil {
 		return dur, 0, false, 0
 	}
-	io.Copy(io.Discard, resp.Body)
-	resp.Body.Close()
-	ok := resp.StatusCode >= 200 && resp.StatusCode < 300
+	io.Copy(io.Discard, resp.Reader())
+	resp.Close()
+	ok := resp.StatusCode() >= 200 && resp.StatusCode() < 300
 	if !ok {
-		return dur, resp.StatusCode, false, 0
+		return dur, resp.StatusCode(), false, 0
 	}
-	return dur, resp.StatusCode, true, batch
+	return dur, resp.StatusCode(), true, batch
 }
 
-func doPullFrame(client *http.Client, codec broker.FrameCodec, addr, token, queue string, limit int, consumerID, group string) (time.Duration, int, bool, int) {
+func doPullFrame(client *fh.Client, codec broker.FrameCodec, addr, token, queue string, limit int, consumerID, group string) (time.Duration, int, bool, int) {
 	query := url.Values{}
 	query.Set("queue", queue)
 	query.Set("consumer_id", consumerID)
 	query.Set("consumer_group", group)
 	query.Set("limit", strconv.Itoa(limit))
-	req, _ := http.NewRequest(http.MethodGet, addr+"/v1/poll/frame?"+query.Encode(), nil)
-	req.Header.Set("Authorization", "Bearer "+token)
 	start := time.Now()
-	resp, err := client.Do(req)
+	resp, err := broker.SendHTTP(context.Background(), client, fh.MethodGET, addr+"/v1/poll/frame?"+query.Encode(), nil, map[string]string{"Authorization": "Bearer " + token})
 	if err != nil {
 		return time.Since(start), 0, false, 0
 	}
-	data, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return time.Since(start), resp.StatusCode, false, 0
+	data, _ := io.ReadAll(resp.Reader())
+	resp.Close()
+	if resp.StatusCode() < 200 || resp.StatusCode() >= 300 {
+		return time.Since(start), resp.StatusCode(), false, 0
 	}
 	messages, err := broker.DecodeMessageFrameBatch(data, codec, limit)
 	if err != nil {
-		return time.Since(start), resp.StatusCode, false, 0
+		return time.Since(start), resp.StatusCode(), false, 0
 	}
 	if len(messages) == 0 {
-		return time.Since(start), resp.StatusCode, true, 0
+		return time.Since(start), resp.StatusCode(), true, 0
 	}
 	acks := make([]broker.AckRequest, len(messages))
 	for i := range messages {
 		acks[i] = broker.AckRequest{MessageID: messages[i].ID, Queue: queue, LeaseToken: messages[i].LeaseToken, ConsumerID: consumerID}
 	}
 	ackBody := broker.EncodeAckFrameBatch(nil, acks)
-	ackReq, _ := http.NewRequest(http.MethodPost, addr+"/v1/ack/frame", bytes.NewReader(ackBody))
-	ackReq.Header.Set("Authorization", "Bearer "+token)
-	ackReq.Header.Set("Content-Type", "application/vnd.pool.broker.acks")
-	ackReq.Header.Set("Prefer", "return=minimal")
-	ackResp, err := client.Do(ackReq)
+	ackResp, err := broker.SendHTTP(context.Background(), client, fh.MethodPOST, addr+"/v1/ack/frame", ackBody, map[string]string{"Authorization": "Bearer " + token, "Content-Type": "application/vnd.pool.broker.acks", "Prefer": "return=minimal"})
 	dur := time.Since(start)
 	if err != nil {
 		return dur, 0, false, 0
 	}
-	io.Copy(io.Discard, ackResp.Body)
-	ackResp.Body.Close()
-	ok := ackResp.StatusCode >= 200 && ackResp.StatusCode < 300
+	io.Copy(io.Discard, ackResp.Reader())
+	ackResp.Close()
+	ok := ackResp.StatusCode() >= 200 && ackResp.StatusCode() < 300
 	if !ok {
-		return dur, ackResp.StatusCode, false, 0
+		return dur, ackResp.StatusCode(), false, 0
 	}
-	return dur, ackResp.StatusCode, true, len(messages)
+	return dur, ackResp.StatusCode(), true, len(messages)
 }
 
 func randPayload(n int) []byte {

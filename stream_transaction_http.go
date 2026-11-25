@@ -1,9 +1,11 @@
 package broker
 
 import (
+	"bytes"
 	"encoding/json"
 	"io"
-	"net/http"
+
+	"github.com/oarkflow/fh"
 )
 
 // StreamTransactionHTTPPayload is the request body for
@@ -17,49 +19,42 @@ type StreamTransactionHTTPPayload struct {
 	Messages       []PublishHTTPPayload `json:"messages,omitempty"`
 }
 
-func (a AdminServer) streamTransaction(w http.ResponseWriter, r *http.Request, stream string) {
-	if r.Method != http.MethodPost {
-		methodBroker(w)
-		return
+func (a AdminServer) streamTransaction(c fh.Ctx) error {
+	stream, ok, err := streamParam(c)
+	if !ok {
+		return err
 	}
-	principal := principalFromContext(r.Context())
+	principal := principalFromContext(c.Context())
 	acl := a.effectiveACL()
 	if !acl.Authorize(principal, PermissionPublish) || !acl.Authorize(principal, PermissionStreamCommit) {
-		WriteBrokerError(w, ErrUnauthorized)
-		return
+		return WriteBrokerError(c, ErrUnauthorized)
 	}
 	var req StreamTransactionHTTPPayload
-	decoder := json.NewDecoder(r.Body)
+	decoder := json.NewDecoder(bytes.NewReader(c.Body()))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&req); err != nil {
-		WriteBrokerError(w, errf(ErrInvalidMessage, "invalid stream transaction body"))
-		return
+		return WriteBrokerError(c, errf(ErrInvalidMessage, "invalid stream transaction body"))
 	}
 	if err := decoder.Decode(new(any)); err != io.EOF {
-		WriteBrokerError(w, errf(ErrInvalidMessage, "stream transaction requires one JSON object"))
-		return
+		return WriteBrokerError(c, errf(ErrInvalidMessage, "stream transaction requires one JSON object"))
 	}
-	tx, err := a.Broker.Publisher().BeginStreamTx(r.Context(), OffsetCommit{Stream: stream, ConsumerGroup: req.ConsumerGroup, Offset: req.Offset, TenantID: req.TenantID}, req.ExpectedOffset)
+	tx, err := a.Broker.Publisher().BeginStreamTx(c.Context(), OffsetCommit{Stream: stream, ConsumerGroup: req.ConsumerGroup, Offset: req.Offset, TenantID: req.TenantID}, req.ExpectedOffset)
 	if err != nil {
-		WriteBrokerError(w, err)
-		return
+		return WriteBrokerError(c, err)
 	}
-	defer tx.Rollback(r.Context())
+	defer tx.Rollback(c.Context())
 	for _, message := range req.Messages {
 		payload, err := message.PayloadBytes()
 		if err != nil {
-			WriteBrokerError(w, errf(ErrInvalidMessage, "invalid output payload: %v", err))
-			return
+			return WriteBrokerError(c, errf(ErrInvalidMessage, "invalid output payload: %v", err))
 		}
 		if err := tx.Publish(message.Topic, payload, message.PublishOptions()...); err != nil {
-			WriteBrokerError(w, err)
-			return
+			return WriteBrokerError(c, err)
 		}
 	}
-	results, err := tx.Commit(r.Context())
+	results, err := tx.Commit(c.Context())
 	if err != nil {
-		WriteBrokerError(w, err)
-		return
+		return WriteBrokerError(c, err)
 	}
-	writeBrokerJSON(w, results)
+	return writeBrokerJSON(c, results)
 }

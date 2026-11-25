@@ -2,11 +2,11 @@ package broker
 
 import (
 	"context"
-	"net/http"
-	"net/http/httptest"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/oarkflow/fh"
 )
 
 func TestPersistentWebhookRetryAndCircuitBreaker(t *testing.T) {
@@ -14,14 +14,13 @@ func TestPersistentWebhookRetryAndCircuitBreaker(t *testing.T) {
 	var shouldFail atomic.Bool
 	shouldFail.Store(true)
 
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := newCatchAllServer(t, func(c fh.Ctx) error {
 		requestCount.Add(1)
 		if shouldFail.Load() {
-			w.WriteHeader(http.StatusInternalServerError)
-			return
+			return c.SendStatus(fh.StatusInternalServerError)
 		}
-		w.WriteHeader(http.StatusOK)
-	}))
+		return c.SendStatus(fh.StatusOK)
+	})
 	defer srv.Close()
 
 	dispatcher := NewPersistentWebhookDispatcher(PersistentWebhookConfig{
@@ -84,10 +83,10 @@ func TestPersistentWebhookRetryAndCircuitBreaker(t *testing.T) {
 func TestPersistentWebhookReTrigger(t *testing.T) {
 	var delivered atomic.Int32
 
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := newCatchAllServer(t, func(c fh.Ctx) error {
 		delivered.Add(1)
-		w.WriteHeader(http.StatusOK)
-	}))
+		return c.SendStatus(fh.StatusOK)
+	})
 	defer srv.Close()
 
 	dispatcher := NewPersistentWebhookDispatcher(PersistentWebhookConfig{

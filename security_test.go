@@ -8,11 +8,11 @@ import (
 	"crypto/x509/pkix"
 	"encoding/json"
 	"errors"
-	"net/http"
-	"net/http/httptest"
 	"os"
 	"testing"
 	"time"
+
+	"github.com/oarkflow/fh"
 )
 
 func TestTenantScopedPrincipalCannotCrossTenant(t *testing.T) {
@@ -130,25 +130,25 @@ func TestTenantScopedStatsLagAndNotificationsDoNotLeak(t *testing.T) {
 
 func TestTenantScopedCredentialCannotAccessGlobalRoutes(t *testing.T) {
 	b := MustNew(Config{})
-	server := httptest.NewServer(AdminServer{Broker: b, ACL: NewACL(AdminToken{
+	server := newTestServer(t, AdminServer{Broker: b, ACL: NewACL(AdminToken{
 		Name:        "tenant-router",
 		Token:       "tenant-token",
 		Permissions: []string{PermissionRouteRead, PermissionRouteWrite},
 		Tenants:     []string{"a"},
-	})}.Handler())
+	})}.App())
 	defer server.Close()
-	for _, method := range []string{http.MethodGet, http.MethodPost} {
-		req, err := http.NewRequest(method, server.URL+"/routes", bytes.NewBufferString(`{"name":"private"}`))
+	for _, method := range []string{fh.MethodGET, fh.MethodPOST} {
+		req, err := newHTTPRequest(method, server.URL+"/routes", bytes.NewBufferString(`{"name":"private"}`))
 		if err != nil {
 			t.Fatal(err)
 		}
 		req.Header.Set("Authorization", "Bearer tenant-token")
-		resp, err := http.DefaultClient.Do(req)
+		resp, err := testHTTP.Do(req)
 		if err != nil {
 			t.Fatal(err)
 		}
 		resp.Body.Close()
-		if resp.StatusCode != http.StatusForbidden {
+		if resp.StatusCode != fh.StatusForbidden {
 			t.Fatalf("%s /routes status=%d, want 403", method, resp.StatusCode)
 		}
 	}
@@ -183,14 +183,14 @@ func TestTenantScopedTaskAndSagaIsolation(t *testing.T) {
 
 func TestSSESecureDefaultAndTenantBroadcastFilter(t *testing.T) {
 	b := MustNew(Config{})
-	server := httptest.NewServer(NewSSEServer(b, SSEConfig{Path: "/events"}).Handler())
+	server := newTestServer(t, NewSSEServer(b, SSEConfig{Path: "/events"}).App())
 	defer server.Close()
-	resp, err := http.Get(server.URL + "/events")
+	resp, err := testHTTP.Get(server.URL + "/events")
 	if err != nil {
 		t.Fatal(err)
 	}
 	resp.Body.Close()
-	if resp.StatusCode != http.StatusUnauthorized {
+	if resp.StatusCode != fh.StatusUnauthorized {
 		t.Fatalf("SSE without configured authentication status=%d", resp.StatusCode)
 	}
 	tenantA := AdminPrincipal{Name: "a", Tenants: []string{"a"}}
@@ -233,34 +233,34 @@ func TestAdminServerRequiresAuthAndACL(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer b.Stop(context.Background())
-	srv := httptest.NewServer(AdminServer{Broker: b, ACL: NewACL(AdminToken{Name: "reader", Token: "read-token", Permissions: []string{PermissionQueueRead}}, AdminToken{Name: "admin", Token: "admin-token", Permissions: []string{PermissionAdminAll}})}.Handler())
+	srv := newTestServer(t, AdminServer{Broker: b, ACL: NewACL(AdminToken{Name: "reader", Token: "read-token", Permissions: []string{PermissionQueueRead}}, AdminToken{Name: "admin", Token: "admin-token", Permissions: []string{PermissionAdminAll}})}.App())
 	defer srv.Close()
-	resp, err := http.Post(srv.URL+"/publish", "application/json", bytes.NewBufferString(`{"queue":"q","payload":{"x":1}}`))
+	resp, err := testHTTP.Post(srv.URL+"/publish", "application/json", bytes.NewBufferString(`{"queue":"q","payload":{"x":1}}`))
 	if err != nil {
 		t.Fatal(err)
 	}
 	resp.Body.Close()
-	if resp.StatusCode != http.StatusUnauthorized {
+	if resp.StatusCode != fh.StatusUnauthorized {
 		t.Fatalf("expected unauthorized without token, got %d", resp.StatusCode)
 	}
-	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/publish", bytes.NewBufferString(`{"queue":"q","payload":{"x":1}}`))
+	req, _ := newHTTPRequest(fh.MethodPOST, srv.URL+"/publish", bytes.NewBufferString(`{"queue":"q","payload":{"x":1}}`))
 	req.Header.Set("Authorization", "Bearer read-token")
-	resp, err = http.DefaultClient.Do(req)
+	resp, err = testHTTP.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
 	resp.Body.Close()
-	if resp.StatusCode != http.StatusForbidden {
+	if resp.StatusCode != fh.StatusForbidden {
 		t.Fatalf("expected forbidden for reader publish, got %d", resp.StatusCode)
 	}
-	req, _ = http.NewRequest(http.MethodPost, srv.URL+"/publish", bytes.NewBufferString(`{"queue":"q","payload":{"x":1}}`))
+	req, _ = newHTTPRequest(fh.MethodPOST, srv.URL+"/publish", bytes.NewBufferString(`{"queue":"q","payload":{"x":1}}`))
 	req.Header.Set("Authorization", "Bearer admin-token")
-	resp, err = http.DefaultClient.Do(req)
+	resp, err = testHTTP.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode != fh.StatusOK {
 		t.Fatalf("expected admin publish ok, got %d", resp.StatusCode)
 	}
 }
@@ -295,12 +295,19 @@ func TestACLCertificateIdentityMapping(t *testing.T) {
 	if !ok || principal.Name != "mtls-worker" || len(principal.Tenants) != 1 || principal.Tenants[0] != "a" {
 		t.Fatalf("certificate principal=%+v ok=%t", principal, ok)
 	}
-	request := httptest.NewRequest(http.MethodGet, "https://broker/stats", nil)
-	request.TLS = &tls.ConnectionState{VerifiedChains: [][]*x509.Certificate{{certificate}}}
+	// Attach the verified chain the way fh's TLS listener does, then
+	// authenticate through the request context.
 	server := AdminServer{ACL: acl}
-	if got, ok := server.authenticate(request); !ok || got.Name != "mtls-worker" {
-		t.Fatalf("HTTP certificate mapping principal=%+v ok=%t", got, ok)
-	}
+	app := fh.New(fh.WithStartupBannerDisabled(true))
+	app.Get("/stats", func(c fh.Ctx) error {
+		c.SetContext(fh.WithTLSState(c.Context(), tls.ConnectionState{VerifiedChains: [][]*x509.Certificate{{certificate}}}))
+		got, ok := server.authenticate(c)
+		if !ok || got.Name != "mtls-worker" {
+			t.Errorf("HTTP certificate mapping principal=%+v ok=%t", got, ok)
+		}
+		return c.SendStatus(fh.StatusNoContent)
+	})
+	serveTest(t, app, newTestRequest(fh.MethodGET, "/stats", nil))
 }
 
 func TestACLPrincipalAdmissionLimits(t *testing.T) {
@@ -336,16 +343,16 @@ func TestACLPrincipalAdmissionLimits(t *testing.T) {
 
 func TestAdminServerRejectsOversizedBody(t *testing.T) {
 	b := MustNew(Config{})
-	srv := httptest.NewServer(AdminServer{Broker: b, InsecureDev: true, MaxBodyBytes: 16}.Handler())
+	srv := newTestServer(t, AdminServer{Broker: b, InsecureDev: true, MaxBodyBytes: 16}.App())
 	defer srv.Close()
 	payload := map[string]any{"queue": "q", "payload": string(bytes.Repeat([]byte("x"), 128))}
 	buf, _ := json.Marshal(payload)
-	resp, err := http.Post(srv.URL+"/publish", "application/json", bytes.NewReader(buf))
+	resp, err := testHTTP.Post(srv.URL+"/publish", "application/json", bytes.NewReader(buf))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusBadRequest && resp.StatusCode != http.StatusRequestEntityTooLarge {
+	if resp.StatusCode != fh.StatusBadRequest && resp.StatusCode != fh.StatusPayloadTooLarge {
 		t.Fatalf("expected body limit failure, got %d", resp.StatusCode)
 	}
 }

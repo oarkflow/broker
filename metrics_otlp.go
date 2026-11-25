@@ -1,18 +1,18 @@
 package broker
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
-	"net/http"
 	"os"
 	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
+
+	"github.com/oarkflow/fh"
 )
 
 // OTLPConfig configures the OpenTelemetry Protocol exporter.
@@ -22,7 +22,7 @@ type OTLPConfig struct {
 	ServiceName        string            `json:"service_name"`
 	ResourceAttributes map[string]string `json:"resource_attributes"`
 	Headers            map[string]string `json:"headers"`
-	Client             *http.Client      `json:"-"`
+	Client             *fh.Client        `json:"-"`
 }
 
 // OTLPOption configures an OTLPConfig.
@@ -60,7 +60,7 @@ func WithOTLPHeaders(headers map[string]string) OTLPOption {
 }
 
 // WithOTLPHTTPClient sets a custom HTTP client.
-func WithOTLPHTTPClient(client *http.Client) OTLPOption {
+func WithOTLPHTTPClient(client *fh.Client) OTLPOption {
 	return func(c *OTLPConfig) {
 		c.Client = client
 	}
@@ -111,7 +111,7 @@ func NewOTLPExporter(endpoint string, interval time.Duration, metrics *Prometheu
 	}
 
 	if cfg.Client == nil {
-		cfg.Client = &http.Client{Timeout: 10 * time.Second}
+		cfg.Client = NewHTTPClient(HTTPClientConfig{Timeout: 10 * time.Second})
 	}
 
 	return &OTLPExporter{
@@ -160,28 +160,24 @@ func (e *OTLPExporter) Export(ctx context.Context) error {
 		return fmt.Errorf("marshal otlp payload: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, e.cfg.Endpoint, bytes.NewReader(data))
-	if err != nil {
-		return fmt.Errorf("create otlp request: %w", err)
-	}
-
-	req.Header.Set("Content-Type", "application/json")
+	headers := make(map[string]string, len(e.cfg.Headers)+1)
+	headers["Content-Type"] = "application/json"
 	for k, v := range e.cfg.Headers {
-		req.Header.Set(k, v)
+		headers[k] = v
 	}
 
-	resp, err := e.cfg.Client.Do(req)
+	resp, err := SendHTTP(ctx, e.cfg.Client, fh.MethodPOST, e.cfg.Endpoint, data, headers)
 	if err != nil {
 		return fmt.Errorf("post otlp metrics: %w", err)
 	}
-	defer resp.Body.Close()
+	defer resp.Close()
 
-	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+	if resp.IsSuccess() {
 		return nil
 	}
 
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-	return fmt.Errorf("otlp endpoint returned status %d: %s", resp.StatusCode, string(body))
+	body, _ := io.ReadAll(io.LimitReader(resp.Reader(), 1024))
+	return fmt.Errorf("otlp endpoint returned status %d: %s", resp.StatusCode(), string(body))
 }
 
 // OTLP JSON data structures according to OpenTelemetry Protocol specification.

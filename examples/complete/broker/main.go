@@ -5,7 +5,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -56,18 +55,18 @@ func run(addr, data, token string) error {
 		return err
 	}
 	admin := broker.AdminServer{Broker: b, Token: token, MaxBodyBytes: 1 << 20}
-	server := admin.HTTPServer(addr)
+	server := admin.App()
 	serverErr := make(chan error, 1)
-	go func() { serverErr <- server.ListenAndServe() }()
+	go func() { serverErr <- broker.ListenHTTPApp(server, addr, nil) }()
 	fmt.Printf("complete broker listening addr=%s data=%s\n", addr, data)
 	select {
 	case <-ctx.Done():
 	case err := <-serverErr:
-		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err != nil {
 			return err
 		}
 	}
 	stopCtx, stop := context.WithTimeout(context.Background(), 10*time.Second)
 	defer stop()
-	return errors.Join(server.Shutdown(stopCtx), b.Stop(stopCtx))
+	return errors.Join(broker.ShutdownHTTPApp(stopCtx, server), b.Stop(stopCtx))
 }

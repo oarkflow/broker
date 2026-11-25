@@ -2,11 +2,12 @@ package broker
 
 import (
 	"encoding/json"
-	"net/http"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/oarkflow/fh"
 )
 
 // DLQDashboardResponse contains an aggregated overview of all dead-letter queues.
@@ -103,17 +104,12 @@ func extractMessageError(m Message) string {
 }
 
 // dlqDashboard handles GET /dlq/dashboard
-func (a AdminServer) dlqDashboard(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		methodBroker(w)
-		return
-	}
+func (a AdminServer) dlqDashboard(c fh.Ctx) error {
 
-	ctx := r.Context()
+	ctx := c.Context()
 	st, err := a.Broker.store.Stats(ctx)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+		return httpError(c, err.Error(), fh.StatusInternalServerError)
 	}
 
 	dlqMap := st.DLQ
@@ -207,33 +203,29 @@ func (a AdminServer) dlqDashboard(w http.ResponseWriter, r *http.Request) {
 	})
 	resp.QueueCount = len(resp.Queues)
 
-	writeBrokerJSON(w, resp)
+	return writeBrokerJSON(c, resp)
 }
 
 // dlqErrors handles GET /dlq/:queue/errors
-func (a AdminServer) dlqErrors(w http.ResponseWriter, r *http.Request, queue string) {
-	if r.Method != http.MethodGet {
-		methodBroker(w)
-		return
-	}
+func (a AdminServer) dlqErrors(c fh.Ctx, queue string) error {
 
-	ctx := r.Context()
+	ctx := c.Context()
 	sampleLimit := 1000
-	if s := r.URL.Query().Get("sample"); s != "" {
+	if s := queryString(c, "sample"); s != "" {
 		if v, err := strconv.Atoi(s); err == nil && v > 0 {
 			sampleLimit = v
 		}
 	}
 
 	page := 1
-	if p := r.URL.Query().Get("page"); p != "" {
+	if p := queryString(c, "page"); p != "" {
 		if v, err := strconv.Atoi(p); err == nil && v > 0 {
 			page = v
 		}
 	}
 
 	limit := 20
-	if l := r.URL.Query().Get("limit"); l != "" {
+	if l := queryString(c, "limit"); l != "" {
 		if v, err := strconv.Atoi(l); err == nil && v > 0 {
 			limit = v
 			if limit > 100 {
@@ -244,8 +236,7 @@ func (a AdminServer) dlqErrors(w http.ResponseWriter, r *http.Request, queue str
 
 	msgs, err := a.Broker.store.ListDLQ(ctx, queue, sampleLimit)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusNotFound)
-		return
+		return httpError(c, err.Error(), fh.StatusNotFound)
 	}
 
 	type errStats struct {
@@ -328,29 +319,25 @@ func (a AdminServer) dlqErrors(w http.ResponseWriter, r *http.Request, queue str
 		})
 	}
 
-	writeBrokerJSON(w, resp)
+	return writeBrokerJSON(c, resp)
 }
 
 // dlqReplayAll handles POST /dlq/:queue/replay-all
-func (a AdminServer) dlqReplayAll(w http.ResponseWriter, r *http.Request, queue string) {
-	if r.Method != http.MethodPost {
-		methodBroker(w)
-		return
-	}
+func (a AdminServer) dlqReplayAll(c fh.Ctx, queue string) error {
 
-	ctx := r.Context()
+	ctx := c.Context()
 	var req DLQReplayAllRequest
-	if r.Header.Get("Content-Type") == "application/json" {
-		_ = json.NewDecoder(r.Body).Decode(&req)
+	if c.Get("Content-Type") == "application/json" {
+		_ = decodeJSON(c, &req)
 	}
 	if req.Destination == "" {
-		req.Destination = r.URL.Query().Get("dest")
+		req.Destination = queryString(c, "dest")
 	}
 	if req.Destination == "" {
 		req.Destination = strings.TrimSuffix(queue, ".dlq")
 	}
 	if req.BatchSize <= 0 {
-		if bs := r.URL.Query().Get("batch_size"); bs != "" {
+		if bs := queryString(c, "batch_size"); bs != "" {
 			if v, err := strconv.Atoi(bs); err == nil && v > 0 {
 				req.BatchSize = v
 			}
@@ -362,7 +349,7 @@ func (a AdminServer) dlqReplayAll(w http.ResponseWriter, r *http.Request, queue 
 	if req.BatchSize > 1000 {
 		req.BatchSize = 1000
 	}
-	if !req.DryRun && r.URL.Query().Get("dry_run") == "true" {
+	if !req.DryRun && queryString(c, "dry_run") == "true" {
 		req.DryRun = true
 	}
 
@@ -371,7 +358,7 @@ func (a AdminServer) dlqReplayAll(w http.ResponseWriter, r *http.Request, queue 
 	mode := MoveRemoveSource
 	if req.Mode != "" {
 		mode = req.Mode
-	} else if m := r.URL.Query().Get("mode"); m != "" {
+	} else if m := queryString(c, "mode"); m != "" {
 		mode = MoveMode(m)
 	}
 
@@ -406,8 +393,7 @@ func (a AdminServer) dlqReplayAll(w http.ResponseWriter, r *http.Request, queue 
 			DryRun:          req.DryRun,
 		})
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusConflict)
-			return
+			return httpError(c, err.Error(), fh.StatusConflict)
 		}
 
 		batches++
@@ -420,7 +406,7 @@ func (a AdminServer) dlqReplayAll(w http.ResponseWriter, r *http.Request, queue 
 		}
 	}
 
-	writeBrokerJSON(w, DLQReplayAllResponse{
+	writeBrokerJSON(c, DLQReplayAllResponse{
 		Source:      queue,
 		Destination: req.Destination,
 		Replayed:    totalReplayed,
@@ -428,34 +414,31 @@ func (a AdminServer) dlqReplayAll(w http.ResponseWriter, r *http.Request, queue 
 		DryRun:      req.DryRun,
 		MessageIDs:  allMovedIDs,
 	})
+	return nil
 }
 
 // dlqArchive handles POST /dlq/:queue/archive
-func (a AdminServer) dlqArchive(w http.ResponseWriter, r *http.Request, queue string) {
-	if r.Method != http.MethodPost {
-		methodBroker(w)
-		return
-	}
+func (a AdminServer) dlqArchive(c fh.Ctx, queue string) error {
 
-	ctx := r.Context()
+	ctx := c.Context()
 	var req DLQArchiveRequest
-	if r.Header.Get("Content-Type") == "application/json" {
-		_ = json.NewDecoder(r.Body).Decode(&req)
+	if c.Get("Content-Type") == "application/json" {
+		_ = decodeJSON(c, &req)
 	}
 	if req.Destination == "" {
-		req.Destination = r.URL.Query().Get("dest")
+		req.Destination = queryString(c, "dest")
 	}
 	if req.Destination == "" {
 		req.Destination = queue + ".archive"
 	}
 	if req.Limit <= 0 {
-		if l := r.URL.Query().Get("limit"); l != "" {
+		if l := queryString(c, "limit"); l != "" {
 			if v, err := strconv.Atoi(l); err == nil && v > 0 {
 				req.Limit = v
 			}
 		}
 	}
-	if !req.DryRun && r.URL.Query().Get("dry_run") == "true" {
+	if !req.DryRun && queryString(c, "dry_run") == "true" {
 		req.DryRun = true
 	}
 
@@ -484,29 +467,25 @@ func (a AdminServer) dlqArchive(w http.ResponseWriter, r *http.Request, queue st
 		DryRun:          req.DryRun,
 	})
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusConflict)
-		return
+		return httpError(c, err.Error(), fh.StatusConflict)
 	}
 
-	writeBrokerJSON(w, DLQArchiveResponse{
+	writeBrokerJSON(c, DLQArchiveResponse{
 		Source:      queue,
 		Destination: req.Destination,
 		Archived:    res.Moved,
 		DryRun:      req.DryRun,
 		MessageIDs:  res.MessageIDs,
 	})
+	return nil
 }
 
 // dlqExport handles GET /dlq/:queue/export streaming NDJSON
-func (a AdminServer) dlqExport(w http.ResponseWriter, r *http.Request, queue string) {
-	if r.Method != http.MethodGet {
-		methodBroker(w)
-		return
-	}
+func (a AdminServer) dlqExport(c fh.Ctx, queue string) error {
 
-	ctx := r.Context()
+	ctx := c.Context()
 	limit := 1000
-	if l := r.URL.Query().Get("limit"); l != "" {
+	if l := queryString(c, "limit"); l != "" {
 		if v, err := strconv.Atoi(l); err == nil && v > 0 {
 			limit = v
 		}
@@ -514,21 +493,21 @@ func (a AdminServer) dlqExport(w http.ResponseWriter, r *http.Request, queue str
 
 	msgs, err := a.Broker.store.ListDLQ(ctx, queue, limit)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusNotFound)
-		return
+		return httpError(c, err.Error(), fh.StatusNotFound)
 	}
 
-	w.Header().Set("Content-Type", "application/x-ndjson")
-	w.Header().Set("X-Content-Type-Options", "nosniff")
-	flusher, _ := w.(http.Flusher)
-	enc := json.NewEncoder(w)
-
-	for _, m := range msgs {
-		if err := enc.Encode(m); err != nil {
-			return
+	c.Set("Content-Type", "application/x-ndjson")
+	c.Set("X-Content-Type-Options", "nosniff")
+	return c.Stream(func(sw *fh.StreamWriter) error {
+		enc := json.NewEncoder(sw)
+		for _, m := range msgs {
+			if err := enc.Encode(m); err != nil {
+				return err
+			}
+			if err := sw.Flush(); err != nil {
+				return err
+			}
 		}
-		if flusher != nil {
-			flusher.Flush()
-		}
-	}
+		return nil
+	})
 }

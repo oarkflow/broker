@@ -2,19 +2,24 @@ package broker
 
 import (
 	"context"
-	"crypto/x509"
 	"encoding/json"
-	"net/http"
+	"net/url"
+	"path"
+	"strings"
 	"sync"
 	"time"
 
-	"github.com/coder/websocket"
+	"github.com/oarkflow/fh"
+	"github.com/oarkflow/fh/pkg/websocket"
 )
 
 // RFC6455Config configures the real WebSocket data-plane listener. It is
 // deliberately separate from SSEConfig.
 type RFC6455Config struct {
-	Path           string
+	Path string
+	// OriginPatterns lists host patterns (path.Match syntax, e.g.
+	// "*.example.com") whose browser Origin may connect. Same-host origins and
+	// requests without an Origin header are always accepted.
 	OriginPatterns []string
 	MaxConnections int
 	MaxMessageSize int64
@@ -27,9 +32,16 @@ type RFC6455Config struct {
 type RFC6455Server struct {
 	broker  *Broker
 	cfg     RFC6455Config
+	actions map[string]webSocketAction
 	mu      sync.Mutex
 	conns   map[*websocket.Conn]struct{}
 	pending int
+}
+
+// webSocketAction is one routable WebSocket request action.
+type webSocketAction struct {
+	permission string
+	handle     func(ctx context.Context, body json.RawMessage) (any, error)
 }
 
 func NewRFC6455Server(b *Broker, cfg RFC6455Config) *RFC6455Server {
@@ -48,7 +60,9 @@ func NewRFC6455Server(b *Broker, cfg RFC6455Config) *RFC6455Server {
 	if cfg.WriteTimeout <= 0 {
 		cfg.WriteTimeout = 10 * time.Second
 	}
-	return &RFC6455Server{broker: b, cfg: cfg, conns: make(map[*websocket.Conn]struct{})}
+	s := &RFC6455Server{broker: b, cfg: cfg, conns: make(map[*websocket.Conn]struct{})}
+	s.actions = s.actionRoutes()
+	return s
 }
 
 type webSocketRequest struct {
@@ -64,81 +78,151 @@ type webSocketResponse struct {
 	Data  any    `json:"data,omitempty"`
 }
 
-func (s *RFC6455Server) Handler() http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != s.cfg.Path {
-			http.NotFound(w, r)
-			return
-		}
-		if !s.cfg.InsecureDev && s.cfg.ACL == nil {
-			http.Error(w, "authentication is not configured", http.StatusServiceUnavailable)
-			return
-		}
-		principal, ok := AdminPrincipal{Name: "development", Permissions: []string{PermissionAdminAll}}, s.cfg.InsecureDev
-		if !ok {
-			var cert *x509.Certificate
-			if r.TLS != nil && len(r.TLS.VerifiedChains) > 0 && len(r.TLS.VerifiedChains[0]) > 0 {
-				cert = r.TLS.VerifiedChains[0][0]
-			}
-			principal, ok = authenticateAdminCredential(s.cfg.ACL, bearerToken(r), cert)
-		}
-		if !ok {
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
-			return
-		}
-		release := func() {}
-		if s.cfg.ACL != nil {
-			var err error
-			release, err = s.cfg.ACL.AdmitConnection(principal)
-			if err != nil {
-				http.Error(w, err.Error(), http.StatusTooManyRequests)
-				return
-			}
-		}
-		defer release()
-		s.mu.Lock()
-		if len(s.conns)+s.pending >= s.cfg.MaxConnections {
-			s.mu.Unlock()
-			http.Error(w, "too many connections", http.StatusServiceUnavailable)
-			return
-		}
-		s.pending++
-		s.mu.Unlock()
-		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{OriginPatterns: s.cfg.OriginPatterns})
-		s.mu.Lock()
-		s.pending--
+// App returns the WebSocket application, serving cfg.Path.
+func (s *RFC6455Server) App() *fh.App {
+	app := NewHTTPApp(HTTPServerOptions{ReadHeaderTimeout: 5 * time.Second}, fh.WithNotFoundHandler(plainNotFound), fh.WithMethodNotAllowedHandler(plainMethodNotAllowed))
+	s.Register(app)
+	return app
+}
+
+// Register mounts the WebSocket endpoint on app at cfg.Path. Authentication
+// and connection admission run as middleware before the upgrade.
+func (s *RFC6455Server) Register(app *fh.App) {
+	app.Get(s.cfg.Path, s.admit, s.upgrade())
+}
+
+const (
+	webSocketPrincipalLocal = "broker.ws.principal"
+	webSocketPendingLocal   = "broker.ws.pending"
+)
+
+// admit authenticates the upgrade request and reserves a connection slot.
+func (s *RFC6455Server) admit(c fh.Ctx) error {
+	if !s.cfg.InsecureDev && s.cfg.ACL == nil {
+		return httpError(c, "authentication is not configured", fh.StatusServiceUnavailable)
+	}
+	principal, ok := AdminPrincipal{Name: "development", Permissions: []string{PermissionAdminAll}}, s.cfg.InsecureDev
+	if !ok {
+		principal, ok = authenticateAdminCredential(s.cfg.ACL, bearerToken(c), verifiedPeerCertificate(c))
+	}
+	if !ok {
+		return httpError(c, "unauthorized", fh.StatusUnauthorized)
+	}
+	release := func() {}
+	if s.cfg.ACL != nil {
+		var err error
+		release, err = s.cfg.ACL.AdmitConnection(principal)
 		if err != nil {
-			s.mu.Unlock()
-			return
+			return httpError(c, err.Error(), fh.StatusTooManyRequests)
 		}
-		conn.SetReadLimit(s.cfg.MaxMessageSize)
-		s.conns[conn] = struct{}{}
+	}
+	defer release()
+	s.mu.Lock()
+	if len(s.conns)+s.pending >= s.cfg.MaxConnections {
 		s.mu.Unlock()
-		defer func() {
+		return httpError(c, "too many connections", fh.StatusServiceUnavailable)
+	}
+	s.pending++
+	s.mu.Unlock()
+	// The upgrade runs synchronously inside Next, so the admission release and
+	// the pending slot cover the whole connection. track() converts the
+	// pending slot into a live connection once the handshake succeeds.
+	tracked := false
+	c.Locals(webSocketPendingLocal, &tracked)
+	defer func() {
+		if !tracked {
 			s.mu.Lock()
-			delete(s.conns, conn)
+			s.pending--
 			s.mu.Unlock()
-			_ = conn.Close(websocket.StatusNormalClosure, "")
-		}()
-		s.serve(r.Context(), conn, principal)
-	})
+		}
+	}()
+	c.Locals(webSocketPrincipalLocal, principal)
+	return c.Next()
+}
+
+func (s *RFC6455Server) upgrade() fh.HandlerFunc {
+	cfg := websocket.DefaultConfig()
+	cfg.MaxMessageSize = int(s.cfg.MaxMessageSize)
+	cfg.MaxFrameSize = int(s.cfg.MaxMessageSize)
+	cfg.MaxFragments = 1 << 10
+	cfg.ReadTimeout = s.cfg.ReadTimeout
+	cfg.WriteTimeout = s.cfg.WriteTimeout
+	// Request throughput is governed by the ACL's per-principal rate limit.
+	cfg.MaxMessagesPerSecond = 1 << 20
+	cfg.EnableHeartbeat = false
+	cfg.CheckOrigin = s.checkOrigin
+	return func(c fh.Ctx) error {
+		principal, _ := c.Locals(webSocketPrincipalLocal).(AdminPrincipal)
+		tracked, _ := c.Locals(webSocketPendingLocal).(*bool)
+		// The upgrade outlives the request Ctx, so capture its context now.
+		parent := context.WithoutCancel(c.Context())
+		return websocket.NewWithConfig(cfg, func(conn *websocket.Conn) error {
+			s.track(conn, tracked)
+			defer s.untrack(conn)
+			s.serve(parent, conn, principal)
+			return nil
+		})(c)
+	}
+}
+
+// checkOrigin accepts non-browser clients, same-host origins and origins whose
+// host matches one of cfg.OriginPatterns.
+func (s *RFC6455Server) checkOrigin(c fh.Ctx) bool {
+	origin := c.Get("Origin")
+	if origin == "" {
+		return true
+	}
+	u, err := url.Parse(origin)
+	if err != nil || u.Host == "" {
+		return false
+	}
+	if strings.EqualFold(u.Host, c.Hostname()) || strings.EqualFold(u.Host, c.Get("Host")) {
+		return true
+	}
+	for _, pattern := range s.cfg.OriginPatterns {
+		if ok, _ := path.Match(strings.ToLower(pattern), strings.ToLower(u.Host)); ok {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *RFC6455Server) track(conn *websocket.Conn, pending *bool) {
+	s.mu.Lock()
+	if pending != nil && !*pending {
+		*pending = true
+		s.pending--
+	}
+	s.conns[conn] = struct{}{}
+	s.mu.Unlock()
+}
+
+func (s *RFC6455Server) untrack(conn *websocket.Conn) {
+	s.mu.Lock()
+	delete(s.conns, conn)
+	s.mu.Unlock()
+	_ = conn.CloseWithStatus(websocket.CloseNormalClosure, "")
 }
 
 func (s *RFC6455Server) serve(parent context.Context, conn *websocket.Conn, principal AdminPrincipal) {
+	ctx := context.WithValue(parent, adminPrincipalKey{}, principal)
 	for {
-		readCtx, cancel := context.WithTimeout(parent, s.cfg.ReadTimeout)
-		messageType, data, err := conn.Read(readCtx)
-		cancel()
+		_ = conn.SetReadDeadline(time.Now().Add(s.cfg.ReadTimeout))
+		opcode, data, err := conn.ReadMessage()
 		if err != nil {
 			return
 		}
-		if messageType != websocket.MessageText {
-			s.write(conn, webSocketResponse{OK: false, Error: "binary WebSocket messages are not supported"})
+		if opcode != websocket.Text {
+			if s.write(conn, webSocketResponse{OK: false, Error: "binary WebSocket messages are not supported"}) != nil {
+				return
+			}
 			continue
 		}
 		var req webSocketRequest
 		if err := json.Unmarshal(data, &req); err != nil {
-			s.write(conn, webSocketResponse{OK: false, Error: "invalid JSON request"})
+			if s.write(conn, webSocketResponse{OK: false, Error: "invalid JSON request"}) != nil {
+				return
+			}
 			continue
 		}
 		if s.cfg.ACL != nil {
@@ -149,9 +233,7 @@ func (s *RFC6455Server) serve(parent context.Context, conn *websocket.Conn, prin
 				continue
 			}
 		}
-		ctx := context.WithValue(parent, adminPrincipalKey{}, principal)
-		resp := s.dispatch(ctx, principal, req)
-		if err := s.write(conn, resp); err != nil {
+		if err := s.write(conn, s.dispatch(ctx, principal, req)); err != nil {
 			return
 		}
 	}
@@ -162,76 +244,87 @@ func (s *RFC6455Server) write(conn *websocket.Conn, response webSocketResponse) 
 	if err != nil {
 		return err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), s.cfg.WriteTimeout)
-	defer cancel()
-	return conn.Write(ctx, websocket.MessageText, data)
+	_ = conn.SetWriteDeadline(time.Now().Add(s.cfg.WriteTimeout))
+	return conn.WriteMessage(websocket.Text, data)
+}
+
+// actionRoutes is the WebSocket action router: each action declares the
+// permission it requires and decodes its own body.
+func (s *RFC6455Server) actionRoutes() map[string]webSocketAction {
+	b := s.broker
+	return map[string]webSocketAction{
+		"publish": {PermissionPublish, func(ctx context.Context, body json.RawMessage) (any, error) {
+			var in struct {
+				Topic    string            `json:"topic"`
+				Queue    string            `json:"queue,omitempty"`
+				Stream   string            `json:"stream,omitempty"`
+				TenantID string            `json:"tenant_id,omitempty"`
+				Payload  json.RawMessage   `json:"payload"`
+				Headers  map[string]string `json:"headers,omitempty"`
+			}
+			if err := json.Unmarshal(body, &in); err != nil {
+				return nil, err
+			}
+			return b.Publisher().Publish(ctx, in.Topic, in.Payload, WithQueue(in.Queue), WithStream(in.Stream), WithTenantID(in.TenantID), WithHeaders(in.Headers))
+		}},
+		"poll": {PermissionConsumerPoll, func(ctx context.Context, body json.RawMessage) (any, error) {
+			var in LeaseRequest
+			if err := json.Unmarshal(body, &in); err != nil {
+				return nil, err
+			}
+			tenant, err := resolveTenant(ctx, in.TenantID)
+			if err != nil {
+				return nil, err
+			}
+			in.TenantID = tenant
+			return b.Store().Lease(ctx, in)
+		}},
+		"ack": {PermissionMessageAck, func(ctx context.Context, body json.RawMessage) (any, error) {
+			var in AckRequest
+			if err := json.Unmarshal(body, &in); err != nil {
+				return nil, err
+			}
+			return nil, b.Store().Ack(ctx, in)
+		}},
+		"nack": {PermissionMessageNack, func(ctx context.Context, body json.RawMessage) (any, error) {
+			var in NackRequest
+			if err := json.Unmarshal(body, &in); err != nil {
+				return nil, err
+			}
+			return nil, b.Store().Nack(ctx, in)
+		}},
+		"read_stream": {PermissionStreamRead, func(ctx context.Context, body json.RawMessage) (any, error) {
+			var in StreamReadRequest
+			if err := json.Unmarshal(body, &in); err != nil {
+				return nil, err
+			}
+			return b.ReadStream(ctx, in)
+		}},
+		"commit_offset": {PermissionStreamCommit, func(ctx context.Context, body json.RawMessage) (any, error) {
+			var in OffsetCommit
+			if err := json.Unmarshal(body, &in); err != nil {
+				return nil, err
+			}
+			return nil, b.CommitOffset(ctx, in)
+		}},
+		"stats": {PermissionBrokerRead, func(ctx context.Context, _ json.RawMessage) (any, error) {
+			return b.Store().Stats(ctx)
+		}},
+		"health": {PermissionBrokerRead, func(context.Context, json.RawMessage) (any, error) {
+			return b.Health(), nil
+		}},
+	}
 }
 
 func (s *RFC6455Server) dispatch(ctx context.Context, principal AdminPrincipal, req webSocketRequest) webSocketResponse {
-	permission := map[string]string{
-		"publish":       PermissionPublish,
-		"poll":          PermissionConsumerPoll,
-		"ack":           PermissionMessageAck,
-		"nack":          PermissionMessageNack,
-		"read_stream":   PermissionStreamRead,
-		"commit_offset": PermissionStreamCommit,
-		"stats":         PermissionBrokerRead,
-		"health":        PermissionBrokerRead,
-	}[req.Action]
-	if permission == "" {
+	action, ok := s.actions[req.Action]
+	if !ok {
 		return webSocketResponse{ID: req.ID, OK: false, Error: "unknown action"}
 	}
-	if !s.cfg.InsecureDev && !s.cfg.ACL.Authorize(principal, permission) {
+	if !s.cfg.InsecureDev && !s.cfg.ACL.Authorize(principal, action.permission) {
 		return webSocketResponse{ID: req.ID, OK: false, Error: "forbidden"}
 	}
-	var data any
-	var err error
-	switch req.Action {
-	case "publish":
-		var in struct {
-			Topic    string            `json:"topic"`
-			Queue    string            `json:"queue,omitempty"`
-			Stream   string            `json:"stream,omitempty"`
-			TenantID string            `json:"tenant_id,omitempty"`
-			Payload  json.RawMessage   `json:"payload"`
-			Headers  map[string]string `json:"headers,omitempty"`
-		}
-		if err = json.Unmarshal(req.Body, &in); err == nil {
-			data, err = s.broker.Publisher().Publish(ctx, in.Topic, in.Payload, WithQueue(in.Queue), WithStream(in.Stream), WithTenantID(in.TenantID), WithHeaders(in.Headers))
-		}
-	case "poll":
-		var in LeaseRequest
-		if err = json.Unmarshal(req.Body, &in); err == nil {
-			in.TenantID, err = resolveTenant(ctx, in.TenantID)
-			if err == nil {
-				data, err = s.broker.Store().Lease(ctx, in)
-			}
-		}
-	case "ack":
-		var in AckRequest
-		if err = json.Unmarshal(req.Body, &in); err == nil {
-			err = s.broker.Store().Ack(ctx, in)
-		}
-	case "nack":
-		var in NackRequest
-		if err = json.Unmarshal(req.Body, &in); err == nil {
-			err = s.broker.Store().Nack(ctx, in)
-		}
-	case "read_stream":
-		var in StreamReadRequest
-		if err = json.Unmarshal(req.Body, &in); err == nil {
-			data, err = s.broker.ReadStream(ctx, in)
-		}
-	case "commit_offset":
-		var in OffsetCommit
-		if err = json.Unmarshal(req.Body, &in); err == nil {
-			err = s.broker.CommitOffset(ctx, in)
-		}
-	case "stats":
-		data, err = s.broker.Store().Stats(ctx)
-	case "health":
-		data = s.broker.Health()
-	}
+	data, err := action.handle(ctx, req.Body)
 	if err != nil {
 		return webSocketResponse{ID: req.ID, OK: false, Error: err.Error()}
 	}
@@ -246,7 +339,7 @@ func (s *RFC6455Server) Stop() {
 	}
 	s.mu.Unlock()
 	for _, conn := range connections {
-		_ = conn.Close(websocket.StatusGoingAway, "server shutting down")
+		_ = conn.CloseWithStatus(websocket.CloseGoingAway, "server shutting down")
 	}
 }
 

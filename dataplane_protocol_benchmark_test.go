@@ -4,17 +4,17 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"net/http"
-	"net/http/httptest"
 	"strconv"
 	"testing"
+
+	"github.com/oarkflow/fh"
 )
 
 // These benchmarks measure the server's per-message protocol cost in isolation:
 // prebuilt request bodies, an in-memory store, and no network or client. They
 // show what each wire format costs the broker, separate from fsync or load
 // generator effects.
-func protocolBenchServer(b *testing.B) (http.Handler, *Broker) {
+func protocolBenchServer(b *testing.B) (*fh.App, *Broker) {
 	b.Helper()
 	store := NewMemoryStore()
 	store.SetHistoryLimit(0)
@@ -27,7 +27,7 @@ func protocolBenchServer(b *testing.B) (http.Handler, *Broker) {
 	if err := br.DeclareQueue(context.Background(), QueueConfig{Name: "q"}); err != nil {
 		b.Fatal(err)
 	}
-	return AdminServer{Broker: br, InsecureDev: true, MaxBodyBytes: 64 << 20}.Handler(), br
+	return AdminServer{Broker: br, InsecureDev: true, MaxBodyBytes: 64 << 20}.App(), br
 }
 
 func benchmarkProtocolPublish(b *testing.B, frame bool, batch int) {
@@ -58,11 +58,10 @@ func benchmarkProtocolPublish(b *testing.B, frame bool, batch int) {
 	b.SetBytes(int64(len(body)))
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		req := httptest.NewRequest(http.MethodPost, path, bytes.NewReader(body))
+		req := newTestRequest(fh.MethodPOST, path, bytes.NewReader(body))
 		req.Header.Set("Content-Type", ctype)
 		req.Header.Set("Prefer", "return=minimal")
-		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, req)
+		rec := serveTest(b, h, req)
 		if rec.Code >= 300 {
 			b.Fatalf("status %d: %s", rec.Code, rec.Body.String())
 		}
@@ -110,14 +109,13 @@ func benchmarkProtocolConsume(b *testing.B, frame bool, batch int) {
 			b.Fatal(err)
 		}
 	}
-	do := func(method, path, ctype string, body []byte) *httptest.ResponseRecorder {
-		req := httptest.NewRequest(method, path, bytes.NewReader(body))
+	do := func(method, path, ctype string, body []byte) *testRecorder {
+		req := newTestRequest(method, path, bytes.NewReader(body))
 		if ctype != "" {
 			req.Header.Set("Content-Type", ctype)
 		}
 		req.Header.Set("Prefer", "return=minimal")
-		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, req)
+		rec := serveTest(b, h, req)
 		return rec
 	}
 	b.ReportAllocs()
@@ -127,7 +125,7 @@ func benchmarkProtocolConsume(b *testing.B, frame bool, batch int) {
 		refill()
 		b.StartTimer()
 		if frame {
-			rec := do(http.MethodGet, "/v1/poll/frame?queue=q&consumer_id=c&consumer_group=g&limit="+strconv.Itoa(batch), "", nil)
+			rec := do(fh.MethodGET, "/v1/poll/frame?queue=q&consumer_id=c&consumer_group=g&limit="+strconv.Itoa(batch), "", nil)
 			msgs, err := DecodeMessageFrameBatch(rec.Body.Bytes(), br.FrameCodec(), batch)
 			if err != nil || len(msgs) != batch {
 				b.Fatalf("poll: n=%d err=%v code=%d", len(msgs), err, rec.Code)
@@ -136,12 +134,12 @@ func benchmarkProtocolConsume(b *testing.B, frame bool, batch int) {
 			for j := range msgs {
 				acks[j] = AckRequest{MessageID: msgs[j].ID, Queue: "q", LeaseToken: msgs[j].LeaseToken, ConsumerID: "c"}
 			}
-			if rec := do(http.MethodPost, "/v1/ack/frame", "application/vnd.pool.broker.acks", EncodeAckFrameBatch(nil, acks)); rec.Code >= 300 {
+			if rec := do(fh.MethodPOST, "/v1/ack/frame", "application/vnd.pool.broker.acks", EncodeAckFrameBatch(nil, acks)); rec.Code >= 300 {
 				b.Fatalf("ack: %d %s", rec.Code, rec.Body.String())
 			}
 		} else {
 			body, _ := json.Marshal(map[string]any{"consumer_id": "c", "consumer_group": "g", "limit": batch})
-			rec := do(http.MethodPost, "/queues/q/pull", "application/json", body)
+			rec := do(fh.MethodPOST, "/queues/q/pull", "application/json", body)
 			var msgs []struct {
 				ID         string `json:"id"`
 				LeaseToken string `json:"lease_token"`
@@ -154,7 +152,7 @@ func benchmarkProtocolConsume(b *testing.B, frame bool, batch int) {
 				acks[j] = map[string]any{"message_id": m.ID, "queue": "q", "lease_token": m.LeaseToken, "consumer_id": "c"}
 			}
 			ackBody, _ := json.Marshal(acks)
-			if rec := do(http.MethodPost, "/ack/batch", "application/json", ackBody); rec.Code >= 300 {
+			if rec := do(fh.MethodPOST, "/ack/batch", "application/json", ackBody); rec.Code >= 300 {
 				b.Fatalf("ack: %d %s", rec.Code, rec.Body.String())
 			}
 		}

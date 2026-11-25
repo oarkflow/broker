@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"net/http"
 	"os"
 	"os/signal"
 	"sort"
@@ -14,6 +13,9 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/oarkflow/broker"
+	"github.com/oarkflow/fh"
 )
 
 type TUIScreen int
@@ -46,7 +48,7 @@ const (
 type TUIApp struct {
 	addr           string
 	token          string
-	client         *http.Client
+	client         *fh.Client
 	currentScreen  TUIScreen
 	mu             sync.Mutex
 	statusMsg      string
@@ -58,57 +60,53 @@ func NewTUIApp(addr, token string) *TUIApp {
 	return &TUIApp{
 		addr:          strings.TrimRight(addr, "/"),
 		token:         token,
-		client:        &http.Client{Timeout: 3 * time.Second},
+		client:        broker.NewHTTPClient(broker.HTTPClientConfig{Timeout: 3 * time.Second}),
 		currentScreen: ScreenDashboard,
 		statusMsg:     "Ready. Press 1-5 to switch tabs, 'r' to refresh, 'q' to quit.",
 	}
 }
 
-func (app *TUIApp) fetchJSON(path string, target any) error {
-	req, err := http.NewRequest(http.MethodGet, app.addr+path, nil)
-	if err != nil {
-		return err
+// headers returns the request headers for a TUI call.
+func (app *TUIApp) headers(contentType string) map[string]string {
+	h := map[string]string{}
+	if contentType != "" {
+		h["Content-Type"] = contentType
 	}
 	if app.token != "" {
-		req.Header.Set("Authorization", "Bearer "+app.token)
+		h["Authorization"] = "Bearer " + app.token
 	}
-	resp, err := app.client.Do(req)
+	return h
+}
+
+func (app *TUIApp) fetchJSON(path string, target any) error {
+	resp, err := broker.SendHTTP(context.Background(), app.client, fh.MethodGET, app.addr+path, nil, app.headers(""))
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		b, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(b))
+	defer resp.Close()
+	if resp.StatusCode() != fh.StatusOK {
+		b, _ := io.ReadAll(resp.Reader())
+		return fmt.Errorf("HTTP %d: %s", resp.StatusCode(), string(b))
 	}
-	return json.NewDecoder(resp.Body).Decode(target)
+	return json.NewDecoder(resp.Reader()).Decode(target)
 }
 
 func (app *TUIApp) postJSON(path string, body any, target any) error {
-	var r io.Reader
+	var payload []byte
 	if body != nil {
-		b, _ := json.Marshal(body)
-		r = strings.NewReader(string(b))
+		payload, _ = json.Marshal(body)
 	}
-	req, err := http.NewRequest(http.MethodPost, app.addr+path, r)
+	resp, err := broker.SendHTTP(context.Background(), app.client, fh.MethodPOST, app.addr+path, payload, app.headers("application/json"))
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Content-Type", "application/json")
-	if app.token != "" {
-		req.Header.Set("Authorization", "Bearer "+app.token)
-	}
-	resp, err := app.client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 300 {
-		b, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(b))
+	defer resp.Close()
+	if resp.StatusCode() >= 300 {
+		b, _ := io.ReadAll(resp.Reader())
+		return fmt.Errorf("HTTP %d: %s", resp.StatusCode(), string(b))
 	}
 	if target != nil {
-		return json.NewDecoder(resp.Body).Decode(target)
+		return json.NewDecoder(resp.Reader()).Decode(target)
 	}
 	return nil
 }

@@ -4,9 +4,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/http"
 	"strconv"
 	"time"
+
+	"github.com/oarkflow/fh"
 )
 
 var (
@@ -232,8 +233,7 @@ func ErrorCode(err error) string {
 	if err == nil {
 		return ""
 	}
-	var maxBytesErr *http.MaxBytesError
-	if errors.As(err, &maxBytesErr) {
+	if requestBodyTooLarge(err) {
 		return errorCodes[ErrMessageTooLarge]
 	}
 	var be BrokerError
@@ -260,49 +260,48 @@ func SentinelForCode(code string) (error, bool) {
 // and a retryable condition from a permanent one.
 func HTTPStatusForError(err error) int {
 	if err == nil {
-		return http.StatusOK
+		return fh.StatusOK
 	}
-	var maxBytesErr *http.MaxBytesError
-	if errors.As(err, &maxBytesErr) {
-		return http.StatusRequestEntityTooLarge
+	if requestBodyTooLarge(err) {
+		return fh.StatusPayloadTooLarge
 	}
 	if IsPermanent(err) {
-		return http.StatusBadRequest
+		return fh.StatusBadRequest
 	}
 	switch {
 	case errors.Is(err, ErrUnauthenticated):
-		return http.StatusUnauthorized
+		return fh.StatusUnauthorized
 	case errors.Is(err, ErrUnauthorized), errors.Is(err, ErrConsumerBanned):
-		return http.StatusForbidden
+		return fh.StatusForbidden
 	case errors.Is(err, ErrLeaseLost), errors.Is(err, ErrOffsetConflict):
-		return http.StatusConflict
+		return fh.StatusConflict
 	case errors.Is(err, ErrInvalidMessage), errors.Is(err, ErrPermanent), errors.Is(err, ErrUnsupportedMode):
-		return http.StatusBadRequest
+		return fh.StatusBadRequest
 	case errors.Is(err, ErrMessageTooLarge):
-		return http.StatusRequestEntityTooLarge
+		return fh.StatusPayloadTooLarge
 	case errors.Is(err, ErrCursorExpired):
-		return http.StatusGone
+		return fh.StatusGone
 	case errors.Is(err, ErrQueueNotFound), errors.Is(err, ErrTopicNotFound),
 		errors.Is(err, ErrStreamNotFound), errors.Is(err, ErrMessageNotFound),
 		errors.Is(err, ErrPartitionNotFound), errors.Is(err, ErrSchemaNotFound), errors.Is(err, ErrClusterNodeNotFound), errors.Is(err, ErrClusterACLPrincipalNotFound), errors.Is(err, ErrClusterTransactionNotFound):
-		return http.StatusNotFound
+		return fh.StatusNotFound
 	case errors.Is(err, ErrDuplicateMessage), errors.Is(err, ErrTaskAlreadyExists),
 		errors.Is(err, ErrClusterNodeInUse), errors.Is(err, ErrClusterNodeUnavailable),
 		errors.Is(err, ErrClusterChangePending), errors.Is(err, ErrPartitionReassignmentRequired),
 		errors.Is(err, ErrPartitionTransferRequired):
-		return http.StatusConflict
+		return fh.StatusConflict
 	case errors.Is(err, ErrCancelled):
-		return http.StatusRequestTimeout
+		return fh.StatusRequestTimeout
 	case errors.Is(err, ErrBackpressure), errors.Is(err, ErrRateLimited), errors.Is(err, ErrThrottled):
-		return http.StatusTooManyRequests
+		return fh.StatusTooManyRequests
 	case errors.Is(err, ErrPublishTimeout), errors.Is(err, ErrRequestTimeout):
-		return http.StatusGatewayTimeout
+		return fh.StatusGatewayTimeout
 	case errors.Is(err, ErrBrokerUnavailable), errors.Is(err, ErrStorageUnavailable),
 		errors.Is(err, ErrQuorumUnavailable), errors.Is(err, ErrNotLeader),
 		errors.Is(err, ErrStaleEpoch), errors.Is(err, ErrStopped):
-		return http.StatusServiceUnavailable
+		return fh.StatusServiceUnavailable
 	default:
-		return http.StatusConflict
+		return fh.StatusConflict
 	}
 }
 
@@ -324,9 +323,9 @@ type wireErrorBody struct {
 // The body is additive: a client that does not understand it still sees a
 // non-empty message, and WriteBrokerError keeps the message text identical to
 // err.Error() so existing string-matching clients keep working.
-func WriteBrokerError(w http.ResponseWriter, err error) {
+func WriteBrokerError(c fh.Ctx, err error) error {
 	if err == nil {
-		return
+		return nil
 	}
 	body := wireErrorBody{
 		Code:      ErrorCode(err),
@@ -335,9 +334,16 @@ func WriteBrokerError(w http.ResponseWriter, err error) {
 		Class:     retryClassOf(err),
 		Details:   retryDetailsOf(err),
 	}
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(HTTPStatusForError(err))
-	_ = json.NewEncoder(w).Encode(wireError{Error: body})
+	return writeBrokerJSONStatus(c, HTTPStatusForError(err), wireError{Error: body})
+}
+
+// requestBodyTooLarge reports whether err is fh's request-body limit error.
+func requestBodyTooLarge(err error) bool {
+	if errors.Is(err, fh.ErrBodyTooLarge) {
+		return true
+	}
+	var he *fh.HTTPError
+	return errors.As(err, &he) && he.Status == fh.StatusPayloadTooLarge
 }
 
 // RemoteError is a broker error recovered from the wire. It unwraps to the

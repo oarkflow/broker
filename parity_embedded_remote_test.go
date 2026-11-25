@@ -7,11 +7,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/http"
-	"net/http/httptest"
 	"sort"
 	"testing"
 	"time"
+
+	"github.com/oarkflow/fh"
 )
 
 // This is a differential harness: it runs the same logical operation through the
@@ -109,11 +109,10 @@ func publishRemote(t *testing.T, a AdminServer, body map[string]any) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	req := httptest.NewRequest(http.MethodPost, "/v1/publish", bytes.NewReader(raw))
+	req := newTestRequest(fh.MethodPOST, "/v1/publish", bytes.NewReader(raw))
 	req.Header.Set("Content-Type", "application/json")
-	rec := httptest.NewRecorder()
-	a.dataPlane(rec, req)
-	if rec.Code != http.StatusOK {
+	rec := serveTest(t, a.App(), req)
+	if rec.Code != fh.StatusOK {
 		t.Fatalf("remote publish: status %d body %s", rec.Code, rec.Body.String())
 	}
 	var res PublishResult
@@ -448,11 +447,10 @@ func TestPollFrameHonoursConsumerState(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				req := httptest.NewRequest(http.MethodPost, endpoint, bytes.NewReader(body))
+				req := newTestRequest(fh.MethodPOST, endpoint, bytes.NewReader(body))
 				req.Header.Set("Content-Type", "application/json")
-				rec := httptest.NewRecorder()
-				admin.dataPlane(rec, req)
-				if rec.Code != http.StatusOK {
+				rec := serveTest(t, admin.App(), req)
+				if rec.Code != fh.StatusOK {
 					t.Fatalf("status %d body %s", rec.Code, rec.Body.String())
 				}
 

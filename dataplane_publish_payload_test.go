@@ -4,9 +4,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"net/http"
-	"net/http/httptest"
 	"testing"
+
+	"github.com/oarkflow/fh"
 )
 
 // PublishHTTPPayload used to carry no JSON tags, so encoding/json matched Go
@@ -162,10 +162,9 @@ func TestV1PublishPreservesTenantFromSnakeCaseBody(t *testing.T) {
 			defer b.Stop(context.Background())
 			a := AdminServer{Broker: b, Token: "t", InsecureDev: true}
 
-			req := httptest.NewRequest(http.MethodPost, "/v1/publish", bytes.NewReader([]byte(tc.body)))
-			rec := httptest.NewRecorder()
-			a.dataPlane(rec, req)
-			if rec.Code != http.StatusOK {
+			req := newTestRequest(fh.MethodPOST, "/v1/publish", bytes.NewReader([]byte(tc.body)))
+			rec := serveTest(t, a.App(), req)
+			if rec.Code != fh.StatusOK {
 				t.Fatalf("status %d body %s", rec.Code, rec.Body.String())
 			}
 
@@ -201,10 +200,9 @@ func TestV1PublishBatchPreservesTenantFromSnakeCaseBody(t *testing.T) {
 	a := AdminServer{Broker: b, Token: "t", InsecureDev: true}
 
 	body := `{"messages":[{"topic":"t1","tenant_id":"tenant-a","payload":{"a":1}},{"topic":"t2","tenant_id":"tenant-b","payload":{"b":2}}]}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/publish/batch", bytes.NewReader([]byte(body)))
-	rec := httptest.NewRecorder()
-	a.dataPlane(rec, req)
-	if rec.Code != http.StatusOK {
+	req := newTestRequest(fh.MethodPOST, "/v1/publish/batch", bytes.NewReader([]byte(body)))
+	rec := serveTest(t, a.App(), req)
+	if rec.Code != fh.StatusOK {
 		t.Fatalf("status %d body %s", rec.Code, rec.Body.String())
 	}
 	var res BatchPublishResult

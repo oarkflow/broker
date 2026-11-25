@@ -1,15 +1,15 @@
 package broker
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"math/rand"
-	"net/http"
 	"sync"
 	"time"
+
+	"github.com/oarkflow/fh"
 )
 
 // WebhookAttempt records an individual delivery attempt for audit and replay.
@@ -27,7 +27,7 @@ type WebhookAttempt struct {
 
 // PersistentWebhookConfig configures the PersistentWebhookDispatcher.
 type PersistentWebhookConfig struct {
-	HTTPClient       *http.Client
+	HTTPClient       *fh.Client
 	MaxAttempts      int
 	InitialBackoff   time.Duration
 	MaxBackoff       time.Duration
@@ -49,7 +49,7 @@ type PersistentWebhookDispatcher struct {
 // NewPersistentWebhookDispatcher creates a new dispatcher.
 func NewPersistentWebhookDispatcher(cfg PersistentWebhookConfig) *PersistentWebhookDispatcher {
 	if cfg.HTTPClient == nil {
-		cfg.HTTPClient = &http.Client{Timeout: 10 * time.Second}
+		cfg.HTTPClient = NewHTTPClient(HTTPClientConfig{Timeout: 10 * time.Second})
 	}
 	if cfg.MaxAttempts <= 0 {
 		cfg.MaxAttempts = 3
@@ -127,15 +127,11 @@ func (d *PersistentWebhookDispatcher) Dispatch(ctx context.Context, url string, 
 			}
 		}
 
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
-		if err != nil {
-			return err
-		}
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("X-Notification-ID", n.ID)
-		req.Header.Set("X-Delivery-Attempt", fmt.Sprint(attempt))
-
-		resp, err := d.cfg.HTTPClient.Do(req)
+		resp, err := SendHTTP(ctx, d.cfg.HTTPClient, fh.MethodPOST, url, body, map[string]string{
+			"Content-Type":       "application/json",
+			"X-Notification-ID":  n.ID,
+			"X-Delivery-Attempt": fmt.Sprint(attempt),
+		})
 		att := &WebhookAttempt{
 			ID:             fmt.Sprintf("att-%d-%s", time.Now().UnixNano(), n.ID),
 			URL:            url,
@@ -154,10 +150,10 @@ func (d *PersistentWebhookDispatcher) Dispatch(ctx context.Context, url string, 
 			continue
 		}
 
-		att.StatusCode = resp.StatusCode
-		_ = resp.Body.Close()
+		att.StatusCode = resp.StatusCode()
+		_ = resp.Close()
 
-		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		if resp.IsSuccess() {
 			att.Success = true
 			d.recordAttempt(url, att)
 			cb.RecordSuccess()
@@ -165,7 +161,7 @@ func (d *PersistentWebhookDispatcher) Dispatch(ctx context.Context, url string, 
 		}
 
 		att.Success = false
-		att.Error = fmt.Sprintf("status code: %d", resp.StatusCode)
+		att.Error = fmt.Sprintf("status code: %d", resp.StatusCode())
 		lastErr = errors.New(att.Error)
 		d.recordAttempt(url, att)
 		cb.RecordFailure()

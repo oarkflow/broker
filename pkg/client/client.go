@@ -12,7 +12,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net/http"
 	"net/url"
 	"os"
 	"sort"
@@ -21,6 +20,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/oarkflow/fh"
 
 	"github.com/oarkflow/broker"
 	"github.com/oarkflow/broker/cluster"
@@ -59,10 +60,15 @@ type Config struct {
 	// MaxResponseBytes bounds HTTP response body memory use for JSON and raw calls.
 	// A non-positive value uses the 64 MiB default.
 	MaxResponseBytes int64
-	HTTPClient       *http.Client
-	Pool             *fw.Pool
-	Hooks            Hooks
-	FrameCodec       broker.FrameCodec
+	// HTTPClient is an optional caller-built fh client, used as-is. Its
+	// timeout must exceed PollWait or long polls will race it.
+	HTTPClient *fh.Client
+	// HTTPTimeout bounds each exchange of the client New builds. Values at or
+	// below PollWait are raised to PollWait plus headroom.
+	HTTPTimeout time.Duration
+	Pool        *fw.Pool
+	Hooks       Hooks
+	FrameCodec  broker.FrameCodec
 	// TLSCertFile is the path to the client TLS certificate for mTLS.
 	TLSCertFile string
 	// TLSKeyFile is the path to the client TLS private key for mTLS.
@@ -96,7 +102,7 @@ type NotificationEvent struct {
 }
 type Client struct {
 	cfg                   Config
-	http                  *http.Client
+	http                  *fh.Client
 	mu                    sync.RWMutex
 	urls                  []string
 	active                int
@@ -161,14 +167,17 @@ func New(cfg Config) *Client {
 	// deadline: the server kept the request open for the remainder of its window
 	// after the client had already given up, and the worker loop slept and retried.
 	// Each attempt therefore left an orphaned handler behind.
+	if cfg.HTTPTimeout <= cfg.PollWait {
+		cfg.HTTPTimeout = cfg.PollWait + pollTimeoutHeadroom
+	}
 	if cfg.HTTPClient == nil {
-		transport := tunedTransport()
+		var tlsCfg *tls.Config
 		if cfg.TLSCertFile != "" && cfg.TLSKeyFile != "" {
 			cert, err := tls.LoadX509KeyPair(cfg.TLSCertFile, cfg.TLSKeyFile)
 			if err != nil {
 				panic(fmt.Sprintf("client: load TLS keypair: %v", err))
 			}
-			tlsCfg := &tls.Config{
+			tlsCfg = &tls.Config{
 				Certificates:       []tls.Certificate{cert},
 				MinVersion:         tls.VersionTLS12,
 				InsecureSkipVerify: cfg.InsecureSkipVerify,
@@ -184,20 +193,19 @@ func New(cfg Config) *Client {
 				}
 				tlsCfg.RootCAs = pool
 			}
-			t := tunedTransport().(*http.Transport)
-			t.TLSClientConfig = tlsCfg
-			transport = t
 		} else if cfg.InsecureSkipVerify {
-			t := tunedTransport().(*http.Transport)
-			t.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
-			transport = t
+			tlsCfg = &tls.Config{InsecureSkipVerify: true}
 		}
-		cfg.HTTPClient = &http.Client{Transport: transport, Timeout: cfg.PollWait + pollTimeoutHeadroom}
-	} else if cfg.HTTPClient.Timeout > 0 && cfg.HTTPClient.Timeout <= cfg.PollWait {
-		// A caller-supplied client is respected, but a timeout at or below the
-		// long-poll window guarantees the race above, so raise it rather than
-		// failing every poll at the deadline.
-		cfg.HTTPClient.Timeout = cfg.PollWait + pollTimeoutHeadroom
+		// The idle pool is sized for many concurrent workers sharing one
+		// broker; connections per host are effectively unbounded.
+		cfg.HTTPClient = broker.NewHTTPClient(broker.HTTPClientConfig{
+			Timeout:             cfg.HTTPTimeout,
+			TLSConfig:           tlsCfg,
+			AllowInsecureTLS:    cfg.InsecureSkipVerify,
+			MaxIdleConns:        1024,
+			MaxIdleConnsPerHost: 512,
+			MaxConnsPerHost:     1 << 16,
+		})
 	}
 	c := cfg.HTTPClient
 	return &Client{cfg: cfg, http: c, urls: urls}
@@ -217,13 +225,13 @@ func remoteError(status int, body []byte) error {
 	if remote := broker.ParseRemoteError(status, body); remote != nil {
 		return remote
 	}
-	return fmt.Errorf("broker %s: %s", http.StatusText(status), strings.TrimSpace(string(body)))
+	return fmt.Errorf("broker %s: %s", fh.StatusReason(status), strings.TrimSpace(string(body)))
 }
 
 // isRetryableStatus is the fallback for servers that return an untyped error
 // body. Typed broker envelopes use their Retryable field instead.
 func isRetryableStatus(status int) bool {
-	return status == http.StatusTooManyRequests || status >= http.StatusInternalServerError
+	return status == fh.StatusTooManyRequests || status >= fh.StatusInternalServerError
 }
 
 func shouldFailover(method string, status int, body []byte) bool {
@@ -234,7 +242,7 @@ func shouldFailover(method string, status int, body []byte) bool {
 		// caller for an idempotency-aware decision.
 		return remote.Class == broker.RetryNotLeader || remote.Code == broker.ErrorCode(broker.ErrNotLeader)
 	}
-	readOnly := method == http.MethodGet || method == http.MethodHead || method == http.MethodOptions
+	readOnly := method == fh.MethodGET || method == fh.MethodHEAD || method == fh.MethodOPTIONS
 	return readOnly && isRetryableStatus(status)
 }
 
@@ -301,7 +309,7 @@ func (c *Client) Register(ctx context.Context, reg broker.ConsumerRegistration) 
 		reg.VisibilityTimeout = c.cfg.VisibilityTimeout.Nanoseconds()
 	}
 	var out broker.ConsumerInfo
-	err := c.doJSON(ctx, http.MethodPost, "/v1/consumers/register", reg, &out)
+	err := c.doJSON(ctx, fh.MethodPOST, "/v1/consumers/register", reg, &out)
 	if err == nil && c.cfg.Hooks.OnRegistered != nil {
 		c.cfg.Hooks.OnRegistered(Event{ConsumerID: out.ConsumerID, Group: out.Group, State: out.State, Time: time.Now()})
 	}
@@ -309,7 +317,7 @@ func (c *Client) Register(ctx context.Context, reg broker.ConsumerRegistration) 
 }
 func (c *Client) Heartbeat(ctx context.Context) (broker.ConsumerInfo, error) {
 	var out broker.ConsumerInfo
-	err := c.doJSON(ctx, http.MethodPost, "/v1/consumers/"+c.cfg.ConsumerID+"/heartbeat", nil, &out)
+	err := c.doJSON(ctx, fh.MethodPOST, "/v1/consumers/"+c.cfg.ConsumerID+"/heartbeat", nil, &out)
 	if err == nil && c.cfg.Hooks.OnHeartbeat != nil {
 		c.cfg.Hooks.OnHeartbeat(Event{ConsumerID: out.ConsumerID, Group: out.Group, State: out.State, Time: time.Now()})
 	}
@@ -320,7 +328,7 @@ func (c *Client) Subscribe(ctx context.Context, sub broker.RemoteSubscription) (
 		sub.AutoCreate = true
 	}
 	var out broker.ConsumerInfo
-	err := c.doJSON(ctx, http.MethodPost, "/v1/consumers/"+c.cfg.ConsumerID+"/subscribe", sub, &out)
+	err := c.doJSON(ctx, fh.MethodPOST, "/v1/consumers/"+c.cfg.ConsumerID+"/subscribe", sub, &out)
 	if err == nil && c.cfg.Hooks.OnSubscribed != nil {
 		c.cfg.Hooks.OnSubscribed(Event{ConsumerID: out.ConsumerID, Group: out.Group, State: out.State, Time: time.Now()})
 	}
@@ -335,7 +343,7 @@ func (c *Client) Poll(ctx context.Context, queue string, limit int) ([]broker.Me
 		c.cfg.Hooks.OnPollStart(Event{ConsumerID: c.cfg.ConsumerID, Group: c.cfg.Group, State: broker.ConsumerPolling, Time: time.Now()})
 	}
 	var out []broker.Message
-	err := c.doJSON(ctx, http.MethodPost, "/v1/poll", req, &out)
+	err := c.doJSON(ctx, fh.MethodPOST, "/v1/poll", req, &out)
 	return out, err
 }
 
@@ -361,7 +369,7 @@ func (c *Client) pollPartition(ctx context.Context, queue string, partition, lim
 		c.cfg.Hooks.OnPollStart(Event{ConsumerID: c.cfg.ConsumerID, Group: c.cfg.Group, State: broker.ConsumerPolling, Time: time.Now()})
 	}
 	var out []broker.Message
-	err = c.doJSONAt(ctx, base, http.MethodPost, "/v1/poll", req, &out)
+	err = c.doJSONAt(ctx, base, fh.MethodPOST, "/v1/poll", req, &out)
 	return out, err
 }
 
@@ -500,7 +508,7 @@ func (c *Client) assignedResourcePartitions(ctx context.Context, kind, name stri
 			Kind      string `json:"kind"`
 		} `json:"id"`
 	}
-	if err := c.doJSON(ctx, http.MethodGet, "/cluster/partitions", nil, &assignments); err != nil {
+	if err := c.doJSON(ctx, fh.MethodGET, "/cluster/partitions", nil, &assignments); err != nil {
 		return nil, err
 	}
 	partitionSet := make(map[int]struct{})
@@ -532,7 +540,7 @@ func (c *Client) GetClusterTransaction(ctx context.Context, id string) (*cluster
 	}
 	var transaction cluster.CoordinatorTransaction
 	path := "/cluster/transactions?id=" + url.QueryEscape(id)
-	if err := c.doJSON(ctx, http.MethodGet, path, nil, &transaction); err != nil {
+	if err := c.doJSON(ctx, fh.MethodGET, path, nil, &transaction); err != nil {
 		return nil, err
 	}
 	return &transaction, nil
@@ -557,7 +565,7 @@ func (c *Client) ListClusterTransactionsPage(ctx context.Context, after string, 
 		Transactions []*cluster.CoordinatorTransaction `json:"transactions"`
 		NextCursor   string                            `json:"next_cursor"`
 	}
-	if err := c.doJSON(ctx, http.MethodGet, "/cluster/transactions?"+query.Encode(), nil, &page); err != nil {
+	if err := c.doJSON(ctx, fh.MethodGET, "/cluster/transactions?"+query.Encode(), nil, &page); err != nil {
 		return nil, "", err
 	}
 	return page.Transactions, page.NextCursor, nil
@@ -579,7 +587,7 @@ func (c *Client) PruneClusterTransactions(ctx context.Context, before time.Time,
 	var result struct {
 		Pruned int `json:"pruned"`
 	}
-	if err := c.doJSON(ctx, http.MethodPost, "/cluster/transactions/prune", map[string]any{
+	if err := c.doJSON(ctx, fh.MethodPOST, "/cluster/transactions/prune", map[string]any{
 		"before": before.UTC(), "limit": limit,
 	}, &result); err != nil {
 		return 0, err
@@ -600,7 +608,7 @@ func (c *Client) ListPartitionQueue(ctx context.Context, queue string, partition
 		path += fmt.Sprintf("?limit=%d", limit)
 	}
 	var out []broker.Message
-	err = c.doJSONAt(ctx, base, http.MethodGet, path, nil, &out)
+	err = c.doJSONAt(ctx, base, fh.MethodGET, path, nil, &out)
 	return out, err
 }
 
@@ -631,7 +639,7 @@ func (c *Client) ListAssignedQueueDetailed(ctx context.Context, queue string, li
 	query.Set("limit", strconv.Itoa(limit))
 	var report broker.AssignedQueueMessages
 	path := "/queues/" + url.PathEscape(queue) + "/assigned/messages?" + query.Encode()
-	if err := c.doJSON(ctx, http.MethodGet, path, nil, &report); err != nil {
+	if err := c.doJSON(ctx, fh.MethodGET, path, nil, &report); err != nil {
 		return nil, err
 	}
 	if report.Queue != queue || len(report.Partitions) == 0 || len(report.Partitions) > maxTopicPagePartitions || len(report.Messages) > limit {
@@ -707,7 +715,7 @@ func (c *Client) partitionQueueControl(ctx context.Context, queue string, partit
 		return err
 	}
 	path := fmt.Sprintf("/queues/%s/partitions/%d/%s", url.PathEscape(queue), partition, action)
-	return c.doJSONAt(ctx, base, http.MethodPost, path, nil, out)
+	return c.doJSONAt(ctx, base, fh.MethodPOST, path, nil, out)
 }
 
 // QueuePartitionOperationResult identifies which assigned partitions accepted
@@ -736,7 +744,7 @@ func (c *Client) applyAssignedQueueControl(ctx context.Context, queue, action st
 	}
 	var result QueuePartitionOperationResult
 	path := "/queues/" + url.PathEscape(queue) + "/assigned/" + action
-	if err := c.doJSON(ctx, http.MethodPost, path, nil, &result); err != nil {
+	if err := c.doJSON(ctx, fh.MethodPOST, path, nil, &result); err != nil {
 		return nil, err
 	}
 	if len(result.Partitions) == 0 || len(result.Partitions) > maxTopicPagePartitions {
@@ -797,10 +805,10 @@ func (c *Client) Ack(ctx context.Context, m broker.Message) error {
 		var base string
 		base, err = c.PartitionResourceLeaderURL(ctx, "queue", m.Queue, m.Partition)
 		if err == nil {
-			err = c.doJSONAt(ctx, base, http.MethodPost, path, body, nil)
+			err = c.doJSONAt(ctx, base, fh.MethodPOST, path, body, nil)
 		}
 	} else {
-		err = c.doJSON(ctx, http.MethodPost, path, body, nil)
+		err = c.doJSON(ctx, fh.MethodPOST, path, body, nil)
 	}
 	if err == nil && c.cfg.Hooks.OnAck != nil {
 		c.cfg.Hooks.OnAck(MessageEvent{Message: m, Queue: m.Queue, Time: time.Now()})
@@ -821,10 +829,10 @@ func (c *Client) Nack(ctx context.Context, m broker.Message, opts ...NackOption)
 		var base string
 		base, err = c.PartitionResourceLeaderURL(ctx, "queue", m.Queue, m.Partition)
 		if err == nil {
-			err = c.doJSONAt(ctx, base, http.MethodPost, path, body, nil)
+			err = c.doJSONAt(ctx, base, fh.MethodPOST, path, body, nil)
 		}
 	} else {
-		err = c.doJSON(ctx, http.MethodPost, path, body, nil)
+		err = c.doJSON(ctx, fh.MethodPOST, path, body, nil)
 	}
 	if err == nil && c.cfg.Hooks.OnNack != nil {
 		c.cfg.Hooks.OnNack(MessageEvent{Message: m, Queue: m.Queue, Error: errors.New(o.Error), Time: time.Now()})
@@ -839,10 +847,10 @@ func (c *Client) Reject(ctx context.Context, m broker.Message, reason string) er
 		var base string
 		base, err = c.PartitionResourceLeaderURL(ctx, "queue", m.Queue, m.Partition)
 		if err == nil {
-			err = c.doJSONAt(ctx, base, http.MethodPost, path, body, nil)
+			err = c.doJSONAt(ctx, base, fh.MethodPOST, path, body, nil)
 		}
 	} else {
-		err = c.doJSON(ctx, http.MethodPost, path, body, nil)
+		err = c.doJSON(ctx, fh.MethodPOST, path, body, nil)
 	}
 	if err == nil && c.cfg.Hooks.OnReject != nil {
 		c.cfg.Hooks.OnReject(MessageEvent{Message: m, Queue: m.Queue, Error: errors.New(reason), Time: time.Now()})
@@ -857,10 +865,10 @@ func (c *Client) Extend(ctx context.Context, m broker.Message, d time.Duration) 
 		var base string
 		base, err = c.PartitionResourceLeaderURL(ctx, "queue", m.Queue, m.Partition)
 		if err == nil {
-			err = c.doJSONAt(ctx, base, http.MethodPost, path, body, nil)
+			err = c.doJSONAt(ctx, base, fh.MethodPOST, path, body, nil)
 		}
 	} else {
-		err = c.doJSON(ctx, http.MethodPost, path, body, nil)
+		err = c.doJSON(ctx, fh.MethodPOST, path, body, nil)
 	}
 	if err == nil && c.cfg.Hooks.OnLeaseExtended != nil {
 		c.cfg.Hooks.OnLeaseExtended(MessageEvent{Message: m, Queue: m.Queue, Time: time.Now()})
@@ -869,7 +877,7 @@ func (c *Client) Extend(ctx context.Context, m broker.Message, d time.Duration) 
 }
 func (c *Client) Progress(ctx context.Context, m broker.Message, p broker.Progress) error {
 	body := map[string]any{"lease_token": m.LeaseToken, "consumer_id": c.cfg.ConsumerID, "queue": m.Queue, "progress": p}
-	err := c.doJSON(ctx, http.MethodPost, "/v1/messages/"+m.ID+"/progress", body, nil)
+	err := c.doJSON(ctx, fh.MethodPOST, "/v1/messages/"+m.ID+"/progress", body, nil)
 	if err == nil && c.cfg.Hooks.OnProgress != nil {
 		c.cfg.Hooks.OnProgress(MessageEvent{Message: m, Queue: m.Queue, Time: time.Now()})
 	}
@@ -881,14 +889,14 @@ func (c *Client) Respond(ctx context.Context, m broker.Message, response any, ac
 		return err
 	}
 	body := map[string]any{"lease_token": m.LeaseToken, "consumer_id": c.cfg.ConsumerID, "queue": m.Queue, "correlation_id": m.CorrelationID, "payload": json.RawMessage(raw), "ack": ack}
-	return c.doJSON(ctx, http.MethodPost, "/v1/messages/"+m.ID+"/respond", body, nil)
+	return c.doJSON(ctx, fh.MethodPOST, "/v1/messages/"+m.ID+"/respond", body, nil)
 }
 func (c *Client) RespondError(ctx context.Context, m broker.Message, e error, ack bool) error {
 	if e == nil {
 		e = errors.New("handler error")
 	}
 	body := map[string]any{"lease_token": m.LeaseToken, "consumer_id": c.cfg.ConsumerID, "queue": m.Queue, "correlation_id": m.CorrelationID, "error": broker.BrokerError{Code: "handler_error", Message: e.Error(), Retryable: true}, "ack": ack}
-	return c.doJSON(ctx, http.MethodPost, "/v1/messages/"+m.ID+"/respond", body, nil)
+	return c.doJSON(ctx, fh.MethodPOST, "/v1/messages/"+m.ID+"/respond", body, nil)
 }
 
 func (c *Client) Complete(ctx context.Context, m broker.Message, result any) error {
@@ -897,7 +905,7 @@ func (c *Client) Complete(ctx context.Context, m broker.Message, result any) err
 		return err
 	}
 	body := map[string]any{"lease_token": m.LeaseToken, "consumer_id": c.cfg.ConsumerID, "queue": m.Queue, "correlation_id": m.CorrelationID, "payload": json.RawMessage(raw), "ack": true}
-	return c.doJSON(ctx, http.MethodPost, "/v1/messages/"+m.ID+"/complete", body, nil)
+	return c.doJSON(ctx, fh.MethodPOST, "/v1/messages/"+m.ID+"/complete", body, nil)
 }
 
 func (c *Client) Fail(ctx context.Context, m broker.Message, e error) error {
@@ -905,7 +913,7 @@ func (c *Client) Fail(ctx context.Context, m broker.Message, e error) error {
 		e = errors.New("handler error")
 	}
 	body := map[string]any{"lease_token": m.LeaseToken, "consumer_id": c.cfg.ConsumerID, "queue": m.Queue, "correlation_id": m.CorrelationID, "error": broker.BrokerError{Code: "handler_error", Message: e.Error(), Retryable: true}, "ack": true}
-	return c.doJSON(ctx, http.MethodPost, "/v1/messages/"+m.ID+"/fail", body, nil)
+	return c.doJSON(ctx, fh.MethodPOST, "/v1/messages/"+m.ID+"/fail", body, nil)
 }
 
 func (c *Client) PublishFrame(ctx context.Context, msg broker.Message) (broker.PublishResult, error) {
@@ -914,7 +922,7 @@ func (c *Client) PublishFrame(ctx context.Context, msg broker.Message) (broker.P
 		return broker.PublishResult{}, err
 	}
 	var out broker.PublishResult
-	err = c.doRaw(ctx, http.MethodPost, "/v1/publish/frame", "application/vnd.pool.broker.frame", frame, &out)
+	err = c.doRaw(ctx, fh.MethodPOST, "/v1/publish/frame", "application/vnd.pool.broker.frame", frame, &out)
 	return out, err
 }
 
@@ -923,7 +931,7 @@ func (c *Client) PollFrames(ctx context.Context, queue string, limit int) ([]bro
 		limit = c.cfg.PollLimit
 	}
 	req := broker.PollRequest{Queue: queue, ConsumerID: c.cfg.ConsumerID, ConsumerGroup: c.cfg.Group, Limit: limit, WaitNS: c.cfg.PollWait.Nanoseconds(), VisibilityTimeoutNS: c.cfg.VisibilityTimeout.Nanoseconds()}
-	data, err := c.doRawBytes(ctx, http.MethodPost, "/v1/poll/frame", "application/json", mustMarshal(req))
+	data, err := c.doRawBytes(ctx, fh.MethodPOST, "/v1/poll/frame", "application/json", mustMarshal(req))
 	if err != nil {
 		return nil, err
 	}
@@ -1028,7 +1036,7 @@ func (c *Client) Publish(ctx context.Context, topic string, payload any, opts ..
 	req := broker.PublishHTTPPayload{Topic: topic, Payload: raw, PayloadEncoding: encoding}
 	o.applyTo(&req)
 	var out broker.PublishResult
-	err = c.doJSON(ctx, http.MethodPost, "/v1/publish", req, &out)
+	err = c.doJSON(ctx, fh.MethodPOST, "/v1/publish", req, &out)
 	return out, err
 }
 
@@ -1067,7 +1075,7 @@ func (c *Client) PublishBatch(ctx context.Context, topic string, payloads []any,
 		req.Messages = append(req.Messages, msg)
 	}
 	var out broker.BatchPublishResult
-	err := c.doJSON(ctx, http.MethodPost, "/v1/publish/batch", req, &out)
+	err := c.doJSON(ctx, fh.MethodPOST, "/v1/publish/batch", req, &out)
 	return out, err
 }
 
@@ -1097,7 +1105,7 @@ func (c *Client) Request(ctx context.Context, subject string, payload any, respo
 	}
 	req := broker.PublishHTTPPayload{Topic: subject, Payload: raw, PayloadEncoding: encoding, TimeoutNS: timeout.Nanoseconds()}
 	var resp broker.Response
-	if err := c.doJSON(ctx, http.MethodPost, "/v1/request", req, &resp); err != nil {
+	if err := c.doJSON(ctx, fh.MethodPOST, "/v1/request", req, &resp); err != nil {
 		return err
 	}
 	if resp.Error != nil {
@@ -1121,12 +1129,12 @@ func (c *Client) SubmitTask(ctx context.Context, name string, payload any, opts 
 	}
 	req := map[string]any{"name": name, "queue": o.Queue, "payload": raw, "payload_encoding": encoding, "tenant_id": o.TenantID, "priority": o.Priority, "max_attempts": o.MaxAttempts, "metadata": o.Metadata}
 	var out broker.TaskInfo
-	err = c.doJSON(ctx, http.MethodPost, "/v1/tasks/submit", req, &out)
+	err = c.doJSON(ctx, fh.MethodPOST, "/v1/tasks/submit", req, &out)
 	return out, err
 }
 func (c *Client) Task(ctx context.Context, id string) (broker.TaskInfo, error) {
 	var out broker.TaskInfo
-	err := c.doJSON(ctx, http.MethodGet, "/v1/tasks/"+id, nil, &out)
+	err := c.doJSON(ctx, fh.MethodGET, "/v1/tasks/"+id, nil, &out)
 	return out, err
 }
 func (c *Client) TaskResult(ctx context.Context, id string) (broker.TaskInfo, []byte, error) {
@@ -1134,16 +1142,16 @@ func (c *Client) TaskResult(ctx context.Context, id string) (broker.TaskInfo, []
 		Task    broker.TaskInfo `json:"task"`
 		Payload json.RawMessage `json:"payload"`
 	}
-	err := c.doJSON(ctx, http.MethodGet, "/v1/tasks/"+id+"/result", nil, &out)
+	err := c.doJSON(ctx, fh.MethodGET, "/v1/tasks/"+id+"/result", nil, &out)
 	return out.Task, []byte(out.Payload), err
 }
 
 func (c *Client) CancelTask(ctx context.Context, id, reason string) error {
-	return c.doJSON(ctx, http.MethodPost, "/v1/tasks/"+id+"/cancel", map[string]string{"reason": reason}, nil)
+	return c.doJSON(ctx, fh.MethodPOST, "/v1/tasks/"+id+"/cancel", map[string]string{"reason": reason}, nil)
 }
 
 func (c *Client) RetryTask(ctx context.Context, id string) error {
-	return c.doJSON(ctx, http.MethodPost, "/v1/tasks/"+id+"/retry", nil, nil)
+	return c.doJSON(ctx, fh.MethodPOST, "/v1/tasks/"+id+"/retry", nil, nil)
 }
 
 func (c *Client) DLQ(ctx context.Context, queue string, limit int) ([]broker.Message, error) {
@@ -1155,7 +1163,7 @@ func (c *Client) DLQ(ctx context.Context, queue string, limit int) ([]broker.Mes
 		path += fmt.Sprintf("?limit=%d", limit)
 	}
 	var out []broker.Message
-	err := c.doJSON(ctx, http.MethodGet, path, nil, &out)
+	err := c.doJSON(ctx, fh.MethodGET, path, nil, &out)
 	return out, err
 }
 
@@ -1163,7 +1171,7 @@ func (c *Client) ReplayDLQ(ctx context.Context, queue string) error {
 	if queue == "" {
 		return errors.New("queue required")
 	}
-	return c.doJSON(ctx, http.MethodPost, "/v1/dlq/"+queue+"/replay", nil, nil)
+	return c.doJSON(ctx, fh.MethodPOST, "/v1/dlq/"+queue+"/replay", nil, nil)
 }
 
 func (c *Client) ReadStream(ctx context.Context, stream, group string, after uint64, limit int) ([]broker.Message, error) {
@@ -1175,12 +1183,12 @@ func (c *Client) ReadStream(ctx context.Context, stream, group string, after uin
 		path += fmt.Sprintf("&limit=%d", limit)
 	}
 	var out []broker.Message
-	err := c.doJSON(ctx, http.MethodGet, path, nil, &out)
+	err := c.doJSON(ctx, fh.MethodGET, path, nil, &out)
 	return out, err
 }
 
 func (c *Client) CommitStreamOffset(ctx context.Context, stream, group string, offset uint64) error {
-	return c.doJSON(ctx, http.MethodPost, "/v1/streams/"+stream+"/commit", broker.OffsetCommit{Stream: stream, ConsumerGroup: group, Offset: offset}, nil)
+	return c.doJSON(ctx, fh.MethodPOST, "/v1/streams/"+stream+"/commit", broker.OffsetCommit{Stream: stream, ConsumerGroup: group, Offset: offset}, nil)
 }
 
 // CommitPartitionStreamOffset commits a consumer checkpoint within one
@@ -1194,7 +1202,7 @@ func (c *Client) CommitPartitionStreamOffset(ctx context.Context, stream, group 
 		return err
 	}
 	path := fmt.Sprintf("/v1/streams/%s/partitions/%d/commit", url.PathEscape(stream), partition)
-	return c.doJSONAt(ctx, base, http.MethodPost, path, broker.OffsetCommit{Stream: stream, ConsumerGroup: group, Offset: offset, Partition: partition, Partitioned: true}, nil)
+	return c.doJSONAt(ctx, base, fh.MethodPOST, path, broker.OffsetCommit{Stream: stream, ConsumerGroup: group, Offset: offset, Partition: partition, Partitioned: true}, nil)
 }
 
 // CommitPartitionStreamOffsetAndAppend atomically commits a partition-local
@@ -1216,7 +1224,7 @@ func (c *Client) CommitPartitionStreamOffsetAndAppend(ctx context.Context, strea
 		Entries       []broker.AppendEntry `json:"entries"`
 	}{ConsumerGroup: group, Offset: offset, TransactionID: transactionID, Entries: entries}
 	var messages []broker.Message
-	err = c.doJSONAt(ctx, base, http.MethodPost, path, body, &messages)
+	err = c.doJSONAt(ctx, base, fh.MethodPOST, path, body, &messages)
 	return messages, err
 }
 
@@ -1234,7 +1242,7 @@ func (c *Client) PartitionStreamOffset(ctx context.Context, stream, group string
 	var out struct {
 		Offset uint64 `json:"offset"`
 	}
-	err = c.doJSONAt(ctx, base, http.MethodGet, path, nil, &out)
+	err = c.doJSONAt(ctx, base, fh.MethodGET, path, nil, &out)
 	return out.Offset, err
 }
 
@@ -1242,7 +1250,7 @@ func (c *Client) PartitionStreamOffset(ctx context.Context, stream, group string
 // operation. ErrOffsetConflict means another commit changed the expected offset.
 func (c *Client) CommitStreamTransaction(ctx context.Context, stream string, tx broker.StreamTransactionHTTPPayload) ([]broker.PublishResult, error) {
 	var out []broker.PublishResult
-	err := c.doJSON(ctx, http.MethodPost, "/v1/streams/"+url.PathEscape(stream)+"/transactions", tx, &out)
+	err := c.doJSON(ctx, fh.MethodPOST, "/v1/streams/"+url.PathEscape(stream)+"/transactions", tx, &out)
 	return out, err
 }
 
@@ -1250,12 +1258,12 @@ func (c *Client) StreamOffset(ctx context.Context, stream, group string) (uint64
 	var out struct {
 		Offset uint64 `json:"offset"`
 	}
-	err := c.doJSON(ctx, http.MethodGet, "/v1/streams/"+stream+"/offset?consumer_group="+group, nil, &out)
+	err := c.doJSON(ctx, fh.MethodGET, "/v1/streams/"+stream+"/offset?consumer_group="+group, nil, &out)
 	return out.Offset, err
 }
 func (c *Client) Consumers(ctx context.Context) ([]broker.ConsumerInfo, error) {
 	var out []broker.ConsumerInfo
-	err := c.doJSON(ctx, http.MethodGet, "/v1/consumers", nil, &out)
+	err := c.doJSON(ctx, fh.MethodGET, "/v1/consumers", nil, &out)
 	return out, err
 }
 
@@ -1275,7 +1283,7 @@ func (c *Client) PartitionResourceRoute(ctx context.Context, kind, name string, 
 		path += "?resource_kind=" + url.QueryEscape(kind)
 	}
 	var route broker.PartitionRoute
-	if err := c.doJSON(ctx, http.MethodGet, path, nil, &route); err != nil {
+	if err := c.doJSON(ctx, fh.MethodGET, path, nil, &route); err != nil {
 		return nil, err
 	}
 	return &route, nil
@@ -1297,7 +1305,7 @@ func (c *Client) PlanPartitionReassignment(ctx context.Context, kind, name strin
 		return nil, err
 	}
 	var plan broker.PartitionReassignmentPlan
-	err = c.doJSONAt(ctx, base, http.MethodGet, path, nil, &plan)
+	err = c.doJSONAt(ctx, base, fh.MethodGET, path, nil, &plan)
 	return &plan, err
 }
 
@@ -1318,7 +1326,7 @@ func (c *Client) ReassignPartition(ctx context.Context, kind, name string, parti
 		Leader   string   `json:"leader,omitempty"`
 	}{Replicas: append([]string(nil), replicas...), Leader: leader}
 	var progress broker.PartitionReassignmentProgress
-	if err := c.doJSONAt(ctx, base, http.MethodPost, path, request, &progress); err != nil {
+	if err := c.doJSONAt(ctx, base, fh.MethodPOST, path, request, &progress); err != nil {
 		return nil, err
 	}
 	return &progress, nil
@@ -1336,7 +1344,7 @@ func (c *Client) CancelPartitionReassignment(ctx context.Context, kind, name str
 		return nil, err
 	}
 	var progress broker.PartitionReassignmentProgress
-	if err := c.doJSONAt(ctx, base, http.MethodPost, path, nil, &progress); err != nil {
+	if err := c.doJSONAt(ctx, base, fh.MethodPOST, path, nil, &progress); err != nil {
 		return nil, err
 	}
 	return &progress, nil
@@ -1350,7 +1358,7 @@ func (c *Client) PlanRaftNodeRemoval(ctx context.Context, peerID uint64) (*broke
 	}
 	var plan broker.RaftNodeRemovalPlan
 	path := fmt.Sprintf("/cluster/nodes/%d/removal-plan", peerID)
-	if err := c.doJSON(ctx, http.MethodGet, path, nil, &plan); err != nil {
+	if err := c.doJSON(ctx, fh.MethodGET, path, nil, &plan); err != nil {
 		return nil, err
 	}
 	return &plan, nil
@@ -1365,7 +1373,7 @@ func (c *Client) PlanClusterUpgrade(ctx context.Context, targetVersion string) (
 	}
 	var plan broker.ClusterUpgradePlan
 	path := "/cluster/upgrade-plan?target_version=" + url.QueryEscape(targetVersion)
-	if err := c.doJSON(ctx, http.MethodGet, path, nil, &plan); err != nil {
+	if err := c.doJSON(ctx, fh.MethodGET, path, nil, &plan); err != nil {
 		return nil, err
 	}
 	if plan.TargetVersion != targetVersion || plan.CompatibilityVerified {
@@ -1384,7 +1392,7 @@ func (c *Client) BeginRaftNodeDrain(ctx context.Context, peerID uint64) (*cluste
 		Node *cluster.NodeInfo `json:"node"`
 	}
 	path := fmt.Sprintf("/cluster/nodes/%d/drain", peerID)
-	if err := c.doJSON(ctx, http.MethodPost, path, struct{}{}, &response); err != nil {
+	if err := c.doJSON(ctx, fh.MethodPOST, path, struct{}{}, &response); err != nil {
 		return nil, err
 	}
 	if response.Node == nil || response.Node.State != cluster.NodeDraining {
@@ -1403,7 +1411,7 @@ func (c *Client) CompleteRaftNodeDrain(ctx context.Context, peerID uint64) (*clu
 		Node *cluster.NodeInfo `json:"node"`
 	}
 	path := fmt.Sprintf("/cluster/nodes/%d/drain/complete", peerID)
-	if err := c.doJSON(ctx, http.MethodPost, path, struct{}{}, &response); err != nil {
+	if err := c.doJSON(ctx, fh.MethodPOST, path, struct{}{}, &response); err != nil {
 		return nil, err
 	}
 	if response.Node == nil || response.Node.State != cluster.NodeLeft {
@@ -1428,7 +1436,7 @@ func (c *Client) AddRaftLearner(ctx context.Context, address string) (*RaftMembe
 	}
 	var result RaftMembershipResult
 	address = strings.TrimSpace(address)
-	if err := c.doJSON(ctx, http.MethodPost, "/cluster/nodes", map[string]string{"address": address}, &result); err != nil {
+	if err := c.doJSON(ctx, fh.MethodPOST, "/cluster/nodes", map[string]string{"address": address}, &result); err != nil {
 		return nil, err
 	}
 	if result.PeerID == 0 || (result.Role != "learner" && result.Role != "voter") {
@@ -1444,7 +1452,7 @@ func (c *Client) PromoteRaftLearner(ctx context.Context, peerID uint64) (*RaftMe
 	}
 	var result RaftMembershipResult
 	path := fmt.Sprintf("/cluster/nodes/%d/promote", peerID)
-	if err := c.doJSON(ctx, http.MethodPost, path, struct{}{}, &result); err != nil {
+	if err := c.doJSON(ctx, fh.MethodPOST, path, struct{}{}, &result); err != nil {
 		return nil, err
 	}
 	if result.PeerID != peerID || result.Role != "voter" {
@@ -1460,7 +1468,7 @@ func (c *Client) TransferControllerLeadership(ctx context.Context, peerID uint64
 		return nil, fmt.Errorf("%w: Raft peer ID must be positive", broker.ErrInvalidMessage)
 	}
 	var result RaftMembershipResult
-	if err := c.doJSON(ctx, http.MethodPost, "/cluster/leadership", map[string]uint64{"peer_id": peerID}, &result); err != nil {
+	if err := c.doJSON(ctx, fh.MethodPOST, "/cluster/leadership", map[string]uint64{"peer_id": peerID}, &result); err != nil {
 		return nil, err
 	}
 	if result.LeaderID != peerID {
@@ -1477,7 +1485,7 @@ func (c *Client) RemoveRaftNode(ctx context.Context, peerID uint64) (*RaftMember
 	}
 	var result RaftMembershipResult
 	path := fmt.Sprintf("/cluster/nodes/%d", peerID)
-	if err := c.doJSON(ctx, http.MethodDelete, path, nil, &result); err != nil {
+	if err := c.doJSON(ctx, fh.MethodDELETE, path, nil, &result); err != nil {
 		return nil, err
 	}
 	if result.PeerID != peerID {
@@ -1495,7 +1503,7 @@ func (c *Client) PlanPartitionPlacement(ctx context.Context, kind, name string, 
 	query.Set("resource_kind", kind)
 	path := fmt.Sprintf("/cluster/partitions/%s/%d/placement-plan?%s", url.PathEscape(name), partition, query.Encode())
 	var plan broker.PartitionPlacementPlan
-	if err := c.doJSON(ctx, http.MethodGet, path, nil, &plan); err != nil {
+	if err := c.doJSON(ctx, fh.MethodGET, path, nil, &plan); err != nil {
 		return nil, err
 	}
 	return &plan, nil
@@ -1514,7 +1522,7 @@ func (c *Client) AssignPartitionBalanced(ctx context.Context, kind, name string,
 		AutoAssign   bool   `json:"auto_assign"`
 	}{Name: name, ResourceKind: kind, Partition: partition, AutoAssign: true}
 	var assignment cluster.PartitionMetadata
-	if err := c.doJSON(ctx, http.MethodPost, "/cluster/partitions", request, &assignment); err != nil {
+	if err := c.doJSON(ctx, fh.MethodPOST, "/cluster/partitions", request, &assignment); err != nil {
 		return nil, err
 	}
 	return &assignment, nil
@@ -1575,7 +1583,7 @@ func (c *Client) ReadPartitionStream(ctx context.Context, stream string, partiti
 		path += "?" + encoded
 	}
 	var messages []broker.Message
-	if err := c.doJSONAt(ctx, base, http.MethodGet, path, nil, &messages); err != nil {
+	if err := c.doJSONAt(ctx, base, fh.MethodGET, path, nil, &messages); err != nil {
 		return nil, err
 	}
 	return messages, nil
@@ -1604,7 +1612,7 @@ func (c *Client) ReadPartitionTopic(ctx context.Context, topic string, partition
 		path += "?" + encoded
 	}
 	var messages []broker.Message
-	if err := c.doJSONAt(ctx, base, http.MethodGet, path, nil, &messages); err != nil {
+	if err := c.doJSONAt(ctx, base, fh.MethodGET, path, nil, &messages); err != nil {
 		return nil, err
 	}
 	return messages, nil
@@ -1642,7 +1650,7 @@ func (c *Client) StreamPartitionLag(ctx context.Context, stream string, partitio
 		path += "?" + encoded
 	}
 	var report broker.PartitionStreamLag
-	err = c.doJSONAt(ctx, base, http.MethodGet, path, nil, &report)
+	err = c.doJSONAt(ctx, base, fh.MethodGET, path, nil, &report)
 	return report, err
 }
 
@@ -1665,7 +1673,7 @@ func (c *Client) StreamLagAssigned(ctx context.Context, stream, consumerGroup st
 		path += "?" + encoded
 	}
 	var report AssignedStreamLag
-	if err := c.doJSON(ctx, http.MethodGet, path, nil, &report); err != nil {
+	if err := c.doJSON(ctx, fh.MethodGET, path, nil, &report); err != nil {
 		return nil, err
 	}
 	resultCount := len(report.Partitions) + len(report.Failures)
@@ -1784,7 +1792,7 @@ func (c *Client) ReadStreamPage(ctx context.Context, stream, cursor string, limi
 			Kind      string `json:"kind"`
 		} `json:"id"`
 	}
-	if err := c.doJSON(ctx, http.MethodGet, "/cluster/partitions", nil, &assignments); err != nil {
+	if err := c.doJSON(ctx, fh.MethodGET, "/cluster/partitions", nil, &assignments); err != nil {
 		return nil, err
 	}
 	partitionSet := make(map[int]struct{})
@@ -1928,7 +1936,7 @@ func (c *Client) ReadTopicPage(ctx context.Context, topic, cursor string, limit 
 			Kind      string `json:"kind"`
 		} `json:"id"`
 	}
-	if err := c.doJSON(ctx, http.MethodGet, "/cluster/partitions", nil, &assignments); err != nil {
+	if err := c.doJSON(ctx, fh.MethodGET, "/cluster/partitions", nil, &assignments); err != nil {
 		return nil, err
 	}
 	partitionSet := make(map[int]struct{})
@@ -2088,7 +2096,7 @@ func (c *Client) Events(ctx context.Context, after string, wait time.Duration) (
 		path += "?" + strings.Join(qs, "&")
 	}
 	var out []broker.Notification
-	err := c.doJSON(ctx, http.MethodGet, path, nil, &out)
+	err := c.doJSON(ctx, fh.MethodGET, path, nil, &out)
 	return out, err
 }
 
@@ -2114,21 +2122,14 @@ func (c *Client) doRawStatus(ctx context.Context, method, path, contentType stri
 	urls := c.orderedURLs()
 	var last error
 	for i, base := range urls {
-		req, err := http.NewRequestWithContext(ctx, method, strings.TrimRight(base, "/")+path, bytes.NewReader(bodyBytes))
-		if err != nil {
-			last = err
-			continue
-		}
-		if contentType != "" {
-			req.Header.Set("Content-Type", contentType)
-		}
-		if c.cfg.Token != "" {
-			req.Header.Set("Authorization", "Bearer "+c.cfg.Token)
-		}
+		headers := c.requestHeaders(contentType)
 		if prefer != "" {
-			req.Header.Set("Prefer", prefer)
+			headers["Prefer"] = prefer
 		}
-		resp, err := c.http.Do(req)
+		if bodyBytes == nil {
+			bodyBytes = []byte{}
+		}
+		resp, err := broker.SendHTTP(ctx, c.http, method, strings.TrimRight(base, "/")+path, bodyBytes, headers)
 		if err != nil {
 			last = err
 			if i == 0 && c.cfg.Hooks.OnReconnect != nil && len(urls) > 1 {
@@ -2136,26 +2137,26 @@ func (c *Client) doRawStatus(ctx context.Context, method, path, contentType stri
 			}
 			continue
 		}
-		if resp.ContentLength > c.cfg.MaxResponseBytes {
-			_ = resp.Body.Close()
+		if resp.Raw.ContentLength > c.cfg.MaxResponseBytes {
+			_ = resp.Close()
 			return nil, 0, fmt.Errorf("%w: limit is %d bytes", ErrResponseTooLarge, c.cfg.MaxResponseBytes)
 		}
-		data, readErr := readBoundedResponse(resp.Body, c.cfg.MaxResponseBytes)
-		_ = resp.Body.Close()
+		data, readErr := readBoundedResponse(resp.Reader(), c.cfg.MaxResponseBytes)
+		_ = resp.Close()
 		if readErr != nil {
 			return nil, 0, readErr
 		}
-		if resp.StatusCode >= 300 {
-			last = remoteError(resp.StatusCode, data)
-			if len(urls) > 1 && shouldFailover(method, resp.StatusCode, data) {
+		if resp.StatusCode() >= 300 {
+			last = remoteError(resp.StatusCode(), data)
+			if len(urls) > 1 && shouldFailover(method, resp.StatusCode(), data) {
 				prioritizeLeaderURL(urls, i, last)
 				continue
 			}
 			c.markActive(base)
-			return nil, resp.StatusCode, last
+			return nil, resp.StatusCode(), last
 		}
 		c.markActive(base)
-		return data, resp.StatusCode, nil
+		return data, resp.StatusCode(), nil
 	}
 	if last == nil {
 		last = errors.New("broker unavailable")
@@ -2210,22 +2211,11 @@ func (c *Client) doJSONBases(ctx context.Context, urls []string, method, path st
 	}
 	var last error
 	for i, base := range urls {
-		var body io.Reader
-		if bodyBytes != nil {
-			body = bytes.NewReader(bodyBytes)
-		}
-		req, err := http.NewRequestWithContext(ctx, method, strings.TrimRight(base, "/")+path, body)
-		if err != nil {
-			last = err
-			continue
-		}
+		contentType := ""
 		if in != nil {
-			req.Header.Set("Content-Type", "application/json")
+			contentType = "application/json"
 		}
-		if c.cfg.Token != "" {
-			req.Header.Set("Authorization", "Bearer "+c.cfg.Token)
-		}
-		resp, err := c.http.Do(req)
+		resp, err := broker.SendHTTP(ctx, c.http, method, strings.TrimRight(base, "/")+path, bodyBytes, c.requestHeaders(contentType))
 		if err != nil {
 			last = err
 			if i == 0 && c.cfg.Hooks.OnReconnect != nil && len(urls) > 1 {
@@ -2233,18 +2223,18 @@ func (c *Client) doJSONBases(ctx context.Context, urls []string, method, path st
 			}
 			continue
 		}
-		if resp.ContentLength > c.cfg.MaxResponseBytes {
-			_ = resp.Body.Close()
+		if resp.Raw.ContentLength > c.cfg.MaxResponseBytes {
+			_ = resp.Close()
 			return fmt.Errorf("%w: limit is %d bytes", ErrResponseTooLarge, c.cfg.MaxResponseBytes)
 		}
-		data, readErr := readBoundedResponse(resp.Body, c.cfg.MaxResponseBytes)
-		_ = resp.Body.Close()
+		data, readErr := readBoundedResponse(resp.Reader(), c.cfg.MaxResponseBytes)
+		_ = resp.Close()
 		if readErr != nil {
 			return readErr
 		}
-		if resp.StatusCode >= 300 {
-			last = remoteError(resp.StatusCode, data)
-			if len(urls) > 1 && shouldFailover(method, resp.StatusCode, data) {
+		if resp.StatusCode() >= 300 {
+			last = remoteError(resp.StatusCode(), data)
+			if len(urls) > 1 && shouldFailover(method, resp.StatusCode(), data) {
 				prioritizeLeaderURL(urls, i, last)
 				continue
 			}
@@ -2406,14 +2396,14 @@ func NackDLQ(v string) NackOption {
 func NackReason(v string) NackOption { return func(o *NackOptions) { o.Reason = v } }
 func NackError(v string) NackOption  { return func(o *NackOptions) { o.Error = v } }
 
-// tunedTransport is http.DefaultTransport with an idle pool sized for many
-// concurrent publishers. The default keeps only 2 idle connections per host, so
-// hundreds of concurrent requests constantly close and reopen sockets.
-func tunedTransport() http.RoundTripper {
-	t := http.DefaultTransport.(*http.Transport).Clone()
-	t.MaxIdleConns = 1024
-	t.MaxIdleConnsPerHost = 512
-	t.MaxConnsPerHost = 0
-	t.IdleConnTimeout = 90 * time.Second
-	return t
+// requestHeaders returns the per-request headers for a broker call.
+func (c *Client) requestHeaders(contentType string) map[string]string {
+	headers := make(map[string]string, 3)
+	if contentType != "" {
+		headers["Content-Type"] = contentType
+	}
+	if c.cfg.Token != "" {
+		headers["Authorization"] = "Bearer " + c.cfg.Token
+	}
+	return headers
 }

@@ -4,8 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
@@ -13,6 +11,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/oarkflow/fh"
 )
 
 // QueuePolicy defines ergonomic per-queue defaults. It intentionally maps to
@@ -375,7 +375,7 @@ func SubmitChannel[T any](p *Pool, ctx context.Context, ch <-chan T, h func(cont
 	}
 }
 
-// HTTP async adapter.
+// HTTP async job intake.
 type HTTPOptions struct {
 	Queue          string
 	AcceptedCode   int
@@ -388,36 +388,39 @@ type HTTPOptions struct {
 	Handler        func(context.Context, HTTPRequest) error
 }
 type HTTPRequest struct {
-	Method     string      `json:"method"`
-	URL        string      `json:"url"`
-	Header     http.Header `json:"header,omitempty"`
-	Body       []byte      `json:"body,omitempty"`
-	RemoteAddr string      `json:"remote_addr,omitempty"`
-	ReceivedAt time.Time   `json:"received_at"`
+	Method     string              `json:"method"`
+	URL        string              `json:"url"`
+	Header     map[string][]string `json:"header,omitempty"`
+	Body       []byte              `json:"body,omitempty"`
+	RemoteAddr string              `json:"remote_addr,omitempty"`
+	ReceivedAt time.Time           `json:"received_at"`
 }
 
-func HTTPMiddleware(p *Pool, opt HTTPOptions) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+// HTTPHandler returns an fh handler that enqueues each request as a pool job
+// and answers immediately with 202 Accepted (or opt.AcceptedCode).
+func HTTPHandler(p *Pool, opt HTTPOptions) fh.HandlerFunc {
+	return func(c fh.Ctx) error {
 		max := opt.MaxBodySize
 		if max <= 0 {
 			max = 1 << 20
 		}
-		body, err := io.ReadAll(io.LimitReader(r.Body, max+1))
-		if err != nil {
-			http.Error(w, err.Error(), 400)
-			return
+		if err := fh.LimitRequestBody(c, max); err != nil {
+			return httpError(c, "request body too large", fh.StatusPayloadTooLarge)
 		}
+		body := c.BodyCopy()
 		if int64(len(body)) > max {
-			http.Error(w, "request body too large", 413)
-			return
+			return httpError(c, "request body too large", fh.StatusPayloadTooLarge)
 		}
-		hdr := http.Header{}
+		hdr := map[string][]string{}
+		reqHeaders := c.GetReqHeaders()
 		for _, k := range opt.CaptureHeaders {
-			if v := r.Header.Values(k); len(v) > 0 {
-				hdr[k] = append([]string(nil), v...)
+			for name, v := range reqHeaders {
+				if strings.EqualFold(name, k) && len(v) > 0 {
+					hdr[k] = append([]string(nil), v...)
+				}
 			}
 		}
-		req := HTTPRequest{Method: r.Method, URL: r.URL.String(), Header: hdr, Body: body, RemoteAddr: r.RemoteAddr, ReceivedAt: time.Now()}
+		req := HTTPRequest{Method: c.Method(), URL: c.OriginalURL(), Header: hdr, Body: body, RemoteAddr: c.IP(), ReceivedAt: time.Now()}
 		handler := opt.Handler
 		if handler == nil {
 			handler = func(context.Context, HTTPRequest) error { return nil }
@@ -426,19 +429,17 @@ func HTTPMiddleware(p *Pool, opt HTTPOptions) http.Handler {
 		if opt.RespondJobID {
 			jo.ID = "job-" + strconv.FormatInt(time.Now().UnixNano(), 10)
 		}
-		err = p.SubmitFunc(func(ctx context.Context) error { return handler(ctx, req) }, jo)
-		if err != nil {
-			http.Error(w, err.Error(), 503)
-			return
+		if err := p.SubmitFunc(func(ctx context.Context) error { return handler(ctx, req) }, jo); err != nil {
+			return httpError(c, err.Error(), fh.StatusServiceUnavailable)
 		}
 		code := opt.AcceptedCode
 		if code == 0 {
-			code = http.StatusAccepted
+			code = fh.StatusAccepted
 		}
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(code)
-		_ = json.NewEncoder(w).Encode(map[string]any{"accepted": true, "job_id": jo.ID})
-	})
+		b, _ := json.Marshal(map[string]any{"accepted": true, "job_id": jo.ID})
+		c.Set("Content-Type", "application/json")
+		return c.Status(code).Send(append(b, '\n'))
+	}
 }
 
 // Job builder.

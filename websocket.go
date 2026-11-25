@@ -4,10 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
-	"net/http"
+	"io"
 	"sync"
 	"time"
+
+	"github.com/oarkflow/fh"
 )
 
 // WebSocketConfig configures the legacy SSE transport.
@@ -68,47 +69,53 @@ func (ws *WebSocketServer) SetToken(token string) {
 	ws.token = token
 }
 
-// Handler returns an HTTP handler for WebSocket connections.
-func (ws *WebSocketServer) Handler() http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != ws.cfg.Path {
-			http.NotFound(w, r)
-			return
-		}
-		ws.handleUpgrade(w, r)
-	})
+// App returns the SSE transport application, serving cfg.Path.
+func (ws *WebSocketServer) App() *fh.App {
+	app := NewHTTPApp(HTTPServerOptions{ReadHeaderTimeout: 5 * time.Second}, fh.WithNotFoundHandler(plainNotFound), fh.WithMethodNotAllowedHandler(plainMethodNotAllowed))
+	ws.Register(app)
+	return app
 }
 
-func (ws *WebSocketServer) handleUpgrade(w http.ResponseWriter, r *http.Request) {
-	principal := AdminPrincipal{Name: "development", Permissions: []string{PermissionAdminAll}}
-	authenticated := ws.cfg.InsecureDev
-	if !authenticated && ws.cfg.ACL != nil {
-		if r.TLS != nil && len(r.TLS.VerifiedChains) > 0 && len(r.TLS.VerifiedChains[0]) > 0 {
-			principal, authenticated = ws.cfg.ACL.AuthenticateCertificate(r.TLS.VerifiedChains[0][0])
+// Register mounts the SSE stream on app at cfg.Path.
+func (ws *WebSocketServer) Register(app *fh.App) {
+	app.Get(ws.cfg.Path, ws.handleStream)
+}
+
+func (ws *WebSocketServer) authenticate(c fh.Ctx) (AdminPrincipal, bool) {
+	if ws.cfg.InsecureDev {
+		return AdminPrincipal{Name: "development", Permissions: []string{PermissionAdminAll}}, true
+	}
+	token := bearerToken(c)
+	if ws.cfg.ACL != nil {
+		if cert := verifiedPeerCertificate(c); cert != nil {
+			if principal, ok := ws.cfg.ACL.AuthenticateCertificate(cert); ok {
+				return principal, true
+			}
 		}
-		if !authenticated {
-			principal, authenticated = ws.cfg.ACL.Authenticate(bearerToken(r))
+		if principal, ok := ws.cfg.ACL.Authenticate(token); ok {
+			return principal, true
 		}
 	}
-	if !authenticated && ws.token != "" && constantTimeEqual(bearerToken(r), ws.token) {
-		principal = AdminPrincipal{Name: "legacy-token", Permissions: []string{PermissionNotification}}
-		authenticated = true
+	if ws.token != "" && constantTimeEqual(token, ws.token) {
+		return AdminPrincipal{Name: "legacy-token", Permissions: []string{PermissionNotification}}, true
 	}
-	if !authenticated {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
-		return
+	return AdminPrincipal{}, false
+}
+
+func (ws *WebSocketServer) handleStream(c fh.Ctx) error {
+	principal, ok := ws.authenticate(c)
+	if !ok {
+		return httpError(c, "unauthorized", fh.StatusUnauthorized)
 	}
 	if ws.cfg.ACL != nil && !ws.cfg.InsecureDev && !ws.cfg.ACL.Authorize(principal, PermissionNotification) {
-		http.Error(w, "forbidden", http.StatusForbidden)
-		return
+		return httpError(c, "forbidden", fh.StatusForbidden)
 	}
 	release := func() {}
 	if ws.cfg.ACL != nil {
 		var err error
 		release, err = ws.cfg.ACL.Admit(principal)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusTooManyRequests)
-			return
+			return httpError(c, err.Error(), fh.StatusTooManyRequests)
 		}
 	}
 	defer release()
@@ -116,26 +123,14 @@ func (ws *WebSocketServer) handleUpgrade(w http.ResponseWriter, r *http.Request)
 	count := len(ws.clients)
 	ws.mu.RUnlock()
 	if count >= ws.cfg.MaxConnections {
-		http.Error(w, "too many connections", http.StatusServiceUnavailable)
-		return
+		return httpError(c, "too many connections", fh.StatusServiceUnavailable)
 	}
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
-		return
-	}
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("X-Accel-Buffering", "no")
 
 	clientID := fmt.Sprintf("ws-%d", time.Now().UnixNano())
 	client := &wsClient{id: clientID, send: make(chan []byte, 256), closed: make(chan struct{}), principal: principal}
 	ws.mu.Lock()
 	ws.clients[clientID] = client
 	ws.mu.Unlock()
-
-	ctx := r.Context()
 	defer func() {
 		ws.mu.Lock()
 		delete(ws.clients, clientID)
@@ -143,85 +138,40 @@ func (ws *WebSocketServer) handleUpgrade(w http.ResponseWriter, r *http.Request)
 		client.closeOnce.Do(func() { close(client.closed) })
 	}()
 
-	// Send client ID
-	fmt.Fprintf(w, "event: connected\ndata: {\"client_id\":\"%s\"}\n\n", clientID)
-	flusher.Flush()
-
-	// Register with broker for consuming
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case msg, ok := <-client.send:
-			if !ok {
-				return
+	ctx := c.Context()
+	c.Set("Content-Type", "text/event-stream")
+	c.Set("Cache-Control", "no-cache")
+	c.Set("X-Accel-Buffering", "no")
+	return c.Stream(func(sw *fh.StreamWriter) error {
+		if _, err := fmt.Fprintf(sw, "event: connected\ndata: {\"client_id\":\"%s\"}\n\n", clientID); err != nil {
+			return err
+		}
+		if err := sw.Flush(); err != nil {
+			return err
+		}
+		heartbeat := time.NewTicker(ws.cfg.HeartbeatInterval)
+		defer heartbeat.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return nil
+			case msg, ok := <-client.send:
+				if !ok {
+					return nil
+				}
+				if _, err := sw.Write(msg); err != nil {
+					return err
+				}
+			case <-heartbeat.C:
+				if _, err := io.WriteString(sw, ": ping\n\n"); err != nil {
+					return err
+				}
 			}
-			_, _ = w.Write(msg)
-			flusher.Flush()
+			if err := sw.Flush(); err != nil {
+				return err
+			}
 		}
-	}
-}
-
-func (ws *WebSocketServer) handleHTTPRequest(w http.ResponseWriter, r *http.Request, clientID string) {
-	action := r.URL.Query().Get("action")
-	msg := wsMessage{ID: r.URL.Query().Get("id"), Action: action}
-	switch action {
-	case "publish":
-		msg.Topic = r.URL.Query().Get("topic")
-		msg.Queue = r.URL.Query().Get("queue")
-		if r.Body != nil {
-			msg.Payload, _ = json.Marshal(map[string]any{})
-		}
-	case "subscribe":
-		msg.Queue = r.URL.Query().Get("queue")
-	case "poll":
-		msg.Queue = r.URL.Query().Get("queue")
-	case "stats":
-		msg.Action = "stats"
-	case "health":
-		msg.Action = "health"
-	}
-	ws.handleAction(w, msg, clientID)
-}
-
-func (ws *WebSocketServer) handleAction(w http.ResponseWriter, msg wsMessage, clientID string) {
-	ctx := context.Background()
-	switch msg.Action {
-	case "publish":
-		opts := []PublishOption{}
-		if msg.Queue != "" {
-			opts = append(opts, WithQueue(msg.Queue))
-		}
-		if msg.Type != "" {
-			opts = append(opts, WithType(msg.Type))
-		}
-		res, err := ws.broker.Publisher().Publish(ctx, msg.Topic, msg.Payload, opts...)
-		if err != nil {
-			w.Header().Set("Content-Type", "application/json")
-			fmt.Fprintf(w, `{"id":"%s","ok":false,"error":"%s"}`, msg.ID, err.Error())
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(wsResponse{ID: msg.ID, OK: true, Data: res})
-	case "stats":
-		stats, _ := ws.broker.Store().Stats(ctx)
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(wsResponse{ID: msg.ID, OK: true, Data: stats})
-	case "health":
-		health := ws.broker.Health()
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(wsResponse{ID: msg.ID, OK: true, Data: health})
-	}
-}
-
-type wsMessage struct {
-	ID      string            `json:"id"`
-	Action  string            `json:"action"`
-	Topic   string            `json:"topic,omitempty"`
-	Queue   string            `json:"queue,omitempty"`
-	Payload json.RawMessage   `json:"payload,omitempty"`
-	Headers map[string]string `json:"headers,omitempty"`
-	Type    string            `json:"type,omitempty"`
+	})
 }
 
 type wsResponse struct {
@@ -287,8 +237,4 @@ func (ws *WebSocketServer) Stop() {
 	}
 	ws.mu.Unlock()
 	ws.wg.Wait()
-}
-
-func init() {
-	_ = log.Printf
 }

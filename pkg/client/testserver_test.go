@@ -2,15 +2,14 @@ package client
 
 import (
 	"context"
-	"net/http/httptest"
 	"testing"
 	"time"
 
 	"github.com/oarkflow/broker"
 )
 
-// newTestBrokerServer starts a real in-process broker behind an httptest
-// server using the admin HTTP data-plane, mirroring the production wire
+// newTestBrokerServer starts a real in-process broker behind an fh
+// application using the admin HTTP data-plane, mirroring the production wire
 // protocol the client package speaks. It declares the given queues before
 // returning. Tests get back the broker (for direct assertions) and the base
 // URL to point a Client/Worker at.
@@ -34,7 +33,6 @@ func newTestBrokerServer(t *testing.T, queues ...string) (*broker.Broker, string
 		}
 	}
 	admin := broker.AdminServer{Broker: b, InsecureDev: true}
-	srv := httptest.NewServer(admin.Handler())
-	t.Cleanup(srv.Close)
+	srv := newTestServer(t, admin.App())
 	return b, srv.URL
 }

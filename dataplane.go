@@ -2,19 +2,17 @@ package broker
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"net/http"
-	"net/url"
-	"strconv"
-	"strings"
 	"time"
 
 	"github.com/oarkflow/broker/cluster"
+	"github.com/oarkflow/fh"
 )
 
 type PollRequest struct {
@@ -232,118 +230,200 @@ func (p *PublishHTTPPayload) UnmarshalJSON(data []byte) error {
 // decodePublishHTTPPayload reads a publish request body. It is the same as
 // json.Decoder.Decode but needs the raw bytes so PublishHTTPPayload can apply
 // its key compatibility rules.
-func decodePublishHTTPPayload(r *http.Request, dst *PublishHTTPPayload) error {
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		return err
-	}
-	return json.Unmarshal(body, dst)
+func decodePublishHTTPPayload(c fh.Ctx, dst *PublishHTTPPayload) error {
+	return json.Unmarshal(c.Body(), dst)
 }
 
-func (a AdminServer) dataPlane(w http.ResponseWriter, r *http.Request) {
-	path := strings.TrimPrefix(r.URL.Path, "/v1")
-	if path == "" {
-		path = "/"
+// registerDataPlaneRoutes mounts the /v1 consumer and producer API.
+//
+// The permissions mirror the data plane's established authorization model.
+// Note that /v1/broker lifecycle changes and /v1/dlq operations have always
+// required only broker:read; the operator-facing /dlq routes use dlq:* scopes.
+func (a AdminServer) registerDataPlaneRoutes(v1 adminRouter) {
+	v1.post("/publish", PermissionPublish, a.v1Publish)
+	v1.post("/publish/batch", PermissionPublish, a.v1PublishBatch)
+	v1.post("/publish/frame", PermissionPublish, a.v1PublishFrame)
+	v1.post("/publish/frame/batch", PermissionPublish, a.v1PublishFrameBatch)
+	v1.post("/request", PermissionPublish, a.v1Request)
+
+	v1.get("/broker", PermissionBrokerRead, a.v1BrokerState)
+	v1.post("/broker", PermissionBrokerRead, a.v1BrokerLifecycle)
+	v1.put("/broker", PermissionBrokerRead, a.v1BrokerLifecycle)
+
+	v1.get("/topics/:topic", PermissionBrokerRead, a.v1Topic)
+	v1.get("/topics/:topic/partitions/:partition/messages", PermissionBrokerRead, a.v1TopicPartition)
+
+	v1.get("/consumers", PermissionConsumerRead, a.v1ConsumerList)
+	v1.post("/consumers/register", PermissionConsumerRegister, a.v1ConsumerRegister)
+	// Without this, GET would fall through to /consumers/:id with id "register".
+	v1.get("/consumers/register", PermissionConsumerRegister, allowOnly(fh.MethodPOST))
+	consumer := v1.group("/consumers/:id")
+	consumer.get("", PermissionConsumerRead, a.v1ConsumerGet)
+	consumer.get("/events", PermissionConsumerRead, a.v1ConsumerEvents)
+	consumer.post("/heartbeat", PermissionConsumerControl, a.v1ConsumerHeartbeat)
+	consumer.post("/subscribe", PermissionConsumerControl, a.v1ConsumerSubscribe)
+	consumer.post("/pause", PermissionConsumerControl, a.v1ConsumerPause)
+	consumer.post("/resume", PermissionConsumerControl, a.v1ConsumerResume)
+	consumer.post("/drain", PermissionConsumerControl, a.v1ConsumerDrain)
+	consumer.post("/ban", PermissionConsumerBan, a.v1ConsumerBan)
+	consumer.post("/unban", PermissionConsumerUnban, a.v1ConsumerUnban)
+	consumer.post("/unregister", PermissionConsumerControl, a.v1ConsumerUnregister)
+	consumer.delete("/unregister", PermissionConsumerControl, a.v1ConsumerUnregister)
+
+	for _, path := range []string{"/poll", "/poll/batch"} {
+		v1.get(path, PermissionConsumerPoll, a.v1Poll)
+		v1.post(path, PermissionConsumerPoll, a.v1Poll)
 	}
-	switch {
-	case path == "/publish":
-		a.v1Publish(w, r)
-	case path == "/publish/frame":
-		a.v1PublishFrame(w, r)
-	case path == "/publish/frame/batch":
-		a.v1PublishFrameBatch(w, r)
-	case path == "/publish/batch":
-		a.v1PublishBatch(w, r)
-	case path == "/request":
-		a.v1Request(w, r)
-	case path == "/broker":
-		if rejectScopedControlPlane(w, r, "broker lifecycle") {
-			return
-		}
-		a.v1BrokerLifecycle(w, r)
-	case strings.HasPrefix(path, "/topics/"):
-		a.v1Topic(w, r, strings.TrimPrefix(path, "/topics/"))
-	case path == "/consumers" && r.Method == http.MethodGet:
-		writeBrokerJSON(w, a.Broker.Consumers().ListContext(r.Context()))
-	case path == "/consumers/register":
-		a.v1ConsumerRegister(w, r)
-	case strings.HasPrefix(path, "/consumers/"):
-		a.v1Consumer(w, r, strings.TrimPrefix(path, "/consumers/"))
-	case path == "/poll" || path == "/poll/batch":
-		a.v1Poll(w, r)
-	case path == "/poll/frame":
-		a.v1PollFrame(w, r)
-	case path == "/ack/frame":
-		a.v1AckFrameBatch(w, r)
-	case strings.HasPrefix(path, "/messages/"):
-		a.v1Message(w, r, strings.TrimPrefix(path, "/messages/"))
-	case path == "/tasks" && r.Method == http.MethodGet:
-		writeBrokerJSON(w, a.Broker.ListTasks(r.Context()))
-	case path == "/tasks/submit":
-		a.v1TaskSubmit(w, r)
-	case strings.HasPrefix(path, "/tasks/"):
-		a.v1Task(w, r, strings.TrimPrefix(path, "/tasks/"))
-	case path == "/streams":
-		a.streams(w, r)
-	case strings.HasPrefix(path, "/streams/"):
-		r2 := new(http.Request)
-		*r2 = *r
-		r2.URL = cloneURL(r.URL)
-		r2.URL.Path = strings.TrimPrefix(r.URL.Path, "/v1")
-		a.stream(w, r2)
-	case path == "/dlq":
-		a.dlq(w, r)
-	case strings.HasPrefix(path, "/dlq/"):
-		r2 := new(http.Request)
-		*r2 = *r
-		r2.URL = cloneURL(r.URL)
-		r2.URL.Path = strings.TrimPrefix(r.URL.Path, "/v1")
-		a.dlqQueue(w, r2)
-	case path == "/events":
-		a.events(w, r)
-	case path == "/sagas":
-		if r.Method == http.MethodPost {
-			a.v1SagaCreate(w, r)
-		} else {
-			writeBrokerJSON(w, a.Broker.SagaEngine().ListSagasContext(r.Context()))
-		}
-	case strings.HasPrefix(path, "/sagas/"):
-		a.v1Saga(w, r, strings.TrimPrefix(path, "/sagas/"))
-	case path == "/groups":
-		if rejectScopedControlPlane(w, r, "global consumer groups") {
-			return
-		}
-		writeBrokerJSON(w, a.Broker.GroupRebalancer().ListGroups())
-	case strings.HasPrefix(path, "/groups/"):
-		if rejectScopedControlPlane(w, r, "global consumer groups") {
-			return
-		}
-		group := strings.TrimPrefix(path, "/groups/")
-		g := a.Broker.GroupRebalancer().GetGroup(group)
-		if g == nil {
-			http.NotFound(w, r)
-			return
-		}
-		writeBrokerJSON(w, g)
-	default:
-		http.NotFound(w, r)
-	}
+	v1.get("/poll/frame", PermissionConsumerPoll, a.v1PollFrame)
+	v1.post("/poll/frame", PermissionConsumerPoll, a.v1PollFrame)
+	v1.post("/ack/frame", PermissionMessageAck, a.v1AckFrameBatch)
+
+	msg := v1.group("/messages/:id")
+	msg.post("/ack", PermissionMessageAck, a.v1MessageAck)
+	msg.post("/nack", PermissionMessageNack, a.v1MessageNack("nack"))
+	msg.post("/reject", PermissionMessageNack, a.v1MessageNack("reject"))
+	msg.post("/extend", PermissionMessageRead, a.v1MessageExtend)
+	msg.post("/progress", PermissionMessageRead, a.v1MessageProgress)
+	msg.post("/respond", PermissionMessageRead, a.v1MessageRespond("respond"))
+	msg.post("/complete", PermissionMessageRead, a.v1MessageRespond("complete"))
+	msg.post("/fail", PermissionMessageRead, a.v1MessageRespond("fail"))
+
+	v1.get("/tasks", PermissionTaskRead, a.v1TaskList)
+	v1.post("/tasks/submit", PermissionTaskWrite, a.v1TaskSubmit)
+	// Without this, GET would fall through to /tasks/:id with id "submit".
+	v1.get("/tasks/submit", PermissionTaskWrite, allowOnly(fh.MethodPOST))
+	task := v1.group("/tasks/:id")
+	task.get("", PermissionTaskRead, a.v1TaskGet)
+	task.get("/result", PermissionTaskRead, a.v1TaskResult)
+	task.get("/logs", PermissionTaskRead, a.v1TaskLogs)
+	task.post("/cancel", PermissionTaskWrite, a.v1TaskCancel)
+	task.post("/retry", PermissionTaskWrite, a.v1TaskRetry)
+
+	v1.get("/streams", PermissionStreamRead, a.streams)
+	v1.post("/streams", PermissionStreamWrite, a.streams)
+	a.registerStreamRoutes(v1.group("/streams/:stream"), PermissionStreamCommit)
+
+	v1.get("/dlq", PermissionBrokerRead, a.dlq)
+	v1.get("/dlq/dashboard", PermissionBrokerRead, a.dlqDashboard)
+	a.registerDLQRoutes(v1.group("/dlq/:queue"), PermissionBrokerRead, PermissionBrokerRead)
+
+	v1.get("/events", PermissionNotification, a.events)
+
+	v1.get("/sagas", PermissionTaskRead, a.v1SagaList)
+	v1.post("/sagas", PermissionTaskWrite, a.v1SagaCreate)
+	v1.get("/sagas/:id", PermissionTaskRead, a.v1Saga)
+
+	v1.get("/groups", PermissionBrokerRead, a.v1Groups)
+	v1.get("/groups/:group", PermissionBrokerRead, a.v1Group)
 }
 
-func (a AdminServer) v1PublishFrame(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		methodBroker(w)
-		return
+func (a AdminServer) v1ConsumerList(c fh.Ctx) error {
+	return writeBrokerJSON(c, a.Broker.Consumers().ListContext(c.Context()))
+}
+
+func (a AdminServer) v1TaskList(c fh.Ctx) error {
+	return writeBrokerJSON(c, a.Broker.ListTasks(c.Context()))
+}
+
+func (a AdminServer) v1SagaList(c fh.Ctx) error {
+	return writeBrokerJSON(c, a.Broker.SagaEngine().ListSagasContext(c.Context()))
+}
+
+func (a AdminServer) v1Saga(c fh.Ctx) error {
+	s, ok := a.Broker.SagaEngine().GetSagaContext(c.Context(), pathParam(c, "id"))
+	if !ok {
+		return notFound(c)
 	}
-	data, err := io.ReadAll(r.Body)
+	return writeBrokerJSON(c, &s)
+}
+
+func (a AdminServer) v1Groups(c fh.Ctx) error {
+	if rejectScopedControlPlane(c, "global consumer groups") {
+		return nil
+	}
+	return writeBrokerJSON(c, a.Broker.GroupRebalancer().ListGroups())
+}
+
+func (a AdminServer) v1Group(c fh.Ctx) error {
+	if rejectScopedControlPlane(c, "global consumer groups") {
+		return nil
+	}
+	g := a.Broker.GroupRebalancer().GetGroup(pathParam(c, "group"))
+	if g == nil {
+		return notFound(c)
+	}
+	return writeBrokerJSON(c, g)
+}
+
+func (a AdminServer) v1BrokerState(c fh.Ctx) error {
+	if rejectScopedControlPlane(c, "broker lifecycle") {
+		return nil
+	}
+	return writeBrokerJSON(c, map[string]any{"state": a.Broker.State()})
+}
+
+// brokerLifecycleActions maps a lifecycle action name to the broker operation.
+var brokerLifecycleActions = map[string]func(*Broker, context.Context) error{
+	"pause":  (*Broker).Pause,
+	"resume": (*Broker).Resume,
+}
+
+func (a AdminServer) v1BrokerLifecycle(c fh.Ctx) error {
+	if rejectScopedControlPlane(c, "broker lifecycle") {
+		return nil
+	}
+	var req struct {
+		Action string `json:"action"`
+		Reason string `json:"reason,omitempty"`
+	}
+	if err := decodeJSON(c, &req); err != nil {
+		return WriteBrokerError(c, errf(ErrInvalidMessage, "invalid body: %v", err))
+	}
+	action, ok := brokerLifecycleActions[req.Action]
+	if !ok {
+		return WriteBrokerError(c, errf(ErrInvalidMessage, "action must be pause or resume, got %q", req.Action))
+	}
+	if err := action(a.Broker, c.Context()); err != nil {
+		return WriteBrokerError(c, err)
+	}
+	return writeBrokerJSON(c, map[string]any{"state": a.Broker.State(), "reason": req.Reason})
+}
+
+func (a AdminServer) v1TopicPartition(c fh.Ctx) error {
+	name, err := sanitizeIdentifier(pathParam(c, "topic"))
+	partition, ok := pathPartition(c, "partition")
+	if err != nil || !ok {
+		return WriteBrokerError(c, ErrInvalidMessage)
+	}
+	if a.Distributed == nil {
+		return WriteBrokerError(c, ErrUnsupportedMode)
+	}
+	msgs, err := a.Distributed.ReadPartitionTopic(c.Context(), name, partition, queryString(c, "after"), queryLimit(c, 100))
 	if err != nil {
-		http.Error(w, err.Error(), 400)
-		return
+		return WriteBrokerError(c, err)
 	}
+	return writeBrokerJSON(c, msgs)
+}
+
+func (a AdminServer) v1Topic(c fh.Ctx) error {
+	name, err := sanitizeIdentifier(pathParam(c, "topic"))
+	if err != nil {
+		return WriteBrokerError(c, ErrInvalidMessage)
+	}
+	msgs, err := a.Broker.ReadTopic(c.Context(), name, queryString(c, "after"), queryLimit(c, 100))
+	if err != nil {
+		return WriteBrokerError(c, err)
+	}
+	return writeBrokerJSON(c, msgs)
+}
+
+func (a AdminServer) v1PublishFrame(c fh.Ctx) error {
+	// Copy the body: decoded frames may alias it, and fh recycles request
+	// buffers once the handler returns.
+	data := c.BodyCopy()
 	var msg Message
 	if err := a.Broker.FrameCodec().DecodeMessage(data, &msg); err != nil {
-		http.Error(w, err.Error(), 400)
-		return
+		return httpError(c, err.Error(), 400)
 	}
 	topic := msg.Topic
 	opts := []PublishOption{WithMessageID(msg.ID), WithHeaders(msg.Headers), WithMetadata(msg.Metadata), WithType(msg.Type), WithContentType(msg.ContentType), WithKey(msg.Key), WithRoutingKey(msg.RoutingKey), WithPriority(msg.Priority), WithTenantID(msg.TenantID), WithProducerID(msg.ProducerID), WithCorrelationID(msg.CorrelationID), WithCausationID(msg.CausationID), WithIdempotencyKey(msg.IdempotencyKey)}
@@ -359,12 +439,11 @@ func (a AdminServer) v1PublishFrame(w http.ResponseWriter, r *http.Request) {
 	if !msg.ExpiresAt.IsZero() && msg.ExpiresAt.After(time.Now()) {
 		opts = append(opts, WithTTL(time.Until(msg.ExpiresAt)))
 	}
-	res, err := a.Broker.Publisher().Publish(r.Context(), topic, msg.Payload, opts...)
+	res, err := a.Broker.Publisher().Publish(c.Context(), topic, msg.Payload, opts...)
 	if err != nil {
-		WriteBrokerError(w, err)
-		return
+		return WriteBrokerError(c, err)
 	}
-	writeBrokerJSON(w, res)
+	return writeBrokerJSON(c, res)
 }
 
 func publishOptionsFromFrame(msg Message) []PublishOption {
@@ -384,30 +463,23 @@ func publishOptionsFromFrame(msg Message) []PublishOption {
 	return opts
 }
 
-func (a AdminServer) v1PublishFrameBatch(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		methodBroker(w)
-		return
-	}
-	messages, err := readFrameBatch(r.Body, a.Broker.FrameCodec(), 1<<20, r.ContentLength)
+func (a AdminServer) v1PublishFrameBatch(c fh.Ctx) error {
+	messages, err := readFrameBatch(bytes.NewReader(c.BodyCopy()), a.Broker.FrameCodec(), 1<<20, int64(len(c.Body())))
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
+		return httpError(c, err.Error(), fh.StatusBadRequest)
 	}
 	if len(messages) == 0 {
-		http.Error(w, "empty frame batch", http.StatusBadRequest)
-		return
+		return httpError(c, "empty frame batch", fh.StatusBadRequest)
 	}
-	if preferMinimal(r) {
-		errs, first := a.Broker.Publisher().publishMessagesMinimal(r.Context(), messages)
-		writeMinimalPublishResponse(w, errs, first)
-		return
+	if preferMinimal(c) {
+		errs, first := a.Broker.Publisher().publishMessagesMinimal(c.Context(), messages)
+		return writeMinimalPublishResponse(c, errs, first)
 	}
 	items := make([]PublishBatchItem, len(messages))
 	for i := range messages {
 		items[i] = PublishBatchItem{Topic: messages[i].Topic, Payload: messages[i].Payload, Options: publishOptionsFromFrame(messages[i])}
 	}
-	results, errs, first := a.Broker.Publisher().publishItemsAligned(r.Context(), items)
+	results, errs, first := a.Broker.Publisher().publishItemsAligned(c.Context(), items)
 	errorsOut := make([]string, len(errs))
 	failed := 0
 	for i, err := range errs {
@@ -417,10 +489,10 @@ func (a AdminServer) v1PublishFrameBatch(w http.ResponseWriter, r *http.Request)
 		}
 	}
 	if failed > 0 {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusMultiStatus)
+		c.Set("Content-Type", "application/json")
+		c.Status(fh.StatusMultiStatus)
 	}
-	writeBrokerJSON(w, map[string]any{"results": results, "errors": errorsOut, "failed": failed, "error": errorString(first)})
+	return writeBrokerJSON(c, map[string]any{"results": results, "errors": errorsOut, "failed": failed, "error": errorString(first)})
 }
 
 // readFrameBatch decodes length-prefixed frames. The request body is buffered
@@ -548,10 +620,6 @@ func decodeAckFrameBatch(reader io.Reader, maxBytes int64) ([]AckRequest, error)
 	return requests, nil
 }
 
-func preferMinimal(r *http.Request) bool {
-	return strings.Contains(strings.ToLower(r.Header.Get("Prefer")), "return=minimal")
-}
-
 func errorString(err error) string {
 	if err == nil {
 		return ""
@@ -559,7 +627,7 @@ func errorString(err error) string {
 	return err.Error()
 }
 
-func writeMinimalPublishResponse(w http.ResponseWriter, errs []error, first error) {
+func writeMinimalPublishResponse(c fh.Ctx, errs []error, first error) error {
 	failed := 0
 	errorsOut := make([]string, len(errs))
 	for i, err := range errs {
@@ -569,34 +637,25 @@ func writeMinimalPublishResponse(w http.ResponseWriter, errs []error, first erro
 		}
 	}
 	if failed == 0 {
-		w.WriteHeader(http.StatusNoContent)
-		return
+		return c.SendStatus(fh.StatusNoContent)
 	}
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusMultiStatus)
-	_ = json.NewEncoder(w).Encode(map[string]any{"errors": errorsOut, "failed": failed, "error": errorString(first)})
+	return writeBrokerJSONStatus(c, fh.StatusMultiStatus, map[string]any{"errors": errorsOut, "failed": failed, "error": errorString(first)})
 }
 
-func (a AdminServer) v1AckFrameBatch(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		methodBroker(w)
-		return
-	}
-	requests, err := decodeAckFrameBatch(r.Body, 1<<20)
+func (a AdminServer) v1AckFrameBatch(c fh.Ctx) error {
+	requests, err := decodeAckFrameBatch(bytes.NewReader(c.BodyCopy()), 1<<20)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
+		return httpError(c, err.Error(), fh.StatusBadRequest)
 	}
 	if len(requests) == 0 {
-		http.Error(w, "empty ack batch", http.StatusBadRequest)
-		return
+		return httpError(c, "empty ack batch", fh.StatusBadRequest)
 	}
 	errs := make([]error, len(requests))
 	if batchStore, ok := a.Broker.store.(BatchAckStore); ok {
-		errs = batchStore.AckBatch(r.Context(), requests)
+		errs = batchStore.AckBatch(c.Context(), requests)
 	} else {
 		for i := range requests {
-			errs[i] = a.Broker.store.Ack(r.Context(), requests[i])
+			errs[i] = a.Broker.store.Ack(c.Context(), requests[i])
 		}
 	}
 	acked := 0
@@ -609,15 +668,14 @@ func (a AdminServer) v1AckFrameBatch(w http.ResponseWriter, r *http.Request) {
 			errorsOut[i] = err.Error()
 		}
 	}
-	if acked == len(requests) && preferMinimal(r) {
-		w.WriteHeader(http.StatusNoContent)
-		return
+	if acked == len(requests) && preferMinimal(c) {
+		return c.SendStatus(fh.StatusNoContent)
 	}
 	if acked != len(requests) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusMultiStatus)
+		c.Set("Content-Type", "application/json")
+		c.Status(fh.StatusMultiStatus)
 	}
-	writeBrokerJSON(w, map[string]any{"acked": acked, "errors": errorsOut})
+	return writeBrokerJSON(c, map[string]any{"acked": acked, "errors": errorsOut})
 }
 
 // messageFromHTTPPayload builds a Message for the "Prefer: return=minimal"
@@ -688,371 +746,109 @@ func messageFromHTTPPayload(p PublishHTTPPayload) Message {
 	return msg
 }
 
-func (a AdminServer) v1Publish(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		methodBroker(w)
-		return
-	}
+func (a AdminServer) v1Publish(c fh.Ctx) error {
 	var req PublishHTTPPayload
-	if decodePublishHTTPPayload(r, &req) != nil {
-		http.Error(w, "invalid json", 400)
-		return
+	if decodePublishHTTPPayload(c, &req) != nil {
+		return httpError(c, "invalid json", 400)
 	}
 	payload, err := req.PayloadBytes()
 	if err != nil {
-		http.Error(w, err.Error(), 400)
-		return
+		return httpError(c, err.Error(), 400)
 	}
 	opts := req.PublishOptions()
-	res, err := a.Broker.Publisher().Publish(r.Context(), req.Topic, payload, opts...)
+	res, err := a.Broker.Publisher().Publish(c.Context(), req.Topic, payload, opts...)
 	if err != nil {
-		WriteBrokerError(w, err)
-		return
+		return WriteBrokerError(c, err)
 	}
-	writeBrokerJSON(w, res)
+	return writeBrokerJSON(c, res)
 }
-func (a AdminServer) v1PublishBatch(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		methodBroker(w)
-		return
-	}
+func (a AdminServer) v1PublishBatch(c fh.Ctx) error {
 	var req struct {
 		Messages []PublishHTTPPayload `json:"messages"`
 	}
-	if json.NewDecoder(r.Body).Decode(&req) != nil {
-		http.Error(w, "invalid json", 400)
-		return
+	if decodeJSON(c, &req) != nil {
+		return httpError(c, "invalid json", 400)
 	}
-	if preferMinimal(r) {
+	if preferMinimal(c) {
 		messages := make([]Message, len(req.Messages))
 		for i := range req.Messages {
 			messages[i] = messageFromHTTPPayload(req.Messages[i])
 		}
-		errs, first := a.Broker.Publisher().publishMessagesMinimal(r.Context(), messages)
-		writeMinimalPublishResponse(w, errs, first)
-		return
+		errs, first := a.Broker.Publisher().publishMessagesMinimal(c.Context(), messages)
+		return writeMinimalPublishResponse(c, errs, first)
 	}
 	items := make([]PublishBatchItem, len(req.Messages))
 	for i, m := range req.Messages {
 		payload, perr := m.PayloadBytes()
 		if perr != nil {
-			http.Error(w, perr.Error(), 400)
-			return
+			return httpError(c, perr.Error(), 400)
 		}
 		items[i] = PublishBatchItem{Topic: m.Topic, Payload: payload, Options: m.PublishOptions()}
 	}
-	res, err := a.Broker.Publisher().PublishItems(r.Context(), items)
+	res, err := a.Broker.Publisher().PublishItems(c.Context(), items)
 	if err != nil && len(res.Errors) == 0 {
-		WriteBrokerError(w, err)
-		return
+		return WriteBrokerError(c, err)
 	}
 	if len(res.Errors) > 0 {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusMultiStatus)
+		c.Set("Content-Type", "application/json")
+		c.Status(fh.StatusMultiStatus)
 	}
-	writeBrokerJSON(w, res)
+	return writeBrokerJSON(c, res)
 }
-func (a AdminServer) v1Request(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		methodBroker(w)
-		return
-	}
+func (a AdminServer) v1Request(c fh.Ctx) error {
 	var req PublishHTTPPayload
-	if decodePublishHTTPPayload(r, &req) != nil {
-		http.Error(w, "invalid json", 400)
-		return
+	if decodePublishHTTPPayload(c, &req) != nil {
+		return httpError(c, "invalid json", 400)
 	}
 	if req.Topic == "" {
-		http.Error(w, "topic/subject required", 400)
-		return
+		return httpError(c, "topic/subject required", 400)
 	}
 	timeout := time.Duration(req.TimeoutNS)
 	if timeout <= 0 {
 		timeout = 30 * time.Second
 	}
-	resp, err := a.Broker.Publisher().requestWithOptions(r.Context(), req.Topic, []byte(req.Payload), RequestOptions{Timeout: timeout, CorrelationID: req.CorrelationID, TenantID: req.TenantID, IdempotencyKey: req.IdempotencyKey})
+	resp, err := a.Broker.Publisher().requestWithOptions(c.Context(), req.Topic, []byte(req.Payload), RequestOptions{Timeout: timeout, CorrelationID: req.CorrelationID, TenantID: req.TenantID, IdempotencyKey: req.IdempotencyKey})
 	if err != nil {
-		http.Error(w, err.Error(), 504)
-		return
+		return httpError(c, err.Error(), 504)
 	}
-	writeBrokerJSON(w, resp)
+	return writeBrokerJSON(c, resp)
 }
-func (a AdminServer) v1ConsumerRegister(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		methodBroker(w)
-		return
-	}
+func (a AdminServer) v1ConsumerRegister(c fh.Ctx) error {
 	var req ConsumerRegistration
-	if json.NewDecoder(r.Body).Decode(&req) != nil {
-		http.Error(w, "invalid json", 400)
-		return
+	if decodeJSON(c, &req) != nil {
+		return httpError(c, "invalid json", 400)
 	}
-	info, err := a.Broker.RegisterRemoteConsumer(r.Context(), req)
+	info, err := a.Broker.RegisterRemoteConsumer(c.Context(), req)
 	if err != nil {
 		if errors.Is(err, ErrUnauthorized) {
-			http.Error(w, err.Error(), http.StatusForbidden)
-			return
+			return httpError(c, err.Error(), fh.StatusForbidden)
 		}
-		WriteBrokerError(w, err)
-		return
+		return WriteBrokerError(c, err)
 	}
-	writeBrokerJSON(w, info)
-}
-
-// v1BrokerLifecycle exposes broker-wide pause and resume. Queue-level pause already
-// existed under /queues, but there was no way to stop the whole broker over HTTP.
-func (a AdminServer) v1BrokerLifecycle(w http.ResponseWriter, r *http.Request) {
-	switch r.Method {
-	case http.MethodGet:
-		writeBrokerJSON(w, map[string]any{"state": a.Broker.State()})
-	case http.MethodPost, http.MethodPut:
-		var req struct {
-			Action string `json:"action"`
-			Reason string `json:"reason,omitempty"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			WriteBrokerError(w, errf(ErrInvalidMessage, "invalid body: %v", err))
-			return
-		}
-		var err error
-		switch req.Action {
-		case "pause":
-			err = a.Broker.Pause(r.Context())
-		case "resume":
-			err = a.Broker.Resume(r.Context())
-		default:
-			WriteBrokerError(w, errf(ErrInvalidMessage, "action must be pause or resume, got %q", req.Action))
-			return
-		}
-		if err != nil {
-			WriteBrokerError(w, err)
-			return
-		}
-		writeBrokerJSON(w, map[string]any{"state": a.Broker.State(), "reason": req.Reason})
-	default:
-		methodBroker(w)
-	}
-}
-
-// v1Topic exposes topic retention. Topics had no read path over HTTP, so an operator
-// could see only counts, never what had actually been published.
-func (a AdminServer) v1Topic(w http.ResponseWriter, r *http.Request, tail string) {
-	parts := strings.Split(strings.Trim(tail, "/"), "/")
-	if len(parts) == 4 && parts[1] == "partitions" && parts[3] == "messages" {
-		name, err := sanitizeIdentifier(parts[0])
-		partition, parseErr := strconv.Atoi(parts[2])
-		if err != nil || parseErr != nil || partition < 0 {
-			WriteBrokerError(w, ErrInvalidMessage)
-			return
-		}
-		if r.Method != http.MethodGet {
-			methodBroker(w)
-			return
-		}
-		if a.Distributed == nil {
-			WriteBrokerError(w, ErrUnsupportedMode)
-			return
-		}
-		msgs, err := a.Distributed.ReadPartitionTopic(r.Context(), name, partition, r.URL.Query().Get("after"), queryLimit(r, 100))
-		if err != nil {
-			WriteBrokerError(w, err)
-			return
-		}
-		writeBrokerJSON(w, msgs)
-		return
-	}
-	name := strings.Trim(tail, "/")
-	if name == "" || strings.Contains(name, "/") {
-		http.NotFound(w, r)
-		return
-	}
-	if validated, err := sanitizeIdentifier(name); err != nil {
-		WriteBrokerError(w, ErrInvalidMessage)
-		return
-	} else {
-		name = validated
-	}
-	if r.Method != http.MethodGet {
-		methodBroker(w)
-		return
-	}
-	msgs, err := a.Broker.ReadTopic(r.Context(), name, r.URL.Query().Get("after"), queryLimit(r, 100))
-	if err != nil {
-		WriteBrokerError(w, err)
-		return
-	}
-	writeBrokerJSON(w, msgs)
-}
-
-func (a AdminServer) v1Consumer(w http.ResponseWriter, r *http.Request, tail string) {
-	parts := strings.Split(strings.Trim(tail, "/"), "/")
-	if len(parts) == 0 || parts[0] == "" {
-		http.NotFound(w, r)
-		return
-	}
-	id := parts[0]
-	if hasRestrictedTenantScope(r.Context()) {
-		info, ok := a.Broker.Consumers().Get(id)
-		if !ok || !tenantAllowed(r.Context(), info.TenantID) {
-			http.NotFound(w, r)
-			return
-		}
-	}
-	if len(parts) == 1 {
-		if r.Method == http.MethodGet {
-			if info, ok := a.Broker.Consumers().Get(id); ok {
-				if !tenantAllowed(r.Context(), info.TenantID) {
-					http.NotFound(w, r)
-					return
-				}
-				writeBrokerJSON(w, info)
-				return
-			}
-			http.NotFound(w, r)
-			return
-		}
-		methodBroker(w)
-		return
-	}
-	switch parts[1] {
-	case "heartbeat":
-		if r.Method != http.MethodPost {
-			methodBroker(w)
-			return
-		}
-		info, err := a.Broker.RemoteConsumerHeartbeat(r.Context(), id)
-		if err != nil {
-			if errors.Is(err, ErrUnauthorized) {
-				http.Error(w, err.Error(), http.StatusForbidden)
-				return
-			}
-			http.Error(w, err.Error(), 404)
-			return
-		}
-		writeBrokerJSON(w, info)
-	case "subscribe":
-		if r.Method != http.MethodPost {
-			methodBroker(w)
-			return
-		}
-		var sub RemoteSubscription
-		if json.NewDecoder(r.Body).Decode(&sub) != nil {
-			http.Error(w, "invalid json", 400)
-			return
-		}
-		if !sub.AutoCreate {
-			sub.AutoCreate = true
-		}
-		info, err := a.Broker.RemoteConsumerSubscribe(r.Context(), id, sub)
-		if err != nil {
-			if errors.Is(err, ErrUnauthorized) {
-				http.Error(w, err.Error(), http.StatusForbidden)
-				return
-			}
-			WriteBrokerError(w, err)
-			return
-		}
-		writeBrokerJSON(w, info)
-	case "pause":
-		info, err := a.Broker.SetRemoteConsumerState(r.Context(), id, ConsumerPaused, "remote pause")
-		if err != nil {
-			if errors.Is(err, ErrUnauthorized) {
-				http.Error(w, err.Error(), http.StatusForbidden)
-				return
-			}
-			http.Error(w, err.Error(), 404)
-			return
-		}
-		writeBrokerJSON(w, info)
-	case "resume":
-		info, err := a.Broker.SetRemoteConsumerState(r.Context(), id, ConsumerReady, "remote resume")
-		if err != nil {
-			if errors.Is(err, ErrUnauthorized) {
-				http.Error(w, err.Error(), http.StatusForbidden)
-				return
-			}
-			http.Error(w, err.Error(), 404)
-			return
-		}
-		writeBrokerJSON(w, info)
-	case "drain":
-		info, err := a.Broker.SetRemoteConsumerState(r.Context(), id, ConsumerDraining, "remote drain")
-		if err != nil {
-			http.Error(w, err.Error(), 404)
-			return
-		}
-		writeBrokerJSON(w, info)
-	case "ban":
-		reason := r.URL.Query().Get("reason")
-		if reason == "" {
-			reason = "remote ban"
-		}
-		info, err := a.Broker.BanRemoteConsumer(r.Context(), id, reason)
-		if err != nil {
-			http.Error(w, err.Error(), 404)
-			return
-		}
-		writeBrokerJSON(w, info)
-	case "unban":
-		info, err := a.Broker.UnbanRemoteConsumer(r.Context(), id)
-		if err != nil {
-			http.Error(w, err.Error(), 404)
-			return
-		}
-		writeBrokerJSON(w, info)
-	case "unregister":
-		if r.Method != http.MethodPost && r.Method != http.MethodDelete {
-			methodBroker(w)
-			return
-		}
-		if err := a.Broker.UnregisterRemoteConsumer(r.Context(), id); err != nil {
-			http.Error(w, err.Error(), 404)
-			return
-		}
-		writeBrokerJSON(w, map[string]bool{"ok": true})
-	case "events":
-		after := r.URL.Query().Get("after")
-		wait := queryDuration(r, "wait", 0)
-		deadline := time.Now().Add(wait)
-		for {
-			evs := a.Broker.Consumers().Events(id, after, queryLimit(r, 100))
-			if len(evs) > 0 || wait <= 0 || time.Now().After(deadline) {
-				writeBrokerJSON(w, evs)
-				return
-			}
-			select {
-			case <-time.After(100 * time.Millisecond):
-			case <-r.Context().Done():
-				return
-			}
-		}
-	default:
-		http.NotFound(w, r)
-	}
+	return writeBrokerJSON(c, info)
 }
 
 // parsePollRequest reads a poll request from either the JSON body or the query
 // string, so both poll endpoints normalise identically.
-func parsePollRequest(w http.ResponseWriter, r *http.Request) (PollRequest, bool) {
+func parsePollRequest(c fh.Ctx) (PollRequest, bool) {
 	var req PollRequest
-	if r.Method == http.MethodPost && r.Body != nil {
-		_ = json.NewDecoder(r.Body).Decode(&req)
+	if c.Method() == fh.MethodPOST {
+		_ = decodeJSON(c, &req)
 	}
-	q := r.URL.Query()
 	if req.Queue == "" {
-		req.Queue = q.Get("queue")
+		req.Queue = queryString(c, "queue")
 	}
 	if req.ConsumerID == "" {
-		req.ConsumerID = firstNonEmpty(q.Get("consumer_id"), q.Get("consumer"))
+		req.ConsumerID = firstNonEmpty(queryString(c, "consumer_id"), queryString(c, "consumer"))
 	}
 	if req.ConsumerGroup == "" {
-		req.ConsumerGroup = firstNonEmpty(q.Get("consumer_group"), q.Get("group"))
+		req.ConsumerGroup = firstNonEmpty(queryString(c, "consumer_group"), queryString(c, "group"))
 	}
 	if req.Limit <= 0 {
-		req.Limit = queryLimit(r, 1)
+		req.Limit = queryLimit(c, 1)
 	}
 	if req.ConsumerID == "" || req.Queue == "" {
-		http.Error(w, "consumer_id and queue required", 400)
+		_ = httpError(c, "consumer_id and queue required", 400)
 		return req, false
 	}
 	return req, true
@@ -1082,24 +878,24 @@ func (a AdminServer) consumerBlocked(consumerID string) bool {
 //
 // It returns the leased messages, or ok=false when it has already written the
 // response.
-func (a AdminServer) leaseForConsumer(w http.ResponseWriter, r *http.Request, req PollRequest) ([]Message, bool) {
+func (a AdminServer) leaseForConsumer(c fh.Ctx, req PollRequest) ([]Message, bool) {
 	if a.Distributed != nil {
-		assigned, err := a.Distributed.hasResourcePartitions(r.Context(), cluster.PartitionResourceQueue, req.Queue)
+		assigned, err := a.Distributed.hasResourcePartitions(c.Context(), cluster.PartitionResourceQueue, req.Queue)
 		if err != nil {
-			WriteBrokerError(w, err)
+			WriteBrokerError(c, err)
 			return nil, false
 		}
 		if assigned && !req.Partitioned {
-			WriteBrokerError(w, fmt.Errorf("%w: queue %q requires a partition-specific poll", ErrUnsupportedMode, req.Queue))
+			WriteBrokerError(c, fmt.Errorf("%w: queue %q requires a partition-specific poll", ErrUnsupportedMode, req.Queue))
 			return nil, false
 		}
 	} else if req.Partitioned {
-		WriteBrokerError(w, ErrUnsupportedMode)
+		WriteBrokerError(c, ErrUnsupportedMode)
 		return nil, false
 	}
-	tenant, err := resolveTenant(r.Context(), req.TenantID)
+	tenant, err := resolveTenant(c.Context(), req.TenantID)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusForbidden)
+		httpError(c, err.Error(), fh.StatusForbidden)
 		return nil, false
 	}
 	if a.consumerBlocked(req.ConsumerID) {
@@ -1107,12 +903,12 @@ func (a AdminServer) leaseForConsumer(w http.ResponseWriter, r *http.Request, re
 	}
 	wait := time.Duration(req.WaitNS)
 	if wait <= 0 {
-		wait = queryDuration(r, "wait", 0)
+		wait = queryDuration(c, "wait", 0)
 	}
 	deadline := time.Now().Add(wait)
 	vis := time.Duration(req.VisibilityTimeoutNS)
 	if vis <= 0 {
-		vis = queryDuration(r, "visibility_timeout", 0)
+		vis = queryDuration(c, "visibility_timeout", 0)
 	}
 	leaseReq := LeaseRequest{
 		Queue:             req.Queue,
@@ -1144,9 +940,9 @@ func (a AdminServer) leaseForConsumer(w http.ResponseWriter, r *http.Request, re
 		ready = signaler.QueueReady(req.Queue)
 	}
 	for {
-		msgs, err := a.Broker.store.Lease(r.Context(), leaseReq)
+		msgs, err := a.Broker.store.Lease(c.Context(), leaseReq)
 		if err != nil {
-			WriteBrokerError(w, err)
+			WriteBrokerError(c, err)
 			return nil, false
 		}
 		if len(msgs) > 0 || wait <= 0 || time.Now().After(deadline) {
@@ -1161,20 +957,20 @@ func (a AdminServer) leaseForConsumer(w http.ResponseWriter, r *http.Request, re
 					leased[i].Status = MessageProcessing
 					taskID := firstNonEmpty(leased[i].TaskID, leased[i].Headers["x-task-id"])
 					if taskID != "" {
-						run, err := a.Broker.startTask(r.Context(), taskID)
+						run, err := a.Broker.startTask(c.Context(), taskID)
 						if err != nil {
 							for _, item := range leased {
-								_ = a.Broker.store.Nack(r.Context(), NackRequest{MessageID: item.ID, Queue: req.Queue, Partition: req.Partition, Partitioned: req.Partitioned, ConsumerID: req.ConsumerID, LeaseToken: item.LeaseToken, Action: NackRequeue})
+								_ = a.Broker.store.Nack(c.Context(), NackRequest{MessageID: item.ID, Queue: req.Queue, Partition: req.Partition, Partitioned: req.Partitioned, ConsumerID: req.ConsumerID, LeaseToken: item.LeaseToken, Action: NackRequeue})
 							}
-							WriteBrokerError(w, err)
+							WriteBrokerError(c, err)
 							return nil, false
 						}
 						if !run {
-							if err := a.Broker.store.Ack(r.Context(), AckRequest{MessageID: leased[i].ID, Queue: req.Queue, Partition: req.Partition, Partitioned: req.Partitioned, LeaseToken: leased[i].LeaseToken, ConsumerID: req.ConsumerID}); err != nil {
+							if err := a.Broker.store.Ack(c.Context(), AckRequest{MessageID: leased[i].ID, Queue: req.Queue, Partition: req.Partition, Partitioned: req.Partitioned, LeaseToken: leased[i].LeaseToken, ConsumerID: req.ConsumerID}); err != nil {
 								for _, item := range leased {
-									_ = a.Broker.store.Nack(r.Context(), NackRequest{MessageID: item.ID, Queue: req.Queue, Partition: req.Partition, Partitioned: req.Partitioned, ConsumerID: req.ConsumerID, LeaseToken: item.LeaseToken, Action: NackRequeue})
+									_ = a.Broker.store.Nack(c.Context(), NackRequest{MessageID: item.ID, Queue: req.Queue, Partition: req.Partition, Partitioned: req.Partitioned, ConsumerID: req.ConsumerID, LeaseToken: item.LeaseToken, Action: NackRequeue})
 								}
-								WriteBrokerError(w, err)
+								WriteBrokerError(c, err)
 								return nil, false
 							}
 							a.Broker.Consumers().AddStats(req.ConsumerID, 0, 1, 0, 0, "")
@@ -1217,7 +1013,7 @@ func (a AdminServer) leaseForConsumer(w http.ResponseWriter, r *http.Request, re
 		select {
 		case <-ready:
 		case <-idle.C:
-		case <-r.Context().Done():
+		case <-c.Context().Done():
 			return nil, false
 		}
 	}
@@ -1226,123 +1022,107 @@ func (a AdminServer) leaseForConsumer(w http.ResponseWriter, r *http.Request, re
 // pollRetryInterval is how long a long poll waits before re-checking the queue.
 const pollRetryInterval = 25 * time.Millisecond
 
-func (a AdminServer) v1PollFrame(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost && r.Method != http.MethodGet {
-		methodBroker(w)
-		return
-	}
-	req, ok := parsePollRequest(w, r)
+func (a AdminServer) v1PollFrame(c fh.Ctx) error {
+	req, ok := parsePollRequest(c)
 	if !ok {
-		return
+		return nil
 	}
-	msgs, ok := a.leaseForConsumer(w, r, req)
+	msgs, ok := a.leaseForConsumer(c, req)
 	if !ok {
-		return
+		return nil
 	}
-	writeFrameBatch(w, a.Broker.FrameCodec(), msgs)
+	writeFrameBatch(c, a.Broker.FrameCodec(), msgs)
+	return nil
 }
 
-func writeFrameBatch(w http.ResponseWriter, codec FrameCodec, msgs []Message) {
+func writeFrameBatch(c fh.Ctx, codec FrameCodec, msgs []Message) error {
 	body, err := EncodeMessageFrameBatch(nil, codec, msgs)
 	if err != nil {
-		http.Error(w, err.Error(), 500)
-		return
+		return httpError(c, err.Error(), 500)
 	}
-	w.Header().Set("Content-Type", "application/vnd.pool.broker.frames")
-	_, _ = w.Write(body)
+	c.Set("Content-Type", "application/vnd.pool.broker.frames")
+	return c.Send(body)
 }
 
-func (a AdminServer) v1Poll(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost && r.Method != http.MethodGet {
-		methodBroker(w)
-		return
-	}
-	req, ok := parsePollRequest(w, r)
+func (a AdminServer) v1Poll(c fh.Ctx) error {
+	req, ok := parsePollRequest(c)
 	if !ok {
-		return
+		return nil
 	}
-	msgs, ok := a.leaseForConsumer(w, r, req)
+	msgs, ok := a.leaseForConsumer(c, req)
 	if !ok {
-		return
+		return nil
 	}
-	writeBrokerJSON(w, msgs)
+	return writeBrokerJSON(c, msgs)
 }
 
-func (a AdminServer) v1Message(w http.ResponseWriter, r *http.Request, tail string) {
-	parts := strings.Split(strings.Trim(tail, "/"), "/")
-	if len(parts) < 2 || parts[0] == "" {
-		http.NotFound(w, r)
-		return
+// ---- /v1/messages/:id ----
+
+func (a AdminServer) v1MessageAck(c fh.Ctx) error {
+	id := pathParam(c, "id")
+	var req AckRequest
+	_ = decodeJSON(c, &req)
+	req.MessageID = id
+	// Validate the lease token before the store does, so the failure is
+	// reported as ErrLeaseLost with the same code and status the frame ack
+	// endpoint and every in-process caller see. This path used to answer 403
+	// with bespoke text while /v1/ack/frame answered 409 with ErrLeaseLost, so
+	// the same logical failure was indistinguishable to a client.
+	m, hadMessage, lookupErr := a.Broker.store.Get(c.Context(), id)
+	if req.Partitioned && a.Distributed != nil {
+		m, hadMessage, lookupErr = a.Distributed.GetPartitionQueueMessage(c.Context(), req.Queue, req.Partition, id)
 	}
-	id, op := parts[0], parts[1]
-	switch op {
-	case "ack":
-		var req AckRequest
-		_ = json.NewDecoder(r.Body).Decode(&req)
-		req.MessageID = id
-		// Validate the lease token before the store does, so the failure is
-		// reported as ErrLeaseLost with the same code and status the frame ack
-		// endpoint and every in-process caller see. This path used to answer 403
-		// with bespoke text while /v1/ack/frame answered 409 with ErrLeaseLost, so
-		// the same logical failure was indistinguishable to a client.
-		m, hadMessage, lookupErr := a.Broker.store.Get(r.Context(), id)
-		if req.Partitioned && a.Distributed != nil {
-			m, hadMessage, lookupErr = a.Distributed.GetPartitionQueueMessage(r.Context(), req.Queue, req.Partition, id)
+	if lookupErr != nil {
+		return WriteBrokerError(c, lookupErr)
+	}
+	if hadMessage && m.LeaseToken != "" {
+		if req.LeaseToken == "" {
+			return WriteBrokerError(c, errf(ErrLeaseLost, "lease token required for leased message %s", id))
 		}
-		if lookupErr != nil {
-			WriteBrokerError(w, lookupErr)
-			return
+		if req.LeaseToken != m.LeaseToken {
+			return WriteBrokerError(c, errf(ErrLeaseLost, "invalid lease token for message %s", id))
 		}
-		if hadMessage && m.LeaseToken != "" {
-			if req.LeaseToken == "" {
-				WriteBrokerError(w, errf(ErrLeaseLost, "lease token required for leased message %s", id))
-				return
-			}
-			if req.LeaseToken != m.LeaseToken {
-				WriteBrokerError(w, errf(ErrLeaseLost, "invalid lease token for message %s", id))
-				return
-			}
+	}
+	if err := a.Broker.store.Ack(c.Context(), req); err != nil {
+		return WriteBrokerError(c, err)
+	}
+	a.Broker.Consumers().AddStats(req.ConsumerID, 0, 1, 0, 0, "")
+	if hadMessage {
+		if err := a.Broker.completeTask(c.Context(), m, nil, nil); err != nil {
+			return WriteBrokerError(c, fmt.Errorf("message %s was acknowledged but task completion could not be persisted: %w", id, err))
 		}
-		if err := a.Broker.store.Ack(r.Context(), req); err != nil {
-			WriteBrokerError(w, err)
-			return
-		}
-		a.Broker.Consumers().AddStats(req.ConsumerID, 0, 1, 0, 0, "")
-		if hadMessage {
-			if err := a.Broker.completeTask(r.Context(), m, nil, nil); err != nil {
-				WriteBrokerError(w, fmt.Errorf("message %s was acknowledged but task completion could not be persisted: %w", id, err))
-				return
-			}
-			a.Broker.notify.Publish(Notification{Type: "message.acked", Source: firstNonEmpty(req.ConsumerID, "remote-consumer"), Severity: SeverityInfo, MessageID: id, TaskID: firstNonEmpty(m.TaskID, m.Headers["x-task-id"]), Topic: m.Topic, Queue: firstNonEmpty(req.Queue, m.Queue), Consumer: req.ConsumerID, ConsumerGroup: m.ConsumerGroup, TenantID: m.TenantID, Timestamp: time.Now()})
-		} else {
-			a.Broker.notify.Publish(Notification{Type: "message.acked", Source: firstNonEmpty(req.ConsumerID, "remote-consumer"), Severity: SeverityInfo, MessageID: id, Queue: req.Queue, Consumer: req.ConsumerID, Timestamp: time.Now()})
-		}
-		writeBrokerJSON(w, map[string]bool{"ok": true})
-	case "nack", "reject":
+		a.Broker.notify.Publish(Notification{Type: "message.acked", Source: firstNonEmpty(req.ConsumerID, "remote-consumer"), Severity: SeverityInfo, MessageID: id, TaskID: firstNonEmpty(m.TaskID, m.Headers["x-task-id"]), Topic: m.Topic, Queue: firstNonEmpty(req.Queue, m.Queue), Consumer: req.ConsumerID, ConsumerGroup: m.ConsumerGroup, TenantID: m.TenantID, Timestamp: time.Now()})
+	} else {
+		a.Broker.notify.Publish(Notification{Type: "message.acked", Source: firstNonEmpty(req.ConsumerID, "remote-consumer"), Severity: SeverityInfo, MessageID: id, Queue: req.Queue, Consumer: req.ConsumerID, Timestamp: time.Now()})
+	}
+	return writeBrokerJSON(c, map[string]bool{"ok": true})
+}
+
+// v1MessageNack serves nack and reject; op is the route verb.
+func (a AdminServer) v1MessageNack(op string) fh.HandlerFunc {
+	return func(c fh.Ctx) error {
+		id := pathParam(c, "id")
 		var req NackRequest
-		_ = json.NewDecoder(r.Body).Decode(&req)
+		_ = decodeJSON(c, &req)
 		req.MessageID = id
 		// Validate the lease token before the store does, so the failure is
 		// reported as ErrLeaseLost with the same code and status the frame ack
 		// endpoint and every in-process caller see. This path used to answer 403
 		// with bespoke text while /v1/ack/frame answered 409 with ErrLeaseLost, so
 		// the same logical failure was indistinguishable to a client.
-		m, hadMessage, lookupErr := a.Broker.store.Get(r.Context(), id)
+		m, hadMessage, lookupErr := a.Broker.store.Get(c.Context(), id)
 		if req.Partitioned && a.Distributed != nil {
-			m, hadMessage, lookupErr = a.Distributed.GetPartitionQueueMessage(r.Context(), req.Queue, req.Partition, id)
+			m, hadMessage, lookupErr = a.Distributed.GetPartitionQueueMessage(c.Context(), req.Queue, req.Partition, id)
 		}
 		if lookupErr != nil {
-			WriteBrokerError(w, lookupErr)
-			return
+			return WriteBrokerError(c, lookupErr)
 		}
 		if hadMessage && m.LeaseToken != "" {
 			if req.LeaseToken == "" {
-				WriteBrokerError(w, errf(ErrLeaseLost, "lease token required for leased message %s", id))
-				return
+				return WriteBrokerError(c, errf(ErrLeaseLost, "lease token required for leased message %s", id))
 			}
 			if req.LeaseToken != m.LeaseToken {
-				WriteBrokerError(w, errf(ErrLeaseLost, "invalid lease token for message %s", id))
-				return
+				return WriteBrokerError(c, errf(ErrLeaseLost, "invalid lease token for message %s", id))
 			}
 		}
 		if req.Action == "" {
@@ -1352,100 +1132,101 @@ func (a AdminServer) v1Message(w http.ResponseWriter, r *http.Request, tail stri
 			req.Action = NackReject
 		}
 		req.IncrementAttempt = true
-		if err := a.Broker.store.Nack(r.Context(), req); err != nil {
-			WriteBrokerError(w, err)
-			return
+		if err := a.Broker.store.Nack(c.Context(), req); err != nil {
+			return WriteBrokerError(c, err)
 		}
 		a.Broker.Consumers().AddStats(req.ConsumerID, 0, 0, 1, 0, req.Error)
 		if req.Action == NackReject || req.Action == NackDLQ {
 			if hadMessage {
 				tid := firstNonEmpty(m.TaskID, m.Headers["x-task-id"])
 				if tid != "" {
-					if taskErr := a.Broker.failTask(r.Context(), tid, errf(ErrPermanent, "%s", firstNonEmpty(req.Error, req.Reason))); taskErr != nil {
-						WriteBrokerError(w, fmt.Errorf("message %s was rejected but task failure could not be persisted: %w", id, taskErr))
-						return
+					if taskErr := a.Broker.failTask(c.Context(), tid, errf(ErrPermanent, "%s", firstNonEmpty(req.Error, req.Reason))); taskErr != nil {
+						return WriteBrokerError(c, fmt.Errorf("message %s was rejected but task failure could not be persisted: %w", id, taskErr))
 					}
 				}
 			}
 		} else if hadMessage {
 			tid := firstNonEmpty(m.TaskID, m.Headers["x-task-id"])
 			if tid != "" {
-				if taskErr := a.Broker.retryTask(r.Context(), tid, fmt.Errorf("%s", firstNonEmpty(req.Error, firstNonEmpty(req.Reason, "message requeued")))); taskErr != nil {
-					WriteBrokerError(w, fmt.Errorf("message %s was requeued but task retry state could not be persisted: %w", id, taskErr))
-					return
+				if taskErr := a.Broker.retryTask(c.Context(), tid, fmt.Errorf("%s", firstNonEmpty(req.Error, firstNonEmpty(req.Reason, "message requeued")))); taskErr != nil {
+					return WriteBrokerError(c, fmt.Errorf("message %s was requeued but task retry state could not be persisted: %w", id, taskErr))
 				}
 			}
 		}
 		if hadMessage {
 			a.Broker.notify.Publish(Notification{Type: "message." + op, Source: firstNonEmpty(req.ConsumerID, "remote-consumer"), Severity: SeverityWarn, MessageID: id, TaskID: firstNonEmpty(m.TaskID, m.Headers["x-task-id"]), Topic: m.Topic, Queue: firstNonEmpty(req.Queue, m.Queue), Consumer: req.ConsumerID, ConsumerGroup: m.ConsumerGroup, TenantID: m.TenantID, Timestamp: time.Now(), Data: map[string]any{"action": req.Action, "reason": firstNonEmpty(req.Reason, req.Error)}})
 		}
-		writeBrokerJSON(w, map[string]bool{"ok": true})
-	case "extend":
-		var req LeaseRequest
-		_ = json.NewDecoder(r.Body).Decode(&req)
-		req.MessageID = id
-		var m Message
-		if req.Partitioned && a.Distributed != nil {
-			var getErr error
-			m, _, getErr = a.Distributed.GetPartitionQueueMessage(r.Context(), req.Queue, req.Partition, id)
-			if getErr != nil {
-				WriteBrokerError(w, getErr)
-				return
-			}
-		} else {
-			m, _, _ = a.Broker.store.Get(r.Context(), id)
+		return writeBrokerJSON(c, map[string]bool{"ok": true})
+	}
+}
+
+func (a AdminServer) v1MessageExtend(c fh.Ctx) error {
+	id := pathParam(c, "id")
+	var req LeaseRequest
+	_ = decodeJSON(c, &req)
+	req.MessageID = id
+	var m Message
+	if req.Partitioned && a.Distributed != nil {
+		var getErr error
+		m, _, getErr = a.Distributed.GetPartitionQueueMessage(c.Context(), req.Queue, req.Partition, id)
+		if getErr != nil {
+			return WriteBrokerError(c, getErr)
 		}
-		if err := a.Broker.store.ExtendLease(r.Context(), req); err != nil {
-			WriteBrokerError(w, err)
-			return
+	} else {
+		m, _, _ = a.Broker.store.Get(c.Context(), id)
+	}
+	if err := a.Broker.store.ExtendLease(c.Context(), req); err != nil {
+		return WriteBrokerError(c, err)
+	}
+	a.Broker.notify.Publish(Notification{Type: "message.lease_extended", Source: firstNonEmpty(req.ConsumerID, "remote-consumer"), Severity: SeverityDebug, MessageID: id, TaskID: firstNonEmpty(m.TaskID, m.Headers["x-task-id"]), Topic: m.Topic, Queue: firstNonEmpty(req.Queue, m.Queue), Consumer: req.ConsumerID, ConsumerGroup: m.ConsumerGroup, TenantID: m.TenantID, Timestamp: time.Now(), Data: map[string]any{"extend_by": req.VisibilityTimeout.String()}})
+	return writeBrokerJSON(c, map[string]bool{"ok": true})
+}
+
+func (a AdminServer) v1MessageProgress(c fh.Ctx) error {
+	id := pathParam(c, "id")
+	var req struct {
+		LeaseToken string   `json:"lease_token"`
+		ConsumerID string   `json:"consumer_id"`
+		Queue      string   `json:"queue"`
+		Progress   Progress `json:"progress"`
+	}
+	if decodeJSON(c, &req) != nil {
+		return httpError(c, "invalid json", 400)
+	}
+	m, ok, err := a.Broker.store.Get(c.Context(), id)
+	if err != nil {
+		return httpError(c, err.Error(), 500)
+	}
+	if !ok {
+		return notFound(c)
+	}
+	if m.LeaseToken != "" && (req.LeaseToken == "" || req.LeaseToken != m.LeaseToken) {
+		return httpError(c, ErrLeaseLost.Error(), 409)
+	}
+	m.Status = MessageProgressing
+	if m.TaskID == "" {
+		m.TaskID = m.Headers["x-task-id"]
+		m.TaskName = m.Headers["x-task-name"]
+	}
+	if err := a.Broker.store.Update(c.Context(), m); err != nil {
+		return WriteBrokerError(c, err)
+	}
+	if req.Progress.UpdatedAt.IsZero() {
+		req.Progress.UpdatedAt = time.Now()
+	}
+	if m.TaskID != "" {
+		if err := a.Broker.updateTaskProgress(c.Context(), m.TaskID, req.Progress); err != nil {
+			return WriteBrokerError(c, err)
 		}
-		a.Broker.notify.Publish(Notification{Type: "message.lease_extended", Source: firstNonEmpty(req.ConsumerID, "remote-consumer"), Severity: SeverityDebug, MessageID: id, TaskID: firstNonEmpty(m.TaskID, m.Headers["x-task-id"]), Topic: m.Topic, Queue: firstNonEmpty(req.Queue, m.Queue), Consumer: req.ConsumerID, ConsumerGroup: m.ConsumerGroup, TenantID: m.TenantID, Timestamp: time.Now(), Data: map[string]any{"extend_by": req.VisibilityTimeout.String()}})
-		writeBrokerJSON(w, map[string]bool{"ok": true})
-	case "progress":
-		var req struct {
-			LeaseToken string   `json:"lease_token"`
-			ConsumerID string   `json:"consumer_id"`
-			Queue      string   `json:"queue"`
-			Progress   Progress `json:"progress"`
-		}
-		if json.NewDecoder(r.Body).Decode(&req) != nil {
-			http.Error(w, "invalid json", 400)
-			return
-		}
-		m, ok, err := a.Broker.store.Get(r.Context(), id)
-		if err != nil {
-			http.Error(w, err.Error(), 500)
-			return
-		}
-		if !ok {
-			http.NotFound(w, r)
-			return
-		}
-		if m.LeaseToken != "" && (req.LeaseToken == "" || req.LeaseToken != m.LeaseToken) {
-			http.Error(w, ErrLeaseLost.Error(), 409)
-			return
-		}
-		m.Status = MessageProgressing
-		if m.TaskID == "" {
-			m.TaskID = m.Headers["x-task-id"]
-			m.TaskName = m.Headers["x-task-name"]
-		}
-		if err := a.Broker.store.Update(r.Context(), m); err != nil {
-			WriteBrokerError(w, err)
-			return
-		}
-		if req.Progress.UpdatedAt.IsZero() {
-			req.Progress.UpdatedAt = time.Now()
-		}
-		if m.TaskID != "" {
-			if err := a.Broker.updateTaskProgress(r.Context(), m.TaskID, req.Progress); err != nil {
-				WriteBrokerError(w, err)
-				return
-			}
-		}
-		a.Broker.notify.Publish(Notification{Type: "message.progress", Source: firstNonEmpty(req.ConsumerID, "remote-consumer"), Severity: SeverityInfo, MessageID: id, TaskID: m.TaskID, Topic: m.Topic, Queue: firstNonEmpty(req.Queue, m.Queue), Consumer: req.ConsumerID, ConsumerGroup: m.ConsumerGroup, TenantID: m.TenantID, Timestamp: time.Now(), Data: map[string]any{"percent": req.Progress.Percent, "message": req.Progress.Message}})
-		writeBrokerJSON(w, map[string]bool{"ok": true})
-	case "respond", "complete", "fail":
+	}
+	a.Broker.notify.Publish(Notification{Type: "message.progress", Source: firstNonEmpty(req.ConsumerID, "remote-consumer"), Severity: SeverityInfo, MessageID: id, TaskID: m.TaskID, Topic: m.Topic, Queue: firstNonEmpty(req.Queue, m.Queue), Consumer: req.ConsumerID, ConsumerGroup: m.ConsumerGroup, TenantID: m.TenantID, Timestamp: time.Now(), Data: map[string]any{"percent": req.Progress.Percent, "message": req.Progress.Message}})
+	return writeBrokerJSON(c, map[string]bool{"ok": true})
+}
+
+// v1MessageRespond serves respond, complete and fail; op is the route verb.
+func (a AdminServer) v1MessageRespond(op string) fh.HandlerFunc {
+	return func(c fh.Ctx) error {
+		id := pathParam(c, "id")
 		var req struct {
 			LeaseToken    string            `json:"lease_token"`
 			ConsumerID    string            `json:"consumer_id"`
@@ -1456,22 +1237,18 @@ func (a AdminServer) v1Message(w http.ResponseWriter, r *http.Request, tail stri
 			Headers       map[string]string `json:"headers"`
 			Ack           bool              `json:"ack"`
 		}
-		if json.NewDecoder(r.Body).Decode(&req) != nil {
-			http.Error(w, "invalid json", 400)
-			return
+		if decodeJSON(c, &req) != nil {
+			return httpError(c, "invalid json", 400)
 		}
-		m, ok, err := a.Broker.store.Get(r.Context(), id)
+		m, ok, err := a.Broker.store.Get(c.Context(), id)
 		if err != nil {
-			http.Error(w, err.Error(), 500)
-			return
+			return httpError(c, err.Error(), 500)
 		}
 		if !ok {
-			http.NotFound(w, r)
-			return
+			return notFound(c)
 		}
 		if m.LeaseToken != "" && (req.LeaseToken == "" || req.LeaseToken != m.LeaseToken) {
-			http.Error(w, ErrLeaseLost.Error(), 409)
-			return
+			return httpError(c, ErrLeaseLost.Error(), 409)
 		}
 		corr := firstNonEmpty(req.CorrelationID, m.CorrelationID)
 		resp := Response{MessageID: a.Broker.nextID("resp"), CorrelationID: corr, Payload: []byte(req.Payload), Headers: req.Headers, Status: ResponseOK, Error: req.Error}
@@ -1479,20 +1256,18 @@ func (a AdminServer) v1Message(w http.ResponseWriter, r *http.Request, tail stri
 			resp.Status = ResponseError
 		}
 		if req.Ack || op == "complete" {
-			if err := a.Broker.store.Ack(r.Context(), AckRequest{MessageID: id, Queue: req.Queue, LeaseToken: req.LeaseToken, ConsumerID: req.ConsumerID}); err != nil {
-				WriteBrokerError(w, err)
-				return
+			if err := a.Broker.store.Ack(c.Context(), AckRequest{MessageID: id, Queue: req.Queue, LeaseToken: req.LeaseToken, ConsumerID: req.ConsumerID}); err != nil {
+				return WriteBrokerError(c, err)
 			}
 			a.Broker.Consumers().AddStats(req.ConsumerID, 0, 1, 0, 0, "")
 			var taskErr error
 			if req.Error != nil || op == "fail" {
-				taskErr = a.Broker.completeTask(r.Context(), m, nil, req.Error)
+				taskErr = a.Broker.completeTask(c.Context(), m, nil, req.Error)
 			} else {
-				taskErr = a.Broker.completeTask(r.Context(), m, []byte(req.Payload), nil)
+				taskErr = a.Broker.completeTask(c.Context(), m, []byte(req.Payload), nil)
 			}
 			if taskErr != nil {
-				WriteBrokerError(w, fmt.Errorf("message %s was acknowledged but task state could not be persisted: %w", id, taskErr))
-				return
+				return WriteBrokerError(c, fmt.Errorf("message %s was acknowledged but task state could not be persisted: %w", id, taskErr))
 			}
 		}
 		delivered := false
@@ -1512,16 +1287,243 @@ func (a AdminServer) v1Message(w http.ResponseWriter, r *http.Request, tail stri
 			severity = SeverityError
 		}
 		a.Broker.notify.Publish(Notification{Type: eventType, Source: firstNonEmpty(req.ConsumerID, "remote-consumer"), Severity: severity, MessageID: id, TaskID: firstNonEmpty(m.TaskID, m.Headers["x-task-id"]), Topic: m.Topic, Queue: firstNonEmpty(req.Queue, m.Queue), Consumer: req.ConsumerID, ConsumerGroup: m.ConsumerGroup, TenantID: m.TenantID, Timestamp: time.Now(), Data: map[string]any{"correlation_id": corr, "delivered": delivered}})
-		writeBrokerJSON(w, map[string]any{"ok": true, "delivered": delivered})
-	default:
-		http.NotFound(w, r)
+		return writeBrokerJSON(c, map[string]any{"ok": true, "delivered": delivered})
 	}
 }
-func (a AdminServer) v1TaskSubmit(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		methodBroker(w)
-		return
+
+// ---- /v1/consumers/:id ----
+
+// consumerParam returns the :id consumer, hiding consumers outside a
+// tenant-scoped principal's tenants as not found.
+func (a AdminServer) consumerParam(c fh.Ctx) (string, bool, error) {
+	id := pathParam(c, "id")
+	if hasRestrictedTenantScope(c.Context()) {
+		info, ok := a.Broker.Consumers().Get(id)
+		if !ok || !tenantAllowed(c.Context(), info.TenantID) {
+			return "", false, notFound(c)
+		}
 	}
+	return id, true, nil
+}
+
+func (a AdminServer) v1ConsumerGet(c fh.Ctx) error {
+	id, ok, err := a.consumerParam(c)
+	if !ok {
+		return err
+	}
+	info, found := a.Broker.Consumers().Get(id)
+	if !found || !tenantAllowed(c.Context(), info.TenantID) {
+		return notFound(c)
+	}
+	return writeBrokerJSON(c, info)
+}
+
+func (a AdminServer) v1ConsumerHeartbeat(c fh.Ctx) error {
+	id, ok, err := a.consumerParam(c)
+	if !ok {
+		return err
+	}
+	info, err := a.Broker.RemoteConsumerHeartbeat(c.Context(), id)
+	if err != nil {
+		if errors.Is(err, ErrUnauthorized) {
+			return httpError(c, err.Error(), fh.StatusForbidden)
+		}
+		return httpError(c, err.Error(), 404)
+	}
+	return writeBrokerJSON(c, info)
+}
+
+func (a AdminServer) v1ConsumerSubscribe(c fh.Ctx) error {
+	id, ok, err := a.consumerParam(c)
+	if !ok {
+		return err
+	}
+	var sub RemoteSubscription
+	if decodeJSON(c, &sub) != nil {
+		return httpError(c, "invalid json", 400)
+	}
+	if !sub.AutoCreate {
+		sub.AutoCreate = true
+	}
+	info, err := a.Broker.RemoteConsumerSubscribe(c.Context(), id, sub)
+	if err != nil {
+		if errors.Is(err, ErrUnauthorized) {
+			return httpError(c, err.Error(), fh.StatusForbidden)
+		}
+		return WriteBrokerError(c, err)
+	}
+	return writeBrokerJSON(c, info)
+}
+
+func (a AdminServer) v1ConsumerPause(c fh.Ctx) error {
+	id, ok, err := a.consumerParam(c)
+	if !ok {
+		return err
+	}
+	info, err := a.Broker.SetRemoteConsumerState(c.Context(), id, ConsumerPaused, "remote pause")
+	if err != nil {
+		if errors.Is(err, ErrUnauthorized) {
+			return httpError(c, err.Error(), fh.StatusForbidden)
+		}
+		return httpError(c, err.Error(), 404)
+	}
+	return writeBrokerJSON(c, info)
+}
+
+func (a AdminServer) v1ConsumerResume(c fh.Ctx) error {
+	id, ok, err := a.consumerParam(c)
+	if !ok {
+		return err
+	}
+	info, err := a.Broker.SetRemoteConsumerState(c.Context(), id, ConsumerReady, "remote resume")
+	if err != nil {
+		if errors.Is(err, ErrUnauthorized) {
+			return httpError(c, err.Error(), fh.StatusForbidden)
+		}
+		return httpError(c, err.Error(), 404)
+	}
+	return writeBrokerJSON(c, info)
+}
+
+func (a AdminServer) v1ConsumerDrain(c fh.Ctx) error {
+	id, ok, err := a.consumerParam(c)
+	if !ok {
+		return err
+	}
+	info, err := a.Broker.SetRemoteConsumerState(c.Context(), id, ConsumerDraining, "remote drain")
+	if err != nil {
+		return httpError(c, err.Error(), 404)
+	}
+	return writeBrokerJSON(c, info)
+}
+
+func (a AdminServer) v1ConsumerBan(c fh.Ctx) error {
+	id, ok, err := a.consumerParam(c)
+	if !ok {
+		return err
+	}
+	reason := queryString(c, "reason")
+	if reason == "" {
+		reason = "remote ban"
+	}
+	info, err := a.Broker.BanRemoteConsumer(c.Context(), id, reason)
+	if err != nil {
+		return httpError(c, err.Error(), 404)
+	}
+	return writeBrokerJSON(c, info)
+}
+
+func (a AdminServer) v1ConsumerUnban(c fh.Ctx) error {
+	id, ok, err := a.consumerParam(c)
+	if !ok {
+		return err
+	}
+	info, err := a.Broker.UnbanRemoteConsumer(c.Context(), id)
+	if err != nil {
+		return httpError(c, err.Error(), 404)
+	}
+	return writeBrokerJSON(c, info)
+}
+
+func (a AdminServer) v1ConsumerUnregister(c fh.Ctx) error {
+	id, ok, err := a.consumerParam(c)
+	if !ok {
+		return err
+	}
+	if err := a.Broker.UnregisterRemoteConsumer(c.Context(), id); err != nil {
+		return httpError(c, err.Error(), 404)
+	}
+	return writeBrokerJSON(c, map[string]bool{"ok": true})
+}
+
+func (a AdminServer) v1ConsumerEvents(c fh.Ctx) error {
+	id, ok, err := a.consumerParam(c)
+	if !ok {
+		return err
+	}
+	after := queryString(c, "after")
+	wait := queryDuration(c, "wait", 0)
+	deadline := time.Now().Add(wait)
+	for {
+		evs := a.Broker.Consumers().Events(id, after, queryLimit(c, 100))
+		if len(evs) > 0 || wait <= 0 || time.Now().After(deadline) {
+			return writeBrokerJSON(c, evs)
+		}
+		select {
+		case <-time.After(100 * time.Millisecond):
+		case <-c.Context().Done():
+			return nil
+		}
+	}
+}
+
+// ---- /v1/tasks/:id ----
+
+// taskParam loads the :id task, hiding tasks outside the caller's tenants.
+func (a AdminServer) taskParam(c fh.Ctx) (taskHandle, TaskInfo, bool, error) {
+	h := taskHandle{b: a.Broker, id: pathParam(c, "id")}
+	info, err := h.Info(c.Context())
+	if err != nil {
+		return h, info, false, httpError(c, err.Error(), 404)
+	}
+	if !tenantAllowed(c.Context(), info.TenantID) {
+		return h, info, false, httpError(c, "task not found", fh.StatusNotFound)
+	}
+	return h, info, true, nil
+}
+
+func (a AdminServer) v1TaskGet(c fh.Ctx) error {
+	_, info, ok, err := a.taskParam(c)
+	if !ok {
+		return err
+	}
+	return writeBrokerJSON(c, info)
+}
+
+func (a AdminServer) v1TaskResult(c fh.Ctx) error {
+	_, info, ok, err := a.taskParam(c)
+	if !ok {
+		return err
+	}
+	return writeBrokerJSON(c, map[string]any{"task": info, "payload": json.RawMessage(info.Result)})
+}
+
+func (a AdminServer) v1TaskCancel(c fh.Ctx) error {
+	h, _, ok, err := a.taskParam(c)
+	if !ok {
+		return err
+	}
+	var req struct{ Reason string }
+	_ = decodeJSON(c, &req)
+	if err := h.Cancel(c.Context(), req.Reason); err != nil {
+		return WriteBrokerError(c, err)
+	}
+	return writeBrokerJSON(c, map[string]bool{"ok": true})
+}
+
+func (a AdminServer) v1TaskRetry(c fh.Ctx) error {
+	h, _, ok, err := a.taskParam(c)
+	if !ok {
+		return err
+	}
+	if err := h.Retry(c.Context()); err != nil {
+		return WriteBrokerError(c, err)
+	}
+	return writeBrokerJSON(c, map[string]bool{"ok": true})
+}
+
+func (a AdminServer) v1TaskLogs(c fh.Ctx) error {
+	h, _, ok, err := a.taskParam(c)
+	if !ok {
+		return err
+	}
+	logs, err := h.Logs(c.Context())
+	if err != nil {
+		return httpError(c, err.Error(), 404)
+	}
+	return writeBrokerJSON(c, logs)
+}
+func (a AdminServer) v1TaskSubmit(c fh.Ctx) error {
 	var req struct {
 		Name        string            `json:"name"`
 		Queue       string            `json:"queue"`
@@ -1531,135 +1533,39 @@ func (a AdminServer) v1TaskSubmit(w http.ResponseWriter, r *http.Request) {
 		MaxAttempts int               `json:"max_attempts"`
 		Metadata    map[string]string `json:"metadata"`
 	}
-	if json.NewDecoder(r.Body).Decode(&req) != nil {
-		http.Error(w, "invalid json", 400)
-		return
+	if decodeJSON(c, &req) != nil {
+		return httpError(c, "invalid json", 400)
 	}
-	tenant, err := resolveTenant(r.Context(), req.TenantID)
+	tenant, err := resolveTenant(c.Context(), req.TenantID)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusForbidden)
-		return
+		return httpError(c, err.Error(), fh.StatusForbidden)
 	}
 	req.TenantID = tenant
-	h, err := a.Broker.Publisher().SubmitTask(r.Context(), req.Name, []byte(req.Payload), WithTaskQueue(req.Queue), WithTaskTenantID(req.TenantID), WithTaskPriority(req.Priority), WithTaskMaxAttempts(req.MaxAttempts), WithTaskMetadata(req.Metadata))
+	h, err := a.Broker.Publisher().SubmitTask(c.Context(), req.Name, []byte(req.Payload), WithTaskQueue(req.Queue), WithTaskTenantID(req.TenantID), WithTaskPriority(req.Priority), WithTaskMaxAttempts(req.MaxAttempts), WithTaskMetadata(req.Metadata))
 	if err != nil {
-		WriteBrokerError(w, err)
-		return
+		return WriteBrokerError(c, err)
 	}
-	info, _ := h.Info(r.Context())
-	writeBrokerJSON(w, info)
+	info, _ := h.Info(c.Context())
+	return writeBrokerJSON(c, info)
 }
-func (a AdminServer) v1Task(w http.ResponseWriter, r *http.Request, tail string) {
-	parts := strings.Split(strings.Trim(tail, "/"), "/")
-	if len(parts) == 0 || parts[0] == "" {
-		http.NotFound(w, r)
-		return
-	}
-	h := taskHandle{b: a.Broker, id: parts[0]}
-	info, err := h.Info(r.Context())
-	if err != nil {
-		http.Error(w, err.Error(), 404)
-		return
-	}
-	if !tenantAllowed(r.Context(), info.TenantID) {
-		http.Error(w, "task not found", http.StatusNotFound)
-		return
-	}
-	if len(parts) == 1 {
-		writeBrokerJSON(w, info)
-		return
-	}
-	switch parts[1] {
-	case "result":
-		writeBrokerJSON(w, map[string]any{"task": info, "payload": json.RawMessage(info.Result)})
-	case "cancel":
-		var req struct{ Reason string }
-		_ = json.NewDecoder(r.Body).Decode(&req)
-		if err := h.Cancel(r.Context(), req.Reason); err != nil {
-			WriteBrokerError(w, err)
-			return
-		}
-		writeBrokerJSON(w, map[string]bool{"ok": true})
-	case "retry":
-		if err := h.Retry(r.Context()); err != nil {
-			WriteBrokerError(w, err)
-			return
-		}
-		writeBrokerJSON(w, map[string]bool{"ok": true})
-	case "logs":
-		logs, err := h.Logs(r.Context())
-		if err != nil {
-			http.Error(w, err.Error(), 404)
-			return
-		}
-		writeBrokerJSON(w, logs)
-	default:
-		http.NotFound(w, r)
-	}
-}
-func (a AdminServer) v1SagaCreate(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		methodBroker(w)
-		return
-	}
+func (a AdminServer) v1SagaCreate(c fh.Ctx) error {
 	var def SagaDefinition
-	if json.NewDecoder(r.Body).Decode(&def) != nil {
-		http.Error(w, "invalid json", 400)
-		return
+	if decodeJSON(c, &def) != nil {
+		return httpError(c, "invalid json", 400)
 	}
 	if def.Name == "" {
-		http.Error(w, "saga name required", 400)
-		return
+		return httpError(c, "saga name required", 400)
 	}
 	if len(def.Steps) == 0 {
-		http.Error(w, "saga steps required", 400)
-		return
+		return httpError(c, "saga steps required", 400)
 	}
-	inst, err := a.Broker.SagaEngine().CreateSagaChecked(r.Context(), def)
+	inst, err := a.Broker.SagaEngine().CreateSagaChecked(c.Context(), def)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusForbidden)
-		return
+		return httpError(c, err.Error(), fh.StatusForbidden)
 	}
-	if err := a.Broker.SagaEngine().ExecuteSaga(r.Context(), inst.ID); err != nil {
-		WriteBrokerError(w, err)
-		return
+	if err := a.Broker.SagaEngine().ExecuteSaga(c.Context(), inst.ID); err != nil {
+		return WriteBrokerError(c, err)
 	}
 	snapshot := inst.clone()
-	writeBrokerJSON(w, &snapshot)
-}
-
-func (a AdminServer) v1Saga(w http.ResponseWriter, r *http.Request, tail string) {
-	id := strings.Trim(tail, "/")
-	if id == "" {
-		http.NotFound(w, r)
-		return
-	}
-	s, ok := a.Broker.SagaEngine().GetSagaContext(r.Context(), id)
-	if !ok {
-		http.NotFound(w, r)
-		return
-	}
-	writeBrokerJSON(w, &s)
-}
-
-func queryDuration(r *http.Request, key string, d time.Duration) time.Duration {
-	raw := r.URL.Query().Get(key)
-	if raw == "" {
-		return d
-	}
-	if n, err := strconv.ParseInt(raw, 10, 64); err == nil {
-		return time.Duration(n)
-	}
-	if v, err := time.ParseDuration(raw); err == nil {
-		return v
-	}
-	return d
-}
-
-func cloneURL(u *url.URL) *url.URL {
-	if u == nil {
-		return nil
-	}
-	v := *u
-	return &v
+	return writeBrokerJSON(c, &snapshot)
 }

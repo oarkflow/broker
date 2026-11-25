@@ -3,12 +3,11 @@ package broker
 import (
 	"context"
 	"encoding/json"
-	"io"
-	"net/http"
-	"net/http/httptest"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/oarkflow/fh"
 )
 
 func TestOTLPExporterCollect(t *testing.T) {
@@ -107,31 +106,18 @@ func TestOTLPExporterHTTPTransmission(t *testing.T) {
 	var receivedPayload atomic.Pointer[OTLPExportRequest]
 	var receivedAuthHeader atomic.Pointer[string]
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		if r.URL.Path != "/v1/metrics" {
-			http.Error(w, "not found", http.StatusNotFound)
-			return
-		}
-		auth := r.Header.Get("Authorization")
+	app := fh.New(fh.WithStartupBannerDisabled(true))
+	app.Post("/v1/metrics", func(c fh.Ctx) error {
+		auth := c.Get("Authorization")
 		receivedAuthHeader.Store(&auth)
-
-		body, err := io.ReadAll(r.Body)
-		if err != nil {
-			http.Error(w, err.Error(), 500)
-			return
-		}
 		var req OTLPExportRequest
-		if err := json.Unmarshal(body, &req); err != nil {
-			http.Error(w, err.Error(), 400)
-			return
+		if err := json.Unmarshal(c.Body(), &req); err != nil {
+			return c.Status(fh.StatusBadRequest).SendString(err.Error())
 		}
 		receivedPayload.Store(&req)
-		w.WriteHeader(http.StatusOK)
-	}))
+		return c.SendStatus(fh.StatusOK)
+	})
+	server := newTestServer(t, app)
 	defer server.Close()
 
 	metrics := NewPrometheusMetrics()
@@ -182,10 +168,10 @@ func TestOTLPExporterHTTPTransmission(t *testing.T) {
 
 func TestBrokerOTLPIntegration(t *testing.T) {
 	var exportCount atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := newCatchAllServer(t, func(c fh.Ctx) error {
 		exportCount.Add(1)
-		w.WriteHeader(http.StatusOK)
-	}))
+		return c.SendStatus(fh.StatusOK)
+	})
 	defer server.Close()
 
 	b := MustNew(Config{

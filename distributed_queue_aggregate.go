@@ -9,13 +9,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net/http"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/oarkflow/broker/cluster"
+	"github.com/oarkflow/fh"
 )
 
 const internalPartitionQueueListPath = "/cluster/internal/partition-queue-list"
@@ -322,25 +322,20 @@ func (db *DistributedBroker) queueControlFromLeader(ctx context.Context, queue s
 	if err != nil {
 		return 0, err
 	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(route.LeaderClientAddress, "/")+internalPartitionQueueControlPath, bytes.NewReader(requestBody))
-	if err != nil {
-		return 0, err
-	}
-	request.Header.Set("Content-Type", "application/json")
-	response, err := db.partitionForwardClient.Do(request)
+	response, err := SendHTTP(ctx, db.partitionForwardClient, fh.MethodPOST, strings.TrimRight(route.LeaderClientAddress, "/")+internalPartitionQueueControlPath, requestBody, jsonRequestHeaders)
 	if err != nil {
 		return 0, fmt.Errorf("forward queue control to partition leader: %w", err)
 	}
-	defer response.Body.Close()
-	if response.StatusCode != http.StatusOK {
-		body, readErr := io.ReadAll(io.LimitReader(response.Body, 4096))
+	defer response.Close()
+	if response.StatusCode() != fh.StatusOK {
+		body, readErr := io.ReadAll(io.LimitReader(response.Reader(), 4096))
 		if readErr != nil {
-			return 0, fmt.Errorf("partition leader returned %s (read error: %v)", response.Status, readErr)
+			return 0, fmt.Errorf("partition leader returned %s (read error: %v)", response.Raw.Status, readErr)
 		}
-		return 0, fmt.Errorf("partition leader returned %s: %s", response.Status, strings.TrimSpace(string(body)))
+		return 0, fmt.Errorf("partition leader returned %s: %s", response.Raw.Status, strings.TrimSpace(string(body)))
 	}
 	var result partitionQueueControlResponse
-	if err := decodeStrictBoundedJSON(response.Body, 1<<20, &result); err != nil {
+	if err := decodeStrictBoundedJSON(response.Reader(), 1<<20, &result); err != nil {
 		return 0, fmt.Errorf("decode partition queue control result: %w", err)
 	}
 	if result.Partition != partition || (action != "purge" && result.Purged != 0) {
@@ -381,25 +376,20 @@ func (db *DistributedBroker) listQueuePartitionFromLeader(ctx context.Context, q
 	if err != nil {
 		return nil, err
 	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(route.LeaderClientAddress, "/")+internalPartitionQueueListPath, bytes.NewReader(payload))
-	if err != nil {
-		return nil, err
-	}
-	request.Header.Set("Content-Type", "application/json")
-	response, err := db.partitionForwardClient.Do(request)
+	response, err := SendHTTP(ctx, db.partitionForwardClient, fh.MethodPOST, strings.TrimRight(route.LeaderClientAddress, "/")+internalPartitionQueueListPath, payload, jsonRequestHeaders)
 	if err != nil {
 		return nil, fmt.Errorf("forward queue listing to partition leader: %w", err)
 	}
-	defer response.Body.Close()
-	if response.StatusCode != http.StatusOK {
-		body, readErr := io.ReadAll(io.LimitReader(response.Body, 4096))
+	defer response.Close()
+	if response.StatusCode() != fh.StatusOK {
+		body, readErr := io.ReadAll(io.LimitReader(response.Reader(), 4096))
 		if readErr != nil {
-			return nil, fmt.Errorf("partition leader returned %s (read error: %v)", response.Status, readErr)
+			return nil, fmt.Errorf("partition leader returned %s (read error: %v)", response.Raw.Status, readErr)
 		}
-		return nil, fmt.Errorf("partition leader returned %s: %s", response.Status, strings.TrimSpace(string(body)))
+		return nil, fmt.Errorf("partition leader returned %s: %s", response.Raw.Status, strings.TrimSpace(string(body)))
 	}
 	var result partitionQueueListResponse
-	if err := decodeStrictBoundedJSON(response.Body, maxAssignedQueuePartitionResponseBytes, &result); err != nil {
+	if err := decodeStrictBoundedJSON(response.Reader(), maxAssignedQueuePartitionResponseBytes, &result); err != nil {
 		return nil, fmt.Errorf("decode partition queue listing: %w", err)
 	}
 	return validatePartitionQueueMessages(result.Messages, queue, partition, limit)
@@ -417,98 +407,74 @@ func validatePartitionQueueMessages(messages []Message, queue string, partition,
 	return messages, nil
 }
 
-func (a AdminServer) internalPartitionQueueList(w http.ResponseWriter, r *http.Request) {
-	if rejectScopedControlPlane(w, r, "internal partition queue listing") {
-		return
+func (a AdminServer) internalPartitionQueueList(c fh.Ctx) error {
+	if rejectScopedControlPlane(c, "internal partition queue listing") {
+		return nil
 	}
 	if a.Distributed == nil {
-		WriteBrokerError(w, ErrUnsupportedMode)
-		return
-	}
-	if r.Method != http.MethodPost {
-		w.Header().Set("Allow", http.MethodPost)
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
+		return WriteBrokerError(c, ErrUnsupportedMode)
 	}
 	var request partitionQueueListRequest
-	decoder := json.NewDecoder(r.Body)
+	decoder := json.NewDecoder(bytes.NewReader(c.Body()))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&request); err != nil {
-		WriteBrokerError(w, err)
-		return
+		return WriteBrokerError(c, err)
 	}
 	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-		WriteBrokerError(w, ErrInvalidMessage)
-		return
+		return WriteBrokerError(c, ErrInvalidMessage)
 	}
 	queue, validationErr := sanitizeIdentifier(request.Queue)
 	if validationErr != nil || queue != request.Queue || request.Partition < 0 || request.Limit <= 0 || request.Limit > maxAssignedQueueListMessages {
-		WriteBrokerError(w, ErrInvalidMessage)
-		return
+		return WriteBrokerError(c, ErrInvalidMessage)
 	}
-	messages, err := a.Distributed.ListPartitionQueue(r.Context(), queue, request.Partition, request.Limit)
+	messages, err := a.Distributed.ListPartitionQueue(c.Context(), queue, request.Partition, request.Limit)
 	if err != nil {
-		a.writeControllerError(w, err)
-		return
+		return a.writeControllerError(c, err)
 	}
 	encoded, err := json.Marshal(partitionQueueListResponse{Messages: messages})
 	if err != nil {
-		WriteBrokerError(w, err)
-		return
+		return WriteBrokerError(c, err)
 	}
 	if len(encoded) > maxAssignedQueuePartitionResponseBytes {
-		WriteBrokerError(w, ErrMessageTooLarge)
-		return
+		return WriteBrokerError(c, ErrMessageTooLarge)
 	}
-	w.Header().Set("Content-Type", "application/json")
-	_, _ = w.Write(encoded)
+	c.Set("Content-Type", "application/json")
+	return c.Send(encoded)
 }
 
-func (a AdminServer) internalPartitionQueueControl(w http.ResponseWriter, r *http.Request) {
-	if rejectScopedControlPlane(w, r, "internal partition queue control") {
-		return
+func (a AdminServer) internalPartitionQueueControl(c fh.Ctx) error {
+	if rejectScopedControlPlane(c, "internal partition queue control") {
+		return nil
 	}
 	if a.Distributed == nil {
-		WriteBrokerError(w, ErrUnsupportedMode)
-		return
-	}
-	if r.Method != http.MethodPost {
-		w.Header().Set("Allow", http.MethodPost)
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
+		return WriteBrokerError(c, ErrUnsupportedMode)
 	}
 	var request partitionQueueControlRequest
-	decoder := json.NewDecoder(r.Body)
+	decoder := json.NewDecoder(bytes.NewReader(c.Body()))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&request); err != nil {
-		WriteBrokerError(w, err)
-		return
+		return WriteBrokerError(c, err)
 	}
 	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-		WriteBrokerError(w, ErrInvalidMessage)
-		return
+		return WriteBrokerError(c, ErrInvalidMessage)
 	}
 	queue, validationErr := sanitizeIdentifier(request.Queue)
 	if validationErr != nil || queue != request.Queue || request.Partition < 0 ||
 		(request.Action != "pause" && request.Action != "resume" && request.Action != "purge") {
-		WriteBrokerError(w, ErrInvalidMessage)
-		return
+		return WriteBrokerError(c, ErrInvalidMessage)
 	}
-	route, err := a.Distributed.PartitionResourceRoute(r.Context(), cluster.PartitionResourceQueue, queue, request.Partition)
+	route, err := a.Distributed.PartitionResourceRoute(c.Context(), cluster.PartitionResourceQueue, queue, request.Partition)
 	if err != nil {
-		a.writeControllerError(w, err)
-		return
+		return a.writeControllerError(c, err)
 	}
 	if !route.LocalLeader {
-		a.writeControllerError(w, NotLeaderError(route.LeaderClientAddress, route.RaftTerm))
-		return
+		return a.writeControllerError(c, NotLeaderError(route.LeaderClientAddress, route.RaftTerm))
 	}
-	purged, err := a.Distributed.applyQueueControlOnLeader(r.Context(), queue, request.Partition, request.Action)
+	purged, err := a.Distributed.applyQueueControlOnLeader(c.Context(), queue, request.Partition, request.Action)
 	if err != nil {
-		a.writeControllerError(w, err)
-		return
+		return a.writeControllerError(c, err)
 	}
-	writeBrokerJSON(w, partitionQueueControlResponse{Partition: request.Partition, Purged: purged})
+	return writeBrokerJSON(c, partitionQueueControlResponse{Partition: request.Partition, Purged: purged})
 }
 
 func boundedQueueFailure(message string) string {

@@ -5,9 +5,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"net/http"
-	"net/http/httptest"
 	"testing"
+
+	"github.com/oarkflow/fh"
 )
 
 func TestStreamTransactionHTTPPermissionsAndConflict(t *testing.T) {
@@ -20,15 +20,14 @@ func TestStreamTransactionHTTPPermissionsAndConflict(t *testing.T) {
 		AdminToken{Token: "no-commit", Permissions: []string{PermissionPublish, PermissionStreamRead, PermissionStreamWrite}},
 		AdminToken{Token: "both", Permissions: []string{PermissionStreamCommit, PermissionPublish}},
 	)
-	handler := (AdminServer{Broker: b, ACL: acl}).Handler()
+	handler := (AdminServer{Broker: b, ACL: acl}).App()
 	body := []byte(`{"consumer_group":"workers","expected_offset":0,"offset":1,"messages":[{"topic":"processed","queue":"jobs","payload":{"ok":true}}]}`)
 	for _, path := range []string{"/streams/input/transactions", "/v1/streams/input/transactions", "/streams/input/transactions/", "/v1/streams/input/transactions/"} {
 		for _, token := range []string{"commit", "publish", "no-commit"} {
-			r := httptest.NewRequest(http.MethodPost, path, bytes.NewReader(body))
+			r := newTestRequest(fh.MethodPOST, path, bytes.NewReader(body))
 			r.Header.Set("Authorization", "Bearer "+token)
-			w := httptest.NewRecorder()
-			handler.ServeHTTP(w, r)
-			if w.Code != http.StatusForbidden {
+			w := serveTest(t, handler, r)
+			if w.Code != fh.StatusForbidden {
 				t.Fatalf("%s token=%s: status=%d, body=%s", path, token, w.Code, w.Body.String())
 			}
 		}
@@ -38,23 +37,21 @@ func TestStreamTransactionHTTPPermissionsAndConflict(t *testing.T) {
 		`{"consumer_group":"workers","expected_offset":0,"offset":1,"unexpected":true}`,
 		`{"consumer_group":"workers","expected_offset":0,"offset":1} {}`,
 	} {
-		r := httptest.NewRequest(http.MethodPost, "/v1/streams/input/transactions", bytes.NewBufferString(malformed))
+		r := newTestRequest(fh.MethodPOST, "/v1/streams/input/transactions", bytes.NewBufferString(malformed))
 		r.Header.Set("Authorization", "Bearer both")
-		w := httptest.NewRecorder()
-		handler.ServeHTTP(w, r)
-		if w.Code != http.StatusBadRequest {
+		w := serveTest(t, handler, r)
+		if w.Code != fh.StatusBadRequest {
 			t.Fatalf("malformed body status=%d, body=%s", w.Code, w.Body.String())
 		}
 	}
-	post := func() *httptest.ResponseRecorder {
-		r := httptest.NewRequest(http.MethodPost, "/v1/streams/input/transactions", bytes.NewReader(body))
+	post := func() *testRecorder {
+		r := newTestRequest(fh.MethodPOST, "/v1/streams/input/transactions", bytes.NewReader(body))
 		r.Header.Set("Authorization", "Bearer both")
-		w := httptest.NewRecorder()
-		handler.ServeHTTP(w, r)
+		w := serveTest(t, handler, r)
 		return w
 	}
 	w := post()
-	if w.Code != http.StatusOK {
+	if w.Code != fh.StatusOK {
 		t.Fatalf("transaction status=%d, body=%s", w.Code, w.Body.String())
 	}
 	var results []PublishResult
@@ -62,7 +59,7 @@ func TestStreamTransactionHTTPPermissionsAndConflict(t *testing.T) {
 		t.Fatalf("results=%v, error=%v", results, err)
 	}
 	w = post()
-	if w.Code != http.StatusConflict || !errors.Is(ParseRemoteError(w.Code, w.Body.Bytes()), ErrOffsetConflict) {
+	if w.Code != fh.StatusConflict || !errors.Is(ParseRemoteError(w.Code, w.Body.Bytes()), ErrOffsetConflict) {
 		t.Fatalf("stale transaction status=%d, body=%s", w.Code, w.Body.String())
 	}
 	messages, err := b.Store().ListQueue(context.Background(), "jobs", 10)
@@ -71,10 +68,20 @@ func TestStreamTransactionHTTPPermissionsAndConflict(t *testing.T) {
 	}
 }
 
+// A trailing slash must not route a commit around the stream:commit check.
 func TestStreamCommitAuthorizationNormalizesTrailingSlash(t *testing.T) {
+	b := MustNew(Config{Store: NewMemoryStore()})
+	if err := b.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer b.Stop(context.Background())
+	acl := NewACL(AdminToken{Name: "reader", Token: "reader", Permissions: []string{PermissionStreamRead, PermissionStreamWrite, PermissionPublish}})
+	app := AdminServer{Broker: b, ACL: acl}.App()
 	for _, path := range []string{"/streams/input/commit/", "/v1/streams/input/commit/", "/streams/input/transactions/", "/v1/streams/input/transactions/"} {
-		if got := adminAction(httptest.NewRequest(http.MethodPost, path, nil)); got != PermissionStreamCommit {
-			t.Fatalf("%s requires %q, got %q", path, PermissionStreamCommit, got)
+		req := newTestRequest(fh.MethodPOST, path, bytes.NewBufferString(`{}`))
+		req.Header.Set("Authorization", "Bearer reader")
+		if rec := serveTest(t, app, req); rec.Code != fh.StatusForbidden && rec.Code != fh.StatusNotFound {
+			t.Fatalf("%s without %q: status %d body %s", path, PermissionStreamCommit, rec.Code, rec.Body.String())
 		}
 	}
 }

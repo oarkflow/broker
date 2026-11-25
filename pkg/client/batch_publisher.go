@@ -5,10 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/http"
 	"sync"
 
 	"github.com/oarkflow/broker"
+	"github.com/oarkflow/fh"
 )
 
 // ErrBatchPublisherClosed is returned by Publish after Close.
@@ -146,7 +146,7 @@ func (p *BatchPublisher) send(batch []*batchItem) {
 		}
 		return
 	}
-	if status == http.StatusNoContent || len(data) == 0 {
+	if status == fh.StatusNoContent || len(data) == 0 {
 		for _, it := range batch {
 			it.done <- nil
 		}
@@ -177,6 +177,6 @@ func (p *BatchPublisher) send(batch []*batchItem) {
 // doFrameBatch posts a frame batch with minimal responses and returns the body
 // and status so per-message failures (207) can be mapped to callers.
 func (c *Client) doFrameBatch(ctx context.Context, body []byte) ([]byte, int, error) {
-	data, status, err := c.doRawStatus(ctx, http.MethodPost, "/v1/publish/frame/batch", "application/vnd.pool.broker.frames", body, "return=minimal")
+	data, status, err := c.doRawStatus(ctx, fh.MethodPOST, "/v1/publish/frame/batch", "application/vnd.pool.broker.frames", body, "return=minimal")
 	return data, status, err
 }

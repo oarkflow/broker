@@ -3,7 +3,6 @@ package broker_test
 import (
 	"context"
 	"encoding/json"
-	"net/http/httptest"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -12,7 +11,7 @@ import (
 	bclient "github.com/oarkflow/broker/pkg/client"
 )
 
-func remoteTestBroker(t *testing.T) (*broker.Broker, *httptest.Server) {
+func remoteTestBroker(t *testing.T) (*broker.Broker, *testServer) {
 	t.Helper()
 	b, err := broker.New(broker.Config{Mode: broker.ModeStandalone, DefaultVisibility: 200 * time.Millisecond, DefaultRetry: broker.RetryPolicy{MaxAttempts: 1, Initial: 10 * time.Millisecond, Max: 20 * time.Millisecond, Factor: 1}})
 	if err != nil {
@@ -21,7 +20,7 @@ func remoteTestBroker(t *testing.T) (*broker.Broker, *httptest.Server) {
 	if err := b.Start(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	ts := httptest.NewServer(broker.AdminServer{Broker: b, InsecureDev: true, MaxBodyBytes: 1 << 20}.Handler())
+	ts := newTestServer(t, broker.AdminServer{Broker: b, InsecureDev: true, MaxBodyBytes: 1 << 20}.App())
 	t.Cleanup(func() { ts.Close(); _ = b.Stop(context.Background()) })
 	return b, ts
 }

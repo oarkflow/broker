@@ -3,22 +3,22 @@ package broker
 import (
 	"bytes"
 	"encoding/json"
-	"net/http"
-	"net/http/httptest"
 	"testing"
+
+	"github.com/oarkflow/fh"
 )
 
 // The console's create dialogs are the only place these request shapes are
 // written down. /publish/batch already shipped documented as {"messages":[...]}
 // when the API wanted a bare array, so each shape the console sends is pinned
 // here rather than left to be discovered in a browser.
-func consoleCreateServer(t *testing.T) (*Broker, *httptest.Server) {
+func consoleCreateServer(t *testing.T) (*Broker, *testServer) {
 	t.Helper()
 	b := MustNew(Config{Store: NewMemoryStore()})
 	if err := b.Start(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	srv := httptest.NewServer(AdminServer{Broker: b, InsecureDev: true}.Handler())
+	srv := newTestServer(t, AdminServer{Broker: b, InsecureDev: true}.App())
 	t.Cleanup(func() {
 		srv.Close()
 		_ = b.Stop(t.Context())
@@ -27,13 +27,13 @@ func consoleCreateServer(t *testing.T) (*Broker, *httptest.Server) {
 }
 
 // post sends exactly the body the console's dialog builds for this endpoint.
-func consolePost(t *testing.T, srv *httptest.Server, path string, body any) (int, []byte) {
+func consolePost(t *testing.T, srv *testServer, path string, body any) (int, []byte) {
 	t.Helper()
 	raw, err := json.Marshal(body)
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp, err := http.Post(srv.URL+path, "application/json", bytes.NewReader(raw))
+	resp, err := testHTTP.Post(srv.URL+path, "application/json", bytes.NewReader(raw))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -56,11 +56,11 @@ func TestConsoleCreateQueue(t *testing.T) {
 		"ack_mode":           "manual",
 		"dlq":                "orders.dlq",
 	})
-	if code != http.StatusOK {
+	if code != fh.StatusOK {
 		t.Fatalf("declare queue: %d %s", code, body)
 	}
 
-	resp, err := http.Get(srv.URL + "/stats")
+	resp, err := testHTTP.Get(srv.URL + "/stats")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -79,12 +79,12 @@ func TestConsoleCreateQueue(t *testing.T) {
 
 	// There is no endpoint that returns a stored QueueConfig, so assert what is
 	// observable: the queue is declared and immediately usable.
-	resp2, err := http.Get(srv.URL + "/queues/orders/messages?limit=1")
+	resp2, err := testHTTP.Get(srv.URL + "/queues/orders/messages?limit=1")
 	if err != nil {
 		t.Fatal(err)
 	}
 	resp2.Body.Close()
-	if resp2.StatusCode != http.StatusOK {
+	if resp2.StatusCode != fh.StatusOK {
 		t.Errorf("declared queue is not usable: %d", resp2.StatusCode)
 	}
 }
@@ -97,7 +97,7 @@ func TestConsoleCreateTopicAndStream(t *testing.T) {
 		"partitions": 2,
 		"retention":  int64(24 * 3600 * 1e9),
 	})
-	if code != http.StatusOK {
+	if code != fh.StatusOK {
 		t.Fatalf("declare topic: %d %s", code, body)
 	}
 
@@ -107,11 +107,11 @@ func TestConsoleCreateTopicAndStream(t *testing.T) {
 		"retention":  int64(7 * 24 * 3600 * 1e9),
 		"compact":    true,
 	})
-	if code != http.StatusOK {
+	if code != fh.StatusOK {
 		t.Fatalf("create stream: %d %s", code, body)
 	}
 
-	resp, err := http.Get(srv.URL + "/stats")
+	resp, err := testHTTP.Get(srv.URL + "/stats")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -149,7 +149,7 @@ func TestConsoleCreateConsumer(t *testing.T) {
 		"max_inflight": 8,
 		"ack_mode":     "manual",
 	})
-	if code != http.StatusOK {
+	if code != fh.StatusOK {
 		t.Fatalf("register consumer: %d %s", code, body)
 	}
 	var info ConsumerInfo
@@ -168,12 +168,12 @@ func TestConsoleCreateConsumer(t *testing.T) {
 
 	// It must then be controllable through the actions the console renders.
 	for _, action := range []string{"pause", "drain", "resume"} {
-		resp, err := http.Post(srv.URL+"/v1/consumers/"+info.ConsumerID+"/"+action, "application/json", nil)
+		resp, err := testHTTP.Post(srv.URL+"/v1/consumers/"+info.ConsumerID+"/"+action, "application/json", nil)
 		if err != nil {
 			t.Fatal(err)
 		}
 		resp.Body.Close()
-		if resp.StatusCode != http.StatusOK {
+		if resp.StatusCode != fh.StatusOK {
 			t.Errorf("consumer %s: %d", action, resp.StatusCode)
 		}
 	}
@@ -187,7 +187,7 @@ func TestConsoleCreateConsumerWithoutID(t *testing.T) {
 		"group":  "workers",
 		"queues": []string{"default"},
 	})
-	if code != http.StatusOK {
+	if code != fh.StatusOK {
 		t.Fatalf("register: %d %s", code, body)
 	}
 	var info ConsumerInfo
@@ -215,7 +215,7 @@ func TestConsolePublish(t *testing.T) {
 			"payload": map[string]any{"hello": "world"},
 		}
 		code, out := consolePost(t, srv, "/publish", body)
-		if code != http.StatusOK {
+		if code != fh.StatusOK {
 			t.Fatalf("publish to %s: %d %s", dest.key, code, out)
 		}
 		var res struct {
@@ -257,11 +257,11 @@ func TestConsoleCreateRoute(t *testing.T) {
 		"to":      []map[string]string{{"type": "queue", "name": "orders"}, {"type": "queue", "name": "invoices"}},
 		"enabled": true,
 	})
-	if code != http.StatusOK {
+	if code != fh.StatusOK {
 		t.Fatalf("add route: %d %s", code, body)
 	}
 
-	resp, err := http.Get(srv.URL + "/routes")
+	resp, err := testHTTP.Get(srv.URL + "/routes")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -290,7 +290,7 @@ func TestConsoleDLQReplay(t *testing.T) {
 	consolePost(t, srv, "/queues", map[string]any{"name": "risky", "max_inflight": 1})
 
 	code, body := consolePost(t, srv, "/dlq/risky.dlq/replay-all", map[string]any{})
-	if code != http.StatusOK {
+	if code != fh.StatusOK {
 		t.Fatalf("replay-all: %d %s", code, body)
 	}
 }

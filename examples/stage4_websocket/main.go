@@ -3,10 +3,10 @@ package main
 import (
 	"context"
 	"log"
-	"net/http"
 	"time"
 
 	"github.com/oarkflow/broker"
+	"github.com/oarkflow/fh"
 )
 
 // Stage 4: WebSocket Transport
@@ -48,11 +48,9 @@ func main() {
 		InsecureDev:       true,
 	})
 
-	mux := http.NewServeMux()
-	mux.Handle("/ws", wsServer.Handler())
-	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("ok"))
-	})
+	app := fh.New(fh.WithStartupBannerDisabled(true))
+	wsServer.Register(app)
+	app.Get("/health", func(c fh.Ctx) error { return c.SendString("ok") })
 
 	// Publish a message to demonstrate real-time delivery
 	go func() {
@@ -68,5 +66,5 @@ func main() {
 
 	log.Println("[server] SSE available at http://localhost:8080/ws")
 	log.Println("[server] Health available at http://localhost:8080/health")
-	log.Fatal(http.ListenAndServe(":8080", mux))
+	log.Fatal(app.Listen(":8080"))
 }

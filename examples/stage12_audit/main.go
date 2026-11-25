@@ -3,10 +3,11 @@ package main
 import (
 	"context"
 	"log"
-	"net/http"
+	"strings"
 	"time"
 
 	"github.com/oarkflow/broker"
+	"github.com/oarkflow/fh"
 )
 
 // Stage 12: Audit Logging
@@ -53,17 +54,26 @@ func main() {
 
 	// Start admin server to view audit logs
 	log.Println("[server] audit logs available at http://localhost:9091/audit")
-	http.Handle("/audit", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
+	app := fh.New(fh.WithStartupBannerDisabled(true))
+	app.Get("/audit", func(c fh.Ctx) error {
 		auditLogger := b.AuditLogger()
-		if auditLogger != nil {
-			events := auditLogger.History(100)
-			for _, e := range events {
-				w.Write([]byte(e.Timestamp.Format(time.RFC3339) + " " + e.Principal + " " + e.Action + " " + e.Resource + " " + e.Status + "\n"))
-			}
-		} else {
-			w.Write([]byte("audit logging not enabled"))
+		if auditLogger == nil {
+			return c.SendString("audit logging not enabled")
 		}
-	}))
-	log.Fatal(http.ListenAndServe(":9091", nil))
+		var out strings.Builder
+		for _, e := range auditLogger.History(100) {
+			out.WriteString(e.Timestamp.Format(time.RFC3339))
+			out.WriteString(" ")
+			out.WriteString(e.Principal)
+			out.WriteString(" ")
+			out.WriteString(e.Action)
+			out.WriteString(" ")
+			out.WriteString(e.Resource)
+			out.WriteString(" ")
+			out.WriteString(e.Status)
+			out.WriteString("\n")
+		}
+		return c.SendString(out.String())
+	})
+	log.Fatal(app.Listen(":9091"))
 }

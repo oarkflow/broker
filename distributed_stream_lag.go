@@ -1,18 +1,17 @@
 package broker
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"net/http"
 	"sort"
 	"strings"
 	"sync"
 
 	"github.com/oarkflow/broker/cluster"
+	"github.com/oarkflow/fh"
 )
 
 const internalPartitionLagPath = "/cluster/internal/partition-lag"
@@ -140,25 +139,20 @@ func (db *DistributedBroker) partitionStreamLagFromLeader(ctx context.Context, s
 	if err != nil {
 		return PartitionStreamLag{}, err
 	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(route.LeaderClientAddress, "/")+internalPartitionLagPath, bytes.NewReader(payload))
-	if err != nil {
-		return PartitionStreamLag{}, err
-	}
-	request.Header.Set("Content-Type", "application/json")
-	response, err := db.partitionForwardClient.Do(request)
+	response, err := SendHTTP(ctx, db.partitionForwardClient, fh.MethodPOST, strings.TrimRight(route.LeaderClientAddress, "/")+internalPartitionLagPath, payload, jsonRequestHeaders)
 	if err != nil {
 		return PartitionStreamLag{}, fmt.Errorf("forward stream lag request to partition leader: %w", err)
 	}
-	defer response.Body.Close()
-	if response.StatusCode != http.StatusOK {
-		body, readErr := io.ReadAll(io.LimitReader(response.Body, 4096))
+	defer response.Close()
+	if response.StatusCode() != fh.StatusOK {
+		body, readErr := io.ReadAll(io.LimitReader(response.Reader(), 4096))
 		if readErr != nil {
-			return PartitionStreamLag{}, fmt.Errorf("partition leader returned %s (read error: %v)", response.Status, readErr)
+			return PartitionStreamLag{}, fmt.Errorf("partition leader returned %s (read error: %v)", response.Raw.Status, readErr)
 		}
-		return PartitionStreamLag{}, fmt.Errorf("partition leader returned %s: %s", response.Status, strings.TrimSpace(string(body)))
+		return PartitionStreamLag{}, fmt.Errorf("partition leader returned %s: %s", response.Raw.Status, strings.TrimSpace(string(body)))
 	}
 	var report PartitionStreamLag
-	if err := decodeStrictBoundedJSON(response.Body, 1<<20, &report); err != nil {
+	if err := decodeStrictBoundedJSON(response.Reader(), 1<<20, &report); err != nil {
 		return PartitionStreamLag{}, fmt.Errorf("decode partition stream lag: %w", err)
 	}
 	if report.Stream != stream || report.Partition != partition || report.ConsumerGroup != consumerGroup {

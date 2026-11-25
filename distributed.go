@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"hash/fnv"
 	"log"
-	"net/http"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -24,6 +23,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/oarkflow/broker/cluster"
+	"github.com/oarkflow/fh"
 )
 
 var (
@@ -313,7 +313,7 @@ type DistributedBroker struct {
 	startTime                  time.Time
 	txRecoveryCancel           context.CancelFunc
 	txRecoveryDone             chan struct{}
-	partitionForwardClient     *http.Client
+	partitionForwardClient     *fh.Client
 	localPlacementSignalsMu    sync.Mutex
 	localPlacementSignalsCache *localPlacementSignalsCacheEntry
 }
@@ -526,18 +526,16 @@ func NewDistributed(cfg Config, distCfg DistributedConfig) (*DistributedBroker, 
 	if distCfg.TLSConfig != nil {
 		forwardTLS := distCfg.TLSConfig.Clone()
 		forwardTLS.ServerName = ""
-		forwardTransport := &http.Transport{TLSClientConfig: forwardTLS, Proxy: nil}
 		forwardTimeout := distCfg.ForwardTimeout
 		if distCfg.SubmitTimeout > forwardTimeout {
 			forwardTimeout = distCfg.SubmitTimeout
 		}
-		db.partitionForwardClient = &http.Client{
-			Transport: forwardTransport,
-			Timeout:   forwardTimeout,
-			CheckRedirect: func(*http.Request, []*http.Request) error {
-				return http.ErrUseLastResponse
-			},
-		}
+		db.partitionForwardClient = NewHTTPClient(HTTPClientConfig{
+			Timeout:          forwardTimeout,
+			TLSConfig:        forwardTLS,
+			AllowInsecureTLS: forwardTLS.InsecureSkipVerify,
+			DisableRedirects: true,
+		})
 	}
 	b.distributedPartitions = db
 	if distCfg.UseEtcdRaft && b.cfg.SchemaRegistry == nil && cq != nil {
@@ -3648,7 +3646,7 @@ func (db *DistributedBroker) abortConsensusStart() error {
 		cleanupErr = errors.Join(cleanupErr, db.transport.Close())
 	}
 	if db.partitionForwardClient != nil {
-		db.partitionForwardClient.CloseIdleConnections()
+		_ = db.partitionForwardClient.Close()
 	}
 	db.closed = true
 	return cleanupErr
@@ -3734,7 +3732,7 @@ func (db *DistributedBroker) Stop(ctx context.Context) error {
 		stopErr = errors.Join(stopErr, db.transport.Close())
 	}
 	if db.partitionForwardClient != nil {
-		db.partitionForwardClient.CloseIdleConnections()
+		_ = db.partitionForwardClient.Close()
 	}
 	stopErr = errors.Join(stopErr, db.Broker.Stop(ctx))
 	if db.wal != nil {

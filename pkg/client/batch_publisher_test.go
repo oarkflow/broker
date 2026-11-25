@@ -3,7 +3,6 @@ package client
 import (
 	"context"
 	"errors"
-	"net/http/httptest"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -29,7 +28,7 @@ func newWALBrokerServer(tb testing.TB, queue string) (*broker.Broker, string) {
 	if err := b.DeclareQueue(context.Background(), broker.QueueConfig{Name: queue}); err != nil {
 		tb.Fatal(err)
 	}
-	srv := httptest.NewServer(broker.AdminServer{Broker: b, InsecureDev: true, MaxBodyBytes: 32 << 20}.Handler())
+	srv := newTestServer(tb, broker.AdminServer{Broker: b, InsecureDev: true, MaxBodyBytes: 32 << 20}.App())
 	tb.Cleanup(srv.Close)
 	return b, srv.URL
 }

@@ -5,10 +5,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"net/http"
-	"net/http/httptest"
 	"testing"
 	"time"
+
+	"github.com/oarkflow/fh"
 )
 
 // A waiting consumer used to learn about newly available work only on its next
@@ -99,14 +99,13 @@ func TestLongPollIsWokenOnPublish(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	req := httptest.NewRequest(http.MethodPost, "/v1/poll", bytes.NewReader(body))
+	req := newTestRequest(fh.MethodPOST, "/v1/poll", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer secret")
-	rec := httptest.NewRecorder()
-	admin.dataPlane(rec, req)
+	rec := serveTest(t, admin.App(), req)
 	elapsed := time.Since(start)
 
-	if rec.Code != http.StatusOK {
+	if rec.Code != fh.StatusOK {
 		t.Fatalf("status %d body %s", rec.Code, rec.Body.String())
 	}
 	var msgs []Message

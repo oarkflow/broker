@@ -2,14 +2,13 @@ package broker_test
 
 import (
 	"context"
-	"net/http"
-	"net/http/httptest"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/oarkflow/broker"
 	bclient "github.com/oarkflow/broker/pkg/client"
+	"github.com/oarkflow/fh"
 )
 
 func TestRemoteCommandHandler(t *testing.T) {
@@ -129,7 +128,7 @@ func TestTaskCancelSendsConsumerEventAndCancelsWorkerContext(t *testing.T) {
 
 func TestRemoteClientFailoverBrokerURLs(t *testing.T) {
 	_, ts := remoteTestBroker(t)
-	bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { http.Error(w, "bad", http.StatusBadGateway) }))
+	bad := newCatchAllServer(t, func(c fh.Ctx) error { return c.Status(fh.StatusBadGateway).SendString("bad") })
 	defer bad.Close()
 	c := bclient.New(bclient.Config{BrokerURLs: []string{bad.URL, ts.URL}, PollWait: 20 * time.Millisecond})
 	// Read requests are safe to retry across brokers. Publishing is not retried
