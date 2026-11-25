@@ -171,7 +171,9 @@ func (s *BinaryFileWALStore) recover() error {
 				return fmt.Errorf("decode legacy JSON WAL record at offset %d: %w", pos-int64(l), err)
 			}
 		}
-		s.applyRecovered(rec)
+		if err := s.applyRecovered(rec); err != nil {
+			return fmt.Errorf("apply WAL record at offset %d: %w", pos-int64(l), err)
+		}
 	}
 }
 
@@ -190,7 +192,7 @@ func (s *BinaryFileWALStore) normalizeRecoveredInflight() {
 	}
 }
 
-func (s *BinaryFileWALStore) applyRecovered(r walRecord) {
+func (s *BinaryFileWALStore) applyRecovered(r walRecord) error {
 	ctx := context.Background()
 	switch r.Op {
 	case "declare_queue":
@@ -203,6 +205,8 @@ func (s *BinaryFileWALStore) applyRecovered(r walRecord) {
 		_, _ = s.MemoryStore.Append(ctx, r.Message, r.Dests)
 	case "append_atomic":
 		_ = s.MemoryStore.appendRecoveredAtomic(r.Entries)
+	case "stream_transaction":
+		return s.MemoryStore.applyStreamTransaction(r)
 	case "lease":
 		_ = s.MemoryStore.Update(ctx, r.Message)
 	case "lease_batch", "update_batch":
@@ -234,6 +238,7 @@ func (s *BinaryFileWALStore) applyRecovered(r walRecord) {
 	case "sweep_leases":
 		_ = s.MemoryStore.applySweepLeases(r.Messages)
 	}
+	return nil
 }
 func (s *BinaryFileWALStore) write(r walRecord) error {
 	req, err := s.writeAsync(r)

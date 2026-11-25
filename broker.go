@@ -385,6 +385,12 @@ func (b *Broker) Stop(ctx context.Context) error {
 	defer func() { b.endStop(stopSucceeded) }()
 	b.setState(ctx, BrokerStopping, nil)
 	b.cancel()
+	b.waitMu.Lock()
+	for corr, ch := range b.waiters {
+		delete(b.waiters, corr)
+		close(ch)
+	}
+	b.waitMu.Unlock()
 	if b.healthMonitor != nil {
 		b.healthMonitor.Stop()
 	}

@@ -1238,6 +1238,14 @@ func (c *Client) PartitionStreamOffset(ctx context.Context, stream, group string
 	return out.Offset, err
 }
 
+// CommitStreamTransaction publishes outputs and advances the input offset in one
+// operation. ErrOffsetConflict means another commit changed the expected offset.
+func (c *Client) CommitStreamTransaction(ctx context.Context, stream string, tx broker.StreamTransactionHTTPPayload) ([]broker.PublishResult, error) {
+	var out []broker.PublishResult
+	err := c.doJSON(ctx, http.MethodPost, "/v1/streams/"+url.PathEscape(stream)+"/transactions", tx, &out)
+	return out, err
+}
+
 func (c *Client) StreamOffset(ctx context.Context, stream, group string) (uint64, error) {
 	var out struct {
 		Offset uint64 `json:"offset"`

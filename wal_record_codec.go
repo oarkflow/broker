@@ -73,6 +73,7 @@ const (
 	// walOpCommitOffsetAppendTxn extends the prior combined operation with a
 	// transaction ID and retained retry outcome without changing its encoding.
 	walOpCommitOffsetAppendTxn
+	walOpStreamTransaction
 )
 
 // WALCodecConfig configures the native BWL1 WAL record codec.
@@ -553,6 +554,8 @@ func walOperationCode(op string) (byte, bool) {
 		return walOpCommitOffsetAppendTxn, true
 	case "sweep_leases":
 		return walOpSweepLeases, true
+	case "stream_transaction":
+		return walOpStreamTransaction, true
 	default:
 		return 0, false
 	}
@@ -602,6 +605,8 @@ func walOperationName(op byte) (string, bool) {
 		return "commit_offset_append_txn", true
 	case walOpSweepLeases:
 		return "sweep_leases", true
+	case walOpStreamTransaction:
+		return "stream_transaction", true
 	default:
 		return "", false
 	}
@@ -620,6 +625,11 @@ func encodeWALOperation(w *walBinaryWriter, op byte, r walRecord) {
 		w.destinations(r.Dests)
 	case walOpAppendAtomic:
 		w.appendEntries(r.Entries)
+	case walOpStreamTransaction:
+		w.appendEntries(r.Entries)
+		w.offsetCommit(r.Offset)
+		w.string(r.Offset.TenantID)
+		w.uvarint(r.ExpectedOffset)
 	case walOpLease:
 		w.message(r.Message, 0)
 		w.leaseRequest(r.Lease)
@@ -679,6 +689,11 @@ func decodeWALOperation(r *walBinaryReader, op byte, out *walRecord) {
 		out.Dests = r.destinations()
 	case walOpAppendAtomic:
 		out.Entries = r.appendEntries()
+	case walOpStreamTransaction:
+		out.Entries = r.appendEntries()
+		out.Offset = r.offsetCommit()
+		out.Offset.TenantID = r.string()
+		out.ExpectedOffset = r.uvarint()
 	case walOpLease:
 		out.Message = r.message(Message{})
 		out.Lease = r.leaseRequest()

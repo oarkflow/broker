@@ -66,6 +66,7 @@ func TestWALRecordCodecRoundTripAllOperations(t *testing.T) {
 		{Op: "declare_stream", At: now, Stream: StreamConfig{Name: "audit", Partitions: 8, Retention: 7 * 24 * time.Hour, Compact: true}},
 		{Op: "append", At: now, Message: message, Dests: []Destination{{Kind: DestinationQueue, Name: "orders"}, {Kind: DestinationStream, Name: "audit"}}},
 		{Op: "append_atomic", At: now, Entries: entries},
+		{Op: "stream_transaction", At: now, Entries: entries, Offset: OffsetCommit{Stream: "input", ConsumerGroup: "tenant\x00workers", Offset: 23}, ExpectedOffset: 21},
 		{Op: "lease", At: now, Message: message, Lease: LeaseRequest{Queue: "orders", ConsumerID: "consumer", ConsumerGroup: "group", Limit: 64, VisibilityTimeout: time.Minute, LeaseToken: "lease", MessageID: "message-1"}},
 		{Op: "lease_batch", At: now, Messages: messages, Lease: LeaseRequest{Queue: "orders", ConsumerID: "consumer", ConsumerGroup: "group", Limit: 64, VisibilityTimeout: time.Minute}},
 		{Op: "update_batch", At: now, Messages: messages},

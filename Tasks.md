@@ -250,6 +250,12 @@ removed because several described APIs rather than verified guarantees.
 - [x] Persist registered task-handler results in the task's terminal state when
   the delivery is acknowledged, so `TaskHandle.Result` returns the handler's
   encoded value. `TestTaskSubmitAndResult` covers the returned payload.
+- [x] Provide a real transactional application outbox: `sqlitestore.NewOutbox`
+  enqueues using an application-owned SQL transaction and dispatches with durable
+  retry state, leased claims and fenced completion. Rollback, restart recovery,
+  append-before-completion interruption and competing workers are tested.
+  Legacy in-memory workers remain compatibility APIs and are documented as such.
+  See `docs/TRANSACTIONAL_OUTBOX.md` for the at-least-once contract.
 - [ ] Establish 80% core and 90% critical-path coverage. Current package
   coverage: 52.8% root, 42.1% cluster, 31.5% AMQP, 85.6% client (raised from
   12.4%), 42.7% pool, 100% queue (raised from 0%); generated API package
@@ -964,6 +970,11 @@ removed because several described APIs rather than verified guarantees.
     - [x] The transaction-prune admin route rejects unknown JSON fields,
       trailing JSON values, zero cutoffs, and negative limits; its request-body
       bound maps oversized requests to HTTP 413.
+  - [x] Single-store/shard offset-plus-produce (`StreamTransaction`) now commits in one durable operation,
+    with expected-offset fencing, crash recovery and SQLite rollback tests. The
+    embedded, HTTP and Go client APIs are documented in `docs/STREAM_TRANSACTIONS.md`.
+    Multi-shard transactions are coordinated by the `CommitOffsetAndAppend`
+    protocol above.
 - [x] Define and test `durable`, `latency`, `throughput`, and `lightweight`
   policy defaults, including default batch-consumer sizes and profile-specific
   adaptive batch-wait starting points, floors, and adjustment rates.

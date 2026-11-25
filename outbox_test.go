@@ -2,6 +2,7 @@ package broker
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 )
@@ -72,5 +73,55 @@ func TestDurableOutboxDispatchAndLifecycle(t *testing.T) {
 	}
 	if string(storedMsg.Payload) != "job-1-payload" {
 		t.Fatalf("payload mismatch: %s", string(storedMsg.Payload))
+	}
+}
+
+func TestLegacyOutboxRestartOwnershipAndFlushFailure(t *testing.T) {
+	store := &failOnceProducerStore{MemoryStore: NewMemoryStore(), fail: true}
+	b := MustNew(Config{Store: store})
+	defer b.Stop(context.Background())
+	o, err := NewDurableOutbox(DurableOutboxConfig{Broker: b, RetryPolicy: RetryPolicy{MaxAttempts: 3, Initial: time.Millisecond, Max: time.Millisecond, Factor: 1}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	message := Message{ID: "owned", Payload: []byte("original")}
+	dests := []Destination{{Kind: DestinationQueue, Name: "jobs"}}
+	if _, err := o.Enqueue(context.Background(), message, dests); err != nil {
+		t.Fatal(err)
+	}
+	message.Payload[0] = 'X'
+	dests[0].Name = "changed"
+	// Append failures are recorded on the entry and retried after the backoff
+	// delay; Flush only reports failures to persist outbox state.
+	if err := o.Flush(context.Background()); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	entry, _ := o.GetEntry("owned")
+	if entry.Status != OutboxFailed || entry.Attempts != 1 || entry.LastError != ErrStorageUnavailable.Error() {
+		t.Fatalf("failed state: %+v", entry)
+	}
+	entry.Message.Payload[0] = 'Y'
+	time.Sleep(20 * time.Millisecond)
+	if err := o.Flush(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	stored, ok, err := store.Get(context.Background(), "owned")
+	if err != nil || !ok || string(stored.Payload) != "original" || stored.Queue != "jobs" {
+		t.Fatalf("caller mutated queued entry: %+v, %v", stored, err)
+	}
+	// Start and Stop are idempotent, but a stopped worker cannot be restarted;
+	// persisted work resumes through a newly constructed outbox.
+	for i := 0; i < 3; i++ {
+		if err := o.Start(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := 0; i < 3; i++ {
+		if err := o.Stop(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := o.Start(); !errors.Is(err, ErrClosed) {
+		t.Fatalf("restart after stop: %v", err)
 	}
 }

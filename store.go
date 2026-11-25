@@ -3736,6 +3736,7 @@ type walRecord struct {
 	QueueName         string                  `json:"queue_name,omitempty"`
 	Offset            OffsetCommit            `json:"offset,omitempty"`
 	OffsetTransaction OffsetAppendTransaction `json:"offset_transaction,omitempty"`
+	ExpectedOffset    uint64                  `json:"expected_offset,omitempty"`
 	At                time.Time               `json:"at"`
 	Checksum          string                  `json:"checksum,omitempty"`
 }
@@ -3916,6 +3917,8 @@ func (s *FileWALStore) applyRecovered(r walRecord) error {
 		_, err = s.MemoryStore.Append(ctx, r.Message, r.Dests)
 	case "append_atomic":
 		err = s.MemoryStore.appendRecoveredAtomic(r.Entries)
+	case "stream_transaction":
+		return s.MemoryStore.applyStreamTransaction(r)
 	case "lease":
 		err = s.MemoryStore.Update(ctx, r.Message)
 	case "lease_batch", "update_batch":

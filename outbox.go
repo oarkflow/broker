@@ -40,7 +40,7 @@ type DurableOutboxEntry struct {
 	NextAttemptAt     time.Time           `json:"next_attempt_at,omitempty"`
 }
 
-// DurableOutboxConfig configures the background transactional outbox engine.
+// DurableOutboxConfig configures the legacy in-memory dispatch worker.
 type DurableOutboxConfig struct {
 	Broker *Broker
 	// Store overrides the broker's StateStore for outbox records. If nil, the
@@ -315,7 +315,7 @@ func (o *DurableOutbox) dispatchLoop() {
 	}
 }
 
-// Flush forces an immediate synchronous dispatch of all pending outbox entries.
+// Flush synchronously dispatches up to BatchSize entries and returns failures.
 func (o *DurableOutbox) Flush(ctx context.Context) error {
 	return o.flushPending(ctx)
 }

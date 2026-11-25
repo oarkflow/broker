@@ -896,6 +896,10 @@ func (a AdminServer) stream(w http.ResponseWriter, r *http.Request) {
 		writeBrokerJSON(w, map[string]any{"stream": name, "group": group, "partition": partition, "offset": off})
 		return
 	}
+	if len(parts) == 2 && parts[1] == "transactions" {
+		a.streamTransaction(w, r, name)
+		return
+	}
 	if len(parts) == 1 || (len(parts) == 2 && parts[1] == "messages") {
 		afterRaw := firstNonEmpty(r.URL.Query().Get("after"), r.URL.Query().Get("after_offset"))
 		after, _ := strconv.ParseUint(afterRaw, 10, 64)
@@ -1655,7 +1659,7 @@ func adminAction(r *http.Request) string {
 		if strings.HasSuffix(path, "/commit-and-append") {
 			return PermissionStreamCommit
 		}
-		if strings.HasSuffix(path, "/commit") {
+		if strings.HasSuffix(strings.TrimRight(path, "/"), "/commit") || strings.HasSuffix(strings.TrimRight(path, "/"), "/transactions") {
 			return PermissionStreamCommit
 		}
 		if isMutation(method) {
@@ -1707,7 +1711,7 @@ func adminAction(r *http.Request) string {
 		}
 		return PermissionQueueRead
 	case strings.HasPrefix(path, "/streams/"):
-		if strings.HasSuffix(path, "/commit") {
+		if strings.HasSuffix(strings.TrimRight(path, "/"), "/commit") || strings.HasSuffix(strings.TrimRight(path, "/"), "/transactions") {
 			return PermissionStreamCommit
 		}
 		return PermissionStreamRead

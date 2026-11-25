@@ -494,7 +494,9 @@ func (s *SegmentedWALStore) replaySegmentFile(ctx context.Context, path string, 
 			}
 		}
 
-		s.applyRecovered(rec)
+		if err := s.applyRecovered(rec); err != nil {
+			return records, recPos, fmt.Errorf("apply segment record: %w", err)
+		}
 		records++
 		if s.manifest.NextSeq <= records {
 			s.manifest.NextSeq = records + 1
@@ -593,7 +595,10 @@ func (s *SegmentedWALStore) migrateLegacyFile(legacyPath string, isFWB bool) err
 					break
 				}
 			}
-			s.applyRecovered(rec)
+			if err := s.applyRecovered(rec); err != nil {
+				migrateErr = fmt.Errorf("apply migrated BWL1 record: %w", err)
+				break
+			}
 			if err := s.writeRecordLocked(rec); err != nil {
 				migrateErr = fmt.Errorf("write migrated BWL1 record: %w", err)
 				break
@@ -620,7 +625,10 @@ func (s *SegmentedWALStore) migrateLegacyFile(legacyPath string, isFWB bool) err
 					migrateErr = fmt.Errorf("verify legacy JSON WAL line %d: %w", lineNo, err)
 					break
 				}
-				s.applyRecovered(rec)
+				if err := s.applyRecovered(rec); err != nil {
+					migrateErr = fmt.Errorf("apply migrated JSON WAL line %d: %w", lineNo, err)
+					break
+				}
 				if err := s.writeRecordLocked(rec); err != nil {
 					migrateErr = fmt.Errorf("write migrated JSON WAL line %d: %w", lineNo, err)
 					break
@@ -691,7 +699,7 @@ func (s *SegmentedWALStore) normalizeRecoveredInflight() {
 	}
 }
 
-func (s *SegmentedWALStore) applyRecovered(r walRecord) {
+func (s *SegmentedWALStore) applyRecovered(r walRecord) error {
 	ctx := context.Background()
 	switch r.Op {
 	case "declare_queue":
@@ -704,6 +712,8 @@ func (s *SegmentedWALStore) applyRecovered(r walRecord) {
 		_, _ = s.MemoryStore.Append(ctx, r.Message, r.Dests)
 	case "append_atomic":
 		_ = s.MemoryStore.appendRecoveredAtomic(r.Entries)
+	case "stream_transaction":
+		return s.MemoryStore.applyStreamTransaction(r)
 	case "lease":
 		_ = s.MemoryStore.Update(ctx, r.Message)
 	case "lease_batch", "update_batch":
@@ -733,6 +743,7 @@ func (s *SegmentedWALStore) applyRecovered(r walRecord) {
 	case "commit_offset_append_txn":
 		_ = s.MemoryStore.appendRecoveredOffsetAtomic(r.Entries, r.Offset, r.OffsetTransaction)
 	}
+	return nil
 }
 
 func (s *SegmentedWALStore) rotateSegmentLocked() error {
@@ -1081,6 +1092,9 @@ func (s *SegmentedWALStore) PurgeQueue(ctx context.Context, name string) (int, e
 func (s *SegmentedWALStore) CommitOffset(ctx context.Context, commit OffsetCommit) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	persisted, err := durableOffsetCommit(ctx, commit)
 	if err != nil {
 		return err

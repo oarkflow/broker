@@ -126,7 +126,7 @@ func (s *MessageStore) persistLocked(ctx context.Context) error {
 	next := s.mem.Snapshot()
 	b, err := json.Marshal(next)
 	if err != nil {
-		s.mem.Restore(s.committed)
+		s.mem.RestoreExact(s.committed)
 		return err
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -139,7 +139,7 @@ func (s *MessageStore) persistLocked(ctx context.Context) error {
 		_ = tx.Rollback()
 	}
 	if err != nil {
-		s.mem.Restore(s.committed)
+		s.mem.RestoreExact(s.committed)
 		return err
 	}
 	s.committed = next
@@ -182,7 +182,7 @@ func (s *MessageStore) Append(ctx context.Context, msg broker.Message, dests []b
 	defer s.mu.Unlock()
 	out, err := s.mem.Append(ctx, msg, dests)
 	if err != nil {
-		s.mem.Restore(s.committed)
+		s.mem.RestoreExact(s.committed)
 		return out, err
 	}
 	return out, s.persistLocked(ctx)
@@ -195,6 +195,19 @@ func (s *MessageStore) AppendAtomic(ctx context.Context, entries []broker.Append
 		return out, err
 	}
 	return out, s.persistLocked(ctx)
+}
+
+func (s *MessageStore) CommitStreamTransaction(ctx context.Context, tx broker.StreamTransaction) ([]broker.Message, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out, err := s.mem.CommitStreamTransaction(ctx, tx)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.persistLocked(ctx); err != nil {
+		return nil, err // persistLocked restores the previous committed snapshot
+	}
+	return out, nil
 }
 func (s *MessageStore) Lease(ctx context.Context, req broker.LeaseRequest) ([]broker.Message, error) {
 	s.mu.Lock()
