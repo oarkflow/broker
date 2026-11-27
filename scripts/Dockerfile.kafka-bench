@@ -1,0 +1,11 @@
+ARG KAFKA_IMAGE=apache/kafka:4.3.1
+FROM ${KAFKA_IMAGE} AS kafka
+
+FROM eclipse-temurin:17-jdk@sha256:7a0b2bc7e1372bb05ee361fb79e8a9e822df47343b8716253b3bbaa75060653e AS build
+COPY --from=kafka /opt/kafka/libs /kafka-libs
+COPY scripts/KafkaParallelProducer.java /src/KafkaParallelProducer.java
+RUN javac --release 17 -cp '/kafka-libs/*' -d /out /src/KafkaParallelProducer.java
+
+FROM ${KAFKA_IMAGE}
+COPY --from=build /out /tmp/kafka-bench-classes
+ENTRYPOINT ["java", "-cp", "/opt/kafka/libs/*:/tmp/kafka-bench-classes", "KafkaParallelProducer"]

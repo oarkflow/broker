@@ -180,6 +180,9 @@ func (c *Connection) handleMethodFrame(frame *Frame) error {
 	case ClassConnection:
 		return c.handleConnectionMethod(method)
 	case ClassChannel:
+		if method.MethodID == MethodChannelOpen {
+			return c.createChannel(frame.ChannelID).handleMethod(method)
+		}
 		ch, err := c.getChannel(frame.ChannelID)
 		if err != nil {
 			return err
@@ -231,8 +234,8 @@ func (c *Connection) sendStart() error {
 		uint8(ProtocolMajor),     // version-major
 		uint8(ProtocolMinor),     // version-minor
 		table(serverProps),       // server-properties
-		c.advertisedMechanisms(), // mechanisms
-		"en_US",                  // locales
+		[]byte(c.advertisedMechanisms()), // mechanisms (AMQP longstr)
+		[]byte("en_US"),                  // locales (AMQP longstr)
 	)
 
 	return c.codec.WriteMethodFrame(0, ClassConnection, MethodConnectionStart, args)
@@ -249,7 +252,7 @@ func (c *Connection) handleStartOk(args []byte) error {
 	// Mechanism
 	mechanism, err := r.ReadString()
 	if err != nil {
-		return fmt.Errorf("connection.start-ok mechanism: %w", err)
+		return fmt.Errorf("connection.start-ok mechanism at offset %d of %d: %w", r.pos, len(r.data), err)
 	}
 	// Response
 	response, err := r.ReadBytes()
@@ -414,18 +417,7 @@ func (c *Connection) handleTuneOk(args []byte) error {
 
 	_ = chanMax
 	c.state.Store(connStateTune)
-
-	// Send Connection.Open
-	return c.sendConnectionOpen()
-}
-
-// sendConnectionOpen sends Connection.Open to the client.
-func (c *Connection) sendConnectionOpen() error {
-	args := EncodeMethodArgs(
-		string(c.vhost), // vhost
-		uint8(0),        // insist
-	)
-	return c.codec.WriteMethodFrame(0, ClassConnection, MethodConnectionOpen, args)
+	return nil
 }
 
 // handleConnectionOpen processes Connection.Open from client.
@@ -599,11 +591,14 @@ func (c *Connection) VHost() string {
 
 // argsReader is a helper for reading AMQP method arguments.
 type argsReader struct {
-	data []byte
-	pos  int
+	data          []byte
+	pos           int
+	boolBits      uint8
+	boolRemaining uint8
 }
 
 func (r *argsReader) ReadUint8() (uint8, error) {
+	r.boolRemaining = 0
 	if r.pos >= len(r.data) {
 		return 0, io.ErrUnexpectedEOF
 	}
@@ -613,6 +608,7 @@ func (r *argsReader) ReadUint8() (uint8, error) {
 }
 
 func (r *argsReader) ReadUint16() (uint16, error) {
+	r.boolRemaining = 0
 	if r.pos+2 > len(r.data) {
 		return 0, io.ErrUnexpectedEOF
 	}
@@ -622,6 +618,7 @@ func (r *argsReader) ReadUint16() (uint16, error) {
 }
 
 func (r *argsReader) ReadUint32() (uint32, error) {
+	r.boolRemaining = 0
 	if r.pos+4 > len(r.data) {
 		return 0, io.ErrUnexpectedEOF
 	}
@@ -631,6 +628,7 @@ func (r *argsReader) ReadUint32() (uint32, error) {
 }
 
 func (r *argsReader) ReadUint64() (uint64, error) {
+	r.boolRemaining = 0
 	if r.pos+8 > len(r.data) {
 		return 0, io.ErrUnexpectedEOF
 	}
@@ -641,17 +639,28 @@ func (r *argsReader) ReadUint64() (uint64, error) {
 }
 
 func (r *argsReader) ReadBool() (bool, error) {
-	v, err := r.ReadUint8()
-	return v != 0, err
+	if r.boolRemaining == 0 {
+		if r.pos >= len(r.data) {
+			return false, io.ErrUnexpectedEOF
+		}
+		r.boolBits = r.data[r.pos]
+		r.pos++
+		r.boolRemaining = 8
+	}
+	value := r.boolBits&1 != 0
+	r.boolBits >>= 1
+	r.boolRemaining--
+	return value, nil
 }
 
 func (r *argsReader) ReadString() (string, error) {
-	length, err := r.ReadUint16()
+	r.boolRemaining = 0
+	length, err := r.ReadUint8()
 	if err != nil {
 		return "", err
 	}
 	if r.pos+int(length) > len(r.data) {
-		return "", io.ErrUnexpectedEOF
+		return "", fmt.Errorf("short string length %d exceeds remaining bytes %d: %w", length, len(r.data)-r.pos, io.ErrUnexpectedEOF)
 	}
 	s := string(r.data[r.pos : r.pos+int(length)])
 	r.pos += int(length)
@@ -659,6 +668,7 @@ func (r *argsReader) ReadString() (string, error) {
 }
 
 func (r *argsReader) ReadLongString() (string, error) {
+	r.boolRemaining = 0
 	length, err := r.ReadUint32()
 	if err != nil {
 		return "", err
@@ -672,6 +682,7 @@ func (r *argsReader) ReadLongString() (string, error) {
 }
 
 func (r *argsReader) ReadBytes() ([]byte, error) {
+	r.boolRemaining = 0
 	length, err := r.ReadUint32()
 	if err != nil {
 		return nil, err

@@ -15,6 +15,7 @@ services:
       - -wal=/data/queue-wal
       - -token=bench-token
       - -quiet
+      - --insecure-dev
     ports:
       - 8090:8090
       - 8091:8091
@@ -40,6 +41,11 @@ services:
       - -batch=${PUBLISH_BATCH:-1000}
       - -payload=${PAYLOAD_SIZE:-256}
       - -messages=${NUM_RECORDS:-1000000}
+    deploy:
+      resources:
+        limits:
+          cpus: '${BENCH_CPUS:-4}'
+          memory: ${BENCH_MEMORY:-4g}
 
   native-consumer:
     build:
@@ -55,6 +61,11 @@ services:
       - -c=${CONSUMER_CONCURRENCY:-8}
       - -fetch=${FETCH_BATCH:-4000}
       - -messages=${NUM_RECORDS:-1000000}
+    deploy:
+      resources:
+        limits:
+          cpus: '${BENCH_CPUS:-4}'
+          memory: ${BENCH_MEMORY:-4g}
 
 volumes:
   native-broker-data:

@@ -49,6 +49,7 @@ func TestEncodeMethodArgs(t *testing.T) {
 		uint16(100),
 		string("hello"),
 		bool(true),
+		bool(false),
 		uint8(42),
 	)
 
@@ -63,15 +64,18 @@ func TestEncodeMethodArgs(t *testing.T) {
 	}
 
 	// Check string length
-	strLen := binary.BigEndian.Uint16(args[2:4])
+	strLen := int(args[2])
 	if strLen != 5 {
 		t.Errorf("expected string length 5, got %d", strLen)
 	}
 
 	// Check string content
-	str := string(args[4 : 4+strLen])
+	str := string(args[3 : 3+strLen])
 	if str != "hello" {
 		t.Errorf("expected string 'hello', got '%s'", str)
+	}
+	if args[8] != 0x01 || args[9] != 42 {
+		t.Errorf("expected packed bit field 0x01 then uint8 42, got %x %d", args[8], args[9])
 	}
 }
 
@@ -256,10 +260,10 @@ func TestParseMethodFrame(t *testing.T) {
 }
 
 func TestParseHeaderFrame(t *testing.T) {
-	payload := make([]byte, 12)
+	payload := make([]byte, 14)
 	binary.BigEndian.PutUint16(payload[0:2], 60)   // class ID
-	binary.BigEndian.PutUint64(payload[2:10], 100) // body size
-	binary.BigEndian.PutUint16(payload[10:12], 0)  // property flags
+	binary.BigEndian.PutUint64(payload[4:12], 100) // body size
+	binary.BigEndian.PutUint16(payload[12:14], 0)  // property flags
 
 	hdr, err := ParseHeaderFrame(payload)
 	if err != nil {

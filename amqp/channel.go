@@ -212,7 +212,7 @@ func (ch *Channel) handleChannelMethod(method *MethodFrame) error {
 }
 
 func (ch *Channel) handleChannelOpen() error {
-	return ch.writeMethodFrame(ClassChannel, MethodChannelOpenOk, nil)
+	return ch.writeMethodFrame(ClassChannel, MethodChannelOpenOk, EncodeMethodArgs([]byte{}))
 }
 
 func (ch *Channel) handleChannelClose(args []byte) error {
@@ -528,7 +528,6 @@ func (ch *Channel) handleQueueDeclare(args []byte) error {
 	}
 	consumerCount := ch.conn.server.queueConsumerCount(ch.conn.requestContext(), queueName)
 	args2 := EncodeMethodArgs(
-		uint16(0),                      // reserved
 		string(queueName),              // queue
 		amqpCountUint32(messageCount),  // message-count
 		amqpCountUint32(consumerCount), // consumer-count

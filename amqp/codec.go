@@ -128,11 +128,14 @@ func (c *Codec) WriteMethodFrame(channelID uint16, classID, methodID uint16, arg
 
 // WriteHeaderFrame writes a content header frame.
 func (c *Codec) WriteHeaderFrame(channelID uint16, classID uint16, bodySize uint64, propertyFlags uint16, propertyBuf []byte) error {
-	payload := make([]byte, 12+len(propertyBuf))
+	payload := make([]byte, 14+len(propertyBuf))
 	binary.BigEndian.PutUint16(payload[0:2], classID)
-	binary.BigEndian.PutUint64(payload[2:10], bodySize)
-	binary.BigEndian.PutUint16(payload[10:12], propertyFlags)
-	copy(payload[12:], propertyBuf)
+	// Content-header frames include a two-byte weight field, which is zero in
+	// AMQP 0-9-1.
+	binary.BigEndian.PutUint16(payload[2:4], 0)
+	binary.BigEndian.PutUint64(payload[4:12], bodySize)
+	binary.BigEndian.PutUint16(payload[12:14], propertyFlags)
+	copy(payload[14:], propertyBuf)
 
 	return c.WriteFrame(&Frame{
 		Type:      FrameHeader,
@@ -173,21 +176,38 @@ func ParseMethodFrame(payload []byte) (*MethodFrame, error) {
 
 // ParseHeaderFrame parses a content header frame payload.
 func ParseHeaderFrame(payload []byte) (*HeaderFrame, error) {
-	if len(payload) < 12 {
+	if len(payload) < 14 {
 		return nil, errors.New("header frame too short")
 	}
 	return &HeaderFrame{
 		ClassID:       binary.BigEndian.Uint16(payload[0:2]),
-		BodySize:      binary.BigEndian.Uint64(payload[2:10]),
-		PropertyFlags: binary.BigEndian.Uint16(payload[10:12]),
-		PropertyBuf:   payload[12:],
+		BodySize:      binary.BigEndian.Uint64(payload[4:12]),
+		PropertyFlags: binary.BigEndian.Uint16(payload[12:14]),
+		PropertyBuf:   payload[14:],
 	}, nil
 }
 
 // EncodeMethodArgs encodes method arguments using AMQP wire format.
 func EncodeMethodArgs(args ...any) []byte {
 	var buf bytes.Buffer
-	for _, arg := range args {
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if _, ok := arg.(bool); ok {
+			var bits uint8
+			for bit := uint(0); bit < 8 && i < len(args); bit++ {
+				value, ok := args[i].(bool)
+				if !ok {
+					break
+				}
+				if value {
+					bits |= 1 << bit
+				}
+				i++
+			}
+			buf.WriteByte(bits)
+			i--
+			continue
+		}
 		switch v := arg.(type) {
 		case uint8:
 			buf.WriteByte(v)
@@ -203,14 +223,8 @@ func EncodeMethodArgs(args ...any) []byte {
 			binary.Write(&buf, binary.BigEndian, uint16(v))
 		case int32:
 			binary.Write(&buf, binary.BigEndian, uint32(v))
-		case bool:
-			if v {
-				buf.WriteByte(1)
-			} else {
-				buf.WriteByte(0)
-			}
 		case string:
-			binary.Write(&buf, binary.BigEndian, uint16(len(v)))
+			buf.WriteByte(uint8(len(v)))
 			buf.WriteString(v)
 		case []byte:
 			binary.Write(&buf, binary.BigEndian, uint32(len(v)))

@@ -200,9 +200,9 @@ func TestAMQPPublisherConfirmsAndFlowNack(t *testing.T) {
 		false,               // mandatory
 		false,               // immediate
 	)
-	hdrPayload := make([]byte, 12)
+	hdrPayload := make([]byte, 14)
 	hdrPayload[1] = 60
-	hdrPayload[9] = 5
+	hdrPayload[11] = 5
 	if err := clientCodec.WriteFrame(&Frame{Type: FrameHeader, ChannelID: 1, Payload: hdrPayload}); err != nil {
 		t.Fatal(err)
 	}
@@ -242,9 +242,9 @@ func TestAMQPPublisherConfirmsAndFlowNack(t *testing.T) {
 		false,
 		false,
 	)
-	hdrPayload2 := make([]byte, 12)
+	hdrPayload2 := make([]byte, 14)
 	hdrPayload2[1] = 60
-	hdrPayload2[9] = 5
+	hdrPayload2[11] = 5
 	if err := clientCodec.WriteFrame(&Frame{Type: FrameHeader, ChannelID: 1, Payload: hdrPayload2}); err != nil {
 		t.Fatal(err)
 	}
